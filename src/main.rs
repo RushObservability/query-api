@@ -35,9 +35,15 @@ async fn main() -> anyhow::Result<()> {
     let clickhouse_db =
         std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "observability".to_string());
 
+    let clickhouse_user =
+        std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
+    let clickhouse_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+
     let ch = Client::default()
         .with_url(&clickhouse_url)
-        .with_database(&clickhouse_db);
+        .with_database(&clickhouse_db)
+        .with_user(&clickhouse_user)
+        .with_password(&clickhouse_password);
 
     let config_db_path =
         std::env::var("WIDE_CONFIG_DB").unwrap_or_else(|_| "./wide_config.db".to_string());
