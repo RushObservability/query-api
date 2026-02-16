@@ -1,6 +1,7 @@
 mod alert_engine;
 mod config_db;
 mod handlers;
+mod migrations;
 mod models;
 mod promql;
 mod query_builder;
@@ -38,6 +39,10 @@ async fn main() -> anyhow::Result<()> {
     let clickhouse_user =
         std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
     let clickhouse_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+
+    // Run migrations before creating the database-scoped client.
+    // This ensures the database and all tables exist on every startup.
+    migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?;
 
     let ch = Client::default()
         .with_url(&clickhouse_url)
@@ -80,6 +85,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/count", post(handlers::query::count_query))
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
+        // Log endpoints
+        .route("/api/v1/logs", post(handlers::logs::query_logs))
+        .route("/api/v1/logs/count", post(handlers::logs::count_logs))
         // Service catalog
         .route("/api/v1/services", get(handlers::services::list_services))
         .route("/api/v1/services/graph", get(handlers::services::service_graph))
@@ -181,6 +189,8 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/api-keys/{id}",
             delete(handlers::settings::delete_api_key),
         )
+        // Stats
+        .route("/api/v1/stats", post(handlers::stats::get_stats))
         // Health
         .route("/healthz", get(handlers::health::healthz))
         .layer(CorsLayer::permissive())
