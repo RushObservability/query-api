@@ -329,6 +329,20 @@ ORDER BY (ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
+    // ── Signal usage tracking ──
+    r"CREATE TABLE IF NOT EXISTS observability.signal_usage
+(
+    signal_name     LowCardinality(String),
+    signal_type     LowCardinality(String),
+    source          LowCardinality(String),
+    last_queried_at DateTime64(3) DEFAULT now64(3),
+    query_count     UInt64 DEFAULT 1
+)
+ENGINE = ReplacingMergeTree(last_queried_at)
+ORDER BY (signal_type, signal_name, source)
+TTL toDateTime(last_queried_at) + INTERVAL 90 DAY DELETE
+SETTINGS index_granularity = 8192",
+
     // ── OTel Logs table (matches otel-collector-contrib clickhouse exporter schema) ──
     r"CREATE TABLE IF NOT EXISTS observability.otel_logs
 (
