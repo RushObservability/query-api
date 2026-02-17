@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::AppState;
 use crate::models::metrics::*;
-use crate::promql::{self, PromExpr, RangeFunc, TimeSeries};
+use crate::promql;
 
 // ═══ Prometheus-compatible API endpoints ═══
 
@@ -39,10 +39,6 @@ async fn prom_query_inner(
     state: AppState,
     params: InstantQueryParams,
 ) -> Result<Json<PromResponse<VectorData>>, (StatusCode, String)> {
-    let expr = promql::parse(&params.query).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("PromQL parse error: {e}"))
-    })?;
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -53,11 +49,9 @@ async fn prom_query_inner(
         .and_then(|t| t.parse::<f64>().ok())
         .unwrap_or(now);
 
-    // For instant queries, look back 5 minutes for data
-    let lookback = 300.0;
-    let start = eval_time - lookback;
-
-    let series = evaluate_expr(&state, &expr, start, eval_time, lookback).await?;
+    let series = promql::evaluate_instant_query(&state.ch, &params.query, eval_time, 300.0)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("PromQL error: {e}")))?;
 
     // Return the latest value from each series
     let result: Vec<VectorResult> = series
@@ -69,6 +63,18 @@ async fn prom_query_inner(
             })
         })
         .collect();
+
+    // Only track usage if the query actually returned data
+    if !result.is_empty() {
+        let metric_names = crate::usage_tracker::extract_metrics_from_query(&params.query);
+        for name in metric_names {
+            state.usage.track(crate::usage_tracker::UsageEvent {
+                signal_name: name,
+                signal_type: "metric".to_string(),
+                source: "prom_api".to_string(),
+            });
+        }
+    }
 
     Ok(Json(PromResponse {
         status: "success",
@@ -107,10 +113,6 @@ async fn prom_query_range_inner(
     state: AppState,
     params: RangeQueryParams,
 ) -> Result<Json<PromResponse<MatrixData>>, (StatusCode, String)> {
-    let expr = promql::parse(&params.query).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("PromQL parse error: {e}"))
-    })?;
-
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
     let step = params
@@ -119,82 +121,29 @@ async fn prom_query_range_inner(
         .and_then(|s| parse_step(s).ok())
         .unwrap_or(15.0);
 
-    // Determine lookback window for range functions
-    let lookback = match &expr {
-        PromExpr::RangeFunction { range_secs, .. } => *range_secs,
-        PromExpr::Aggregation { inner, .. } => match inner.as_ref() {
-            PromExpr::RangeFunction { range_secs, .. } => *range_secs,
-            _ => 300.0,
-        },
-        _ => 300.0,
-    };
+    let series = promql::evaluate_range_query(&state.ch, &params.query, start, end, step)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("PromQL error: {e}")))?;
 
-    let series = evaluate_expr(&state, &expr, start - lookback, end, lookback).await?;
+    let result: Vec<MatrixResult> = series
+        .into_iter()
+        .map(|ts| MatrixResult {
+            metric: ts.labels,
+            values: ts.samples.iter().map(|(t, v)| (*t, format_value(*v))).collect(),
+        })
+        .collect();
 
-    // Align to step grid
-    let step_timestamps = generate_steps(start, end, step);
-
-    let result: Vec<MatrixResult> = match &expr {
-        PromExpr::Aggregation { op, by_labels, without, inner } => {
-            // For aggregations over range functions, we need step-aligned evaluation
-            let inner_series = match inner.as_ref() {
-                PromExpr::RangeFunction { func, range_secs, .. } => {
-                    // Compute rate/irate/increase at each step
-                    evaluate_range_at_steps(&series, *func, *range_secs, &step_timestamps)
-                }
-                _ => series,
-            };
-
-            let aggregated = promql::aggregate_series(
-                inner_series,
-                *op,
-                by_labels,
-                *without,
-                &step_timestamps,
-            );
-
-            aggregated
-                .into_iter()
-                .map(|ts| MatrixResult {
-                    metric: ts.labels,
-                    values: ts.samples.iter().map(|(t, v)| (*t, format_value(*v))).collect(),
-                })
-                .collect()
+    // Only track usage if the query actually returned data
+    if !result.is_empty() {
+        let metric_names = crate::usage_tracker::extract_metrics_from_query(&params.query);
+        for name in metric_names {
+            state.usage.track(crate::usage_tracker::UsageEvent {
+                signal_name: name,
+                signal_type: "metric".to_string(),
+                source: "prom_api".to_string(),
+            });
         }
-        PromExpr::RangeFunction { func, range_secs, .. } => {
-            let rated = evaluate_range_at_steps(&series, *func, *range_secs, &step_timestamps);
-            rated
-                .into_iter()
-                .map(|ts| MatrixResult {
-                    metric: ts.labels,
-                    values: ts.samples.iter().map(|(t, v)| (*t, format_value(*v))).collect(),
-                })
-                .collect()
-        }
-        PromExpr::Selector(_) => {
-            // Raw samples aligned to steps
-            series
-                .into_iter()
-                .map(|ts| {
-                    let values: Vec<(f64, String)> = step_timestamps
-                        .iter()
-                        .filter_map(|&t| {
-                            // Find the latest sample at or before this step
-                            ts.samples
-                                .iter()
-                                .rev()
-                                .find(|(st, _)| *st <= t + step / 2.0)
-                                .map(|(_, v)| (t, format_value(*v)))
-                        })
-                        .collect();
-                    MatrixResult {
-                        metric: ts.labels,
-                        values,
-                    }
-                })
-                .collect()
-        }
-    };
+    }
 
     Ok(Json(PromResponse {
         status: "success",
@@ -251,25 +200,32 @@ async fn prom_series_inner(
     let mut all_series = Vec::new();
 
     for expr_str in &match_exprs {
-        let selector = match promql::parse(expr_str) {
-            Ok(PromExpr::Selector(s)) => s,
+        // Parse with promql-parser and extract the VectorSelector
+        let expr = match promql_parser::parser::parse(expr_str) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let vs = match &expr {
+            promql_parser::parser::Expr::VectorSelector(vs) => vs,
             _ => continue,
         };
 
         let mut where_parts = vec![
-            format!(
-                "TimeUnix >= toDateTime64({}, 9)",
-                start_secs as i64
-            ),
-            format!(
-                "TimeUnix <= toDateTime64({}, 9)",
-                end_secs as i64
-            ),
+            format!("TimeUnix >= toDateTime64({}, 9)", start_secs as i64),
+            format!("TimeUnix <= toDateTime64({}, 9)", end_secs as i64),
         ];
-        if !selector.name.is_empty() {
-            where_parts.push(format!("MetricName = '{}'", selector.name.replace('\'', "\\'")));
+        if let Some(name) = &vs.name {
+            if !name.is_empty() {
+                where_parts.push(format!("MetricName = '{}'", name.replace('\'', "\\'")));
+            }
         }
-        where_parts.extend(promql::matchers_to_sql(&selector.matchers));
+        // Add matchers (skip __name__ since we handle it via vs.name)
+        let non_name_matchers: Vec<_> = vs.matchers.matchers.iter()
+            .filter(|m| m.name != "__name__")
+            .cloned()
+            .collect();
+        where_parts.extend(promql::matchers_to_sql(&non_name_matchers));
 
         let where_clause = where_parts.join(" AND ");
 
@@ -312,8 +268,15 @@ async fn prom_series_inner(
 
 // ── /api/v1/labels — label names ──
 
+#[derive(Debug, Deserialize)]
+pub struct LabelsParams {
+    #[serde(rename = "match[]")]
+    pub match_expr: Option<String>,
+}
+
 pub async fn prom_labels(
     State(state): State<AppState>,
+    Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Return well-known labels plus discovered attribute keys
     let mut labels = vec![
@@ -322,14 +285,21 @@ pub async fn prom_labels(
         "job".to_string(),
     ];
 
+    // Build optional metric filter
+    let metric_filter = params.match_expr.as_ref().map(|m| {
+        format!("AND MetricName = '{}'", m.replace('\'', "\\'"))
+    });
+
     // Discover attribute keys from gauge and sum tables
     for table in &["otel_metrics_gauge", "otel_metrics_sum"] {
         let sql = format!(
             "SELECT DISTINCT arrayJoin(mapKeys(Attributes)) AS name \
              FROM {table} \
              WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+             {filter} \
              ORDER BY name \
-             LIMIT 200"
+             LIMIT 200",
+            filter = metric_filter.as_deref().unwrap_or("")
         );
 
         let rows: Vec<LabelNameRow> = state
@@ -360,19 +330,27 @@ pub async fn prom_labels(
 pub async fn prom_label_values(
     State(state): State<AppState>,
     Path(label_name): Path<String>,
+    Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut values = Vec::new();
+
+    let metric_filter = params.match_expr.as_ref().map(|m| {
+        format!("AND MetricName = '{}'", m.replace('\'', "\\'"))
+    });
+    let filter = metric_filter.as_deref().unwrap_or("");
 
     for table in &["otel_metrics_gauge", "otel_metrics_sum"] {
         let sql = match label_name.as_str() {
             "__name__" => format!(
                 "SELECT DISTINCT MetricName AS value FROM {table} \
                  WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+                 {filter} \
                  ORDER BY value LIMIT 500"
             ),
             "service_name" | "job" => format!(
                 "SELECT DISTINCT ServiceName AS value FROM {table} \
                  WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+                 {filter} \
                  ORDER BY value LIMIT 500"
             ),
             _ => {
@@ -381,6 +359,7 @@ pub async fn prom_label_values(
                     "SELECT DISTINCT Attributes['{escaped}'] AS value FROM {table} \
                      WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
                        AND value != '' \
+                     {filter} \
                      ORDER BY value LIMIT 500"
                 )
             }
@@ -409,138 +388,7 @@ pub async fn prom_label_values(
     }))
 }
 
-// ═══ Internal evaluation helpers ═══
-
-/// Evaluate a PromQL expression against ClickHouse, returning raw TimeSeries.
-async fn evaluate_expr(
-    state: &AppState,
-    expr: &PromExpr,
-    start_secs: f64,
-    end_secs: f64,
-    _lookback: f64,
-) -> Result<Vec<TimeSeries>, (StatusCode, String)> {
-    let selector = extract_selector(expr);
-
-    let mut where_parts = vec![
-        format!(
-            "TimeUnix >= toDateTime64({}, 9)",
-            start_secs as i64
-        ),
-        format!(
-            "TimeUnix <= toDateTime64({}, 9)",
-            end_secs as i64
-        ),
-    ];
-
-    if !selector.name.is_empty() {
-        where_parts.push(format!(
-            "MetricName = '{}'",
-            selector.name.replace('\'', "\\'")
-        ));
-    }
-    where_parts.extend(promql::matchers_to_sql(&selector.matchers));
-
-    let where_clause = where_parts.join(" AND ");
-
-    // Query both gauge and sum tables in parallel
-    let gauge_sql = format!(
-        "SELECT MetricName, ServiceName, Attributes, \
-         toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
-         FROM otel_metrics_gauge \
-         WHERE {where_clause} \
-         ORDER BY TimeUnix"
-    );
-    let sum_sql = format!(
-        "SELECT MetricName, ServiceName, Attributes, \
-         toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
-         FROM otel_metrics_sum \
-         WHERE {where_clause} \
-         ORDER BY TimeUnix"
-    );
-
-    let (gauge_res, sum_res) = tokio::join!(
-        state.ch.query(&gauge_sql).fetch_all::<MetricSample>(),
-        state.ch.query(&sum_sql).fetch_all::<MetricSample>(),
-    );
-
-    let gauge_rows = gauge_res.unwrap_or_default();
-    let sum_rows = sum_res.unwrap_or_default();
-
-    // Merge and group into series
-    let all_samples: Vec<(BTreeMap<String, String>, f64, f64)> = gauge_rows
-        .iter()
-        .chain(sum_rows.iter())
-        .map(|s| {
-            let labels = promql::build_label_set(
-                &s.metric_name,
-                &s.service_name,
-                &s.attributes,
-            );
-            let ts_secs = s.ts_ms as f64 / 1000.0;
-            (labels, ts_secs, s.value)
-        })
-        .collect();
-
-    Ok(promql::group_into_series(all_samples))
-}
-
-/// Extract the innermost MetricSelector from any expression.
-fn extract_selector(expr: &PromExpr) -> &promql::MetricSelector {
-    match expr {
-        PromExpr::Selector(s) => s,
-        PromExpr::RangeFunction { selector, .. } => selector,
-        PromExpr::Aggregation { inner, .. } => extract_selector(inner),
-    }
-}
-
-/// Evaluate a range function (rate/irate/increase) at each step timestamp.
-fn evaluate_range_at_steps(
-    raw_series: &[TimeSeries],
-    func: RangeFunc,
-    range_secs: f64,
-    step_timestamps: &[f64],
-) -> Vec<TimeSeries> {
-    raw_series
-        .iter()
-        .map(|ts| {
-            let samples: Vec<(f64, f64)> = step_timestamps
-                .iter()
-                .filter_map(|&t| {
-                    // Gather samples in [t - range_secs, t]
-                    let window: Vec<(f64, f64)> = ts
-                        .samples
-                        .iter()
-                        .filter(|(st, _)| *st >= t - range_secs && *st <= t)
-                        .copied()
-                        .collect();
-
-                    let value = match func {
-                        RangeFunc::Rate => promql::compute_rate(&window),
-                        RangeFunc::Irate => promql::compute_irate(&window),
-                        RangeFunc::Increase => promql::compute_increase(&window),
-                    };
-
-                    value.map(|v| (t, v))
-                })
-                .collect();
-
-            TimeSeries {
-                labels: ts.labels.clone(),
-                samples,
-            }
-        })
-        .collect()
-}
-
-fn generate_steps(start: f64, end: f64, step: f64) -> Vec<f64> {
-    let mut timestamps = Vec::new();
-    let mut t = start;
-    while t <= end {
-        timestamps.push(t);
-        t += step;
-    }
-    timestamps
-}
+// ═══ Helpers ═══
 
 fn parse_timestamp(s: &str) -> Result<f64, (StatusCode, String)> {
     s.parse::<f64>().map_err(|_| {

@@ -55,6 +55,15 @@ pub async fn execute_query(
         .map(|r| r.count)
         .unwrap_or(0);
 
+    // Only track usage if the query returned results
+    if total > 0 {
+        let filter_pairs: Vec<(String, String)> = req.filters.iter()
+            .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+            .collect();
+        let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
+        state.usage.track_many(signals, "span", "explore");
+    }
+
     Ok(Json(QueryResponse {
         rows: json_rows,
         total,
@@ -225,6 +234,15 @@ pub async fn timeseries_query(
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
             })?;
 
+        // Only track usage if results returned
+        if !buckets.is_empty() {
+            let filter_pairs: Vec<(String, String)> = req.filters.iter()
+                .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+                .collect();
+            let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
+            state.usage.track_many(signals, "span", "explore");
+        }
+
         Ok(Json(serde_json::json!({ "buckets": buckets, "grouped": true })))
     } else {
         let sql = format!(
@@ -251,6 +269,15 @@ pub async fn timeseries_query(
                 tracing::error!("Timeseries query failed: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
             })?;
+
+        // Only track usage if results returned
+        if !buckets.is_empty() {
+            let filter_pairs: Vec<(String, String)> = req.filters.iter()
+                .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+                .collect();
+            let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
+            state.usage.track_many(signals, "span", "explore");
+        }
 
         Ok(Json(serde_json::json!({ "buckets": buckets, "grouped": false })))
     }

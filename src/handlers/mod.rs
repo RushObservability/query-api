@@ -11,3 +11,4 @@ pub mod slos;
 pub mod stats;
 pub mod suggest;
 pub mod traces;
+pub mod usage;

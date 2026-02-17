@@ -126,6 +126,15 @@ pub async fn query_logs(
         .map(|r| r.count)
         .unwrap_or(0);
 
+    // Only track usage if the query returned results
+    if total > 0 {
+        let filter_pairs: Vec<(String, String)> = req.filters.iter()
+            .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+            .collect();
+        let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
+        state.usage.track_many(signals, "log", "explore");
+    }
+
     Ok(Json(QueryResponse {
         rows: json_rows,
         total,

@@ -6,6 +6,7 @@ mod models;
 mod promql;
 mod query_builder;
 mod slo_engine;
+mod usage_tracker;
 
 use axum::{Router, routing::delete, routing::get, routing::post, routing::put};
 use clickhouse::Client;
@@ -16,11 +17,13 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use config_db::ConfigDb;
+use usage_tracker::UsageTracker;
 
 #[derive(Clone)]
 pub struct AppState {
     pub ch: Client,
     pub config_db: Arc<ConfigDb>,
+    pub usage: UsageTracker,
 }
 
 #[tokio::main]
@@ -72,9 +75,13 @@ async fn main() -> anyhow::Result<()> {
     alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config);
     slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
 
+    // Spawn usage tracker (fire-and-forget signal usage tracking)
+    let usage = usage_tracker::spawn(ch.clone());
+
     let state = AppState {
         ch,
         config_db,
+        usage,
     };
 
     let app = Router::new()
@@ -191,6 +198,9 @@ async fn main() -> anyhow::Result<()> {
         )
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
+        // Signal usage
+        .route("/api/v1/usage", get(handlers::usage::get_usage))
+        .route("/api/v1/usage/cardinality/{metric}", get(handlers::usage::get_label_breakdown))
         // Health
         .route("/healthz", get(handlers::health::healthz))
         .layer(CorsLayer::permissive())
