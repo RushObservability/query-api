@@ -3,6 +3,18 @@ name = "wide-query-api"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "wide_query_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wide-query-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "wide-anomaly-engine"
+path = "src/bin/anomaly_engine.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 clickhouse = { version = "0.13", features = ["time", "uuid"] }
@@ -23,6 +35,8 @@ rand = "0.9"
 lettre = { version = "0.10", features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
 promql-parser = "0.7"
 regex = "1"
+dotenvy = "0.15"
+urlencoding = "2"
 
 [profile.release]
 lto = true

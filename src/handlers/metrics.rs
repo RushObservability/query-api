@@ -285,9 +285,27 @@ pub async fn prom_labels(
         "job".to_string(),
     ];
 
-    // Build optional metric filter
-    let metric_filter = params.match_expr.as_ref().map(|m| {
-        format!("AND MetricName = '{}'", m.replace('\'', "\\'"))
+    // Build optional metric filter — parse Prometheus match expression
+    // e.g. {__name__="http_requests_total"} → MetricName = 'http_requests_total'
+    // e.g. {__name__=~"http_.*"} → MetricName LIKE 'http_%'
+    let metric_filter = params.match_expr.as_ref().and_then(|m| {
+        let trimmed = m.trim().trim_start_matches('{').trim_end_matches('}');
+        // Exact match: __name__="value"
+        if let Some(val) = trimmed.strip_prefix("__name__=\"").and_then(|s| s.strip_suffix('"')) {
+            let escaped = val.replace('\'', "\\'");
+            return Some(format!("AND MetricName = '{escaped}'"));
+        }
+        // Regex match: __name__=~"value"
+        if let Some(val) = trimmed.strip_prefix("__name__=~\"").and_then(|s| s.strip_suffix('"')) {
+            let like = val.replace(".*", "%").replace('.', "_").replace('\'', "\\'");
+            return Some(format!("AND MetricName LIKE '{like}'"));
+        }
+        // Fallback: treat as literal metric name
+        if !trimmed.is_empty() {
+            let escaped = trimmed.replace('\'', "\\'");
+            return Some(format!("AND MetricName = '{escaped}'"));
+        }
+        None
     });
 
     // Discover attribute keys from gauge and sum tables
@@ -334,8 +352,21 @@ pub async fn prom_label_values(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut values = Vec::new();
 
-    let metric_filter = params.match_expr.as_ref().map(|m| {
-        format!("AND MetricName = '{}'", m.replace('\'', "\\'"))
+    let metric_filter = params.match_expr.as_ref().and_then(|m| {
+        let trimmed = m.trim().trim_start_matches('{').trim_end_matches('}');
+        if let Some(val) = trimmed.strip_prefix("__name__=\"").and_then(|s| s.strip_suffix('"')) {
+            let escaped = val.replace('\'', "\\'");
+            return Some(format!("AND MetricName = '{escaped}'"));
+        }
+        if let Some(val) = trimmed.strip_prefix("__name__=~\"").and_then(|s| s.strip_suffix('"')) {
+            let like = val.replace(".*", "%").replace('.', "_").replace('\'', "\\'");
+            return Some(format!("AND MetricName LIKE '{like}'"));
+        }
+        if !trimmed.is_empty() {
+            let escaped = trimmed.replace('\'', "\\'");
+            return Some(format!("AND MetricName = '{escaped}'"));
+        }
+        None
     });
     let filter = metric_filter.as_deref().unwrap_or("");
 

@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod anomalies;
 pub mod dashboards;
 pub mod deploys;
 pub mod health;

@@ -60,6 +60,35 @@ pub async fn delete_channel(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn notify_channel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let channel = state
+        .config_db
+        .get_channel(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "channel not found".to_string()))?;
+
+    let config: serde_json::Value = serde_json::from_str(&channel.config)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let url = config
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "channel config missing url".to_string()))?;
+
+    let client = reqwest::Client::new();
+    client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_alerts(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -193,6 +222,16 @@ pub async fn list_alert_events(
     let events = state
         .config_db
         .list_alert_events(&id, 100)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "events": events })))
+}
+
+pub async fn list_all_alert_events(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let events = state
+        .config_db
+        .list_all_alert_events(200)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }
