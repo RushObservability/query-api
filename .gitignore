@@ -2,3 +2,4 @@
 wide_config.db
 wide_config.db-shm
 wide_config.db-wal
+.env

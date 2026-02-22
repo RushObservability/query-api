@@ -98,6 +98,18 @@ pub struct AlertEvent {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertEventWithRule {
+    pub id: String,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub state: String,
+    pub value: f64,
+    pub threshold: f64,
+    pub message: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateChannelRequest {
     pub name: String,

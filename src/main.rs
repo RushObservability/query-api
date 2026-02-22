@@ -1,13 +1,3 @@
-mod alert_engine;
-mod config_db;
-mod handlers;
-mod migrations;
-mod models;
-mod promql;
-mod query_builder;
-mod slo_engine;
-mod usage_tracker;
-
 use axum::{Router, routing::delete, routing::get, routing::post, routing::put};
 use clickhouse::Client;
 use std::net::SocketAddr;
@@ -16,18 +6,18 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use config_db::ConfigDb;
-use usage_tracker::UsageTracker;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub ch: Client,
-    pub config_db: Arc<ConfigDb>,
-    pub usage: UsageTracker,
-}
+use wide_query_api::alert_engine;
+use wide_query_api::config_db::ConfigDb;
+use wide_query_api::handlers;
+use wide_query_api::migrations;
+use wide_query_api::slo_engine;
+use wide_query_api::usage_tracker;
+use wide_query_api::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("wide_query_api=debug,tower_http=debug")
@@ -131,6 +121,15 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/channels/{id}",
             delete(handlers::alerts::delete_channel),
         )
+        .route(
+            "/api/v1/channels/{id}/notify",
+            post(handlers::alerts::notify_channel),
+        )
+        // Alert events (all rules)
+        .route(
+            "/api/v1/alert-events",
+            get(handlers::alerts::list_all_alert_events),
+        )
         // Alert rules
         .route(
             "/api/v1/alerts",
@@ -160,6 +159,34 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/slos/{id}/events",
             get(handlers::slos::list_slo_events),
+        )
+        // Anomaly rules
+        .route(
+            "/api/v1/anomaly-rules",
+            get(handlers::anomalies::list_anomaly_rules)
+                .post(handlers::anomalies::create_anomaly_rule),
+        )
+        .route(
+            "/api/v1/anomaly-rules/{id}",
+            get(handlers::anomalies::get_anomaly_rule)
+                .put(handlers::anomalies::update_anomaly_rule)
+                .delete(handlers::anomalies::delete_anomaly_rule),
+        )
+        .route(
+            "/api/v1/anomaly-events",
+            get(handlers::anomalies::list_all_anomaly_events),
+        )
+        .route(
+            "/api/v1/anomaly-events/{event_id}",
+            get(handlers::anomalies::get_anomaly_event),
+        )
+        .route(
+            "/api/v1/anomaly-events/{event_id}/correlations",
+            get(handlers::anomalies::get_event_correlations),
+        )
+        .route(
+            "/api/v1/anomaly-events/{event_id}/analyze",
+            post(handlers::anomalies::analyze_anomaly_event),
         )
         // Prometheus-compatible metrics API (for Grafana)
         .route(

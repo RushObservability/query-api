@@ -131,8 +131,61 @@ impl ConfigDb {
                 prefix     TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+
+            CREATE TABLE IF NOT EXISTS anomaly_rules (
+                id                      TEXT PRIMARY KEY,
+                name                    TEXT NOT NULL,
+                description             TEXT NOT NULL DEFAULT '',
+                enabled                 INTEGER NOT NULL DEFAULT 1,
+                source                  TEXT NOT NULL CHECK(source IN ('prometheus','apm')),
+                pattern                 TEXT NOT NULL DEFAULT '',
+                query                   TEXT NOT NULL DEFAULT '',
+                service_name            TEXT NOT NULL DEFAULT '',
+                apm_metric              TEXT NOT NULL DEFAULT '',
+                sensitivity             REAL NOT NULL DEFAULT 3.0,
+                alpha                   REAL NOT NULL DEFAULT 0.25,
+                eval_interval_secs      INTEGER NOT NULL DEFAULT 300,
+                window_secs             INTEGER NOT NULL DEFAULT 3600,
+                notification_channel_ids TEXT NOT NULL DEFAULT '[]',
+                state                   TEXT NOT NULL DEFAULT 'normal' CHECK(state IN ('normal','anomalous','no_data')),
+                last_eval_at            TEXT,
+                last_triggered_at       TEXT,
+                created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS anomaly_events (
+                id         TEXT PRIMARY KEY,
+                rule_id    TEXT NOT NULL REFERENCES anomaly_rules(id) ON DELETE CASCADE,
+                state      TEXT NOT NULL,
+                metric     TEXT NOT NULL DEFAULT '',
+                value      REAL NOT NULL,
+                expected   REAL NOT NULL,
+                deviation  REAL NOT NULL DEFAULT 0.0,
+                message    TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_anomaly_events_rule ON anomaly_events(rule_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             ",
         )?;
+
+        // Add split_labels column if it doesn't exist yet
+        {
+            let has_col: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('anomaly_rules') WHERE name = 'split_labels'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE anomaly_rules ADD COLUMN split_labels TEXT NOT NULL DEFAULT '[]';",
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -525,6 +578,35 @@ impl ConfigDb {
         Ok(rows)
     }
 
+    pub fn list_all_alert_events(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::models::alert::AlertEventWithRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.rule_id, COALESCE(r.name, 'deleted rule') as rule_name, \
+             e.state, e.value, e.threshold, e.message, e.created_at \
+             FROM alert_events e \
+             LEFT JOIN alert_rules r ON e.rule_id = r.id \
+             ORDER BY e.created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(crate::models::alert::AlertEventWithRule {
+                    id: row.get(0)?,
+                    rule_id: row.get(1)?,
+                    rule_name: row.get(2)?,
+                    state: row.get(3)?,
+                    value: row.get(4)?,
+                    threshold: row.get(5)?,
+                    message: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_channel(&self, id: &str) -> anyhow::Result<Option<crate::models::alert::NotificationChannel>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -882,5 +964,332 @@ impl ConfigDb {
         let conn = self.conn.lock().unwrap();
         let count = conn.execute("DELETE FROM api_keys WHERE id = ?1", params![id])?;
         Ok(count > 0)
+    }
+
+    // ── Anomaly rule operations ──
+
+    pub fn list_anomaly_rules(&self) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, enabled, source, pattern, query, service_name, \
+             apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, \
+             split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, \
+             created_at, updated_at FROM anomaly_rules ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::models::anomaly::AnomalyRule {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    enabled: row.get(3)?,
+                    source: row.get(4)?,
+                    pattern: row.get(5)?,
+                    query: row.get(6)?,
+                    service_name: row.get(7)?,
+                    apm_metric: row.get(8)?,
+                    sensitivity: row.get(9)?,
+                    alpha: row.get(10)?,
+                    eval_interval_secs: row.get(11)?,
+                    window_secs: row.get(12)?,
+                    split_labels: row.get(13)?,
+                    notification_channel_ids: row.get(14)?,
+                    state: row.get(15)?,
+                    last_eval_at: row.get(16)?,
+                    last_triggered_at: row.get(17)?,
+                    created_at: row.get(18)?,
+                    updated_at: row.get(19)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_anomaly_rule(&self, id: &str) -> anyhow::Result<Option<crate::models::anomaly::AnomalyRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, enabled, source, pattern, query, service_name, \
+             apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, \
+             split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, \
+             created_at, updated_at FROM anomaly_rules WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(crate::models::anomaly::AnomalyRule {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                enabled: row.get(3)?,
+                source: row.get(4)?,
+                pattern: row.get(5)?,
+                query: row.get(6)?,
+                service_name: row.get(7)?,
+                apm_metric: row.get(8)?,
+                sensitivity: row.get(9)?,
+                alpha: row.get(10)?,
+                eval_interval_secs: row.get(11)?,
+                window_secs: row.get(12)?,
+                split_labels: row.get(13)?,
+                notification_channel_ids: row.get(14)?,
+                state: row.get(15)?,
+                last_eval_at: row.get(16)?,
+                last_triggered_at: row.get(17)?,
+                created_at: row.get(18)?,
+                updated_at: row.get(19)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn create_anomaly_rule(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+        enabled: bool,
+        source: &str,
+        pattern: &str,
+        query: &str,
+        service_name: &str,
+        apm_metric: &str,
+        sensitivity: f64,
+        alpha: f64,
+        eval_interval_secs: i64,
+        window_secs: i64,
+        split_labels: &str,
+        notification_channel_ids: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO anomaly_rules (id, name, description, enabled, source, pattern, query, \
+             service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, \
+             split_labels, notification_channel_ids) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![id, name, description, enabled, source, pattern, query,
+                    service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs,
+                    split_labels, notification_channel_ids],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_anomaly_rule(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+        enabled: bool,
+        source: &str,
+        pattern: &str,
+        query: &str,
+        service_name: &str,
+        apm_metric: &str,
+        sensitivity: f64,
+        alpha: f64,
+        eval_interval_secs: i64,
+        window_secs: i64,
+        split_labels: &str,
+        notification_channel_ids: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "UPDATE anomaly_rules SET name = ?2, description = ?3, enabled = ?4, source = ?5, \
+             pattern = ?6, query = ?7, service_name = ?8, apm_metric = ?9, sensitivity = ?10, \
+             alpha = ?11, eval_interval_secs = ?12, window_secs = ?13, \
+             split_labels = ?14, notification_channel_ids = ?15, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
+            params![id, name, description, enabled, source, pattern, query,
+                    service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs,
+                    split_labels, notification_channel_ids],
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn delete_anomaly_rule(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute("DELETE FROM anomaly_rules WHERE id = ?1", params![id])?;
+        Ok(count > 0)
+    }
+
+    pub fn get_due_anomaly_rules(&self, now: &str) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, enabled, source, pattern, query, service_name, \
+             apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, \
+             split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, \
+             created_at, updated_at FROM anomaly_rules \
+             WHERE enabled = 1 AND (last_eval_at IS NULL OR \
+             strftime('%s', ?1) - strftime('%s', last_eval_at) >= eval_interval_secs)",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |row| {
+                Ok(crate::models::anomaly::AnomalyRule {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    enabled: row.get(3)?,
+                    source: row.get(4)?,
+                    pattern: row.get(5)?,
+                    query: row.get(6)?,
+                    service_name: row.get(7)?,
+                    apm_metric: row.get(8)?,
+                    sensitivity: row.get(9)?,
+                    alpha: row.get(10)?,
+                    eval_interval_secs: row.get(11)?,
+                    window_secs: row.get(12)?,
+                    split_labels: row.get(13)?,
+                    notification_channel_ids: row.get(14)?,
+                    state: row.get(15)?,
+                    last_eval_at: row.get(16)?,
+                    last_triggered_at: row.get(17)?,
+                    created_at: row.get(18)?,
+                    updated_at: row.get(19)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_anomaly_state(
+        &self,
+        id: &str,
+        state: &str,
+        last_eval_at: &str,
+        last_triggered_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        match last_triggered_at {
+            Some(t) => {
+                conn.execute(
+                    "UPDATE anomaly_rules SET state = ?2, last_eval_at = ?3, last_triggered_at = ?4 WHERE id = ?1",
+                    params![id, state, last_eval_at, t],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE anomaly_rules SET state = ?2, last_eval_at = ?3 WHERE id = ?1",
+                    params![id, state, last_eval_at],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    // ── Anomaly event operations ──
+
+    pub fn get_anomaly_event(&self, id: &str) -> anyhow::Result<Option<crate::models::anomaly::AnomalyEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, rule_id, state, metric, value, expected, deviation, message, created_at \
+             FROM anomaly_events WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(crate::models::anomaly::AnomalyEvent {
+                id: row.get(0)?,
+                rule_id: row.get(1)?,
+                state: row.get(2)?,
+                metric: row.get(3)?,
+                value: row.get(4)?,
+                expected: row.get(5)?,
+                deviation: row.get(6)?,
+                message: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn create_anomaly_event(
+        &self,
+        id: &str,
+        rule_id: &str,
+        state: &str,
+        metric: &str,
+        value: f64,
+        expected: f64,
+        deviation: f64,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO anomaly_events (id, rule_id, state, metric, value, expected, deviation, message) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, rule_id, state, metric, value, expected, deviation, message],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_anomaly_events(
+        &self,
+        rule_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, rule_id, state, metric, value, expected, deviation, message, created_at \
+             FROM anomaly_events WHERE rule_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![rule_id, limit], |row| {
+                Ok(crate::models::anomaly::AnomalyEvent {
+                    id: row.get(0)?,
+                    rule_id: row.get(1)?,
+                    state: row.get(2)?,
+                    metric: row.get(3)?,
+                    value: row.get(4)?,
+                    expected: row.get(5)?,
+                    deviation: row.get(6)?,
+                    message: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ── Settings operations ──
+
+    pub fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+        let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_all_anomaly_events(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyEventWithRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.rule_id, COALESCE(r.name, 'deleted rule') as rule_name, \
+             e.state, e.metric, e.value, e.expected, e.deviation, e.message, e.created_at \
+             FROM anomaly_events e \
+             LEFT JOIN anomaly_rules r ON e.rule_id = r.id \
+             ORDER BY e.created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(crate::models::anomaly::AnomalyEventWithRule {
+                    id: row.get(0)?,
+                    rule_id: row.get(1)?,
+                    rule_name: row.get(2)?,
+                    state: row.get(3)?,
+                    metric: row.get(4)?,
+                    value: row.get(5)?,
+                    expected: row.get(6)?,
+                    deviation: row.get(7)?,
+                    message: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }

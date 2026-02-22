@@ -2,7 +2,7 @@ BINARY  := wide-query-api
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
-.PHONY: build release run dev check test fmt lint clean docker package
+.PHONY: build release run run-anomaly dev check test fmt lint clean docker package
 
 ## Development
 
@@ -12,10 +12,24 @@ build:                ## Build debug binary
 release:              ## Build optimised release binary
 	cargo build --release
 
-run:                  ## Run in debug mode
-	RUST_LOG=wide_query_api=debug,tower_http=debug cargo run
+run:                  ## Run query-api in debug mode
+	RUST_LOG=wide_query_api=debug,tower_http=debug cargo run --bin wide-query-api
+
+run-anomaly:          ## Run anomaly engine in debug mode
+	WIDE_PROM_BASE_URL=http://localhost:8080 \
+	RUST_LOG=wide_query_api=debug \
+	cargo run --bin wide-anomaly-engine
 
 dev: run              ## Alias for run
+
+watch:                ## Watch & restart query-api on code changes
+	RUST_LOG=wide_query_api=debug,tower_http=debug \
+	cargo watch -x 'run --bin wide-query-api'
+
+watch-anomaly:        ## Watch & restart anomaly engine on code changes
+	WIDE_PROM_BASE_URL=http://localhost:8080 \
+	RUST_LOG=wide_query_api=debug \
+	cargo watch -x 'run --bin wide-anomaly-engine'
 
 ## Quality
 

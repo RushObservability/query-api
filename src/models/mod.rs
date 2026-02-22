@@ -1,4 +1,5 @@
 pub mod alert;
+pub mod anomaly;
 pub mod dashboard;
 pub mod deploy;
 pub mod log;
