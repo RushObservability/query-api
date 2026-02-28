@@ -380,6 +380,53 @@ PRIMARY KEY (ServiceName, TimestampTime)
 ORDER BY (ServiceName, TimestampTime, Timestamp)
 TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+
+    // ── RUM (Real User Monitoring) events ──
+    r"CREATE TABLE IF NOT EXISTS observability.rum_events
+(
+    Timestamp          DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    TimestampTime      DateTime DEFAULT toDateTime(Timestamp),
+    AppName            LowCardinality(String) CODEC(ZSTD(1)),
+    AppVersion         LowCardinality(String) CODEC(ZSTD(1)),
+    Environment        LowCardinality(String) CODEC(ZSTD(1)),
+    SessionId          String CODEC(ZSTD(1)),
+    UserId             String CODEC(ZSTD(1)),
+    PageUrl            String CODEC(ZSTD(1)),
+    PagePath           String CODEC(ZSTD(1)),
+    ViewName           String CODEC(ZSTD(1)),
+    Referrer           String CODEC(ZSTD(1)),
+    BrowserName        LowCardinality(String) CODEC(ZSTD(1)),
+    BrowserVersion     LowCardinality(String) CODEC(ZSTD(1)),
+    OsName             LowCardinality(String) CODEC(ZSTD(1)),
+    OsVersion          LowCardinality(String) CODEC(ZSTD(1)),
+    DeviceType         LowCardinality(String) CODEC(ZSTD(1)),
+    ScreenWidth        UInt16 CODEC(ZSTD(1)),
+    ScreenHeight       UInt16 CODEC(ZSTD(1)),
+    EventType          LowCardinality(String) CODEC(ZSTD(1)),
+    EventName          String CODEC(ZSTD(1)),
+    VitalName          LowCardinality(String) CODEC(ZSTD(1)),
+    VitalValue         Float64 CODEC(Gorilla, ZSTD(1)),
+    VitalRating        LowCardinality(String) CODEC(ZSTD(1)),
+    ErrorMessage       String CODEC(ZSTD(1)),
+    ErrorStack         String CODEC(ZSTD(1)),
+    ErrorType          LowCardinality(String) CODEC(ZSTD(1)),
+    InteractionTarget  String CODEC(ZSTD(1)),
+    InteractionType    LowCardinality(String) CODEC(ZSTD(1)),
+    DurationMs         Float64 CODEC(Gorilla, ZSTD(1)),
+    TraceId            String CODEC(ZSTD(1)),
+    SpanId             String CODEC(ZSTD(1)),
+    Attributes         String CODEC(ZSTD(1)),
+    INDEX idx_session_id SessionId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_user_id UserId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_error_message ErrorMessage TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 8
+)
+ENGINE = MergeTree
+PARTITION BY toDate(TimestampTime)
+PRIMARY KEY (AppName, EventType, TimestampTime)
+ORDER BY (AppName, EventType, TimestampTime, Timestamp)
+TTL toDateTime(Timestamp) + INTERVAL 14 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 ];
 
 /// Run all migrations against ClickHouse.
