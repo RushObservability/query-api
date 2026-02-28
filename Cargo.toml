@@ -37,6 +37,7 @@ promql-parser = "0.7"
 regex = "1"
 dotenvy = "0.15"
 urlencoding = "2"
+toml = "0.8"
 
 [profile.release]
 lto = true

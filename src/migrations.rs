@@ -1,5 +1,7 @@
 use clickhouse::Client;
 
+use crate::config::WideConfig;
+
 /// Ordered list of DDL statements to ensure the observability schema exists.
 /// Every statement is idempotent (`IF NOT EXISTS`) so safe to run on every startup.
 const MIGRATIONS: &[&str] = &[
@@ -385,7 +387,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 /// Connects **without** a default database so that `CREATE DATABASE` succeeds
 /// even on a fresh instance. Every statement uses `IF NOT EXISTS` so this is
 /// safe to call on every startup.
-pub async fn run(url: &str, user: &str, password: &str) -> anyhow::Result<()> {
+pub async fn run(url: &str, user: &str, password: &str, config: &WideConfig) -> anyhow::Result<()> {
     let client = Client::default()
         .with_url(url)
         .with_user(user)
@@ -403,5 +405,137 @@ pub async fn run(url: &str, user: &str, password: &str) -> anyhow::Result<()> {
     }
 
     tracing::info!("clickhouse migrations complete");
+
+    apply_retention_ttl(&client, config).await?;
+    apply_storage_policy(&client, config).await;
+
     Ok(())
+}
+
+/// Adjust table-level TTLs based on config. Uses the effective (max) TTL so
+/// that part-level drops don't remove data that has longer per-rule retention.
+async fn apply_retention_ttl(client: &Client, config: &WideConfig) -> anyhow::Result<()> {
+    let metrics_days = config.effective_metrics_ttl_days();
+    let traces_days = config.effective_traces_ttl_days();
+    let logs_days = config.effective_logs_ttl_days();
+
+    tracing::info!(
+        "applying retention TTLs: metrics={metrics_days}d, traces={traces_days}d, logs={logs_days}d"
+    );
+
+    // Metrics tables
+    let metric_tables = [
+        "otel_metrics_gauge",
+        "otel_metrics_sum",
+        "otel_metrics_histogram",
+        "otel_metrics_exponential_histogram",
+        "otel_metrics_summary",
+    ];
+    for table in metric_tables {
+        let sql = format!(
+            "ALTER TABLE observability.{table} MODIFY TTL toDateTime(TimeUnix) + INTERVAL {metrics_days} DAY DELETE"
+        );
+        if let Err(e) = client.query(&sql).execute().await {
+            tracing::warn!("failed to set TTL on {table}: {e}");
+        }
+    }
+
+    // Trace tables
+    let trace_ttl_specs: &[(&str, &str)] = &[
+        ("otel_traces", "toDateTime(Timestamp)"),
+        ("wide_events", "toDateTime(timestamp)"),
+    ];
+    for (table, ts_expr) in trace_ttl_specs {
+        let sql = format!(
+            "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {traces_days} DAY DELETE"
+        );
+        if let Err(e) = client.query(&sql).execute().await {
+            tracing::warn!("failed to set TTL on {table}: {e}");
+        }
+    }
+
+    // Log table
+    let sql = format!(
+        "ALTER TABLE observability.otel_logs MODIFY TTL toDateTime(Timestamp) + INTERVAL {logs_days} DAY DELETE"
+    );
+    if let Err(e) = client.query(&sql).execute().await {
+        tracing::warn!("failed to set TTL on otel_logs: {e}");
+    }
+
+    Ok(())
+}
+
+/// Apply the tiered storage policy and per-signal TTL MOVE rules.
+///
+/// Each signal type (metrics, traces, logs) can independently control when
+/// parts are moved from the local (hot) volume to S3 (cold) via
+/// `*_move_after_days` in `[storage.tiering]`.  Set to 0 to disable tiering
+/// for that signal type — the table keeps the `tiered` policy but no TTL MOVE
+/// rule is added, so data stays on the hot volume.
+///
+/// Non-fatal — if ClickHouse doesn't have the s3_disk registered yet (e.g.
+/// first boot before MinIO is ready), we just log and continue.
+async fn apply_storage_policy(client: &Client, config: &WideConfig) {
+    if config.storage.s3.is_none() {
+        tracing::debug!("no S3 config, skipping storage policy");
+        return;
+    }
+
+    let tiering = &config.storage.tiering;
+
+    // (table, timestamp_expr, move_after_days)
+    let specs: &[(&str, &str, u32)] = &[
+        // Metrics
+        ("otel_metrics_gauge", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("otel_metrics_sum", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("otel_metrics_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("otel_metrics_exponential_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("otel_metrics_summary", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        // Traces / spans
+        ("otel_traces", "toDateTime(Timestamp)", tiering.traces_move_after_days),
+        ("wide_events", "toDateTime(timestamp)", tiering.traces_move_after_days),
+        // Logs
+        ("otel_logs", "toDateTime(Timestamp)", tiering.logs_move_after_days),
+    ];
+
+    for (table, ts_expr, move_days) in specs {
+        // Always assign the tiered policy so the cold volume is available
+        let policy_sql = format!(
+            "ALTER TABLE observability.{table} MODIFY SETTING storage_policy = 'tiered'"
+        );
+        if let Err(e) = client.query(&policy_sql).execute().await {
+            tracing::warn!("could not set tiered storage on {table} (non-fatal): {e}");
+            continue; // no point setting TTL MOVE if the policy didn't apply
+        }
+
+        if *move_days == 0 {
+            tracing::info!("tiering disabled for {table} (move_after_days=0)");
+            continue;
+        }
+
+        // Add TTL MOVE rule: parts older than N days move to the cold (S3) volume
+        // We use MODIFY TTL which replaces any existing TTL expression, so we must
+        // include the existing DELETE TTL alongside the new MOVE TTL.
+        let delete_days = match *table {
+            t if t.starts_with("otel_metrics") => config.effective_metrics_ttl_days(),
+            "otel_traces" | "wide_events" => config.effective_traces_ttl_days(),
+            "otel_logs" => config.effective_logs_ttl_days(),
+            _ => 30,
+        };
+        let sql = format!(
+            "ALTER TABLE observability.{table} MODIFY TTL \
+             {ts_expr} + INTERVAL {move_days} DAY TO VOLUME 'cold', \
+             {ts_expr} + INTERVAL {delete_days} DAY DELETE"
+        );
+        if let Err(e) = client.query(&sql).execute().await {
+            tracing::warn!("could not set TTL MOVE on {table} (non-fatal): {e}");
+        }
+    }
+
+    tracing::info!(
+        "tiered storage policy applied (metrics={}d, traces={}d, logs={}d)",
+        tiering.metrics_move_after_days,
+        tiering.traces_move_after_days,
+        tiering.logs_move_after_days,
+    );
 }

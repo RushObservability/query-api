@@ -108,6 +108,10 @@ pub async fn create_alert(
     if !valid_ops.contains(&req.condition_op.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid condition_op: {}", req.condition_op)));
     }
+    let valid_signal_types = ["apm", "metrics", "logs"];
+    if !valid_signal_types.contains(&req.signal_type.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, format!("invalid signal_type: {}", req.signal_type)));
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let query_config = serde_json::to_string(&req.query_config)
@@ -122,6 +126,7 @@ pub async fn create_alert(
             &req.name,
             &req.description,
             req.enabled,
+            &req.signal_type,
             &query_config,
             &req.condition_op,
             req.condition_threshold,
@@ -168,6 +173,10 @@ pub async fn update_alert(
     if !valid_ops.contains(&req.condition_op.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid condition_op: {}", req.condition_op)));
     }
+    let valid_signal_types = ["apm", "metrics", "logs"];
+    if !valid_signal_types.contains(&req.signal_type.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, format!("invalid signal_type: {}", req.signal_type)));
+    }
 
     let query_config = serde_json::to_string(&req.query_config)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -181,6 +190,7 @@ pub async fn update_alert(
             &req.name,
             &req.description,
             req.enabled,
+            &req.signal_type,
             &query_config,
             &req.condition_op,
             req.condition_threshold,

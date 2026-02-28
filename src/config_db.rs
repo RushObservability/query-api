@@ -186,6 +186,18 @@ impl ConfigDb {
             }
         }
 
+        // Add signal_type column to alert_rules if it doesn't exist yet
+        {
+            let has_col: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('alert_rules') WHERE name = 'signal_type'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE alert_rules ADD COLUMN signal_type TEXT NOT NULL DEFAULT 'apm';",
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -371,7 +383,7 @@ impl ConfigDb {
     pub fn list_alerts(&self) -> anyhow::Result<Vec<crate::models::alert::AlertRule>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, enabled, query_config, condition_op, condition_threshold, \
+            "SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, \
              eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, \
              created_at, updated_at FROM alert_rules ORDER BY created_at DESC",
         )?;
@@ -382,16 +394,17 @@ impl ConfigDb {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     enabled: row.get(3)?,
-                    query_config: row.get(4)?,
-                    condition_op: row.get(5)?,
-                    condition_threshold: row.get(6)?,
-                    eval_interval_secs: row.get(7)?,
-                    notification_channel_ids: row.get(8)?,
-                    state: row.get(9)?,
-                    last_eval_at: row.get(10)?,
-                    last_triggered_at: row.get(11)?,
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    signal_type: row.get(4)?,
+                    query_config: row.get(5)?,
+                    condition_op: row.get(6)?,
+                    condition_threshold: row.get(7)?,
+                    eval_interval_secs: row.get(8)?,
+                    notification_channel_ids: row.get(9)?,
+                    state: row.get(10)?,
+                    last_eval_at: row.get(11)?,
+                    last_triggered_at: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -401,7 +414,7 @@ impl ConfigDb {
     pub fn get_alert(&self, id: &str) -> anyhow::Result<Option<crate::models::alert::AlertRule>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, enabled, query_config, condition_op, condition_threshold, \
+            "SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, \
              eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, \
              created_at, updated_at FROM alert_rules WHERE id = ?1",
         )?;
@@ -411,16 +424,17 @@ impl ConfigDb {
                 name: row.get(1)?,
                 description: row.get(2)?,
                 enabled: row.get(3)?,
-                query_config: row.get(4)?,
-                condition_op: row.get(5)?,
-                condition_threshold: row.get(6)?,
-                eval_interval_secs: row.get(7)?,
-                notification_channel_ids: row.get(8)?,
-                state: row.get(9)?,
-                last_eval_at: row.get(10)?,
-                last_triggered_at: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                signal_type: row.get(4)?,
+                query_config: row.get(5)?,
+                condition_op: row.get(6)?,
+                condition_threshold: row.get(7)?,
+                eval_interval_secs: row.get(8)?,
+                notification_channel_ids: row.get(9)?,
+                state: row.get(10)?,
+                last_eval_at: row.get(11)?,
+                last_triggered_at: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -432,6 +446,7 @@ impl ConfigDb {
         name: &str,
         description: &str,
         enabled: bool,
+        signal_type: &str,
         query_config: &str,
         condition_op: &str,
         condition_threshold: f64,
@@ -440,10 +455,10 @@ impl ConfigDb {
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO alert_rules (id, name, description, enabled, query_config, condition_op, \
+            "INSERT INTO alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, \
              condition_threshold, eval_interval_secs, notification_channel_ids) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, name, description, enabled, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids],
         )?;
         Ok(())
     }
@@ -454,6 +469,7 @@ impl ConfigDb {
         name: &str,
         description: &str,
         enabled: bool,
+        signal_type: &str,
         query_config: &str,
         condition_op: &str,
         condition_threshold: f64,
@@ -462,10 +478,10 @@ impl ConfigDb {
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count = conn.execute(
-            "UPDATE alert_rules SET name = ?2, description = ?3, enabled = ?4, query_config = ?5, \
-             condition_op = ?6, condition_threshold = ?7, eval_interval_secs = ?8, \
-             notification_channel_ids = ?9, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
-            params![id, name, description, enabled, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids],
+            "UPDATE alert_rules SET name = ?2, description = ?3, enabled = ?4, signal_type = ?5, query_config = ?6, \
+             condition_op = ?7, condition_threshold = ?8, eval_interval_secs = ?9, \
+             notification_channel_ids = ?10, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
+            params![id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids],
         )?;
         Ok(count > 0)
     }
@@ -504,7 +520,7 @@ impl ConfigDb {
     pub fn get_due_alerts(&self, now: &str) -> anyhow::Result<Vec<crate::models::alert::AlertRule>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, enabled, query_config, condition_op, condition_threshold, \
+            "SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, \
              eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, \
              created_at, updated_at FROM alert_rules \
              WHERE enabled = 1 AND (last_eval_at IS NULL OR \
@@ -517,16 +533,17 @@ impl ConfigDb {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     enabled: row.get(3)?,
-                    query_config: row.get(4)?,
-                    condition_op: row.get(5)?,
-                    condition_threshold: row.get(6)?,
-                    eval_interval_secs: row.get(7)?,
-                    notification_channel_ids: row.get(8)?,
-                    state: row.get(9)?,
-                    last_eval_at: row.get(10)?,
-                    last_triggered_at: row.get(11)?,
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    signal_type: row.get(4)?,
+                    query_config: row.get(5)?,
+                    condition_op: row.get(6)?,
+                    condition_threshold: row.get(7)?,
+                    eval_interval_secs: row.get(8)?,
+                    notification_channel_ids: row.get(9)?,
+                    state: row.get(10)?,
+                    last_eval_at: row.get(11)?,
+                    last_triggered_at: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
