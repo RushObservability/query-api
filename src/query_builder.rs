@@ -79,8 +79,16 @@ pub fn build_where_clause_with_search(
 #[derive(Debug)]
 enum SearchExpr {
     Term(String),
+    KeyValue(String, String), // key=value attribute lookup
     And(Vec<SearchExpr>),
     Or(Vec<SearchExpr>),
+}
+
+/// Context for SQL generation — different tables have different attribute column shapes.
+#[derive(Debug, Clone, Copy)]
+enum SearchContext {
+    Spans, // attributes is JSON string, no ResourceAttributes
+    Logs,  // LogAttributes & ResourceAttributes are Map columns
 }
 
 /// Tokenize a search string, keeping double-quoted phrases as single tokens.
@@ -163,14 +171,26 @@ fn parse_search_expr(input: &str) -> Option<SearchExpr> {
         return None;
     }
 
+    // Convert a token to a Term or KeyValue expression
+    let token_to_expr = |tok: String| -> SearchExpr {
+        if let Some((key, value)) = tok.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            if !key.is_empty() && !value.is_empty() {
+                return SearchExpr::KeyValue(key.to_string(), value.to_string());
+            }
+        }
+        SearchExpr::Term(tok)
+    };
+
     // Convert groups to expressions
     let or_parts: Vec<SearchExpr> = and_groups
         .into_iter()
         .map(|group| {
             if group.len() == 1 {
-                SearchExpr::Term(group.into_iter().next().unwrap())
+                token_to_expr(group.into_iter().next().unwrap())
             } else {
-                SearchExpr::And(group.into_iter().map(SearchExpr::Term).collect())
+                SearchExpr::And(group.into_iter().map(token_to_expr).collect())
             }
         })
         .collect();
@@ -222,16 +242,48 @@ fn term_match_sql(term: &str, columns: &[(&str, bool)]) -> String {
     }
 }
 
+/// Generate SQL for a `key=value` attribute lookup.
+/// Supports `*` wildcards in the value (e.g. `container.name=wide*`).
+fn kv_match_sql(key: &str, value: &str, ctx: SearchContext) -> String {
+    let ek = key.replace('\'', "\\'");
+    let ev = value.replace('\'', "\\'");
+    let has_wildcard = value.contains('*');
+
+    match ctx {
+        SearchContext::Logs => {
+            if has_wildcard {
+                let pattern = ev.replace('%', "\\%").replace('_', "\\_").replace('*', "%");
+                format!(
+                    "(LogAttributes['{ek}'] ILIKE '{pattern}' OR ResourceAttributes['{ek}'] ILIKE '{pattern}')"
+                )
+            } else {
+                format!(
+                    "(LogAttributes['{ek}'] = '{ev}' OR ResourceAttributes['{ek}'] = '{ev}')"
+                )
+            }
+        }
+        SearchContext::Spans => {
+            if has_wildcard {
+                let pattern = ev.replace('%', "\\%").replace('_', "\\_").replace('*', "%");
+                format!("JSONExtractString(attributes, '{ek}') ILIKE '{pattern}'")
+            } else {
+                format!("JSONExtractString(attributes, '{ek}') = '{ev}'")
+            }
+        }
+    }
+}
+
 /// Recursively generate SQL for a search expression tree.
-fn search_expr_to_sql(expr: &SearchExpr, columns: &[(&str, bool)]) -> String {
+fn search_expr_to_sql(expr: &SearchExpr, columns: &[(&str, bool)], ctx: SearchContext) -> String {
     match expr {
         SearchExpr::Term(term) => term_match_sql(term, columns),
+        SearchExpr::KeyValue(key, value) => kv_match_sql(key, value, ctx),
         SearchExpr::And(exprs) => {
-            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, columns)).collect();
+            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, columns, ctx)).collect();
             format!("({})", parts.join(" AND "))
         }
         SearchExpr::Or(exprs) => {
-            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, columns)).collect();
+            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, columns, ctx)).collect();
             format!("({})", parts.join(" OR "))
         }
     }
@@ -246,7 +298,7 @@ pub fn build_span_search_sql(search: &str) -> Option<String> {
         ("event_names", true),
         ("event_attributes", true),
     ];
-    Some(search_expr_to_sql(&expr, &columns))
+    Some(search_expr_to_sql(&expr, &columns, SearchContext::Spans))
 }
 
 /// Build a SQL condition for free-text search on log columns (otel_logs table).
@@ -255,8 +307,9 @@ pub fn build_log_search_sql(search: &str) -> Option<String> {
     let columns: Vec<(&str, bool)> = vec![
         ("Body", false),
         ("toString(LogAttributes)", false),
+        ("toString(ResourceAttributes)", false),
     ];
-    Some(search_expr_to_sql(&expr, &columns))
+    Some(search_expr_to_sql(&expr, &columns, SearchContext::Logs))
 }
 
 pub fn format_value(value: &serde_json::Value) -> String {
