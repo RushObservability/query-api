@@ -26,8 +26,11 @@ fn resolve_log_field(field: &str) -> String {
             } else if let Some(attr) = field.strip_prefix("log.") {
                 format!("LogAttributes['{attr}']")
             } else {
-                // Default: try LogAttributes
-                format!("LogAttributes['{field}']")
+                // Unqualified key: check both LogAttributes and ResourceAttributes
+                let escaped = field.replace('\'', "\\'");
+                format!(
+                    "if(LogAttributes['{escaped}'] != '', LogAttributes['{escaped}'], ResourceAttributes['{escaped}'])"
+                )
             }
         }
     }
