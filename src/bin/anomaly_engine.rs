@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 use wide_query_api::alert_engine::SmtpConfig;
 use wide_query_api::anomaly_engine;
+use wide_query_api::config::WideConfig;
 use wide_query_api::config_db::ConfigDb;
 use wide_query_api::migrations;
 
@@ -23,7 +24,11 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
     let clickhouse_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
 
-    migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?;
+    let wide_config_path =
+        std::env::var("WIDE_CONFIG").unwrap_or_else(|_| "./wide.toml".to_string());
+    let wide_config = WideConfig::load(&wide_config_path)?;
+
+    migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password, &wide_config).await?;
 
     let ch = clickhouse::Client::default()
         .with_url(&clickhouse_url)

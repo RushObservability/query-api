@@ -178,10 +178,17 @@ async fn eval_anomaly_rules(
             let latest_val = *values.last().unwrap_or(&0.0);
             let result = ewma_eval(values, rule.alpha, rule.sensitivity);
 
+            let series_state = if result.anomalous { "anomalous" } else { "normal" };
+
             tracing::info!(
                 "anomaly engine: '{}' [{}] — {} pts, latest={:.2}, ewma={:.2}, dev={:.1}σ, anomalous={}",
                 rule.name, metric_label, values.len(), latest_val, result.mean, result.deviation, result.anomalous
             );
+
+            // Write a log per series evaluation to ClickHouse
+            if let Err(e) = insert_anomaly_log(ch, &now, &rule, series_state, metric_label, latest_val, result.mean, result.deviation).await {
+                tracing::warn!("anomaly '{}': failed to write eval log: {e}", rule.name);
+            }
 
             if result.anomalous {
                 any_anomalous = true;
@@ -351,6 +358,48 @@ async fn fetch_prom_data(
     }).collect();
 
     Ok(results)
+}
+
+async fn insert_anomaly_log(
+    ch: &Client,
+    now: &chrono::DateTime<chrono::Utc>,
+    rule: &AnomalyRule,
+    state: &str,
+    metric: &str,
+    value: f64,
+    expected: f64,
+    deviation: f64,
+) -> anyhow::Result<()> {
+    let ts_nanos = now.timestamp_nanos_opt().unwrap_or(now.timestamp() * 1_000_000_000);
+    let severity_text = if state == "anomalous" { "WARN" } else { "INFO" };
+    let severity_number: u8 = if state == "anomalous" { 13 } else { 9 }; // WARN=13, INFO=9
+
+    let body = format!(
+        "[wide-anomaly] rule={} state={} metric={} value={:.2} expected={:.2} deviation={:.1}σ",
+        rule.name, state, metric, value, expected, deviation,
+    );
+
+    let sql = format!(
+        "INSERT INTO otel_logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES \
+         ({ts_nanos}, '{severity_text}', {severity_number}, 'wide-anomaly-engine', '{body}', \
+         {{'anomaly.rule_id': '{rule_id}', 'anomaly.rule_name': '{rule_name}', 'anomaly.state': '{state}', \
+         'anomaly.metric': '{metric}', 'anomaly.value': '{value:.2}', 'anomaly.expected': '{expected:.2}', \
+         'anomaly.deviation': '{deviation:.1}'}})",
+        ts_nanos = ts_nanos,
+        severity_text = severity_text,
+        severity_number = severity_number,
+        body = body.replace('\'', "\\'"),
+        rule_id = rule.id,
+        rule_name = rule.name.replace('\'', "\\'"),
+        state = state,
+        metric = metric.replace('\'', "\\'"),
+        value = value,
+        expected = expected,
+        deviation = deviation,
+    );
+
+    ch.query(&sql).execute().await?;
+    Ok(())
 }
 
 async fn send_notifications(

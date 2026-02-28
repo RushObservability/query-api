@@ -7,9 +7,11 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use wide_query_api::alert_engine;
+use wide_query_api::config::WideConfig;
 use wide_query_api::config_db::ConfigDb;
 use wide_query_api::handlers;
 use wide_query_api::migrations;
+use wide_query_api::retention_enforcer;
 use wide_query_api::slo_engine;
 use wide_query_api::usage_tracker;
 use wide_query_api::AppState;
@@ -33,9 +35,14 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
     let clickhouse_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
 
+    // Load wide.toml config (defaults if file missing)
+    let wide_config_path =
+        std::env::var("WIDE_CONFIG").unwrap_or_else(|_| "./wide.toml".to_string());
+    let wide_config = WideConfig::load(&wide_config_path)?;
+
     // Run migrations before creating the database-scoped client.
     // This ensures the database and all tables exist on every startup.
-    migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?;
+    migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password, &wide_config).await?;
 
     let ch = Client::default()
         .with_url(&clickhouse_url)
@@ -64,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn background engines
     alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config);
     slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
+    retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone());
 
     // Spawn usage tracker (fire-and-forget signal usage tracking)
     let usage = usage_tracker::spawn(ch.clone());
@@ -72,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         ch,
         config_db,
         usage,
+        config: wide_config,
     };
 
     let app = Router::new()

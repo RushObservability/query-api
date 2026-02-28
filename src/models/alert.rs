@@ -36,6 +36,7 @@ pub struct AlertRule {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    pub signal_type: String,
     pub query_config: String,
     pub condition_op: String,
     pub condition_threshold: f64,
@@ -54,6 +55,7 @@ pub struct AlertRuleResponse {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    pub signal_type: String,
     pub query_config: serde_json::Value,
     pub condition_op: String,
     pub condition_threshold: f64,
@@ -73,6 +75,7 @@ impl From<AlertRule> for AlertRuleResponse {
             name: r.name,
             description: r.description,
             enabled: r.enabled,
+            signal_type: r.signal_type,
             query_config: serde_json::from_str(&r.query_config).unwrap_or(serde_json::Value::Object(Default::default())),
             condition_op: r.condition_op,
             condition_threshold: r.condition_threshold,
@@ -124,6 +127,8 @@ pub struct CreateAlertRequest {
     pub description: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_signal_type")]
+    pub signal_type: String,
     pub query_config: serde_json::Value,
     pub condition_op: String,
     pub condition_threshold: f64,
@@ -140,6 +145,8 @@ pub struct UpdateAlertRequest {
     pub description: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_signal_type")]
+    pub signal_type: String,
     pub query_config: serde_json::Value,
     pub condition_op: String,
     pub condition_threshold: f64,
@@ -155,6 +162,10 @@ fn default_true() -> bool {
 
 fn default_eval_interval() -> i64 {
     60
+}
+
+fn default_signal_type() -> String {
+    "apm".to_string()
 }
 
 fn default_empty_array() -> serde_json::Value {

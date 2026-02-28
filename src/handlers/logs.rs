@@ -8,7 +8,7 @@ use axum::{
 use crate::AppState;
 use crate::models::log::LogRecord;
 use crate::models::query::{CountBucket, CountQueryRequest, CountRow, QueryResponse, TimeRange, Filter, FilterOp};
-use crate::query_builder::format_value;
+use crate::query_builder::{format_value, build_log_search_sql};
 
 /// Resolve a log field name to a ClickHouse column expression.
 fn resolve_log_field(field: &str) -> String {
@@ -57,13 +57,8 @@ fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str
     }
 
     if let Some(term) = search {
-        let term = term.trim();
-        if !term.is_empty() {
-            let escaped = term.replace('\'', "\\'");
-            conditions.push(format!(
-                "(positionCaseInsensitive(Body, '{escaped}') > 0 \
-                 OR positionCaseInsensitive(toString(LogAttributes), '{escaped}') > 0)"
-            ));
+        if let Some(sql) = build_log_search_sql(term) {
+            conditions.push(sql);
         }
     }
 

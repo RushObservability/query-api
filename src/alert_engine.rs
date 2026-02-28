@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use crate::config_db::ConfigDb;
 use crate::models::query::Filter;
-use crate::query_builder::build_where_clause;
+use crate::query_builder::{build_where_clause, build_metrics_where_clause, build_logs_where_clause};
 use clickhouse::Client;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
@@ -84,8 +84,28 @@ async fn eval_alerts(
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
 
-        let where_clause = build_where_clause(&query_config.filters, &from, &now_str);
-        let sql = format!("SELECT count() as count FROM wide_events WHERE {where_clause}");
+        let sql = match rule.signal_type.as_str() {
+            "metrics" => {
+                let wc = build_metrics_where_clause(&query_config.filters, &from, &now_str);
+                format!(
+                    "SELECT count() as count FROM (\
+                     SELECT TimeUnix FROM observability.otel_metrics_gauge WHERE {wc} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_sum WHERE {wc} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_histogram WHERE {wc} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_exponential_histogram WHERE {wc} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_summary WHERE {wc})"
+                )
+            }
+            "logs" => {
+                let wc = build_logs_where_clause(&query_config.filters, &from, &now_str);
+                format!("SELECT count() as count FROM observability.otel_logs WHERE {wc}")
+            }
+            _ => {
+                // "apm" (default) — query wide_events
+                let wc = build_where_clause(&query_config.filters, &from, &now_str);
+                format!("SELECT count() as count FROM wide_events WHERE {wc}")
+            }
+        };
 
         let value = match ch.query(&sql).fetch_one::<CountRow>().await {
             Ok(row) => row.count as f64,
