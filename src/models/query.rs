@@ -33,14 +33,14 @@ pub struct TimeRange {
     pub to: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Filter {
     pub field: String,
     pub op: FilterOp,
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum FilterOp {
     #[serde(rename = "=")]
     Eq,

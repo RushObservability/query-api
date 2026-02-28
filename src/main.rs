@@ -232,6 +232,15 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/api-keys/{id}",
             delete(handlers::settings::delete_api_key),
         )
+        // RUM (Real User Monitoring)
+        .route("/api/v1/rum/ingest", post(handlers::rum::ingest))
+        .route("/api/v1/rum/apps", get(handlers::rum::list_apps))
+        .route("/api/v1/rum/query", post(handlers::rum::query_events))
+        .route("/api/v1/rum/vitals", post(handlers::rum::vitals))
+        .route("/api/v1/rum/pages", post(handlers::rum::pages))
+        .route("/api/v1/rum/errors", post(handlers::rum::errors))
+        .route("/api/v1/rum/sessions", post(handlers::rum::sessions))
+        .route("/api/v1/rum/session/{id}", get(handlers::rum::session_detail))
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
         // Signal usage

@@ -5,5 +5,6 @@ pub mod deploy;
 pub mod log;
 pub mod metrics;
 pub mod query;
+pub mod rum;
 pub mod slo;
 pub mod trace;
