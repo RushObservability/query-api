@@ -6,16 +6,22 @@ pub struct Slo {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    pub slo_type: String,
+    pub indicator_type: String,
     pub service_name: String,
+    pub metric_name: String,
     pub window_type: String,
     pub target_percentage: f64,
-    pub good_filters: String,
+    pub threshold_ms: Option<f64>,
+    pub threshold_value: Option<f64>,
+    pub threshold_op: Option<String>,
+    pub error_filters: String,
     pub total_filters: String,
     pub eval_interval_secs: i64,
     pub notification_channel_ids: String,
     pub state: String,
     pub error_budget_remaining: Option<f64>,
-    pub good_count: Option<i64>,
+    pub error_count: Option<i64>,
     pub total_count: Option<i64>,
     pub last_eval_at: Option<String>,
     pub last_breached_at: Option<String>,
@@ -29,16 +35,22 @@ pub struct SloResponse {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    pub slo_type: String,
+    pub indicator_type: String,
     pub service_name: String,
+    pub metric_name: String,
     pub window_type: String,
     pub target_percentage: f64,
-    pub good_filters: serde_json::Value,
+    pub threshold_ms: Option<f64>,
+    pub threshold_value: Option<f64>,
+    pub threshold_op: Option<String>,
+    pub error_filters: serde_json::Value,
     pub total_filters: serde_json::Value,
     pub eval_interval_secs: i64,
     pub notification_channel_ids: serde_json::Value,
     pub state: String,
     pub error_budget_remaining: Option<f64>,
-    pub good_count: Option<i64>,
+    pub error_count: Option<i64>,
     pub total_count: Option<i64>,
     pub last_eval_at: Option<String>,
     pub last_breached_at: Option<String>,
@@ -53,16 +65,22 @@ impl From<Slo> for SloResponse {
             name: s.name,
             description: s.description,
             enabled: s.enabled,
+            slo_type: s.slo_type,
+            indicator_type: s.indicator_type,
             service_name: s.service_name,
+            metric_name: s.metric_name,
             window_type: s.window_type,
             target_percentage: s.target_percentage,
-            good_filters: serde_json::from_str(&s.good_filters).unwrap_or(serde_json::json!([])),
+            threshold_ms: s.threshold_ms,
+            threshold_value: s.threshold_value,
+            threshold_op: s.threshold_op,
+            error_filters: serde_json::from_str(&s.error_filters).unwrap_or(serde_json::json!([])),
             total_filters: serde_json::from_str(&s.total_filters).unwrap_or(serde_json::json!([])),
             eval_interval_secs: s.eval_interval_secs,
             notification_channel_ids: serde_json::from_str(&s.notification_channel_ids).unwrap_or(serde_json::json!([])),
             state: s.state,
             error_budget_remaining: s.error_budget_remaining,
-            good_count: s.good_count,
+            error_count: s.error_count,
             total_count: s.total_count,
             last_eval_at: s.last_eval_at,
             last_breached_at: s.last_breached_at,
@@ -77,7 +95,7 @@ pub struct SloEvent {
     pub id: String,
     pub slo_id: String,
     pub state: String,
-    pub good_count: i64,
+    pub error_count: i64,
     pub total_count: i64,
     pub error_budget_remaining: f64,
     pub message: String,
@@ -91,10 +109,23 @@ pub struct CreateSloRequest {
     pub description: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_slo_type")]
+    pub slo_type: String,
+    #[serde(default = "default_indicator_type")]
+    pub indicator_type: String,
+    #[serde(default)]
     pub service_name: String,
+    #[serde(default)]
+    pub metric_name: String,
     pub window_type: String,
     pub target_percentage: f64,
-    pub good_filters: serde_json::Value,
+    #[serde(default)]
+    pub threshold_ms: Option<f64>,
+    #[serde(default)]
+    pub threshold_value: Option<f64>,
+    #[serde(default)]
+    pub threshold_op: Option<String>,
+    pub error_filters: serde_json::Value,
     #[serde(default = "default_empty_array")]
     pub total_filters: serde_json::Value,
     #[serde(default = "default_eval_interval")]
@@ -110,10 +141,23 @@ pub struct UpdateSloRequest {
     pub description: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_slo_type")]
+    pub slo_type: String,
+    #[serde(default = "default_indicator_type")]
+    pub indicator_type: String,
+    #[serde(default)]
     pub service_name: String,
+    #[serde(default)]
+    pub metric_name: String,
     pub window_type: String,
     pub target_percentage: f64,
-    pub good_filters: serde_json::Value,
+    #[serde(default)]
+    pub threshold_ms: Option<f64>,
+    #[serde(default)]
+    pub threshold_value: Option<f64>,
+    #[serde(default)]
+    pub threshold_op: Option<String>,
+    pub error_filters: serde_json::Value,
     #[serde(default = "default_empty_array")]
     pub total_filters: serde_json::Value,
     #[serde(default = "default_eval_interval")]
@@ -124,6 +168,14 @@ pub struct UpdateSloRequest {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_slo_type() -> String {
+    "trace".to_string()
+}
+
+fn default_indicator_type() -> String {
+    "availability".to_string()
 }
 
 fn default_eval_interval() -> i64 {
