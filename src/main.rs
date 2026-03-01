@@ -13,6 +13,7 @@ use wide_query_api::handlers;
 use wide_query_api::migrations;
 use wide_query_api::retention_enforcer;
 use wide_query_api::slo_engine;
+use wide_query_api::stats_engine;
 use wide_query_api::usage_tracker;
 use wide_query_api::AppState;
 
@@ -72,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
     alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config);
     slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
     retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone());
+    stats_engine::spawn_stats_engine(ch.clone());
 
     // Spawn usage tracker (fire-and-forget signal usage tracking)
     let usage = usage_tracker::spawn(ch.clone());

@@ -9,6 +9,7 @@ pub mod promql;
 pub mod query_builder;
 pub mod retention_enforcer;
 pub mod slo_engine;
+pub mod stats_engine;
 pub mod usage_tracker;
 
 use clickhouse::Client;

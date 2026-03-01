@@ -94,16 +94,18 @@ impl ConfigDb {
                 name                    TEXT NOT NULL,
                 description             TEXT NOT NULL DEFAULT '',
                 enabled                 INTEGER NOT NULL DEFAULT 1,
+                slo_type                TEXT NOT NULL DEFAULT 'trace' CHECK(slo_type IN ('trace','metric')),
                 service_name            TEXT NOT NULL,
+                metric_name             TEXT NOT NULL DEFAULT '',
                 window_type             TEXT NOT NULL CHECK(window_type IN ('rolling_1h','rolling_24h','rolling_7d','rolling_30d')),
                 target_percentage       REAL NOT NULL,
-                good_filters            TEXT NOT NULL,
+                error_filters            TEXT NOT NULL,
                 total_filters           TEXT NOT NULL,
                 eval_interval_secs      INTEGER NOT NULL DEFAULT 60,
                 notification_channel_ids TEXT NOT NULL DEFAULT '[]',
                 state                   TEXT NOT NULL DEFAULT 'compliant' CHECK(state IN ('compliant','breaching','no_data')),
                 error_budget_remaining  REAL,
-                good_count              INTEGER,
+                error_count              INTEGER,
                 total_count             INTEGER,
                 last_eval_at            TEXT,
                 last_breached_at        TEXT,
@@ -116,7 +118,7 @@ impl ConfigDb {
                 id         TEXT PRIMARY KEY,
                 slo_id     TEXT NOT NULL REFERENCES slos(id) ON DELETE CASCADE,
                 state      TEXT NOT NULL,
-                good_count INTEGER NOT NULL,
+                error_count INTEGER NOT NULL,
                 total_count INTEGER NOT NULL,
                 error_budget_remaining REAL NOT NULL,
                 message    TEXT NOT NULL,
@@ -194,6 +196,104 @@ impl ConfigDb {
             if !has_col {
                 conn.execute_batch(
                     "ALTER TABLE alert_rules ADD COLUMN signal_type TEXT NOT NULL DEFAULT 'apm';",
+                )?;
+            }
+        }
+
+        // Add slo_type and metric_name columns to slos if they don't exist yet
+        {
+            let has_slo_type: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'slo_type'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_slo_type {
+                conn.execute_batch(
+                    "ALTER TABLE slos ADD COLUMN slo_type TEXT NOT NULL DEFAULT 'trace';",
+                )?;
+            }
+        }
+        {
+            let has_metric_name: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'metric_name'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_metric_name {
+                conn.execute_batch(
+                    "ALTER TABLE slos ADD COLUMN metric_name TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+        }
+
+        // Rename good_filters -> error_filters and good_count -> error_count in slos
+        {
+            let has_good_filters: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'good_filters'")?
+                .query_row([], |row| row.get(0))?;
+            if has_good_filters {
+                conn.execute_batch(
+                    "ALTER TABLE slos RENAME COLUMN good_filters TO error_filters;",
+                )?;
+            }
+        }
+        {
+            let has_good_count: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'good_count'")?
+                .query_row([], |row| row.get(0))?;
+            if has_good_count {
+                conn.execute_batch(
+                    "ALTER TABLE slos RENAME COLUMN good_count TO error_count;",
+                )?;
+            }
+        }
+
+        // Rename good_count -> error_count in slo_events
+        {
+            let has_good_count: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slo_events') WHERE name = 'good_count'")?
+                .query_row([], |row| row.get(0))?;
+            if has_good_count {
+                conn.execute_batch(
+                    "ALTER TABLE slo_events RENAME COLUMN good_count TO error_count;",
+                )?;
+            }
+        }
+
+        // Add indicator_type, threshold_ms, threshold_value, threshold_op columns to slos
+        {
+            let has_indicator_type: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'indicator_type'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_indicator_type {
+                conn.execute_batch(
+                    "ALTER TABLE slos ADD COLUMN indicator_type TEXT NOT NULL DEFAULT 'availability';",
+                )?;
+            }
+        }
+        {
+            let has_threshold_ms: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'threshold_ms'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_threshold_ms {
+                conn.execute_batch(
+                    "ALTER TABLE slos ADD COLUMN threshold_ms REAL;",
+                )?;
+            }
+        }
+        {
+            let has_threshold_value: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'threshold_value'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_threshold_value {
+                conn.execute_batch(
+                    "ALTER TABLE slos ADD COLUMN threshold_value REAL;",
+                )?;
+            }
+        }
+        {
+            let has_threshold_op: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'threshold_op'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_threshold_op {
+                conn.execute_batch(
+                    "ALTER TABLE slos ADD COLUMN threshold_op TEXT;",
                 )?;
             }
         }
@@ -710,9 +810,10 @@ impl ConfigDb {
     pub fn list_slos(&self) -> anyhow::Result<Vec<crate::models::slo::Slo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, enabled, service_name, window_type, target_percentage, \
-             good_filters, total_filters, eval_interval_secs, notification_channel_ids, state, \
-             error_budget_remaining, good_count, total_count, last_eval_at, last_breached_at, \
+            "SELECT id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, \
+             window_type, target_percentage, threshold_ms, threshold_value, threshold_op, \
+             error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, \
+             error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, \
              created_at, updated_at FROM slos ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -722,21 +823,27 @@ impl ConfigDb {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     enabled: row.get(3)?,
-                    service_name: row.get(4)?,
-                    window_type: row.get(5)?,
-                    target_percentage: row.get(6)?,
-                    good_filters: row.get(7)?,
-                    total_filters: row.get(8)?,
-                    eval_interval_secs: row.get(9)?,
-                    notification_channel_ids: row.get(10)?,
-                    state: row.get(11)?,
-                    error_budget_remaining: row.get(12)?,
-                    good_count: row.get(13)?,
-                    total_count: row.get(14)?,
-                    last_eval_at: row.get(15)?,
-                    last_breached_at: row.get(16)?,
-                    created_at: row.get(17)?,
-                    updated_at: row.get(18)?,
+                    slo_type: row.get(4)?,
+                    indicator_type: row.get(5)?,
+                    service_name: row.get(6)?,
+                    metric_name: row.get(7)?,
+                    window_type: row.get(8)?,
+                    target_percentage: row.get(9)?,
+                    threshold_ms: row.get(10)?,
+                    threshold_value: row.get(11)?,
+                    threshold_op: row.get(12)?,
+                    error_filters: row.get(13)?,
+                    total_filters: row.get(14)?,
+                    eval_interval_secs: row.get(15)?,
+                    notification_channel_ids: row.get(16)?,
+                    state: row.get(17)?,
+                    error_budget_remaining: row.get(18)?,
+                    error_count: row.get(19)?,
+                    total_count: row.get(20)?,
+                    last_eval_at: row.get(21)?,
+                    last_breached_at: row.get(22)?,
+                    created_at: row.get(23)?,
+                    updated_at: row.get(24)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -746,9 +853,10 @@ impl ConfigDb {
     pub fn get_slo(&self, id: &str) -> anyhow::Result<Option<crate::models::slo::Slo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, enabled, service_name, window_type, target_percentage, \
-             good_filters, total_filters, eval_interval_secs, notification_channel_ids, state, \
-             error_budget_remaining, good_count, total_count, last_eval_at, last_breached_at, \
+            "SELECT id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, \
+             window_type, target_percentage, threshold_ms, threshold_value, threshold_op, \
+             error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, \
+             error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, \
              created_at, updated_at FROM slos WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -757,21 +865,27 @@ impl ConfigDb {
                 name: row.get(1)?,
                 description: row.get(2)?,
                 enabled: row.get(3)?,
-                service_name: row.get(4)?,
-                window_type: row.get(5)?,
-                target_percentage: row.get(6)?,
-                good_filters: row.get(7)?,
-                total_filters: row.get(8)?,
-                eval_interval_secs: row.get(9)?,
-                notification_channel_ids: row.get(10)?,
-                state: row.get(11)?,
-                error_budget_remaining: row.get(12)?,
-                good_count: row.get(13)?,
-                total_count: row.get(14)?,
-                last_eval_at: row.get(15)?,
-                last_breached_at: row.get(16)?,
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                slo_type: row.get(4)?,
+                indicator_type: row.get(5)?,
+                service_name: row.get(6)?,
+                metric_name: row.get(7)?,
+                window_type: row.get(8)?,
+                target_percentage: row.get(9)?,
+                threshold_ms: row.get(10)?,
+                threshold_value: row.get(11)?,
+                threshold_op: row.get(12)?,
+                error_filters: row.get(13)?,
+                total_filters: row.get(14)?,
+                eval_interval_secs: row.get(15)?,
+                notification_channel_ids: row.get(16)?,
+                state: row.get(17)?,
+                error_budget_remaining: row.get(18)?,
+                error_count: row.get(19)?,
+                total_count: row.get(20)?,
+                last_eval_at: row.get(21)?,
+                last_breached_at: row.get(22)?,
+                created_at: row.get(23)?,
+                updated_at: row.get(24)?,
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -783,21 +897,29 @@ impl ConfigDb {
         name: &str,
         description: &str,
         enabled: bool,
+        slo_type: &str,
+        indicator_type: &str,
         service_name: &str,
+        metric_name: &str,
         window_type: &str,
         target_percentage: f64,
-        good_filters: &str,
+        threshold_ms: Option<f64>,
+        threshold_value: Option<f64>,
+        threshold_op: Option<&str>,
+        error_filters: &str,
         total_filters: &str,
         eval_interval_secs: i64,
         notification_channel_ids: &str,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO slos (id, name, description, enabled, service_name, window_type, \
-             target_percentage, good_filters, total_filters, eval_interval_secs, notification_channel_ids) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![id, name, description, enabled, service_name, window_type,
-                    target_percentage, good_filters, total_filters, eval_interval_secs, notification_channel_ids],
+            "INSERT INTO slos (id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, \
+             window_type, target_percentage, threshold_ms, threshold_value, threshold_op, \
+             error_filters, total_filters, eval_interval_secs, notification_channel_ids) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![id, name, description, enabled, slo_type, indicator_type, service_name, metric_name,
+                    window_type, target_percentage, threshold_ms, threshold_value, threshold_op,
+                    error_filters, total_filters, eval_interval_secs, notification_channel_ids],
         )?;
         Ok(())
     }
@@ -808,22 +930,31 @@ impl ConfigDb {
         name: &str,
         description: &str,
         enabled: bool,
+        slo_type: &str,
+        indicator_type: &str,
         service_name: &str,
+        metric_name: &str,
         window_type: &str,
         target_percentage: f64,
-        good_filters: &str,
+        threshold_ms: Option<f64>,
+        threshold_value: Option<f64>,
+        threshold_op: Option<&str>,
+        error_filters: &str,
         total_filters: &str,
         eval_interval_secs: i64,
         notification_channel_ids: &str,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count = conn.execute(
-            "UPDATE slos SET name = ?2, description = ?3, enabled = ?4, service_name = ?5, \
-             window_type = ?6, target_percentage = ?7, good_filters = ?8, total_filters = ?9, \
-             eval_interval_secs = ?10, notification_channel_ids = ?11, \
+            "UPDATE slos SET name = ?2, description = ?3, enabled = ?4, slo_type = ?5, \
+             indicator_type = ?6, service_name = ?7, metric_name = ?8, window_type = ?9, target_percentage = ?10, \
+             threshold_ms = ?11, threshold_value = ?12, threshold_op = ?13, \
+             error_filters = ?14, total_filters = ?15, \
+             eval_interval_secs = ?16, notification_channel_ids = ?17, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
-            params![id, name, description, enabled, service_name, window_type,
-                    target_percentage, good_filters, total_filters, eval_interval_secs, notification_channel_ids],
+            params![id, name, description, enabled, slo_type, indicator_type, service_name, metric_name,
+                    window_type, target_percentage, threshold_ms, threshold_value, threshold_op,
+                    error_filters, total_filters, eval_interval_secs, notification_channel_ids],
         )?;
         Ok(count > 0)
     }
@@ -837,9 +968,10 @@ impl ConfigDb {
     pub fn get_due_slos(&self, now: &str) -> anyhow::Result<Vec<crate::models::slo::Slo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, enabled, service_name, window_type, target_percentage, \
-             good_filters, total_filters, eval_interval_secs, notification_channel_ids, state, \
-             error_budget_remaining, good_count, total_count, last_eval_at, last_breached_at, \
+            "SELECT id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, \
+             window_type, target_percentage, threshold_ms, threshold_value, threshold_op, \
+             error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, \
+             error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, \
              created_at, updated_at FROM slos \
              WHERE enabled = 1 AND (last_eval_at IS NULL OR \
              strftime('%s', ?1) - strftime('%s', last_eval_at) >= eval_interval_secs)",
@@ -851,21 +983,27 @@ impl ConfigDb {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     enabled: row.get(3)?,
-                    service_name: row.get(4)?,
-                    window_type: row.get(5)?,
-                    target_percentage: row.get(6)?,
-                    good_filters: row.get(7)?,
-                    total_filters: row.get(8)?,
-                    eval_interval_secs: row.get(9)?,
-                    notification_channel_ids: row.get(10)?,
-                    state: row.get(11)?,
-                    error_budget_remaining: row.get(12)?,
-                    good_count: row.get(13)?,
-                    total_count: row.get(14)?,
-                    last_eval_at: row.get(15)?,
-                    last_breached_at: row.get(16)?,
-                    created_at: row.get(17)?,
-                    updated_at: row.get(18)?,
+                    slo_type: row.get(4)?,
+                    indicator_type: row.get(5)?,
+                    service_name: row.get(6)?,
+                    metric_name: row.get(7)?,
+                    window_type: row.get(8)?,
+                    target_percentage: row.get(9)?,
+                    threshold_ms: row.get(10)?,
+                    threshold_value: row.get(11)?,
+                    threshold_op: row.get(12)?,
+                    error_filters: row.get(13)?,
+                    total_filters: row.get(14)?,
+                    eval_interval_secs: row.get(15)?,
+                    notification_channel_ids: row.get(16)?,
+                    state: row.get(17)?,
+                    error_budget_remaining: row.get(18)?,
+                    error_count: row.get(19)?,
+                    total_count: row.get(20)?,
+                    last_eval_at: row.get(21)?,
+                    last_breached_at: row.get(22)?,
+                    created_at: row.get(23)?,
+                    updated_at: row.get(24)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -877,7 +1015,7 @@ impl ConfigDb {
         id: &str,
         state: &str,
         error_budget_remaining: f64,
-        good_count: i64,
+        error_count: i64,
         total_count: i64,
         last_eval_at: &str,
         last_breached_at: Option<&str>,
@@ -886,16 +1024,16 @@ impl ConfigDb {
         match last_breached_at {
             Some(t) => {
                 conn.execute(
-                    "UPDATE slos SET state = ?2, error_budget_remaining = ?3, good_count = ?4, \
+                    "UPDATE slos SET state = ?2, error_budget_remaining = ?3, error_count = ?4, \
                      total_count = ?5, last_eval_at = ?6, last_breached_at = ?7 WHERE id = ?1",
-                    params![id, state, error_budget_remaining, good_count, total_count, last_eval_at, t],
+                    params![id, state, error_budget_remaining, error_count, total_count, last_eval_at, t],
                 )?;
             }
             None => {
                 conn.execute(
-                    "UPDATE slos SET state = ?2, error_budget_remaining = ?3, good_count = ?4, \
+                    "UPDATE slos SET state = ?2, error_budget_remaining = ?3, error_count = ?4, \
                      total_count = ?5, last_eval_at = ?6 WHERE id = ?1",
-                    params![id, state, error_budget_remaining, good_count, total_count, last_eval_at],
+                    params![id, state, error_budget_remaining, error_count, total_count, last_eval_at],
                 )?;
             }
         }
@@ -907,16 +1045,16 @@ impl ConfigDb {
         id: &str,
         slo_id: &str,
         state: &str,
-        good_count: i64,
+        error_count: i64,
         total_count: i64,
         error_budget_remaining: f64,
         message: &str,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO slo_events (id, slo_id, state, good_count, total_count, error_budget_remaining, message) \
+            "INSERT INTO slo_events (id, slo_id, state, error_count, total_count, error_budget_remaining, message) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, slo_id, state, good_count, total_count, error_budget_remaining, message],
+            params![id, slo_id, state, error_count, total_count, error_budget_remaining, message],
         )?;
         Ok(())
     }
@@ -928,7 +1066,7 @@ impl ConfigDb {
     ) -> anyhow::Result<Vec<crate::models::slo::SloEvent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, slo_id, state, good_count, total_count, error_budget_remaining, message, created_at \
+            "SELECT id, slo_id, state, error_count, total_count, error_budget_remaining, message, created_at \
              FROM slo_events WHERE slo_id = ?1 ORDER BY created_at DESC LIMIT ?2",
         )?;
         let rows = stmt
@@ -937,7 +1075,7 @@ impl ConfigDb {
                     id: row.get(0)?,
                     slo_id: row.get(1)?,
                     state: row.get(2)?,
-                    good_count: row.get(3)?,
+                    error_count: row.get(3)?,
                     total_count: row.get(4)?,
                     error_budget_remaining: row.get(5)?,
                     message: row.get(6)?,
