@@ -46,6 +46,10 @@ fn resolve_rum_field(field: &str) -> String {
 
 fn build_rum_where(filters: &[Filter], from: &str, to: &str) -> String {
     let mut conditions = vec![
+        // TimestampTime (DateTime) is in the PRIMARY KEY — these enable index pruning
+        format!("TimestampTime >= toDateTime(parseDateTimeBestEffort('{from}'))"),
+        format!("TimestampTime <= toDateTime(parseDateTimeBestEffort('{to}'))"),
+        // Precise nanosecond filtering on the full-resolution column
         format!("Timestamp >= parseDateTimeBestEffort('{from}')"),
         format!("Timestamp <= parseDateTimeBestEffort('{to}')"),
     ];
@@ -343,7 +347,9 @@ pub async fn ingest(
 pub async fn list_apps(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let sql = "SELECT AppName, count() as cnt FROM rum_events GROUP BY AppName ORDER BY cnt DESC";
+    let sql = "SELECT AppName, count() as cnt FROM rum_events \
+                WHERE TimestampTime >= now() - INTERVAL 7 DAY \
+                GROUP BY AppName ORDER BY cnt DESC";
     let rows = state
         .ch
         .query(sql)

@@ -142,7 +142,8 @@ async fn eval_metric_threshold(
 }
 
 /// Write SLO gauge metrics to ClickHouse so they can be graphed over time.
-/// Emits: rush_slo_current, rush_slo_error_budget_remaining, rush_slo_error_count, rush_slo_total_count
+/// Emits: rush_slo_current, rush_slo_error_budget_remaining, rush_slo_error_count,
+///        rush_slo_total_count, rush_slo_compliant
 async fn write_slo_metrics(
     ch: &Client,
     slo_id: &str,
@@ -151,6 +152,7 @@ async fn write_slo_metrics(
     error_budget_remaining: f64,
     error_count: i64,
     total_count: i64,
+    compliant: bool,
     now_nanos: i64,
 ) {
     let escaped_name = slo_name.replace('\'', "\\'");
@@ -162,6 +164,7 @@ async fn write_slo_metrics(
         ("rush_slo_error_budget_remaining", error_budget_remaining * 100.0),
         ("rush_slo_error_count", error_count as f64),
         ("rush_slo_total_count", total_count as f64),
+        ("rush_slo_compliant", if compliant { 1.0 } else { 0.0 }),
     ];
     let values: Vec<String> = metrics.iter().map(|(name, val)| {
         format!(
@@ -366,7 +369,9 @@ async fn eval_slos(
         write_slo_metrics(
             ch, &slo.id, &slo.name,
             current_pct, error_budget_remaining,
-            error_count, total_count, now_nanos,
+            error_count, total_count,
+            new_state == "compliant",
+            now_nanos,
         ).await;
     }
 
