@@ -41,9 +41,17 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("WIDE_CONFIG").unwrap_or_else(|_| "./wide.toml".to_string());
     let wide_config = WideConfig::load(&wide_config_path)?;
 
-    // Run migrations before creating the database-scoped client.
-    // This ensures the database and all tables exist on every startup.
+    // Run schema migrations (CREATE TABLE etc.) — blocks until tables exist.
     migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password, &wide_config).await?;
+
+    // Spawn TTL + storage policy maintenance in the background so the API
+    // starts serving immediately instead of blocking on ALTER TABLE mutations.
+    migrations::spawn_maintenance(
+        clickhouse_url.clone(),
+        clickhouse_user.clone(),
+        clickhouse_password.clone(),
+        wide_config.clone(),
+    );
 
     let ch = Client::default()
         .with_url(&clickhouse_url)
@@ -220,10 +228,25 @@ async fn main() -> anyhow::Result<()> {
             "/prom/api/v1/label/{name}/values",
             get(handlers::metrics::prom_label_values),
         )
+        // Prometheus remote write
+        .route(
+            "/prom/api/v1/write",
+            post(handlers::remote_write::prom_remote_write),
+        )
         // Deploy markers
         .route(
             "/api/v1/deploys",
             get(handlers::deploys::list_deploys).post(handlers::deploys::create_deploy),
+        )
+        // Service Links (service → GitHub repo mapping)
+        .route(
+            "/api/v1/service-links",
+            get(handlers::service_links::list_service_links)
+                .post(handlers::service_links::create_service_link),
+        )
+        .route(
+            "/api/v1/service-links/{service_name}",
+            delete(handlers::service_links::delete_service_link),
         )
         // API Keys (settings)
         .route(

@@ -434,7 +434,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 /// Connects **without** a default database so that `CREATE DATABASE` succeeds
 /// even on a fresh instance. Every statement uses `IF NOT EXISTS` so this is
 /// safe to call on every startup.
-pub async fn run(url: &str, user: &str, password: &str, config: &WideConfig) -> anyhow::Result<()> {
+pub async fn run(url: &str, user: &str, password: &str, _config: &WideConfig) -> anyhow::Result<()> {
     let client = Client::default()
         .with_url(url)
         .with_user(user)
@@ -453,14 +453,51 @@ pub async fn run(url: &str, user: &str, password: &str, config: &WideConfig) -> 
 
     tracing::info!("clickhouse migrations complete");
 
-    apply_retention_ttl(&client, config).await?;
-    apply_storage_policy(&client, config).await;
-
     Ok(())
+}
+
+/// Spawn background maintenance tasks (retention TTLs, storage policies).
+/// These run asynchronously so the API starts serving immediately.
+pub fn spawn_maintenance(url: String, user: String, password: String, config: WideConfig) {
+    tokio::spawn(async move {
+        let client = Client::default()
+            .with_url(&url)
+            .with_user(&user)
+            .with_password(&password);
+
+        if let Err(e) = apply_retention_ttl(&client, &config).await {
+            tracing::error!("background retention TTL application failed: {e}");
+        }
+        apply_storage_policy(&client, &config).await;
+        tracing::info!("background maintenance tasks complete");
+    });
+}
+
+/// Check if a table's TTL expression already contains the desired interval,
+/// returning true if the ALTER can be skipped.
+async fn ttl_matches(client: &Client, table: &str, days: u32) -> bool {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct EngineRow {
+        engine_full: String,
+    }
+    let sql = format!(
+        "SELECT engine_full FROM system.tables WHERE database = 'observability' AND name = '{table}'"
+    );
+    match client.query(&sql).fetch_one::<EngineRow>().await {
+        Ok(row) => {
+            // The engine_full string contains something like "INTERVAL 30 DAY DELETE"
+            let needle = format!("INTERVAL {days} DAY");
+            row.engine_full.contains(&needle)
+        }
+        Err(_) => false,
+    }
 }
 
 /// Adjust table-level TTLs based on config. Uses the effective (max) TTL so
 /// that part-level drops don't remove data that has longer per-rule retention.
+///
+/// Skips tables whose TTL already matches the desired interval to avoid
+/// blocking on redundant ALTER TABLE mutations at every boot.
 async fn apply_retention_ttl(client: &Client, config: &WideConfig) -> anyhow::Result<()> {
     let metrics_days = config.effective_metrics_ttl_days();
     let traces_days = config.effective_traces_ttl_days();
@@ -479,6 +516,10 @@ async fn apply_retention_ttl(client: &Client, config: &WideConfig) -> anyhow::Re
         "otel_metrics_summary",
     ];
     for table in metric_tables {
+        if ttl_matches(client, table, metrics_days).await {
+            tracing::debug!("TTL on {table} already {metrics_days}d, skipping");
+            continue;
+        }
         let sql = format!(
             "ALTER TABLE observability.{table} MODIFY TTL toDateTime(TimeUnix) + INTERVAL {metrics_days} DAY DELETE"
         );
@@ -493,6 +534,10 @@ async fn apply_retention_ttl(client: &Client, config: &WideConfig) -> anyhow::Re
         ("wide_events", "toDateTime(timestamp)"),
     ];
     for (table, ts_expr) in trace_ttl_specs {
+        if ttl_matches(client, table, traces_days).await {
+            tracing::debug!("TTL on {table} already {traces_days}d, skipping");
+            continue;
+        }
         let sql = format!(
             "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {traces_days} DAY DELETE"
         );
@@ -502,11 +547,15 @@ async fn apply_retention_ttl(client: &Client, config: &WideConfig) -> anyhow::Re
     }
 
     // Log table
-    let sql = format!(
-        "ALTER TABLE observability.otel_logs MODIFY TTL toDateTime(Timestamp) + INTERVAL {logs_days} DAY DELETE"
-    );
-    if let Err(e) = client.query(&sql).execute().await {
-        tracing::warn!("failed to set TTL on otel_logs: {e}");
+    if !ttl_matches(client, "otel_logs", logs_days).await {
+        let sql = format!(
+            "ALTER TABLE observability.otel_logs MODIFY TTL toDateTime(Timestamp) + INTERVAL {logs_days} DAY DELETE"
+        );
+        if let Err(e) = client.query(&sql).execute().await {
+            tracing::warn!("failed to set TTL on otel_logs: {e}");
+        }
+    } else {
+        tracing::debug!("TTL on otel_logs already {logs_days}d, skipping");
     }
 
     Ok(())
