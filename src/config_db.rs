@@ -256,6 +256,17 @@ impl ConfigDb {
             }
         }
 
+        // Create service_links table for mapping services to GitHub repos
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS service_links (
+                service_name   TEXT PRIMARY KEY,
+                github_repo    TEXT NOT NULL,
+                default_branch TEXT NOT NULL DEFAULT 'main',
+                root_path      TEXT NOT NULL DEFAULT '',
+                updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );",
+        )?;
+
         // Add indicator_type, threshold_ms, threshold_value, threshold_op columns to slos
         {
             let has_indicator_type: bool = conn
@@ -1446,5 +1457,79 @@ impl ConfigDb {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // ── Service link operations ──
+
+    pub fn list_service_links(&self) -> anyhow::Result<Vec<crate::models::service_link::ServiceLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT service_name, github_repo, default_branch, root_path, updated_at \
+             FROM service_links ORDER BY service_name ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::models::service_link::ServiceLink {
+                    service_name: row.get(0)?,
+                    github_repo: row.get(1)?,
+                    default_branch: row.get(2)?,
+                    root_path: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_service_link(&self, service_name: &str) -> anyhow::Result<Option<crate::models::service_link::ServiceLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT service_name, github_repo, default_branch, root_path, updated_at \
+             FROM service_links WHERE service_name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![service_name], |row| {
+            Ok(crate::models::service_link::ServiceLink {
+                service_name: row.get(0)?,
+                github_repo: row.get(1)?,
+                default_branch: row.get(2)?,
+                root_path: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(link)) => Ok(Some(link)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_service_link(
+        &self,
+        service_name: &str,
+        github_repo: &str,
+        default_branch: &str,
+        root_path: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO service_links (service_name, github_repo, default_branch, root_path, updated_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             ON CONFLICT(service_name) DO UPDATE SET
+               github_repo = excluded.github_repo,
+               default_branch = excluded.default_branch,
+               root_path = excluded.root_path,
+               updated_at = excluded.updated_at",
+            params![service_name, github_repo, default_branch, root_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_service_link(&self, service_name: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "DELETE FROM service_links WHERE service_name = ?1",
+            params![service_name],
+        )?;
+        Ok(count > 0)
     }
 }
