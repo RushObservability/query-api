@@ -60,17 +60,18 @@ pub async fn suggest_values(
         field.clone()
     };
 
-    let where_prefix = if params.prefix.is_empty() {
-        String::new()
-    } else {
+    // P4: Always constrain to recent data to avoid full table scans
+    let mut where_parts = vec!["timestamp >= now() - INTERVAL 24 HOUR".to_string()];
+    if !params.prefix.is_empty() {
         let escaped = params.prefix.replace('\'', "\\'");
-        format!("WHERE val LIKE '{escaped}%'")
-    };
+        where_parts.push(format!("val LIKE '{escaped}%'"));
+    }
+    let where_clause = format!("WHERE {}", where_parts.join(" AND "));
 
     let sql = format!(
         "SELECT DISTINCT {col_expr} as val \
          FROM wide_events \
-         {where_prefix} \
+         {where_clause} \
          ORDER BY val \
          LIMIT {}",
         params.limit.min(100),

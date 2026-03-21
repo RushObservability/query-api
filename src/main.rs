@@ -1,4 +1,4 @@
-use axum::{Router, routing::delete, routing::get, routing::post, routing::put};
+use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use clickhouse::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -57,7 +57,8 @@ async fn main() -> anyhow::Result<()> {
         .with_url(&clickhouse_url)
         .with_database(&clickhouse_db)
         .with_user(&clickhouse_user)
-        .with_password(&clickhouse_password);
+        .with_password(&clickhouse_password)
+        .with_option("max_execution_time", "30");
 
     let config_db_path =
         std::env::var("WIDE_CONFIG_DB").unwrap_or_else(|_| "./wide_config.db".to_string());
@@ -271,8 +272,41 @@ async fn main() -> anyhow::Result<()> {
         // Signal usage
         .route("/api/v1/usage", get(handlers::usage::get_usage))
         .route("/api/v1/usage/cardinality/{metric}", get(handlers::usage::get_label_breakdown))
+        // ═══ Datadog Agent Ingestion ═══
+        // Logs (agent log forwarder sends to {logs_dd_url}/api/v2/logs)
+        .route("/datadog/v1/input", post(handlers::dd_logs::ingest_logs))
+        .route("/api/v2/logs", post(handlers::dd_logs::ingest_logs))
+        // Metrics
+        .route("/datadog/api/v1/series", post(handlers::dd_metrics::ingest_v1))
+        .route("/datadog/api/v2/series", post(handlers::dd_metrics::ingest_v2))
+        .route("/datadog/api/v1/check_run", post(handlers::dd_metrics::check_run))
+        // Traces (dd-trace libs use PUT, dd-agent trace writer uses POST)
+        .route("/datadog/api/v0.2/traces", any(handlers::dd_traces::ingest_agent))
+        .route("/datadog/v0.3/traces", any(handlers::dd_traces::ingest_v03))
+        .route("/datadog/v0.4/traces", any(handlers::dd_traces::ingest_v04))
+        // Trace stats from agent trace writer
+        .route("/datadog/api/v0.6/stats", any(handlers::dd_common::stub_ok))
+        .route("/datadog/api/v0.2/stats", any(handlers::dd_common::stub_ok))
+        // Validate & metadata stubs
+        .route("/datadog/api/v1/validate", post(handlers::dd_common::validate))
+        .route("/datadog/api/v1/metadata", any(handlers::dd_common::stub_ok))
+        .route("/datadog/api/v2/host_metadata", any(handlers::dd_common::stub_ok))
+        .route("/datadog/api/v2/events", any(handlers::dd_common::stub_ok))
+        .route("/datadog/api/v1/collector", any(handlers::dd_common::stub_ok))
+        .route("/datadog/intake/", any(handlers::dd_common::stub_ok))
+        .route("/datadog/intake", any(handlers::dd_common::stub_ok))
         // Health
         .route("/healthz", get(handlers::health::healthz))
+        // Catch-all for unmatched DD agent paths (debug logging)
+        .fallback(|req: axum::http::Request<axum::body::Body>| async move {
+            tracing::warn!(
+                "unmatched request: {} {} (content-type: {:?})",
+                req.method(),
+                req.uri(),
+                req.headers().get("content-type").and_then(|v| v.to_str().ok())
+            );
+            (axum::http::StatusCode::NOT_FOUND, "not found")
+        })
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

@@ -99,13 +99,6 @@ pub struct CountRow {
     pub count: u64,
 }
 
-/// Query result wrapper.
-#[derive(Debug, Serialize)]
-pub struct QueryResponse {
-    pub rows: Vec<serde_json::Value>,
-    pub total: u64,
-}
-
 /// Timeseries query — returns time-bucketed aggregations including duration percentiles.
 #[derive(Debug, Deserialize)]
 pub struct TimeseriesRequest {

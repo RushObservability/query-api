@@ -213,10 +213,6 @@ pub async fn prom_remote_write(
             match label.name.as_str() {
                 "__name__" => metric_name = label.value.clone(),
                 "job" => service_name = label.value.clone(),
-                "instance" => {
-                    // Keep instance as an attribute
-                    attrs.push((label.name.clone(), label.value.clone()));
-                }
                 _ => {
                     attrs.push((label.name.clone(), label.value.clone()));
                 }
@@ -232,34 +228,35 @@ pub async fn prom_remote_write(
             .cloned()
             .unwrap_or_default();
 
-        for sample in &ts.samples {
-            // Prometheus timestamps are milliseconds since epoch
-            // ClickHouse DateTime64(9) expects nanoseconds
-            let time_ns = sample.timestamp * 1_000_000;
+        // P1: Build template row once per timeseries, only update time+value per sample
+        let template = GaugeRow {
+            resource_attributes: Vec::new(),
+            resource_schema_url: String::new(),
+            scope_name: "prometheus".to_string(),
+            scope_version: String::new(),
+            scope_attributes: Vec::new(),
+            scope_dropped_attr_count: 0,
+            scope_schema_url: String::new(),
+            service_name,
+            metric_name,
+            metric_description: description,
+            metric_unit: unit,
+            attributes: attrs,
+            start_time_unix: 0,
+            time_unix: 0,
+            value: 0.0,
+            flags: 0,
+            exemplars_filtered_attributes: Vec::new(),
+            exemplars_time_unix: Vec::new(),
+            exemplars_value: Vec::new(),
+            exemplars_span_id: Vec::new(),
+            exemplars_trace_id: Vec::new(),
+        };
 
-            let row = GaugeRow {
-                resource_attributes: Vec::new(),
-                resource_schema_url: String::new(),
-                scope_name: "prometheus".to_string(),
-                scope_version: String::new(),
-                scope_attributes: Vec::new(),
-                scope_dropped_attr_count: 0,
-                scope_schema_url: String::new(),
-                service_name: service_name.clone(),
-                metric_name: metric_name.clone(),
-                metric_description: description.clone(),
-                metric_unit: unit.clone(),
-                attributes: attrs.clone(),
-                start_time_unix: 0,
-                time_unix: time_ns,
-                value: sample.value,
-                flags: 0,
-                exemplars_filtered_attributes: Vec::new(),
-                exemplars_time_unix: Vec::new(),
-                exemplars_value: Vec::new(),
-                exemplars_span_id: Vec::new(),
-                exemplars_trace_id: Vec::new(),
-            };
+        for sample in &ts.samples {
+            let mut row = template.clone();
+            row.time_unix = sample.timestamp * 1_000_000;
+            row.value = sample.value;
 
             insert.write(&row).await.map_err(|e| {
                 (

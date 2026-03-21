@@ -21,6 +21,7 @@ pub async fn get_trace(
         ));
     }
 
+    // Use FINAL to deduplicate (MergeTree may have duplicate span_ids from MV + direct insert)
     let rows = state
         .ch
         .query(
@@ -47,7 +48,22 @@ pub async fn get_trace(
 
 /// Build the span tree from a flat list of wide events.
 fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
-    let nodes: Vec<SpanNode> = events
+    // Deduplicate by span_id, preferring rows with more complete data
+    // (e.g. non-empty service_version over empty)
+    let mut best: std::collections::HashMap<String, WideEvent> = std::collections::HashMap::new();
+    for e in events {
+        best.entry(e.span_id.clone())
+            .and_modify(|existing| {
+                // Prefer the row with non-empty service_version
+                if existing.service_version.is_empty() && !e.service_version.is_empty() {
+                    *existing = e.clone();
+                }
+            })
+            .or_insert(e);
+    }
+    let events: Vec<WideEvent> = best.into_values().collect();
+
+    let mut nodes: Vec<Option<SpanNode>> = events
         .iter()
         .map(|e| {
             let attributes: serde_json::Value =
@@ -76,7 +92,7 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
                 })
                 .collect();
 
-            SpanNode {
+            Some(SpanNode {
                 span_id: e.span_id.clone(),
                 parent_span_id: e.parent_span_id.clone(),
                 service_name: e.service_name.clone(),
@@ -90,40 +106,49 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
                 attributes,
                 events: span_events,
                 children: vec![],
-            }
+            })
         })
         .collect();
 
     let span_count = nodes.len();
 
-    let mut services: Vec<String> = nodes.iter().map(|n| n.service_name.clone()).collect();
-    services.sort();
+    // Collect services and max duration before taking ownership
+    let mut services: Vec<String> = nodes.iter()
+        .filter_map(|n| n.as_ref().map(|n| n.service_name.clone()))
+        .collect();
+    services.sort_unstable();
     services.dedup();
 
-    let total_duration = nodes.iter().map(|n| n.duration_ns).max().unwrap_or(0);
+    let total_duration = nodes.iter()
+        .filter_map(|n| n.as_ref().map(|n| n.duration_ns))
+        .max()
+        .unwrap_or(0);
 
-    // Build parent -> children map
+    // Build parent -> children map using references to span_id/parent_span_id
     let empty_parent = "0000000000000000";
     let mut children_map: HashMap<String, Vec<usize>> = HashMap::new();
     let mut root_indices: Vec<usize> = Vec::new();
 
     for (i, node) in nodes.iter().enumerate() {
-        if node.parent_span_id == empty_parent || node.parent_span_id.is_empty() {
-            root_indices.push(i);
-        } else {
-            children_map
-                .entry(node.parent_span_id.clone())
-                .or_default()
-                .push(i);
+        if let Some(n) = node {
+            if n.parent_span_id == empty_parent || n.parent_span_id.is_empty() {
+                root_indices.push(i);
+            } else {
+                children_map
+                    .entry(n.parent_span_id.clone())
+                    .or_default()
+                    .push(i);
+            }
         }
     }
 
+    // Take ownership via Option::take — no cloning
     fn build_tree(
         index: usize,
-        nodes: &[SpanNode],
+        nodes: &mut Vec<Option<SpanNode>>,
         children_map: &HashMap<String, Vec<usize>>,
     ) -> SpanNode {
-        let mut node = nodes[index].clone();
+        let mut node = nodes[index].take().expect("node already taken");
         if let Some(child_indices) = children_map.get(&node.span_id) {
             node.children = child_indices
                 .iter()
@@ -136,7 +161,7 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
 
     let spans: Vec<SpanNode> = root_indices
         .iter()
-        .map(|&ri| build_tree(ri, &nodes, &children_map))
+        .map(|&ri| build_tree(ri, &mut nodes, &children_map))
         .collect();
 
     TraceResponse {

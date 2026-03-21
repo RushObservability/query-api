@@ -381,6 +381,26 @@ ORDER BY (ServiceName, TimestampTime, Timestamp)
 TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
+    // ── Replace Body tokenbf_v1 index: lower(Body) + GRANULARITY 1 for hasToken(lower(Body), ...) ──
+    "ALTER TABLE observability.otel_logs DROP INDEX IF EXISTS idx_body",
+    "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS idx_body lower(Body) TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1",
+    "ALTER TABLE observability.otel_logs MATERIALIZE INDEX idx_body",
+
+    // ── Add ngrambf_v1 on lower(Body) for substring LIKE searches ──
+    "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
+    "ALTER TABLE observability.otel_logs MATERIALIZE INDEX idx_body_ngram",
+
+    // ── Materialized columns for frequently filtered resource attributes ──
+    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_namespace` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.namespace.name'] CODEC(ZSTD(1))",
+    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_pod` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.pod.name'] CODEC(ZSTD(1))",
+    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_container` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.container.name'] CODEC(ZSTD(1))",
+    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_deployment` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.deployment.name'] CODEC(ZSTD(1))",
+    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_environment` LowCardinality(String) MATERIALIZED ResourceAttributes['deployment.environment'] CODEC(ZSTD(1))",
+
+    // ── P5+P6: Bloom filter indexes on wide_events for trace_id and span_id lookups ──
+    "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS idx_trace_id trace_id TYPE bloom_filter(0.001) GRANULARITY 1",
+    "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS idx_span_id span_id TYPE bloom_filter(0.001) GRANULARITY 1",
+
     // ── RUM (Real User Monitoring) events ──
     r"CREATE TABLE IF NOT EXISTS observability.rum_events
 (

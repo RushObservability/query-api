@@ -293,6 +293,9 @@ fn search_expr_to_sql(expr: &SearchExpr, columns: &[(&str, bool)], ctx: SearchCo
 pub fn build_span_search_sql(search: &str) -> Option<String> {
     let expr = parse_search_expr(search)?;
     let columns: Vec<(&str, bool)> = vec![
+        ("trace_id", false),
+        ("span_id", false),
+        ("service_name", false),
         ("http_path", false),
         ("attributes", false),
         ("event_names", true),
@@ -302,14 +305,85 @@ pub fn build_span_search_sql(search: &str) -> Option<String> {
 }
 
 /// Build a SQL condition for free-text search on log columns (otel_logs table).
+/// Body uses hasToken(lower(Body), ...) to leverage the tokenbf_v1 skip index,
+/// falling back to lower(Body) LIKE ... for wildcard/substring searches (ngrambf_v1).
+/// Other scalar columns use positionCaseInsensitive (short/LowCardinality, always fast).
+/// Map columns are skipped — users search them via `key=value` syntax (direct map lookup).
 pub fn build_log_search_sql(search: &str) -> Option<String> {
     let expr = parse_search_expr(search)?;
-    let columns: Vec<(&str, bool)> = vec![
-        ("Body", false),
-        ("toString(LogAttributes)", false),
-        ("toString(ResourceAttributes)", false),
-    ];
-    Some(search_expr_to_sql(&expr, &columns, SearchContext::Logs))
+    Some(log_search_expr_to_sql(&expr))
+}
+
+/// Recursively generate SQL for a log search expression, using hasToken for Body.
+fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
+    match expr {
+        SearchExpr::Term(term) => log_term_match_sql(term),
+        SearchExpr::KeyValue(key, value) => kv_match_sql(key, value, SearchContext::Logs),
+        SearchExpr::And(exprs) => {
+            let parts: Vec<String> = exprs.iter().map(log_search_expr_to_sql).collect();
+            format!("({})", parts.join(" AND "))
+        }
+        SearchExpr::Or(exprs) => {
+            let parts: Vec<String> = exprs.iter().map(log_search_expr_to_sql).collect();
+            format!("({})", parts.join(" OR "))
+        }
+    }
+}
+
+/// Generate SQL for a single search term on log columns.
+/// Body: hasToken(lower(Body), 'token') for each alphanumeric sub-token (uses tokenbf_v1).
+/// Body wildcard: lower(Body) LIKE '%pattern%' (uses ngrambf_v1).
+/// Other columns: positionCaseInsensitive (short strings, always fast).
+fn log_term_match_sql(term: &str) -> String {
+    let has_wildcard = term.contains('*');
+    let escaped = term.replace('\'', "\\'");
+
+    let other_cols = ["TraceId", "SpanId", "ServiceName", "SeverityText"];
+
+    if has_wildcard {
+        let pattern = escaped
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('*', "%");
+        let like_pattern = format!("%{pattern}%");
+        let lower_pattern = like_pattern.to_lowercase();
+
+        let mut parts: Vec<String> = other_cols
+            .iter()
+            .map(|col| format!("{col} ILIKE '{like_pattern}'"))
+            .collect();
+        // lower(Body) LIKE leverages ngrambf_v1 index
+        parts.push(format!("lower(Body) LIKE '{lower_pattern}'"));
+        format!("({})", parts.join(" OR "))
+    } else {
+        let mut parts: Vec<String> = other_cols
+            .iter()
+            .map(|col| format!("positionCaseInsensitive({col}, '{escaped}') > 0"))
+            .collect();
+
+        // Extract alphanumeric tokens for hasToken (matches tokenbf_v1 tokenisation)
+        let lower_term = escaped.to_lowercase();
+        let tokens: Vec<&str> = lower_term
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        if tokens.is_empty() {
+            // No alphanumeric content — fall back to LIKE
+            parts.push(format!("lower(Body) LIKE '%{lower_term}%'"));
+        } else if tokens.len() == 1 {
+            parts.push(format!("hasToken(lower(Body), '{}')", tokens[0]));
+        } else {
+            // Multiple sub-tokens (e.g. UUID with hyphens) — AND them all
+            let token_conds: Vec<String> = tokens
+                .iter()
+                .map(|t| format!("hasToken(lower(Body), '{t}')"))
+                .collect();
+            parts.push(format!("({})", token_conds.join(" AND ")));
+        }
+
+        format!("({})", parts.join(" OR "))
+    }
 }
 
 pub fn format_value(value: &serde_json::Value) -> String {

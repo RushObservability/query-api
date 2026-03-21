@@ -40,6 +40,9 @@ urlencoding = "2"
 toml = "0.8"
 prost = "0.13"
 snap = "1"
+flate2 = "1"
+rmp-serde = "1"
+zstd = "0.13"
 
 [profile.release]
 lto = true
