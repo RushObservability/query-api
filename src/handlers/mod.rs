@@ -1,6 +1,10 @@
 pub mod alerts;
 pub mod anomalies;
 pub mod dashboards;
+pub mod dd_common;
+pub mod dd_logs;
+pub mod dd_metrics;
+pub mod dd_traces;
 pub mod deploys;
 pub mod health;
 pub mod logs;

@@ -7,7 +7,7 @@ use axum::{
 
 use crate::AppState;
 use crate::models::query::{
-    CountBucket, CountQueryRequest, CountRow, GroupedTimeseriesBucket, QueryRequest, QueryResponse,
+    CountBucket, CountQueryRequest, CountRow, GroupedTimeseriesBucket, QueryRequest,
     TimeseriesBucket, TimeseriesRequest,
 };
 use crate::models::trace::WideEvent;
@@ -26,34 +26,20 @@ pub async fn execute_query(
         req.offset,
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
-        .fetch_all::<WideEvent>()
-        .await
-        .map_err(|e| {
-            tracing::error!("Query failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("query failed: {e}"),
-            )
-        })?;
-
-    // Convert to JSON values for flexible response
-    let json_rows: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
-        .collect();
-
-    // Get total count
     let count_sql = format!("SELECT count() as count FROM wide_events WHERE {where_clause}");
-    let total: u64 = state
-        .ch
-        .query(&count_sql)
-        .fetch_one::<CountRow>()
-        .await
-        .map(|r| r.count)
-        .unwrap_or(0);
+
+    // P0: Run data fetch and count in parallel
+    let (rows_result, count_result) = tokio::join!(
+        state.ch.query(&sql).fetch_all::<WideEvent>(),
+        state.ch.query(&count_sql).fetch_one::<CountRow>(),
+    );
+
+    let rows = rows_result.map_err(|e| {
+        tracing::error!("Query failed: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+    })?;
+
+    let total = count_result.map(|r| r.count).unwrap_or(0);
 
     // Only track usage if the query returned results
     if total > 0 {
@@ -64,10 +50,8 @@ pub async fn execute_query(
         state.usage.track_many(signals, "span", "explore");
     }
 
-    Ok(Json(QueryResponse {
-        rows: json_rows,
-        total,
-    }))
+    // P7: Serialize typed structs directly — no intermediate serde_json::Value
+    Ok(Json(serde_json::json!({ "rows": rows, "total": total })))
 }
 
 /// Count events bucketed by time interval.
@@ -282,4 +266,3 @@ pub async fn timeseries_query(
         Ok(Json(serde_json::json!({ "buckets": buckets, "grouped": false })))
     }
 }
-
