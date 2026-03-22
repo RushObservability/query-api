@@ -1,0 +1,36 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  query-api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_DATABASE=observability
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - RUST_LOG=wide_query_api=info,tower_http=info
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    profiles:
+      - full
+
+volumes:
+  clickhouse-data:
