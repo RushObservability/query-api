@@ -173,6 +173,19 @@ impl ConfigDb {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS custom_skills (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL UNIQUE,
+                title           TEXT NOT NULL,
+                description     TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                allowed_tools   TEXT NOT NULL DEFAULT '[]',
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                created_by      TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
             ",
         )?;
 
@@ -1530,6 +1543,165 @@ impl ConfigDb {
             "DELETE FROM service_links WHERE service_name = ?1",
             params![service_name],
         )?;
+        Ok(count > 0)
+    }
+
+    // ── Custom skills operations ──
+
+    pub fn list_custom_skills(
+        &self,
+    ) -> anyhow::Result<Vec<crate::models::custom_skills::CustomSkill>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, title, description, content, allowed_tools, enabled, \
+             created_by, created_at, updated_at FROM custom_skills ORDER BY name ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let allowed_tools_json: String = row.get(5)?;
+                let enabled_int: i64 = row.get(6)?;
+                Ok(crate::models::custom_skills::CustomSkill {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    title: row.get(2)?,
+                    description: row.get(3)?,
+                    content: row.get(4)?,
+                    allowed_tools: serde_json::from_str(&allowed_tools_json)
+                        .unwrap_or_else(|_| Vec::new()),
+                    enabled: enabled_int != 0,
+                    created_by: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_custom_skill(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::models::custom_skills::CustomSkill>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, title, description, content, allowed_tools, enabled, \
+             created_by, created_at, updated_at FROM custom_skills WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            let allowed_tools_json: String = row.get(5)?;
+            let enabled_int: i64 = row.get(6)?;
+            Ok(crate::models::custom_skills::CustomSkill {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                title: row.get(2)?,
+                description: row.get(3)?,
+                content: row.get(4)?,
+                allowed_tools: serde_json::from_str(&allowed_tools_json)
+                    .unwrap_or_else(|_| Vec::new()),
+                enabled: enabled_int != 0,
+                created_by: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn get_custom_skill_by_name(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::models::custom_skills::CustomSkill>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, title, description, content, allowed_tools, enabled, \
+             created_by, created_at, updated_at FROM custom_skills WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |row| {
+            let allowed_tools_json: String = row.get(5)?;
+            let enabled_int: i64 = row.get(6)?;
+            Ok(crate::models::custom_skills::CustomSkill {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                title: row.get(2)?,
+                description: row.get(3)?,
+                content: row.get(4)?,
+                allowed_tools: serde_json::from_str(&allowed_tools_json)
+                    .unwrap_or_else(|_| Vec::new()),
+                enabled: enabled_int != 0,
+                created_by: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn create_custom_skill(
+        &self,
+        req: &crate::models::custom_skills::CreateCustomSkillRequest,
+        created_by: &str,
+    ) -> anyhow::Result<crate::models::custom_skills::CustomSkill> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let allowed_tools_json = serde_json::to_string(&req.allowed_tools)?;
+        let enabled_int: i64 = if req.enabled { 1 } else { 0 };
+
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO custom_skills (id, name, title, description, content, \
+                 allowed_tools, enabled, created_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id,
+                    req.name,
+                    req.title,
+                    req.description,
+                    req.content,
+                    allowed_tools_json,
+                    enabled_int,
+                    created_by,
+                ],
+            )?;
+        }
+
+        self.get_custom_skill(&id)?
+            .ok_or_else(|| anyhow::anyhow!("failed to fetch newly created custom skill"))
+    }
+
+    pub fn update_custom_skill(
+        &self,
+        id: &str,
+        req: &crate::models::custom_skills::UpdateCustomSkillRequest,
+    ) -> anyhow::Result<Option<crate::models::custom_skills::CustomSkill>> {
+        let allowed_tools_json = serde_json::to_string(&req.allowed_tools)?;
+        let enabled_int: i64 = if req.enabled { 1 } else { 0 };
+
+        let count = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE custom_skills SET title = ?2, description = ?3, content = ?4, \
+                 allowed_tools = ?5, enabled = ?6, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
+                params![
+                    id,
+                    req.title,
+                    req.description,
+                    req.content,
+                    allowed_tools_json,
+                    enabled_int,
+                ],
+            )?
+        };
+
+        if count == 0 {
+            return Ok(None);
+        }
+        self.get_custom_skill(id)
+    }
+
+    pub fn delete_custom_skill(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute("DELETE FROM custom_skills WHERE id = ?1", params![id])?;
         Ok(count > 0)
     }
 }

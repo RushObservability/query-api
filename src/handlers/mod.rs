@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod anomalies;
 pub mod argocd;
+pub mod custom_skills;
 pub mod dashboards;
 pub mod dd_common;
 pub mod dd_logs;
