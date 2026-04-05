@@ -2,6 +2,7 @@
 name = "rush-api"
 version = "0.1.24"
 edition = "2024"
+license-file = "LICENSE"
 
 [lib]
 name = "rush_api"
