@@ -6,16 +6,16 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use wide_query_api::alert_engine;
-use wide_query_api::config::WideConfig;
-use wide_query_api::config_db::ConfigDb;
-use wide_query_api::handlers;
-use wide_query_api::migrations;
-use wide_query_api::retention_enforcer;
-use wide_query_api::slo_engine;
-use wide_query_api::stats_engine;
-use wide_query_api::usage_tracker;
-use wide_query_api::AppState;
+use rush_api::alert_engine;
+use rush_api::config::WideConfig;
+use rush_api::config_db::ConfigDb;
+use rush_api::handlers;
+use rush_api::migrations;
+use rush_api::retention_enforcer;
+use rush_api::slo_engine;
+use rush_api::stats_engine;
+use rush_api::usage_tracker;
+use rush_api::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("wide_query_api=debug,tower_http=debug")
+            EnvFilter::new("rush_api=debug,tower_http=debug")
         }))
         .init();
 
@@ -328,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    tracing::info!("wide-query-api listening on {addr}");
+    tracing::info!("rush-api listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

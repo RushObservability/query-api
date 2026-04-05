@@ -12,8 +12,8 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/wide-query-api /usr/local/bin/wide-query-api
+COPY --from=builder /app/target/release/rush-api /usr/local/bin/rush-api
 
 EXPOSE 8080
 
-CMD ["wide-query-api"]
+CMD ["rush-api"]

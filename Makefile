@@ -1,4 +1,4 @@
-BINARY  := wide-query-api
+BINARY  := rush-api
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
@@ -14,7 +14,7 @@ deps:                 ## Start ClickHouse in Docker
 	@echo "ClickHouse ready on :8123"
 
 run-local: deps       ## Run query-api locally (ClickHouse in Docker)
-	RUST_LOG=wide_query_api=debug,tower_http=debug cargo run --bin wide-query-api
+	RUST_LOG=rush_api=debug,tower_http=debug cargo run --bin rush-api
 
 build:                ## Build debug binary
 	cargo build
@@ -23,22 +23,22 @@ release:              ## Build optimised release binary
 	cargo build --release
 
 run:                  ## Run query-api in debug mode (no dependency start)
-	RUST_LOG=wide_query_api=debug,tower_http=debug cargo run --bin wide-query-api
+	RUST_LOG=rush_api=debug,tower_http=debug cargo run --bin rush-api
 
 run-anomaly:          ## Run anomaly engine in debug mode
 	WIDE_PROM_BASE_URL=http://localhost:8080 \
-	RUST_LOG=wide_query_api=debug \
+	RUST_LOG=rush_api=debug \
 	cargo run --bin wide-anomaly-engine
 
 dev: run-local        ## Alias for run-local
 
 watch: deps           ## Watch & restart query-api on code changes
-	RUST_LOG=wide_query_api=debug,tower_http=debug \
-	cargo watch -x 'run --bin wide-query-api'
+	RUST_LOG=rush_api=debug,tower_http=debug \
+	cargo watch -x 'run --bin rush-api'
 
 watch-anomaly:        ## Watch & restart anomaly engine on code changes
 	WIDE_PROM_BASE_URL=http://localhost:8080 \
-	RUST_LOG=wide_query_api=debug \
+	RUST_LOG=rush_api=debug \
 	cargo watch -x 'run --bin wide-anomaly-engine'
 
 ## Quality

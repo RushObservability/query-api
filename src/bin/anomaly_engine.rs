@@ -1,18 +1,18 @@
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use wide_query_api::alert_engine::SmtpConfig;
-use wide_query_api::anomaly_engine;
-use wide_query_api::config::WideConfig;
-use wide_query_api::config_db::ConfigDb;
-use wide_query_api::migrations;
+use rush_api::alert_engine::SmtpConfig;
+use rush_api::anomaly_engine;
+use rush_api::config::WideConfig;
+use rush_api::config_db::ConfigDb;
+use rush_api::migrations;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("wide_query_api=debug")
+            EnvFilter::new("rush_api=debug")
         }))
         .init();
 

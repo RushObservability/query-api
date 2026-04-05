@@ -1,14 +1,14 @@
 [package]
-name = "wide-query-api"
-version = "0.1.23"
+name = "rush-api"
+version = "0.1.24"
 edition = "2024"
 
 [lib]
-name = "wide_query_api"
+name = "rush_api"
 path = "src/lib.rs"
 
 [[bin]]
-name = "wide-query-api"
+name = "rush-api"
 path = "src/main.rs"
 
 [[bin]]
