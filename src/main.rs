@@ -258,6 +258,18 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/api-keys/{id}",
             delete(handlers::settings::delete_api_key),
         )
+        // Custom skills (user-defined investigation playbooks)
+        .route(
+            "/api/v1/custom-skills",
+            get(handlers::custom_skills::list_custom_skills)
+                .post(handlers::custom_skills::create_custom_skill),
+        )
+        .route(
+            "/api/v1/custom-skills/{id}",
+            get(handlers::custom_skills::get_custom_skill)
+                .put(handlers::custom_skills::update_custom_skill)
+                .delete(handlers::custom_skills::delete_custom_skill),
+        )
         // RUM (Real User Monitoring)
         .route("/api/v1/rum/ingest", post(handlers::rum::ingest))
         .route("/api/v1/rum/apps", get(handlers::rum::list_apps))
