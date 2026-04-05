@@ -2218,6 +2218,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "rush-api"
+version = "0.1.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clickhouse",
+ "dotenvy",
+ "flate2",
+ "futures-util",
+ "k8s-openapi",
+ "kube",
+ "lettre",
+ "promql-parser",
+ "prost",
+ "rand 0.9.2",
+ "regex",
+ "reqwest",
+ "rmp-serde",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "snap",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3281,44 +3319,6 @@ checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "wide-query-api"
-version = "0.1.23"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "clickhouse",
- "dotenvy",
- "flate2",
- "futures-util",
- "k8s-openapi",
- "kube",
- "lettre",
- "promql-parser",
- "prost",
- "rand 0.9.2",
- "regex",
- "reqwest",
- "rmp-serde",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "snap",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "toml",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
- "zstd",
 ]
 
 [[package]]

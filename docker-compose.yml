@@ -27,7 +27,7 @@ services:
       - CLICKHOUSE_DATABASE=observability
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
-      - RUST_LOG=wide_query_api=info,tower_http=info
+      - RUST_LOG=rush_api=info,tower_http=info
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -49,7 +49,7 @@ services:
       - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o}
       - LLM_API_KEY=${LLM_API_KEY}
-      - RUST_LOG=wide_query_api=info,tower_http=info
+      - RUST_LOG=rush_api=info,tower_http=info
     depends_on:
       clickhouse:
         condition: service_healthy
