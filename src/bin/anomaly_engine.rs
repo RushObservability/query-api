@@ -3,7 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 use rush_api::alert_engine::SmtpConfig;
 use rush_api::anomaly_engine;
-use rush_api::config::WideConfig;
+use rush_api::config::RushConfig;
 use rush_api::config_db::ConfigDb;
 use rush_api::migrations;
 
@@ -25,8 +25,8 @@ async fn main() -> anyhow::Result<()> {
     let clickhouse_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
 
     let wide_config_path =
-        std::env::var("WIDE_CONFIG").unwrap_or_else(|_| "./wide.toml".to_string());
-    let wide_config = WideConfig::load(&wide_config_path)?;
+        std::env::var("RUSH_CONFIG").unwrap_or_else(|_| "./rush.toml".to_string());
+    let wide_config = RushConfig::load(&wide_config_path)?;
 
     migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password, &wide_config).await?;
 
@@ -37,23 +37,23 @@ async fn main() -> anyhow::Result<()> {
         .with_password(&clickhouse_password);
 
     let config_db_path =
-        std::env::var("WIDE_CONFIG_DB").unwrap_or_else(|_| "./wide_config.db".to_string());
+        std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());
     let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
     tracing::info!("config db opened at {config_db_path}");
 
     let smtp_config = SmtpConfig {
-        host: std::env::var("WIDE_SMTP_HOST").ok(),
-        port: std::env::var("WIDE_SMTP_PORT")
+        host: std::env::var("RUSH_SMTP_HOST").ok(),
+        port: std::env::var("RUSH_SMTP_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(587),
-        user: std::env::var("WIDE_SMTP_USER").ok(),
-        pass: std::env::var("WIDE_SMTP_PASS").ok(),
-        from: std::env::var("WIDE_SMTP_FROM")
+        user: std::env::var("RUSH_SMTP_USER").ok(),
+        pass: std::env::var("RUSH_SMTP_PASS").ok(),
+        from: std::env::var("RUSH_SMTP_FROM")
             .unwrap_or_else(|_| "wide@localhost".to_string()),
     };
 
-    let prom_base_url = std::env::var("WIDE_PROM_BASE_URL")
+    let prom_base_url = std::env::var("RUSH_PROM_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:8080".to_string());
 
     tracing::info!("wide-anomaly-engine starting");

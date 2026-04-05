@@ -1,11 +1,11 @@
 use clickhouse::Client;
 use std::time::Duration;
 
-use crate::config::{MetricRetentionRule, TraceRetentionRule, WideConfig};
+use crate::config::{MetricRetentionRule, TraceRetentionRule, RushConfig};
 
 /// Spawn the retention enforcer as a background task (fire-and-forget).
 /// Follows the same pattern as `alert_engine::spawn_alert_engine`.
-pub fn spawn_retention_enforcer(ch: Client, config: WideConfig) {
+pub fn spawn_retention_enforcer(ch: Client, config: RushConfig) {
     if !config.retention.enforcer.enabled {
         tracing::info!("retention enforcer: disabled by config");
         return;
@@ -31,7 +31,7 @@ pub fn spawn_retention_enforcer(ch: Client, config: WideConfig) {
     });
 }
 
-async fn enforce_retention(ch: &Client, config: &WideConfig) -> anyhow::Result<()> {
+async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<()> {
     let table_metrics_ttl = config.effective_metrics_ttl_days();
     let table_traces_ttl = config.effective_traces_ttl_days();
     let dry_run = config.retention.enforcer.dry_run;

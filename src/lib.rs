@@ -15,7 +15,7 @@ pub mod usage_tracker;
 use clickhouse::Client;
 use std::sync::Arc;
 
-use config::WideConfig;
+use config::RushConfig;
 use config_db::ConfigDb;
 use usage_tracker::UsageTracker;
 
@@ -24,5 +24,5 @@ pub struct AppState {
     pub ch: Client,
     pub config_db: Arc<ConfigDb>,
     pub usage: UsageTracker,
-    pub config: WideConfig,
+    pub config: RushConfig,
 }

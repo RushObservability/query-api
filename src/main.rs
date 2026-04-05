@@ -7,7 +7,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use rush_api::alert_engine;
-use rush_api::config::WideConfig;
+use rush_api::config::RushConfig;
 use rush_api::config_db::ConfigDb;
 use rush_api::handlers;
 use rush_api::migrations;
@@ -36,10 +36,10 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
     let clickhouse_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
 
-    // Load wide.toml config (defaults if file missing)
+    // Load rush.toml config (defaults if file missing)
     let wide_config_path =
-        std::env::var("WIDE_CONFIG").unwrap_or_else(|_| "./wide.toml".to_string());
-    let wide_config = WideConfig::load(&wide_config_path)?;
+        std::env::var("RUSH_CONFIG").unwrap_or_else(|_| "./rush.toml".to_string());
+    let wide_config = RushConfig::load(&wide_config_path)?;
 
     // Run schema migrations (CREATE TABLE etc.) — blocks until tables exist.
     migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password, &wide_config).await?;
@@ -61,20 +61,20 @@ async fn main() -> anyhow::Result<()> {
         .with_option("max_execution_time", "30");
 
     let config_db_path =
-        std::env::var("WIDE_CONFIG_DB").unwrap_or_else(|_| "./wide_config.db".to_string());
+        std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());
     let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
     tracing::info!("config db opened at {config_db_path}");
 
     // SMTP config for email notifications (optional)
     let smtp_config = alert_engine::SmtpConfig {
-        host: std::env::var("WIDE_SMTP_HOST").ok(),
-        port: std::env::var("WIDE_SMTP_PORT")
+        host: std::env::var("RUSH_SMTP_HOST").ok(),
+        port: std::env::var("RUSH_SMTP_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(587),
-        user: std::env::var("WIDE_SMTP_USER").ok(),
-        pass: std::env::var("WIDE_SMTP_PASS").ok(),
-        from: std::env::var("WIDE_SMTP_FROM")
+        user: std::env::var("RUSH_SMTP_USER").ok(),
+        pass: std::env::var("RUSH_SMTP_PASS").ok(),
+        from: std::env::var("RUSH_SMTP_FROM")
             .unwrap_or_else(|_| "wide@localhost".to_string()),
     };
 
