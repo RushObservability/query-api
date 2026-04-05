@@ -16,6 +16,7 @@ name = "wide-anomaly-engine"
 path = "src/bin/anomaly_engine.rs"
 
 [dependencies]
+async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 clickhouse = { version = "0.13", features = ["time", "uuid"] }
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +44,10 @@ snap = "1"
 flate2 = "1"
 rmp-serde = "1"
 zstd = "0.13"
+tokio-stream = "0.1"
+futures-util = "0.3"
+kube = { version = "0.98", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
 
 [profile.release]
 lto = true

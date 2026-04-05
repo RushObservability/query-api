@@ -267,6 +267,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/rum/errors", post(handlers::rum::errors))
         .route("/api/v1/rum/sessions", post(handlers::rum::sessions))
         .route("/api/v1/rum/session/{id}", get(handlers::rum::session_detail))
+        // ArgoCD integration
+        .route("/api/v1/argocd/applications", get(handlers::argocd::list_applications))
+        .route("/api/v1/argocd/applications/{name}", get(handlers::argocd::get_application))
+        .route("/api/v1/argocd/applicationsets", get(handlers::argocd::list_applicationsets))
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
         // Signal usage
