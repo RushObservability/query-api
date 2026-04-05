@@ -2,9 +2,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Top-level config loaded from `wide.toml`.
+/// Top-level config loaded from `rush.toml`.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct WideConfig {
+pub struct RushConfig {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
@@ -148,7 +148,7 @@ fn default_3600() -> u64 {
     3600
 }
 
-impl WideConfig {
+impl RushConfig {
     /// Load config from a TOML file. Returns defaults if the file doesn't exist.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -157,7 +157,7 @@ impl WideConfig {
             return Ok(Self::default());
         }
         let contents = std::fs::read_to_string(path)?;
-        let config: WideConfig = toml::from_str(&contents)?;
+        let config: RushConfig = toml::from_str(&contents)?;
         tracing::info!("loaded config from {}", path.display());
         Ok(config)
     }

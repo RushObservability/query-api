@@ -1,6 +1,6 @@
 use clickhouse::Client;
 
-use crate::config::WideConfig;
+use crate::config::RushConfig;
 
 /// Ordered list of DDL statements to ensure the observability schema exists.
 /// Every statement is idempotent (`IF NOT EXISTS`) so safe to run on every startup.
@@ -454,7 +454,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 /// Connects **without** a default database so that `CREATE DATABASE` succeeds
 /// even on a fresh instance. Every statement uses `IF NOT EXISTS` so this is
 /// safe to call on every startup.
-pub async fn run(url: &str, user: &str, password: &str, _config: &WideConfig) -> anyhow::Result<()> {
+pub async fn run(url: &str, user: &str, password: &str, _config: &RushConfig) -> anyhow::Result<()> {
     let client = Client::default()
         .with_url(url)
         .with_user(user)
@@ -478,7 +478,7 @@ pub async fn run(url: &str, user: &str, password: &str, _config: &WideConfig) ->
 
 /// Spawn background maintenance tasks (retention TTLs, storage policies).
 /// These run asynchronously so the API starts serving immediately.
-pub fn spawn_maintenance(url: String, user: String, password: String, config: WideConfig) {
+pub fn spawn_maintenance(url: String, user: String, password: String, config: RushConfig) {
     tokio::spawn(async move {
         let client = Client::default()
             .with_url(&url)
@@ -518,7 +518,7 @@ async fn ttl_matches(client: &Client, table: &str, days: u32) -> bool {
 ///
 /// Skips tables whose TTL already matches the desired interval to avoid
 /// blocking on redundant ALTER TABLE mutations at every boot.
-async fn apply_retention_ttl(client: &Client, config: &WideConfig) -> anyhow::Result<()> {
+async fn apply_retention_ttl(client: &Client, config: &RushConfig) -> anyhow::Result<()> {
     let metrics_days = config.effective_metrics_ttl_days();
     let traces_days = config.effective_traces_ttl_days();
     let logs_days = config.effective_logs_ttl_days();
@@ -591,7 +591,7 @@ async fn apply_retention_ttl(client: &Client, config: &WideConfig) -> anyhow::Re
 ///
 /// Non-fatal — if ClickHouse doesn't have the s3_disk registered yet (e.g.
 /// first boot before MinIO is ready), we just log and continue.
-async fn apply_storage_policy(client: &Client, config: &WideConfig) {
+async fn apply_storage_policy(client: &Client, config: &RushConfig) {
     if config.storage.s3.is_none() {
         tracing::debug!("no S3 config, skipping storage policy");
         return;

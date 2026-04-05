@@ -65,7 +65,7 @@ Environment variables (defaults in `.env`):
 | `CLICKHOUSE_DATABASE` | `observability` | Database name (auto-created) |
 | `CLICKHOUSE_USER` | `default` | ClickHouse user |
 | `CLICKHOUSE_PASSWORD` | _(empty)_ | ClickHouse password |
-| `WIDE_CONFIG_DB` | `./wide_config.db` | SQLite config database path |
+| `RUSH_CONFIG_DB` | `./rush_config.db` | SQLite config database path |
 | `RUST_LOG` | — | Log level filter |
 
 ## Ingestion Endpoints
