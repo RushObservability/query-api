@@ -17,7 +17,9 @@ services:
       retries: 10
 
   query-api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
     environment:
@@ -25,6 +27,28 @@ services:
       - CLICKHOUSE_DATABASE=observability
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
+      - RUST_LOG=wide_query_api=info,tower_http=info
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    profiles:
+      - full
+
+  sre-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    ports:
+      - "8081:8081"
+    environment:
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_DATABASE=observability
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - SRE_AGENT_PORT=8081
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o}
+      - LLM_API_KEY=${LLM_API_KEY}
       - RUST_LOG=wide_query_api=info,tower_http=info
     depends_on:
       clickhouse:
