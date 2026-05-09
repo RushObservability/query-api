@@ -1,5 +1,66 @@
 use crate::models::query::{Filter, FilterOp};
 
+/// Split SQL clauses for ClickHouse PREWHERE optimization.
+///
+/// `prewhere` holds conditions evaluated at the granule level before reading column data
+/// (time ranges, low-cardinality keys like tenant_id). `where_clause` holds the remaining
+/// conditions evaluated after decompression.
+pub struct QueryClauses {
+    pub prewhere: String,
+    pub where_clause: String,
+}
+
+impl QueryClauses {
+    /// Format as `PREWHERE x WHERE y`. Omits either part if empty.
+    pub fn to_sql(&self) -> String {
+        match (self.prewhere.is_empty(), self.where_clause.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => format!("WHERE {}", self.where_clause),
+            (false, true) => format!("PREWHERE {}", self.prewhere),
+            (false, false) => format!("PREWHERE {} WHERE {}", self.prewhere, self.where_clause),
+        }
+    }
+
+    /// Returns `"PREWHERE x"` or `""` if prewhere is empty — for use with ARRAY JOIN.
+    pub fn prewhere_sql(&self) -> String {
+        if self.prewhere.is_empty() {
+            String::new()
+        } else {
+            format!("PREWHERE {}", self.prewhere)
+        }
+    }
+
+    /// Returns `"WHERE w AND extra"` (or `"WHERE extra"` if where_clause is empty) — for
+    /// use when additional conditions must be appended after an ARRAY JOIN.
+    pub fn where_with_extra(&self, extra: &str) -> String {
+        match (self.where_clause.is_empty(), extra.is_empty()) {
+            (_, true) => self.to_sql(),
+            (true, false) => format!("WHERE {extra}"),
+            (false, false) => format!("WHERE {} AND {extra}", self.where_clause),
+        }
+    }
+
+    /// Prepend a condition to PREWHERE (e.g. `tenant_id = 'x'`).
+    pub fn with_prewhere_prefix(&self, prefix: &str) -> Self {
+        let prewhere = if self.prewhere.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix} AND {}", self.prewhere)
+        };
+        QueryClauses { prewhere, where_clause: self.where_clause.clone() }
+    }
+
+    /// Append a condition to WHERE (e.g. `Duration > threshold`).
+    pub fn with_where_extra(&self, extra: &str) -> Self {
+        let where_clause = if self.where_clause.is_empty() {
+            extra.to_string()
+        } else {
+            format!("{} AND {extra}", self.where_clause)
+        };
+        QueryClauses { prewhere: self.prewhere.clone(), where_clause }
+    }
+}
+
 /// Map a user-facing field name to the ClickHouse column expression.
 /// OTel attributes use flat dotted keys (e.g. "gateway.route", "http.status_code"),
 /// so we try the flat key first, falling back to nested path extraction.
@@ -24,22 +85,25 @@ pub fn resolve_field(field: &str) -> String {
     }
 }
 
-/// Build a WHERE clause from filters, time range, and optional free-text search.
-pub fn build_where_clause(filters: &[Filter], from: &str, to: &str) -> String {
+/// Build query clauses from filters, time range, and optional free-text search.
+/// Time range goes into PREWHERE for efficient granule skipping; filters go into WHERE.
+pub fn build_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
     build_where_clause_with_search(filters, from, to, None)
 }
 
-/// Build a WHERE clause with optional free-text search across multiple columns.
+/// Build query clauses with optional free-text search across multiple columns.
+/// Time range goes into PREWHERE for efficient granule skipping; filters+search go into WHERE.
 pub fn build_where_clause_with_search(
     filters: &[Filter],
     from: &str,
     to: &str,
     search: Option<&str>,
-) -> String {
-    let mut conditions = vec![
-        format!("timestamp >= parseDateTimeBestEffort('{from}')"),
-        format!("timestamp <= parseDateTimeBestEffort('{to}')"),
-    ];
+) -> QueryClauses {
+    let prewhere = format!(
+        "timestamp >= parseDateTimeBestEffort('{from}') AND timestamp <= parseDateTimeBestEffort('{to}')"
+    );
+
+    let mut conditions = Vec::new();
 
     for filter in filters {
         let field = resolve_field(&filter.field);
@@ -65,7 +129,7 @@ pub fn build_where_clause_with_search(
         }
     }
 
-    conditions.join(" AND ")
+    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
 }
 
 /// A parsed search expression supporting AND/OR boolean logic.
@@ -432,13 +496,14 @@ fn resolve_metric_field(field: &str) -> String {
     }
 }
 
-/// Build a WHERE clause for metric tables (otel_metrics_gauge, _sum, etc.).
-/// Time column is `TimeUnix`.
-pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> String {
-    let mut conditions = vec![
-        format!("toDateTime(TimeUnix) >= parseDateTimeBestEffort('{from}')"),
-        format!("toDateTime(TimeUnix) <= parseDateTimeBestEffort('{to}')"),
-    ];
+/// Build query clauses for metric tables (otel_metrics_gauge, _sum, etc.).
+/// Time column is `TimeUnix`. Time range goes into PREWHERE; filters go into WHERE.
+pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
+    let prewhere = format!(
+        "toDateTime(TimeUnix) >= parseDateTimeBestEffort('{from}') AND toDateTime(TimeUnix) <= parseDateTimeBestEffort('{to}')"
+    );
+
+    let mut conditions = Vec::new();
 
     for filter in filters {
         let field = resolve_metric_field(&filter.field);
@@ -457,7 +522,7 @@ pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> S
         conditions.push(condition);
     }
 
-    conditions.join(" AND ")
+    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
 }
 
 // ── Logs query builder ──
@@ -479,12 +544,14 @@ fn resolve_log_field(field: &str) -> String {
     }
 }
 
-/// Build a WHERE clause for the otel_logs table. Time column is `Timestamp`.
-pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> String {
-    let mut conditions = vec![
-        format!("Timestamp >= parseDateTimeBestEffort('{from}')"),
-        format!("Timestamp <= parseDateTimeBestEffort('{to}')"),
-    ];
+/// Build query clauses for the otel_logs table. Time column is `Timestamp`.
+/// Time range goes into PREWHERE; filters go into WHERE.
+pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
+    let prewhere = format!(
+        "Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
+    );
+
+    let mut conditions = Vec::new();
 
     for filter in filters {
         let field = resolve_log_field(&filter.field);
@@ -503,5 +570,5 @@ pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> Stri
         conditions.push(condition);
     }
 
-    conditions.join(" AND ")
+    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
 }
