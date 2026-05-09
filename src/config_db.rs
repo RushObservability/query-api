@@ -118,6 +118,7 @@ impl ConfigDb {
                 name                    TEXT NOT NULL,
                 description             TEXT NOT NULL DEFAULT '',
                 enabled                 INTEGER NOT NULL DEFAULT 1,
+                tenant_id               TEXT NOT NULL DEFAULT 'default',
                 slo_type                TEXT NOT NULL DEFAULT 'trace' CHECK(slo_type IN ('trace','metric')),
                 service_name            TEXT NOT NULL,
                 metric_name             TEXT NOT NULL DEFAULT '',
@@ -444,6 +445,19 @@ impl ConfigDb {
             if !has_tenant_id {
                 conn.execute_batch(
                     "ALTER TABLE api_keys ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id);",
+                )?;
+            }
+        }
+
+        // Add tenant_id column to slos if it doesn't exist yet
+        {
+            let has_tenant_id: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'tenant_id'")?
+                .query_row([], |row| row.get(0))?;
+            if !has_tenant_id {
+                conn.execute_batch(
+                    "ALTER TABLE slos ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';\
+                     CREATE INDEX IF NOT EXISTS idx_slos_tenant_state ON slos(tenant_id, state, enabled);",
                 )?;
             }
         }
