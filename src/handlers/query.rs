@@ -24,16 +24,17 @@ pub async fn execute_query(
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
-    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
+    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
+        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     let sql = format!(
-        "SELECT * FROM wide_events WHERE {where_clause} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
+        "SELECT * FROM wide_events {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
+        clauses.to_sql(),
         req.limit.min(1000),
         req.offset,
     );
 
-    let count_sql = format!("SELECT count() as count FROM wide_events WHERE {where_clause}");
+    let count_sql = format!("SELECT count() as count FROM wide_events {}", clauses.to_sql());
 
     // P0: Run data fetch and count in parallel
     let (rows_result, count_result) = tokio::join!(
@@ -80,8 +81,8 @@ pub async fn count_query(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
-    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
+    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
+        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     let interval_fn = match req.interval.as_str() {
         "1s" => "toStartOfSecond(timestamp)",
@@ -97,10 +98,10 @@ pub async fn count_query(
     let sql = format!(
         "SELECT toString({interval_fn}) as bucket, count() as count, \
          countIf(http_status_code >= 500 OR status = 'ERROR') as error_count \
-         FROM wide_events \
-         WHERE {where_clause} \
+         FROM wide_events {} \
          GROUP BY bucket \
-         ORDER BY bucket ASC"
+         ORDER BY bucket ASC",
+        clauses.to_sql(),
     );
 
     let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -132,8 +133,8 @@ pub async fn group_query(
 
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
-    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
+    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
+        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     let group_cols: Vec<String> = req
         .group_by
@@ -149,11 +150,11 @@ pub async fn group_query(
 
     let sql = format!(
         "SELECT {group_select}, count() as count \
-         FROM wide_events \
-         WHERE {where_clause} \
+         FROM wide_events {} \
          GROUP BY {group_by} \
          ORDER BY count DESC \
          LIMIT {}",
+        clauses.to_sql(),
         req.limit.min(1000),
     );
 
@@ -202,8 +203,8 @@ pub async fn timeseries_query(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
-    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
+    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
+        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     let interval_fn = match req.interval.as_str() {
         "1s" => "toStartOfSecond(timestamp)",
@@ -228,10 +229,10 @@ pub async fn timeseries_query(
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
                 quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
-             FROM wide_events \
-             WHERE {where_clause} \
+             FROM wide_events {} \
              GROUP BY bucket, group_key \
-             ORDER BY bucket ASC, count DESC"
+             ORDER BY bucket ASC, count DESC",
+            clauses.to_sql(),
         );
 
         let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -262,10 +263,10 @@ pub async fn timeseries_query(
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
                 quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
-             FROM wide_events \
-             WHERE {where_clause} \
+             FROM wide_events {} \
              GROUP BY bucket \
-             ORDER BY bucket ASC"
+             ORDER BY bucket ASC",
+            clauses.to_sql(),
         );
 
         let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)

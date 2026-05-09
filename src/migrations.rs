@@ -93,11 +93,13 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     `link_span_ids` Array(String),
     INDEX idx_trace_id trace_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_span_id span_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_status status TYPE set(8) GRANULARITY 4,
+    INDEX idx_http_status http_status_code TYPE set(50) GRANULARITY 4,
     INDEX idx_duration duration_ns TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(timestamp)
-ORDER BY (tenant_id, service_name, http_path, timestamp, trace_id)
+ORDER BY (tenant_id, toDate(timestamp), timestamp, service_name, trace_id, span_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -187,11 +189,12 @@ GROUP BY tenant_id, service_name, http_path, http_method",
     INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_value Value TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -227,11 +230,12 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_value Value TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -271,11 +275,13 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_min Min TYPE minmax GRANULARITY 1,
+    INDEX idx_max Max TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -319,11 +325,13 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_min Min TYPE minmax GRANULARITY 1,
+    INDEX idx_max Max TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -354,11 +362,12 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_sum Sum TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -404,8 +413,8 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 )
 ENGINE = MergeTree
 PARTITION BY TimestampDate
-PRIMARY KEY (tenant_id, ServiceName, SeverityText, TimestampTime, Timestamp)
-ORDER BY (tenant_id, ServiceName, SeverityText, TimestampTime, Timestamp)
+PRIMARY KEY (tenant_id, TimestampDate, TimestampTime, ServiceName, SeverityText)
+ORDER BY (tenant_id, TimestampDate, TimestampTime, ServiceName, SeverityText, Timestamp)
 TTL TimestampDate + toIntervalDay(30)
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -463,7 +472,9 @@ SETTINGS index_granularity = 8192",
     INDEX idx_session_id SessionId TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_user_id UserId TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
-    INDEX idx_error_message ErrorMessage TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 8
+    INDEX idx_error_message ErrorMessage TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 8,
+    INDEX idx_vital_name VitalName TYPE set(20) GRANULARITY 4,
+    INDEX idx_vital_value VitalValue TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY toDate(TimestampTime)

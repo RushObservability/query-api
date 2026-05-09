@@ -285,24 +285,25 @@ async fn eval_alerts(
 
         let sql = match rule.signal_type.as_str() {
             "metrics" => {
-                let wc = build_metrics_where_clause(&query_config.filters, &from, &now_str);
+                let mc = build_metrics_where_clause(&query_config.filters, &from, &now_str);
+                let s = mc.to_sql();
                 format!(
                     "SELECT count() as count FROM (\
-                     SELECT TimeUnix FROM observability.otel_metrics_gauge WHERE {wc} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_sum WHERE {wc} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_histogram WHERE {wc} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_exponential_histogram WHERE {wc} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_summary WHERE {wc})"
+                     SELECT TimeUnix FROM observability.otel_metrics_gauge {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_sum {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_histogram {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_exponential_histogram {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_summary {s})"
                 )
             }
             "logs" => {
-                let wc = build_logs_where_clause(&query_config.filters, &from, &now_str);
-                format!("SELECT count() as count FROM observability.otel_logs WHERE {wc}")
+                let lc = build_logs_where_clause(&query_config.filters, &from, &now_str);
+                format!("SELECT count() as count FROM observability.otel_logs {}", lc.to_sql())
             }
             _ => {
                 // "apm" (default) — query wide_events
                 let wc = build_where_clause(&query_config.filters, &from, &now_str);
-                format!("SELECT count() as count FROM wide_events WHERE {wc}")
+                format!("SELECT count() as count FROM wide_events {}", wc.to_sql())
             }
         };
 

@@ -22,12 +22,12 @@ async fn eval_trace_availability(
     from: &str,
     to: &str,
 ) -> anyhow::Result<(i64, i64)> {
-    let error_where = build_where_clause(error_filters, from, to);
-    let error_sql = format!("SELECT count() as count FROM wide_events WHERE {error_where}");
+    let error_clauses = build_where_clause(error_filters, from, to);
+    let error_sql = format!("SELECT count() as count FROM wide_events {}", error_clauses.to_sql());
     let error_count = ch.query(&error_sql).fetch_one::<CountRow>().await?.count as i64;
 
-    let total_where = build_where_clause(total_filters, from, to);
-    let total_sql = format!("SELECT count() as count FROM wide_events WHERE {total_where}");
+    let total_clauses = build_where_clause(total_filters, from, to);
+    let total_sql = format!("SELECT count() as count FROM wide_events {}", total_clauses.to_sql());
     let total_count = ch.query(&total_sql).fetch_one::<CountRow>().await?.count as i64;
 
     Ok((error_count, total_count))
@@ -42,13 +42,14 @@ async fn eval_trace_latency(
     from: &str,
     to: &str,
 ) -> anyhow::Result<(i64, i64)> {
-    let total_where = build_where_clause(total_filters, from, to);
-    let total_sql = format!("SELECT count() as count FROM wide_events WHERE {total_where}");
+    let total_clauses = build_where_clause(total_filters, from, to);
+    let total_sql = format!("SELECT count() as count FROM wide_events {}", total_clauses.to_sql());
     let total_count = ch.query(&total_sql).fetch_one::<CountRow>().await?.count as i64;
 
     // Count requests that exceeded the threshold (slow = errors for budget)
     let slow_sql = format!(
-        "SELECT count() as count FROM wide_events WHERE {total_where} AND Duration > {threshold_ns}"
+        "SELECT count() as count FROM wide_events {}",
+        total_clauses.with_where_extra(&format!("Duration > {threshold_ns}")).to_sql(),
     );
     let slow_count = ch.query(&slow_sql).fetch_one::<CountRow>().await?.count as i64;
 
@@ -63,12 +64,12 @@ async fn eval_metric_availability(
     from: &str,
     to: &str,
 ) -> anyhow::Result<(i64, i64)> {
-    let error_where = build_metrics_where_clause(error_filters, from, to);
-    let error_sql = format!("SELECT sum(Value) as total FROM otel_metrics_sum WHERE {error_where}");
+    let error_clauses = build_metrics_where_clause(error_filters, from, to);
+    let error_sql = format!("SELECT sum(Value) as total FROM otel_metrics_sum {}", error_clauses.to_sql());
     let error_count = ch.query(&error_sql).fetch_one::<SumRow>().await?.total as i64;
 
-    let total_where = build_metrics_where_clause(total_filters, from, to);
-    let total_sql = format!("SELECT sum(Value) as total FROM otel_metrics_sum WHERE {total_where}");
+    let total_clauses = build_metrics_where_clause(total_filters, from, to);
+    let total_sql = format!("SELECT sum(Value) as total FROM otel_metrics_sum {}", total_clauses.to_sql());
     let total_count = ch.query(&total_sql).fetch_one::<SumRow>().await?.total as i64;
 
     Ok((error_count, total_count))
@@ -83,21 +84,26 @@ async fn eval_metric_latency(
     from: &str,
     to: &str,
 ) -> anyhow::Result<(i64, i64)> {
-    let where_clause = build_metrics_where_clause(total_filters, from, to);
+    let clauses = build_metrics_where_clause(total_filters, from, to);
 
     // Total count from histogram
     let total_sql = format!(
-        "SELECT sum(Count) as total FROM otel_metrics_histogram WHERE {where_clause}"
+        "SELECT sum(Count) as total FROM otel_metrics_histogram {}",
+        clauses.to_sql(),
     );
     let total_count = ch.query(&total_sql).fetch_one::<SumRow>().await?.total as i64;
 
     // Fast count: samples in buckets <= threshold
     // Histogram ExplicitBounds are in the metric's unit; we pass threshold_ms directly
+    // PREWHERE (time range) comes before ARRAY JOIN; remaining conditions go in WHERE.
     let fast_sql = format!(
         "SELECT sum(BucketCounts[indexOf(ExplicitBounds, eb)]) as total \
          FROM otel_metrics_histogram \
+         {} \
          ARRAY JOIN ExplicitBounds AS eb \
-         WHERE {where_clause} AND eb <= {threshold_ms}"
+         {}",
+        clauses.prewhere_sql(),
+        clauses.where_with_extra(&format!("eb <= {threshold_ms}")),
     );
     let fast_count = ch.query(&fast_sql).fetch_one::<SumRow>().await.unwrap_or(SumRow { total: 0.0 }).total as i64;
 
@@ -116,10 +122,11 @@ async fn eval_metric_threshold(
     from: &str,
     to: &str,
 ) -> anyhow::Result<(i64, i64)> {
-    let where_clause = build_metrics_where_clause(total_filters, from, to);
+    let clauses = build_metrics_where_clause(total_filters, from, to);
 
     let total_sql = format!(
-        "SELECT count() as count FROM otel_metrics_gauge WHERE {where_clause}"
+        "SELECT count() as count FROM otel_metrics_gauge {}",
+        clauses.to_sql(),
     );
     let total_count = ch.query(&total_sql).fetch_one::<CountRow>().await?.count as i64;
 
@@ -134,7 +141,8 @@ async fn eval_metric_threshold(
     };
 
     let violating_sql = format!(
-        "SELECT count() as count FROM otel_metrics_gauge WHERE {where_clause} AND {violating_op}"
+        "SELECT count() as count FROM otel_metrics_gauge {}",
+        clauses.with_where_extra(&violating_op).to_sql(),
     );
     let violating_count = ch.query(&violating_sql).fetch_one::<CountRow>().await?.count as i64;
 
