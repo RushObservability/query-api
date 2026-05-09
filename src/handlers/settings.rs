@@ -1,9 +1,10 @@
-use axum::{Json, extract::{Path, State}, http::StatusCode, response::IntoResponse};
+use axum::{Json, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use rand::Rng;
 
 use crate::AppState;
+use crate::handlers::users::require_admin;
 
 #[derive(Debug, Serialize)]
 pub struct ApiKeyListEntry {
@@ -41,7 +42,9 @@ fn hash_key(key: &str) -> String {
 
 pub async fn list_api_keys(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let rows = state.config_db.list_api_keys().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
     })?;
@@ -54,8 +57,10 @@ pub async fn list_api_keys(
 
 pub async fn create_api_key(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateApiKeyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let id = uuid::Uuid::new_v4().to_string();
     let key = generate_api_key();
     let key_hash = hash_key(&key);
@@ -77,8 +82,10 @@ pub async fn create_api_key(
 
 pub async fn delete_api_key(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let deleted = state.config_db.delete_api_key(&id).map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
     })?;

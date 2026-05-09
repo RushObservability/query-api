@@ -40,7 +40,7 @@ pub struct UserResponse {
 
 /// Extract the calling user from the session cookie.
 /// Returns (user_id, username, display_name, tenant_id, role) or 401.
-fn require_auth(
+pub(crate) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
@@ -59,7 +59,7 @@ fn require_auth(
 }
 
 /// Require that the caller is an admin.
-fn require_admin(
+pub(crate) fn require_admin(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
