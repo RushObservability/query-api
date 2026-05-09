@@ -3,9 +3,11 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::models::log::LogRecord;
 use crate::models::query::{CountBucket, CountQueryRequest, CountRow, Filter, FilterOp, TimeRange};
 use crate::query_builder::{format_value, build_log_search_sql};
@@ -45,8 +47,10 @@ fn resolve_log_field(field: &str) -> String {
     }
 }
 
-fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str>) -> String {
+fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str>, tenant_id: &str) -> String {
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let mut conditions = vec![
+        format!("tenant_id = '{escaped_tenant}'"),
         format!("Timestamp >= parseDateTimeBestEffort('{from}')"),
         format!("Timestamp <= parseDateTimeBestEffort('{to}')"),
     ];
@@ -96,9 +100,12 @@ fn default_limit() -> u64 { 100 }
 /// Query logs from otel_logs.
 pub async fn query_logs(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let start = std::time::Instant::now();
+    let tenant_id = &tenant.tenant_id;
+    let where_clause = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
     let limit = req.limit.min(1000);
     let select_cols = "Timestamp, TraceId, SpanId, SeverityText, SeverityNumber, \
@@ -117,15 +124,15 @@ pub async fn query_logs(
                 .unwrap_or_else(|_| chrono::Utc::now().into());
             (to_dt - chrono::Duration::hours(1)).to_rfc3339()
         };
-        let narrow_where = build_log_where(&req.filters, &narrow_from, narrow_to, None);
+        let narrow_where = build_log_where(&req.filters, &narrow_from, narrow_to, None, tenant_id);
         let narrow_sql = format!(
             "SELECT {select_cols} FROM otel_logs WHERE {narrow_where} \
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}"
         );
-        let narrow_rows = state.ch.query(&narrow_sql)
+        let narrow_rows = crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
             .fetch_all::<LogRecord>().await
             .map_err(|e| {
-                tracing::error!("Log narrow query failed: {e}");
+                tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
             })?;
 
@@ -139,10 +146,10 @@ pub async fn query_logs(
                 "SELECT {select_cols} FROM otel_logs WHERE {where_clause} \
                  ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}"
             );
-            let rows = state.ch.query(&full_sql)
+            let rows = crate::tenant_query(&state.ch, &full_sql, tenant_id)
                 .fetch_all::<LogRecord>().await
                 .map_err(|e| {
-                    tracing::error!("Log query failed: {e}");
+                    tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
                     (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
                 })?;
             let total = rows.len() as u64;
@@ -156,21 +163,27 @@ pub async fn query_logs(
             req.offset,
         );
         if req.search.is_some() {
-            tracing::info!("Log search SQL: {sql}");
+            tracing::debug!(signal = "logs", handler = "query_logs", "log search query executing");
         }
-        let rows = state.ch.query(&sql)
+        let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
             .fetch_all::<LogRecord>().await
             .map_err(|e| {
-                tracing::error!("Log query failed: {e} | SQL: {sql}");
+                tracing::error!(error = %e, signal = "logs", handler = "query_logs", "search query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
             })?;
         let total = rows.len() as u64;
         (rows, total)
     };
 
-    if req.search.is_some() {
-        tracing::info!("Log search returned {} rows, total={}", rows.len(), total);
-    }
+    tracing::info!(
+        signal = "logs",
+        tenant_id = %tenant_id,
+        query = "log_search",
+        rows = rows.len(),
+        total = total,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "log search completed"
+    );
 
     // Only track usage if the query returned results
     if total > 0 {
@@ -188,9 +201,11 @@ pub async fn query_logs(
 /// Count logs bucketed by time interval.
 pub async fn count_logs(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CountQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let tenant_id = &tenant.tenant_id;
+    let where_clause = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
     let interval_fn = match req.interval.as_str() {
         "1s" => "toStartOfSecond(Timestamp)",
@@ -212,13 +227,11 @@ pub async fn count_logs(
          ORDER BY bucket ASC"
     );
 
-    let buckets = state
-        .ch
-        .query(&sql)
+    let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<CountBucket>()
         .await
         .map_err(|e| {
-            tracing::error!("Log count query failed: {e}");
+            tracing::error!(error = %e, signal = "logs", handler = "count_logs", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 

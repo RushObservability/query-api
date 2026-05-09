@@ -4,11 +4,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
+    Extension,
 };
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::TenantContext;
 use super::dd_common::{validate_api_key, decompress_body};
 
 // ═══ V1 Series payload ═══
@@ -99,6 +101,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Row)]
 struct GaugeRow {
+    tenant_id: String,
     #[serde(rename = "ResourceAttributes")]
     resource_attributes: Vec<(String, String)>,
     #[serde(rename = "ResourceSchemaUrl")]
@@ -146,6 +149,7 @@ struct GaugeRow {
 /// ClickHouse row for otel_metrics_sum (has AggregationTemporality + IsMonotonic).
 #[derive(Debug, Clone, Serialize, Row)]
 struct SumRow {
+    tenant_id: String,
     #[serde(rename = "ResourceAttributes")]
     resource_attributes: Vec<(String, String)>,
     #[serde(rename = "ResourceSchemaUrl")]
@@ -197,6 +201,7 @@ struct SumRow {
 impl SumRow {
     fn from_gauge(g: &GaugeRow, monotonic: bool) -> Self {
         SumRow {
+            tenant_id: g.tenant_id.clone(),
             resource_attributes: g.resource_attributes.clone(),
             resource_schema_url: g.resource_schema_url.clone(),
             scope_name: g.scope_name.clone(),
@@ -257,12 +262,14 @@ fn build_template(
     unit: String,
     attrs: Vec<(String, String)>,
     host: &str,
+    tenant_id: &str,
 ) -> GaugeRow {
     let mut resource_attributes = Vec::new();
     if !host.is_empty() {
         resource_attributes.push(("host.name".to_string(), host.to_string()));
     }
     GaugeRow {
+        tenant_id: tenant_id.to_string(),
         resource_attributes,
         resource_schema_url: String::new(),
         scope_name: "datadog".to_string(),
@@ -290,9 +297,11 @@ fn build_template(
 /// POST /datadog/api/v1/series — Datadog V1 metrics intake (JSON).
 pub async fn ingest_v1(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     validate_api_key(&headers)?;
     let raw = decompress_body(&headers, body)?;
 
@@ -317,6 +326,7 @@ pub async fn ingest_v1(
             String::new(),
             attrs,
             &series.host,
+            tenant_id,
         );
 
         for point in &series.points {
@@ -362,7 +372,21 @@ pub async fn ingest_v1(
     }
 
     let total = gauge_rows.len() + sum_rows.len();
-    tracing::info!("datadog metrics v1: ingested {total} samples ({} gauge, {} sum)", gauge_rows.len(), sum_rows.len());
+
+    // Record usage for per-tenant ingest metering
+    state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
+
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        series_count = payload.series.len(),
+        datapoints = total,
+        gauge_count = gauge_rows.len(),
+        sum_count = sum_rows.len(),
+        source = "datadog",
+        endpoint = "v1",
+        "ingested metrics"
+    );
 
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))))
 }
@@ -372,9 +396,11 @@ pub async fn ingest_v1(
 /// gracefully accept protobuf payloads we can't yet decode.
 pub async fn ingest_v2(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     validate_api_key(&headers)?;
     let raw = decompress_body(&headers, body)?;
 
@@ -384,9 +410,11 @@ pub async fn ingest_v2(
         Ok(p) => p,
         Err(_) => {
             tracing::debug!(
-                "datadog metrics v2: received non-JSON payload ({} bytes, content-type: {:?}), accepting",
-                raw.len(),
-                headers.get("content-type").and_then(|v| v.to_str().ok())
+                signal = "metrics",
+                endpoint = "v2",
+                bytes = raw.len(),
+                content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none"),
+                "received non-JSON payload, accepting"
             );
             return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))));
         }
@@ -425,6 +453,7 @@ pub async fn ingest_v2(
             series.unit.clone(),
             attrs,
             host,
+            tenant_id,
         );
 
         for point in &series.points {
@@ -467,7 +496,19 @@ pub async fn ingest_v2(
     }
 
     let total = gauge_rows.len() + sum_rows.len();
-    tracing::info!("datadog metrics v2: ingested {total} samples");
+
+    // Record usage for per-tenant ingest metering
+    state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
+
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        series_count = payload.series.len(),
+        datapoints = total,
+        source = "datadog",
+        endpoint = "v2",
+        "ingested metrics"
+    );
 
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))))
 }
@@ -476,9 +517,11 @@ pub async fn ingest_v2(
 /// Maps check status to a gauge metric: dd.check.{check_name} = status.
 pub async fn check_run(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     validate_api_key(&headers)?;
     let raw = decompress_body(&headers, body)?;
 
@@ -490,7 +533,7 @@ pub async fn check_run(
             match serde_json::from_slice::<ServiceCheck>(&raw) {
                 Ok(c) => vec![c],
                 Err(_) => {
-                    tracing::debug!("datadog check_run: ignoring unparseable payload");
+                    tracing::debug!(signal = "metrics", endpoint = "check_run", "ignoring unparseable payload");
                     return Ok(Json(serde_json::json!({"status": "ok"})));
                 }
             }
@@ -516,6 +559,7 @@ pub async fn check_run(
             String::new(),
             attrs,
             &check.host_name,
+            tenant_id,
         );
         row.time_unix = ts;
         row.value = check.status as f64;
@@ -529,7 +573,17 @@ pub async fn check_run(
         (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
     })?;
 
-    tracing::info!("datadog check_run: ingested {} checks", checks.len());
+    // Record usage for per-tenant ingest metering
+    state.usage_accumulator.record(tenant_id, "metrics", checks.len() as u64, raw.len() as u64);
+
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        count = checks.len(),
+        source = "datadog",
+        endpoint = "check_run",
+        "ingested service checks"
+    );
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }

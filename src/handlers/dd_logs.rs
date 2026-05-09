@@ -4,11 +4,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
+    Extension,
 };
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::TenantContext;
 use super::dd_common::{validate_api_key, decompress_body, parse_dd_tags, dd_status_to_severity};
 
 /// A single Datadog log entry from the JSON payload.
@@ -33,23 +35,29 @@ struct DdLogEntry {
 
 /// ClickHouse row matching the otel_logs schema.
 #[derive(Debug, Clone, Serialize, Row)]
+/// Column order MUST match the otel_logs table exactly (positional encoding).
+/// Table: tenant_id, Timestamp, TimestampDate, TimestampTime, TraceId, SpanId,
+///        TraceFlags, SeverityText, SeverityNumber, Body, ServiceName, ...
 struct LogInsertRow {
+    tenant_id: String,
     #[serde(rename = "Timestamp")]
     timestamp: i64, // DateTime64(9) — nanoseconds
+    // TimestampDate and TimestampTime are DEFAULT columns — ClickHouse computes them.
+    // They must NOT appear in the insert struct.
     #[serde(rename = "TraceId")]
     trace_id: String,
     #[serde(rename = "SpanId")]
     span_id: String,
     #[serde(rename = "TraceFlags")]
-    trace_flags: u8,
+    trace_flags: u32, // v2 schema: UInt32 (was UInt8)
     #[serde(rename = "SeverityText")]
     severity_text: String,
     #[serde(rename = "SeverityNumber")]
     severity_number: u8,
-    #[serde(rename = "ServiceName")]
-    service_name: String,
     #[serde(rename = "Body")]
     body: String,
+    #[serde(rename = "ServiceName")]
+    service_name: String,
     #[serde(rename = "ResourceSchemaUrl")]
     resource_schema_url: String,
     #[serde(rename = "ResourceAttributes")]
@@ -74,6 +82,31 @@ struct LogInsertRow {
 /// Maps DD log fields to the otel_logs ClickHouse schema.
 pub async fn ingest_logs(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    ingest_logs_inner(state, tenant.tenant_id.clone(), headers, body).await
+}
+
+/// Tenant-override variant: the tenant is taken from the URL path instead of the
+/// middleware. Used when the DD agent's log forwarder can't send the DD-API-KEY header.
+/// Route: POST /api/v2/logs/t/{tenant}
+pub async fn ingest_logs_with_tenant(
+    State(state): State<AppState>,
+    axum::extract::Path(tenant_override): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state.config_db.is_tenant_enabled(&tenant_override) {
+        return Err((StatusCode::BAD_REQUEST, format!("tenant '{}' not found or disabled", tenant_override)));
+    }
+    ingest_logs_inner(state, tenant_override, headers, body).await
+}
+
+async fn ingest_logs_inner(
+    state: AppState,
+    tenant_id: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -107,10 +140,26 @@ pub async fn ingest_logs(
     let mut count = 0u64;
 
     for entry in &entries {
-        let (severity_text, severity_number) = if entry.status.is_empty() {
-            ("INFO".into(), 9u8)
-        } else {
-            dd_status_to_severity(&entry.status)
+        // Determine severity: prefer parsing from the log body (more accurate)
+        // over the DD agent's status field (which is often just stderr=error).
+        let (severity_text, severity_number) = {
+            let body = entry.message.as_str();
+            if body.contains(" ERROR ") || body.contains(" error ") || body.contains("\\bERROR\\b") {
+                ("ERROR".into(), 17u8)
+            } else if body.contains(" WARN ") || body.contains(" WARNING ") || body.contains(" warn ") {
+                ("WARN".into(), 13u8)
+            } else if body.contains(" DEBUG ") || body.contains(" debug ") {
+                ("DEBUG".into(), 5u8)
+            } else if body.contains(" FATAL ") || body.contains(" fatal ") || body.contains(" CRITICAL ") {
+                ("FATAL".into(), 21u8)
+            } else if body.contains(" INFO ") || body.contains(" info ") {
+                ("INFO".into(), 9u8)
+            } else if !entry.status.is_empty() {
+                // Fall back to DD status if body doesn't have a recognizable level
+                dd_status_to_severity(&entry.status)
+            } else {
+                ("INFO".into(), 9u8)
+            }
         };
 
         // Timestamp: DD sends Unix ms; if absent use now
@@ -142,6 +191,7 @@ pub async fn ingest_logs(
         }
 
         let row = LogInsertRow {
+            tenant_id: tenant_id.clone(),
             timestamp: ts_ns,
             trace_id: String::new(),
             span_id: String::new(),
@@ -170,7 +220,16 @@ pub async fn ingest_logs(
         (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
     })?;
 
-    tracing::info!("datadog logs: ingested {count} entries");
+    // Record usage for per-tenant ingest metering
+    state.usage_accumulator.record(&tenant_id, "logs", count, raw.len() as u64);
+
+    tracing::info!(
+        signal = "logs",
+        tenant_id = %tenant_id,
+        count = count,
+        source = "datadog",
+        "ingested logs"
+    );
 
     Ok(Json(serde_json::json!({})))
 }

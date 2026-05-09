@@ -18,10 +18,11 @@ pub async fn evaluate_instant_query(
     query: &str,
     eval_time: f64,
     lookback: f64,
+    tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
     let expr = parser::parse(query).map_err(|e| format!("{e}"))?;
     let step_timestamps = vec![eval_time];
-    evaluate(&expr, ch, eval_time - lookback, eval_time, &step_timestamps).await
+    evaluate(&expr, ch, eval_time - lookback, eval_time, &step_timestamps, tenant_id).await
 }
 
 /// Evaluate a range query (multiple points across a time range).
@@ -31,11 +32,12 @@ pub async fn evaluate_range_query(
     start: f64,
     end: f64,
     step: f64,
+    tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
     let expr = parser::parse(query).map_err(|e| format!("{e}"))?;
     let lookback = extract_lookback(&expr);
     let step_timestamps = generate_steps(start, end, step);
-    evaluate(&expr, ch, start - lookback, end, &step_timestamps).await
+    evaluate(&expr, ch, start - lookback, end, &step_timestamps, tenant_id).await
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -49,11 +51,12 @@ fn evaluate<'a>(
     query_start: f64,
     query_end: f64,
     step_timestamps: &'a [f64],
+    tenant_id: &'a str,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<TimeSeries>, String>> + Send + 'a>> {
     Box::pin(async move {
     match expr {
         Expr::VectorSelector(vs) => {
-            query_clickhouse(ch, vs, query_start, query_end, step_timestamps, true).await
+            query_clickhouse(ch, vs, query_start, query_end, step_timestamps, true, tenant_id).await
         }
 
         Expr::MatrixSelector(ms) => {
@@ -62,7 +65,7 @@ fn evaluate<'a>(
             // so that range functions (rate, increase, etc.) have enough data.
             let range_secs = ms.range.as_secs_f64();
             let adjusted_start = query_start - range_secs;
-            query_clickhouse(ch, &ms.vs, adjusted_start, query_end, step_timestamps, false).await
+            query_clickhouse(ch, &ms.vs, adjusted_start, query_end, step_timestamps, false, tenant_id).await
         }
 
         Expr::Call(call) => {
@@ -71,7 +74,7 @@ fn evaluate<'a>(
             // Check if it's a range function
             if let Some(range_func) = translate::to_range_func(func_name) {
                 return evaluate_range_call(
-                    &call.args.args, range_func, func_name, ch, query_start, query_end, step_timestamps,
+                    &call.args.args, range_func, func_name, ch, query_start, query_end, step_timestamps, tenant_id,
                 )
                 .await;
             }
@@ -79,7 +82,7 @@ fn evaluate<'a>(
             // Check if it's a scalar function
             if let Some(scalar_func) = translate::to_scalar_func(func_name) {
                 return evaluate_scalar_call(
-                    &call.args.args, scalar_func, func_name, ch, query_start, query_end, step_timestamps,
+                    &call.args.args, scalar_func, func_name, ch, query_start, query_end, step_timestamps, tenant_id,
                 )
                 .await;
             }
@@ -91,7 +94,7 @@ fn evaluate<'a>(
             let op = translate::to_agg_op(agg.op)?;
             let (by_labels, without) = translate::extract_label_modifier(&agg.modifier);
 
-            let inner = evaluate(&agg.expr, ch, query_start, query_end, step_timestamps).await?;
+            let inner = evaluate(&agg.expr, ch, query_start, query_end, step_timestamps, tenant_id).await?;
 
             // Extract param (e.g., for quantile, topk, bottomk)
             let param = match &agg.param {
@@ -112,8 +115,8 @@ fn evaluate<'a>(
         Expr::Binary(bin) => {
             // Evaluate both sides in parallel
             let (lhs_result, rhs_result) = tokio::join!(
-                evaluate(&bin.lhs, ch, query_start, query_end, step_timestamps),
-                evaluate(&bin.rhs, ch, query_start, query_end, step_timestamps),
+                evaluate(&bin.lhs, ch, query_start, query_end, step_timestamps, tenant_id),
+                evaluate(&bin.rhs, ch, query_start, query_end, step_timestamps, tenant_id),
             );
 
             let lhs = lhs_result?;
@@ -129,7 +132,7 @@ fn evaluate<'a>(
         }
 
         Expr::Unary(unary) => {
-            let mut inner = evaluate(&unary.expr, ch, query_start, query_end, step_timestamps).await?;
+            let mut inner = evaluate(&unary.expr, ch, query_start, query_end, step_timestamps, tenant_id).await?;
             // Negate all values
             for ts in &mut inner {
                 for sample in &mut ts.samples {
@@ -140,7 +143,7 @@ fn evaluate<'a>(
         }
 
         Expr::Paren(paren) => {
-            evaluate(&paren.expr, ch, query_start, query_end, step_timestamps).await
+            evaluate(&paren.expr, ch, query_start, query_end, step_timestamps, tenant_id).await
         }
 
         Expr::NumberLiteral(num) => {
@@ -179,6 +182,7 @@ async fn evaluate_range_call(
     query_start: f64,
     query_end: f64,
     step_timestamps: &[f64],
+    tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
     // Range functions expect their first arg to be a MatrixSelector (or nested expr).
     // Some have an additional numeric parameter (quantile_over_time, predict_linear).
@@ -214,6 +218,7 @@ async fn evaluate_range_call(
         query_start - range_secs,
         query_end,
         step_timestamps,
+        tenant_id,
     )
     .await?;
 
@@ -236,6 +241,7 @@ async fn evaluate_scalar_call(
     query_start: f64,
     query_end: f64,
     step_timestamps: &[f64],
+    tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
     // Classify based on function argument patterns
     let (inner_expr, extra_args): (&Expr, Vec<f64>) = match func_name {
@@ -289,7 +295,7 @@ async fn evaluate_scalar_call(
         }
     };
 
-    let inner_series = evaluate(inner_expr, ch, query_start, query_end, step_timestamps).await?;
+    let inner_series = evaluate(inner_expr, ch, query_start, query_end, step_timestamps, tenant_id).await?;
     Ok(scalar::apply_scalar_func(inner_series, scalar_func, &extra_args))
 }
 
@@ -307,8 +313,11 @@ async fn query_clickhouse(
     end_secs: f64,
     step_timestamps: &[f64],
     align: bool,
+    tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let mut where_parts = vec![
+        format!("tenant_id = '{escaped_tenant}'"),
         format!("TimeUnix >= toDateTime64({}, 9)", start_secs as i64),
         format!("TimeUnix <= toDateTime64({}, 9)", end_secs as i64),
     ];
@@ -352,8 +361,8 @@ async fn query_clickhouse(
     );
 
     let (gauge_res, sum_res) = tokio::join!(
-        ch.query(&gauge_sql).fetch_all::<MetricSample>(),
-        ch.query(&sum_sql).fetch_all::<MetricSample>(),
+        crate::tenant_query(ch, &gauge_sql, tenant_id).fetch_all::<MetricSample>(),
+        crate::tenant_query(ch, &sum_sql, tenant_id).fetch_all::<MetricSample>(),
     );
 
     let gauge_rows = gauge_res.unwrap_or_default();

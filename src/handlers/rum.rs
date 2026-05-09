@@ -3,9 +3,11 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::models::query::{TimeRange, Filter, FilterOp};
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
@@ -44,8 +46,10 @@ fn resolve_rum_field(field: &str) -> String {
     }
 }
 
-fn build_rum_where(filters: &[Filter], from: &str, to: &str) -> String {
+fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) -> String {
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let mut conditions = vec![
+        format!("tenant_id = '{escaped_tenant}'"),
         // TimestampTime (DateTime) is in the PRIMARY KEY — these enable index pruning
         format!("TimestampTime >= toDateTime(parseDateTimeBestEffort('{from}'))"),
         format!("TimestampTime <= toDateTime(parseDateTimeBestEffort('{to}'))"),
@@ -76,13 +80,13 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str) -> String {
 
 // ── Request / response types ──
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct RumIngestPayload {
     pub meta: RumIngestMeta,
     pub events: Vec<RumIngestEvent>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct RumIngestMeta {
     pub app_name: String,
     #[serde(default)]
@@ -117,7 +121,7 @@ pub struct RumIngestMeta {
     pub screen_height: u16,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct RumIngestEvent {
     pub event_type: String,
     #[serde(default)]
@@ -221,8 +225,10 @@ pub struct RumSessionRow {
 /// POST /api/v1/rum/ingest — SDK sends batched events
 pub async fn ingest(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(payload): Json<RumIngestPayload>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     let meta = &payload.meta;
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
@@ -234,6 +240,7 @@ pub async fn ingest(
     for evt in &payload.events {
         let ts = evt.timestamp.unwrap_or(now_ns);
         let record = RumRecord {
+            tenant_id: tenant_id.clone(),
             timestamp: ts,
             app_name: meta.app_name.clone(),
             app_version: meta.app_version.clone(),
@@ -284,7 +291,12 @@ pub async fn ingest(
         .collect();
 
     if !trace_events.is_empty() {
-        tracing::info!("RUM ingest: creating {} synthetic span(s) in wide_events", trace_events.len());
+        tracing::debug!(
+            signal = "rum",
+            tenant_id = %tenant_id,
+            synthetic_spans = trace_events.len(),
+            "creating synthetic spans in wide_events"
+        );
         match state.ch.insert("wide_events") {
             Ok(mut span_insert) => {
                 for evt in &trace_events {
@@ -304,41 +316,55 @@ pub async fn ingest(
                     });
 
                     let span = WideEvent {
+                        tenant_id: tenant_id.clone(),
                         timestamp: ts,
                         trace_id: evt.trace_id.clone(),
                         span_id: evt.span_id.clone(),
                         parent_span_id: String::new(),
                         service_name: meta.app_name.clone(),
-                        service_version: meta.app_version.clone(),
-                        environment: meta.environment.clone(),
-                        host_name: format!("{} {}", meta.browser_name, meta.browser_version),
+                        span_name: format!("pageview {}", meta.page_path),
+                        kind: "CLIENT".to_string(),
+                        status: "OK".to_string(),
+                        duration_ns,
                         http_method: "GET".to_string(),
                         http_path: meta.page_path.clone(),
                         http_status_code: 200,
-                        duration_ns,
-                        status: "OK".to_string(),
                         attributes: attrs.to_string(),
-                        event_timestamps: vec![],
                         event_names: vec![],
+                        event_timestamps: vec![],
                         event_attributes: vec![],
                         link_trace_ids: vec![],
                         link_span_ids: vec![],
                     };
                     if let Err(e) = span_insert.write(&span).await {
-                        tracing::error!("RUM span write failed: {e}");
+                        tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span write failed");
                     }
                 }
                 if let Err(e) = span_insert.end().await {
-                    tracing::error!("RUM span insert end failed: {e}");
+                    tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span insert end failed");
                 } else {
-                    tracing::info!("RUM synthetic spans committed OK");
+                    tracing::debug!(signal = "rum", synthetic_spans = trace_events.len(), "synthetic spans committed");
                 }
             }
             Err(e) => {
-                tracing::error!("RUM span insert init failed: {e}");
+                tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span insert init failed");
             }
         }
     }
+
+    // Record usage for per-tenant ingest metering
+    // Estimate payload bytes from the serialized JSON size since we consumed the deserialized struct
+    let estimated_bytes = serde_json::to_string(&payload).map(|s| s.len() as u64).unwrap_or(0);
+    state.usage_accumulator.record(tenant_id, "rum", payload.events.len() as u64, estimated_bytes);
+
+    tracing::info!(
+        signal = "rum",
+        tenant_id = %tenant_id,
+        events = payload.events.len(),
+        app = %meta.app_name,
+        source = "rum_sdk",
+        "ingested RUM events"
+    );
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "accepted": payload.events.len() }))))
 }
@@ -346,17 +372,21 @@ pub async fn ingest(
 /// GET /api/v1/rum/apps — list known apps
 pub async fn list_apps(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let sql = "SELECT AppName, count() as cnt FROM rum_events \
-                WHERE TimestampTime >= now() - INTERVAL 7 DAY \
-                GROUP BY AppName ORDER BY cnt DESC";
-    let rows = state
-        .ch
-        .query(sql)
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let sql = format!(
+        "SELECT AppName, count() as cnt FROM rum_events \
+         WHERE tenant_id = '{escaped_tenant}' \
+         AND TimestampTime >= now() - INTERVAL 7 DAY \
+         GROUP BY AppName ORDER BY cnt DESC"
+    );
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<RumAppRow>()
         .await
         .map_err(|e| {
-            tracing::error!("RUM apps query failed: {e}");
+            tracing::error!(error = %e, signal = "rum", handler = "list_apps", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 
@@ -366,12 +396,14 @@ pub async fn list_apps(
 /// POST /api/v1/rum/query — raw event query
 pub async fn query_events(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to);
+    let tenant_id = &tenant.tenant_id;
+    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
-        "SELECT Timestamp, AppName, AppVersion, Environment, SessionId, UserId, \
+        "SELECT tenant_id, Timestamp, AppName, AppVersion, Environment, SessionId, UserId, \
          PageUrl, PagePath, ViewName, Referrer, BrowserName, BrowserVersion, \
          OsName, OsVersion, DeviceType, ScreenWidth, ScreenHeight, \
          EventType, EventName, VitalName, VitalValue, VitalRating, \
@@ -383,13 +415,11 @@ pub async fn query_events(
         req.offset,
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<RumRecord>()
         .await
         .map_err(|e| {
-            tracing::error!("RUM query failed: {e}");
+            tracing::error!(error = %e, signal = "rum", handler = "query_events", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 
@@ -404,15 +434,17 @@ pub async fn query_events(
 /// POST /api/v1/rum/vitals — web vitals aggregation
 pub async fn vitals(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     let mut filters = req.filters.clone();
     filters.push(Filter {
         field: "EventType".to_string(),
         op: FilterOp::Eq,
         value: serde_json::Value::String("web_vital".to_string()),
     });
-    let where_clause = build_rum_where(&filters, &req.time_range.from, &req.time_range.to);
+    let where_clause = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -427,13 +459,11 @@ pub async fn vitals(
          ORDER BY VitalName"
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<RumVitalRow>()
         .await
         .map_err(|e| {
-            tracing::error!("RUM vitals query failed: {e}");
+            tracing::error!(error = %e, signal = "rum", handler = "vitals", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 
@@ -443,9 +473,11 @@ pub async fn vitals(
 /// POST /api/v1/rum/pages — page performance
 pub async fn pages(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to);
+    let tenant_id = &tenant.tenant_id;
+    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -462,13 +494,11 @@ pub async fn pages(
         req.limit.min(100),
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<RumPageRow>()
         .await
         .map_err(|e| {
-            tracing::error!("RUM pages query failed: {e}");
+            tracing::error!(error = %e, signal = "rum", handler = "pages", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 
@@ -478,15 +508,17 @@ pub async fn pages(
 /// POST /api/v1/rum/errors — error groups
 pub async fn errors(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     let mut filters = req.filters.clone();
     filters.push(Filter {
         field: "EventType".to_string(),
         op: FilterOp::Eq,
         value: serde_json::Value::String("error".to_string()),
     });
-    let where_clause = build_rum_where(&filters, &req.time_range.from, &req.time_range.to);
+    let where_clause = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -504,13 +536,11 @@ pub async fn errors(
         req.limit.min(100),
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<RumErrorRow>()
         .await
         .map_err(|e| {
-            tracing::error!("RUM errors query failed: {e}");
+            tracing::error!(error = %e, signal = "rum", handler = "errors", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 
@@ -520,9 +550,11 @@ pub async fn errors(
 /// POST /api/v1/rum/sessions — session list
 pub async fn sessions(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to);
+    let tenant_id = &tenant.tenant_id;
+    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -542,13 +574,11 @@ pub async fn sessions(
         req.offset,
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<RumSessionRow>()
         .await
         .map_err(|e| {
-            tracing::error!("RUM sessions query failed: {e}");
+            tracing::error!(error = %e, signal = "rum", handler = "sessions", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 
@@ -558,29 +588,30 @@ pub async fn sessions(
 /// GET /api/v1/rum/session/{id} — session timeline
 pub async fn session_detail(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let escaped_id = id.replace('\'', "\\'");
     let sql = format!(
-        "SELECT Timestamp, AppName, AppVersion, Environment, SessionId, UserId, \
+        "SELECT tenant_id, Timestamp, AppName, AppVersion, Environment, SessionId, UserId, \
          PageUrl, PagePath, ViewName, Referrer, BrowserName, BrowserVersion, \
          OsName, OsVersion, DeviceType, ScreenWidth, ScreenHeight, \
          EventType, EventName, VitalName, VitalValue, VitalRating, \
          ErrorMessage, ErrorStack, ErrorType, InteractionTarget, InteractionType, \
          DurationMs, TraceId, SpanId, Attributes \
          FROM rum_events \
-         WHERE SessionId = '{escaped_id}' \
+         WHERE tenant_id = '{escaped_tenant}' AND SessionId = '{escaped_id}' \
          ORDER BY Timestamp ASC \
          LIMIT 1000"
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<RumRecord>()
         .await
         .map_err(|e| {
-            tracing::error!("RUM session detail query failed: {e}");
+            tracing::error!(error = %e, signal = "rum", handler = "session_detail", "query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 

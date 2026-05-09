@@ -3,10 +3,12 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 use serde::Deserialize;
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::models::query::StringValueRow;
 
 #[derive(Debug, Deserialize)]
@@ -23,9 +25,12 @@ fn default_limit() -> u64 {
 
 pub async fn suggest_values(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(field): Path<String>,
     Query(params): Query<SuggestParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let col_expr = if let Some(attr_path) = field.strip_prefix("attributes.") {
         // OTel attributes use flat dotted keys — try flat key first, nested as fallback
         let parts: Vec<&str> = attr_path.split('.').collect();
@@ -44,9 +49,8 @@ pub async fn suggest_values(
     } else {
         let allowed = [
             "service_name",
-            "service_version",
-            "environment",
-            "host_name",
+            "span_name",
+            "kind",
             "http_method",
             "http_path",
             "status",
@@ -61,7 +65,10 @@ pub async fn suggest_values(
     };
 
     // P4: Always constrain to recent data to avoid full table scans
-    let mut where_parts = vec!["timestamp >= now() - INTERVAL 24 HOUR".to_string()];
+    let mut where_parts = vec![
+        format!("tenant_id = '{escaped_tenant}'"),
+        "timestamp >= now() - INTERVAL 24 HOUR".to_string(),
+    ];
     if !params.prefix.is_empty() {
         let escaped = params.prefix.replace('\'', "\\'");
         where_parts.push(format!("val LIKE '{escaped}%'"));
@@ -77,9 +84,7 @@ pub async fn suggest_values(
         params.limit.min(100),
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<StringValueRow>()
         .await
         .map_err(|e| {

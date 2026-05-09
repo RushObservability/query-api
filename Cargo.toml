@@ -13,7 +13,7 @@ name = "rush-api"
 path = "src/main.rs"
 
 [[bin]]
-name = "wide-anomaly-engine"
+name = "rush-anomaly-engine"
 path = "src/bin/anomaly_engine.rs"
 
 [dependencies]
@@ -25,7 +25,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-logfmt = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
@@ -34,6 +35,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json"] }
 sha2 = "0.10"
 rand = "0.9"
+bcrypt = "0.17"
 lettre = { version = "0.10", features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
 promql-parser = "0.7"
 regex = "1"
@@ -49,6 +51,11 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 kube = { version = "0.98", features = ["client", "runtime", "derive"] }
 k8s-openapi = { version = "0.24", features = ["v1_32"] }
+base64 = "0.22"
+quick-xml = "0.37"
+url = "2"
+openssl = "0.10"
+dashmap = "6"
 
 [profile.release]
 lto = true

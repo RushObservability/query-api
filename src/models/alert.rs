@@ -3,18 +3,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationChannel {
     pub id: String,
+    pub tenant_id: String,
     pub name: String,
     pub channel_type: String,
     pub config: String,
+    pub enabled: bool,
     pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationChannelResponse {
     pub id: String,
+    pub tenant_id: String,
     pub name: String,
     pub channel_type: String,
     pub config: serde_json::Value,
+    pub enabled: bool,
     pub created_at: String,
 }
 
@@ -22,12 +26,35 @@ impl From<NotificationChannel> for NotificationChannelResponse {
     fn from(c: NotificationChannel) -> Self {
         Self {
             id: c.id,
+            tenant_id: c.tenant_id,
             name: c.name,
             channel_type: c.channel_type,
             config: serde_json::from_str(&c.config).unwrap_or(serde_json::Value::Object(Default::default())),
+            enabled: c.enabled,
             created_at: c.created_at,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationLogEntry {
+    pub id: String,
+    pub channel_id: String,
+    pub tenant_id: String,
+    pub alert_type: String,
+    pub alert_name: String,
+    pub severity: String,
+    pub status: String,
+    pub error: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateChannelRequest {
+    pub name: String,
+    pub config: serde_json::Value,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

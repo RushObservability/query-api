@@ -1,5 +1,7 @@
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
+use axum::{extract::Request, middleware::Next, response::Response};
 use clickhouse::Client;
+use sha2::{Sha256, Digest};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -11,21 +13,176 @@ use rush_api::config::RushConfig;
 use rush_api::config_db::ConfigDb;
 use rush_api::handlers;
 use rush_api::migrations;
+use rush_api::monitor_engine;
 use rush_api::retention_enforcer;
+use rush_api::siem_engine;
 use rush_api::slo_engine;
 use rush_api::stats_engine;
+use rush_api::usage_accumulator::UsageAccumulator;
 use rush_api::usage_tracker;
 use rush_api::AppState;
+use rush_api::TenantContext;
+
+/// Middleware that resolves the tenant for every request. Four methods,
+/// checked in priority order:
+///
+/// 1. `Authorization: Bearer <api_key>` — resolves the key to a tenant via
+///    the config DB. Secure; the key is the trust boundary.
+/// 2. `rush_session` cookie — resolves a session to its user, then uses
+///    the user's tenant_id.
+/// 3. `X-Rush-Tenant: <tenant_name_or_id>` — use the header value directly.
+///    No auth required. Intended for simple / dev / single-org deployments
+///    where teams trust each other and don't want to manage API keys.
+/// 4. Fall back to the `"default"` tenant (backward compatible, no headers
+///    needed at all).
+async fn tenant_middleware(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let tenant_id = resolve_tenant_from_request(&state, &req);
+    req.extensions_mut().insert(TenantContext { tenant_id });
+    next.run(req).await
+}
+
+fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
+    // ── Priority 1: Bearer token → fixed to the key's tenant ──
+    // API keys are scoped to one tenant (for collectors, CI, Grafana).
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(val) = auth_header {
+        if val.len() > 7 && val[..7].eq_ignore_ascii_case("bearer ") {
+            let key = val[7..].trim();
+            let mut hasher = Sha256::new();
+            hasher.update(key.as_bytes());
+            let key_hash = format!("{:x}", hasher.finalize());
+
+            match state.config_db.resolve_tenant_for_api_key(&key_hash) {
+                Ok(Some(tid)) => return tid,
+                Ok(None) => {
+                    tracing::debug!(method = "api_key", "tenant resolution: key not found, falling through");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, method = "api_key", "tenant resolution failed");
+                }
+            }
+        }
+    }
+
+    // ── Priority 1b: DD-API-KEY header (Datadog agent) ──
+    // The Datadog agent sends its API key in this header. Resolve it the
+    // same way as a Bearer token so DD agents map to tenants via API keys.
+    if let Some(dd_key) = req.headers().get("dd-api-key").and_then(|v| v.to_str().ok()) {
+        let key = dd_key.trim();
+        if !key.is_empty() {
+            let mut hasher = Sha256::new();
+            hasher.update(key.as_bytes());
+            let key_hash = format!("{:x}", hasher.finalize());
+
+            match state.config_db.resolve_tenant_for_api_key(&key_hash) {
+                Ok(Some(tid)) => return tid,
+                Ok(None) => {
+                    tracing::debug!(method = "dd_api_key", "tenant resolution: DD key not found, falling through");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, method = "dd_api_key", "tenant resolution failed");
+                }
+            }
+        }
+    }
+
+    // ── Priority 2: X-Rush-Tenant header ──
+    // The frontend tenant switcher sends this. It takes priority over the
+    // session's default tenant so users can switch between tenants they
+    // have access to.
+    //
+    // If the tenant has auth_required=true (locked), the X-Rush-Tenant header
+    // alone is NOT enough — the request must also have been authenticated via
+    // Bearer token, DD-API-KEY, or session cookie (priorities 1/1b above).
+    // This prevents unauthenticated ingest into locked tenants.
+    if let Some(val) = req.headers().get("x-rush-tenant").and_then(|v| v.to_str().ok()) {
+        let tenant = val.trim();
+        if !tenant.is_empty() {
+            if state.config_db.is_tenant_enabled(tenant) {
+                if state.config_db.is_tenant_auth_required(tenant) {
+                    // Locked tenant: header alone isn't enough. Check if we have
+                    // a valid session (authenticated user can switch to any tenant).
+                    let has_session = req.headers().get("cookie")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|c| c.contains("rush_session="))
+                        .unwrap_or(false);
+                    if has_session {
+                        if let Some(token) = handlers::auth::extract_session_cookie(req.headers()) {
+                            if state.config_db.get_session_user(&token).is_some() {
+                                return tenant.to_string();
+                            }
+                        }
+                    }
+                    tracing::debug!(
+                        tenant_id = %tenant,
+                        method = "header",
+                        "tenant requires auth — X-Rush-Tenant header rejected without valid session/API key"
+                    );
+                } else {
+                    // Open tenant: header is enough
+                    return tenant.to_string();
+                }
+            } else {
+                tracing::debug!(tenant_id = %tenant, method = "header", "tenant disabled or missing, falling through");
+            }
+        }
+    }
+
+    // ── Priority 3: Session cookie → user's default tenant ──
+    // Fallback when no explicit tenant header is sent (e.g., first page load
+    // before the tenant switcher initializes).
+    if let Some(token) = handlers::auth::extract_session_cookie(req.headers()) {
+        if let Some((_user_id, _username, _display_name, tenant_id, _role)) =
+            state.config_db.get_session_user(&token)
+        {
+            return tenant_id;
+        }
+    }
+
+    // ── Priority 4: default ──
+    "default".to_string()
+}
+
+use axum::extract::State;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("rush_api=debug,tower_http=debug")
-        }))
-        .init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("rush_api=debug,tower_http=debug"));
+
+    let log_format = std::env::var("RUSH_LOG_FORMAT").unwrap_or_else(|_| "pretty".to_string());
+    match log_format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+        "logfmt" => {
+            let layer = tracing_logfmt::layer();
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(layer)
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .init();
+        }
+    }
 
     let clickhouse_url =
         std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
@@ -60,10 +217,25 @@ async fn main() -> anyhow::Result<()> {
         .with_password(&clickhouse_password)
         .with_option("max_execution_time", "30");
 
+    // Check if ClickHouse supports the rush_tenant_id custom setting for row policy enforcement.
+    // If not (no custom_settings_prefixes configured), row policies are NOT created (they would
+    // break all queries). The API-layer WHERE clause is still the primary enforcement.
+    rush_api::probe_row_policy_support(&ch).await;
+    if rush_api::row_policy_supported() {
+        migrations::apply_row_policies(&ch).await;
+    }
+
     let config_db_path =
         std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());
     let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
-    tracing::info!("config db opened at {config_db_path}");
+    config_db.ensure_default_tenant()?;
+    config_db.ensure_default_admin()?;
+    config_db.ensure_default_groups()?;
+    config_db.ensure_default_templates()?;
+    tracing::info!(
+        config_db = %config_db_path,
+        "config db opened"
+    );
 
     // SMTP config for email notifications (optional)
     let smtp_config = alert_engine::SmtpConfig {
@@ -79,18 +251,30 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Spawn background engines
-    alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config);
+    alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config.clone());
     slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
-    retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone());
+    retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone(), config_db.clone());
     stats_engine::spawn_stats_engine(ch.clone());
+
+    // Spawn the Datadog-style monitor engine (v2 alerting)
+    monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config);
+
+    // Seed built-in SIEM detection rules and spawn the SIEM detection engine
+    config_db.ensure_default_detection_rules()?;
+    siem_engine::spawn(ch.clone(), config_db.clone());
 
     // Spawn usage tracker (fire-and-forget signal usage tracking)
     let usage = usage_tracker::spawn(ch.clone());
+
+    // Spawn usage accumulator (per-tenant ingest metering)
+    let usage_accumulator = UsageAccumulator::new();
+    usage_accumulator.spawn_flusher(ch.clone());
 
     let state = AppState {
         ch,
         config_db,
         usage,
+        usage_accumulator,
         config: wide_config,
     };
 
@@ -102,6 +286,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/count", post(handlers::query::count_query))
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
+        // BubbleUp comparison analysis
+        .route("/api/v1/bubbleup", post(handlers::bubbleup::bubbleup))
         // Log endpoints
         .route("/api/v1/logs", post(handlers::logs::query_logs))
         .route("/api/v1/logs/count", post(handlers::logs::count_logs))
@@ -119,6 +305,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::dashboards::list_dashboards).post(handlers::dashboards::create_dashboard),
         )
         .route(
+            "/api/v1/dashboards/import",
+            post(handlers::dashboards::import_dashboard),
+        )
+        .route(
             "/api/v1/dashboards/{id}",
             get(handlers::dashboards::get_dashboard)
                 .put(handlers::dashboards::update_dashboard)
@@ -132,6 +322,19 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/dashboards/{id}/widgets/{wid}",
             put(handlers::dashboards::update_widget).delete(handlers::dashboards::delete_widget),
         )
+        .route(
+            "/api/v1/dashboards/{id}/export",
+            get(handlers::dashboards::export_dashboard),
+        )
+        // Dashboard template endpoints
+        .route(
+            "/api/v1/dashboard-templates",
+            get(handlers::dashboards::list_dashboard_templates),
+        )
+        .route(
+            "/api/v1/dashboard-templates/{tid}/create",
+            post(handlers::dashboards::create_from_template),
+        )
         // Notification channels
         .route(
             "/api/v1/channels",
@@ -139,11 +342,19 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/channels/{id}",
-            delete(handlers::alerts::delete_channel),
+            put(handlers::alerts::update_channel).delete(handlers::alerts::delete_channel),
         )
         .route(
             "/api/v1/channels/{id}/notify",
             post(handlers::alerts::notify_channel),
+        )
+        .route(
+            "/api/v1/channels/{id}/test",
+            post(handlers::alerts::test_channel),
+        )
+        .route(
+            "/api/v1/notifications/log",
+            get(handlers::alerts::list_notification_log),
         )
         // Alert events (all rules)
         .route(
@@ -164,6 +375,41 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/alerts/{id}/events",
             get(handlers::alerts::list_alert_events),
+        )
+        // Monitors (Datadog-style v2 alerting)
+        .route(
+            "/api/v1/monitors",
+            get(handlers::monitors::list_monitors).post(handlers::monitors::create_monitor),
+        )
+        .route(
+            "/api/v1/monitors/autocomplete",
+            get(handlers::monitors::autocomplete),
+        )
+        .route(
+            "/api/v1/monitors/suggest",
+            post(handlers::monitors::suggest),
+        )
+        .route(
+            "/api/v1/monitors/preview",
+            post(handlers::monitors::preview_monitor),
+        )
+        .route(
+            "/api/v1/monitors/{id}",
+            get(handlers::monitors::get_monitor)
+                .put(handlers::monitors::update_monitor)
+                .delete(handlers::monitors::delete_monitor),
+        )
+        .route(
+            "/api/v1/monitors/{id}/events",
+            get(handlers::monitors::list_monitor_events),
+        )
+        .route(
+            "/api/v1/monitors/{id}/mute",
+            post(handlers::monitors::mute_monitor),
+        )
+        .route(
+            "/api/v1/monitors/{id}/unmute",
+            post(handlers::monitors::unmute_monitor),
         )
         // SLOs
         .route(
@@ -207,6 +453,26 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/anomaly-events/{event_id}/analyze",
             post(handlers::anomalies::analyze_anomaly_event),
+        )
+        // SIEM Detection rules
+        .route(
+            "/api/v1/detection/rules",
+            get(handlers::detection::list_detection_rules)
+                .post(handlers::detection::create_detection_rule),
+        )
+        .route(
+            "/api/v1/detection/rules/{id}",
+            get(handlers::detection::get_detection_rule)
+                .put(handlers::detection::update_detection_rule)
+                .delete(handlers::detection::delete_detection_rule),
+        )
+        .route(
+            "/api/v1/detection/rules/{id}/test",
+            post(handlers::detection::test_detection_rule),
+        )
+        .route(
+            "/api/v1/detection/events",
+            get(handlers::detection::list_detection_events),
         )
         // Prometheus-compatible metrics API (for Grafana)
         .route(
@@ -270,6 +536,73 @@ async fn main() -> anyhow::Result<()> {
                 .put(handlers::custom_skills::update_custom_skill)
                 .delete(handlers::custom_skills::delete_custom_skill),
         )
+        // Tenants (multi-tenant isolation boundaries)
+        .route(
+            "/api/v1/tenants",
+            get(handlers::tenants::list_tenants)
+                .post(handlers::tenants::create_tenant),
+        )
+        .route(
+            "/api/v1/tenants/{id}",
+            delete(handlers::tenants::delete_tenant),
+        )
+        .route(
+            "/api/v1/tenants/{id}/toggle",
+            put(handlers::tenants::toggle_tenant),
+        )
+        .route(
+            "/api/v1/tenants/{id}/auth",
+            put(handlers::tenants::set_auth_required),
+        )
+        // Tenant retention overrides
+        .route(
+            "/api/v1/tenants/{id}/retention",
+            get(handlers::retention::get_tenant_retention)
+                .put(handlers::retention::set_tenant_retention),
+        )
+        .route(
+            "/api/v1/tenants/{id}/retention/{signal}",
+            delete(handlers::retention::delete_tenant_retention),
+        )
+        // Users (user management)
+        .route(
+            "/api/v1/users",
+            get(handlers::users::list_users)
+                .post(handlers::users::create_user),
+        )
+        .route(
+            "/api/v1/users/{id}",
+            delete(handlers::users::delete_user),
+        )
+        .route(
+            "/api/v1/users/{id}/password",
+            put(handlers::users::change_password),
+        )
+        .route(
+            "/api/v1/users/{id}/toggle",
+            put(handlers::users::toggle_user),
+        )
+        // Groups (RBAC group management)
+        .route(
+            "/api/v1/groups",
+            get(handlers::groups::list_groups)
+                .post(handlers::groups::create_group),
+        )
+        .route(
+            "/api/v1/groups/{id}",
+            put(handlers::groups::update_group)
+                .delete(handlers::groups::delete_group),
+        )
+        .route(
+            "/api/v1/groups/{id}/tenants",
+            put(handlers::groups::set_group_tenants),
+        )
+        // User group membership
+        .route(
+            "/api/v1/users/{user_id}/groups",
+            get(handlers::groups::get_user_groups)
+                .put(handlers::groups::set_user_groups),
+        )
         // RUM (Real User Monitoring)
         .route("/api/v1/rum/ingest", post(handlers::rum::ingest))
         .route("/api/v1/rum/apps", get(handlers::rum::list_apps))
@@ -288,10 +621,15 @@ async fn main() -> anyhow::Result<()> {
         // Signal usage
         .route("/api/v1/usage", get(handlers::usage::get_usage))
         .route("/api/v1/usage/cardinality/{metric}", get(handlers::usage::get_label_breakdown))
+        // Usage metering (per-tenant ingest volume)
+        .route("/api/v1/usage/summary", get(handlers::usage_metering::usage_summary))
+        .route("/api/v1/usage/breakdown", get(handlers::usage_metering::usage_breakdown))
+        .route("/api/v1/usage/tenants", get(handlers::usage_metering::usage_tenants))
         // ═══ Datadog Agent Ingestion ═══
         // Logs (agent log forwarder sends to {logs_dd_url}/api/v2/logs)
         .route("/datadog/v1/input", post(handlers::dd_logs::ingest_logs))
         .route("/api/v2/logs", post(handlers::dd_logs::ingest_logs))
+        .route("/api/v2/logs/t/{tenant}", post(handlers::dd_logs::ingest_logs_with_tenant))
         // Metrics
         .route("/datadog/api/v1/series", post(handlers::dd_metrics::ingest_v1))
         .route("/datadog/api/v2/series", post(handlers::dd_metrics::ingest_v2))
@@ -311,24 +649,75 @@ async fn main() -> anyhow::Result<()> {
         .route("/datadog/api/v1/collector", any(handlers::dd_common::stub_ok))
         .route("/datadog/intake/", any(handlers::dd_common::stub_ok))
         .route("/datadog/intake", any(handlers::dd_common::stub_ok))
+        // SSO login flow (OIDC + SAML)
+        .route("/auth/sso/login", get(handlers::sso::sso_login))
+        .route("/auth/sso/callback", get(handlers::sso::sso_callback))
+        .route("/auth/sso/acs", post(handlers::sso::sso_acs))
+        .route("/auth/sso/metadata", get(handlers::sso::sso_metadata))
+        // SSO config admin endpoints
+        .route(
+            "/api/v1/sso/providers",
+            get(handlers::sso::list_sso_providers).post(handlers::sso::save_sso_provider),
+        )
+        .route(
+            "/api/v1/sso/providers/{id}",
+            delete(handlers::sso::delete_sso_provider),
+        )
+        .route(
+            "/api/v1/sso/mappings",
+            get(handlers::sso::list_idp_group_mappings).post(handlers::sso::create_idp_group_mapping),
+        )
+        .route(
+            "/api/v1/sso/mappings/{id}",
+            delete(handlers::sso::delete_idp_group_mapping),
+        )
+        .route("/api/v1/sso/status", get(handlers::sso::sso_status))
+        .route(
+            "/api/v1/sso/setup-token",
+            post(handlers::sso::create_setup_token),
+        )
+        .route(
+            "/api/v1/sso/setup-token/{token}/validate",
+            get(handlers::sso::validate_setup_token),
+        )
+        .route(
+            "/api/v1/sso/setup-token/{token}/complete",
+            post(handlers::sso::complete_setup_token),
+        )
+        // Auth
+        .route("/api/v1/auth/login", post(handlers::auth::login))
+        .route("/api/v1/auth/logout", post(handlers::auth::logout))
+        .route("/api/v1/auth/me", get(handlers::auth::me))
         // Health
         .route("/healthz", get(handlers::health::healthz))
         // Catch-all for unmatched DD agent paths (debug logging)
         .fallback(|req: axum::http::Request<axum::body::Body>| async move {
             tracing::warn!(
-                "unmatched request: {} {} (content-type: {:?})",
-                req.method(),
-                req.uri(),
-                req.headers().get("content-type").and_then(|v| v.to_str().ok())
+                method = %req.method(),
+                uri = %req.uri(),
+                content_type = req.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none"),
+                "unmatched request"
             );
             (axum::http::StatusCode::NOT_FOUND, "not found")
         })
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    tracing::info!("rush-api listening on {addr}");
+    let port: u16 = std::env::var("RUSH_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        port = port,
+        clickhouse_url = %clickhouse_url,
+        config_db = %config_db_path,
+        row_policies = rush_api::row_policy_supported(),
+        "rush-api started"
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
