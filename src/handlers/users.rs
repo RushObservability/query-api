@@ -87,7 +87,7 @@ pub async fn list_users(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers)?;
+    require_admin(&state, &headers)?;
 
     let rows = state
         .config_db
