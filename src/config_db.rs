@@ -18,8 +18,147 @@ impl ConfigDb {
 
     fn run_migrations(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "
+
+        // Single canonical schema — all tables at their final column set.
+        // For existing databases the CREATE TABLE IF NOT EXISTS statements are
+        // no-ops; the ALTER TABLE blocks below add any missing columns.
+        conn.execute_batch("
+            -- ── Auth & multi-tenancy ─────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS tenants (
+                id            TEXT PRIMARY KEY,
+                name          TEXT NOT NULL UNIQUE,
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                auth_required INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS groups (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                scopes      TEXT NOT NULL DEFAULT '[\"all\"]',
+                permissions TEXT NOT NULL DEFAULT '[\"read\"]',
+                system      INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id            TEXT PRIMARY KEY,
+                username      TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                display_name  TEXT NOT NULL DEFAULT '',
+                tenant_id     TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id),
+                role          TEXT NOT NULL DEFAULT 'admin',
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                auth_provider TEXT NOT NULL DEFAULT 'local',
+                external_id   TEXT NOT NULL DEFAULT '',
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                token       TEXT PRIMARY KEY,
+                user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                expires_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+
+            CREATE TABLE IF NOT EXISTS group_tenants (
+                group_id  TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                PRIMARY KEY (group_id, tenant_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS user_groups (
+                user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, group_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS sso_providers (
+                id                    TEXT PRIMARY KEY,
+                name                  TEXT NOT NULL,
+                protocol              TEXT NOT NULL,
+                enabled               INTEGER NOT NULL DEFAULT 0,
+                client_id             TEXT NOT NULL DEFAULT '',
+                client_secret         TEXT NOT NULL DEFAULT '',
+                issuer_url            TEXT NOT NULL DEFAULT '',
+                oidc_scopes           TEXT NOT NULL DEFAULT 'openid profile email groups',
+                groups_claim          TEXT NOT NULL DEFAULT 'groups',
+                email_claim           TEXT NOT NULL DEFAULT 'email',
+                first_name_claim      TEXT NOT NULL DEFAULT 'given_name',
+                last_name_claim       TEXT NOT NULL DEFAULT 'family_name',
+                jit_provisioning      INTEGER NOT NULL DEFAULT 1,
+                default_group_id      TEXT NOT NULL DEFAULT '',
+                saml_idp_metadata_url TEXT NOT NULL DEFAULT '',
+                saml_idp_sso_url      TEXT NOT NULL DEFAULT '',
+                saml_idp_cert         TEXT NOT NULL DEFAULT '',
+                saml_sp_entity_id     TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS idp_group_mappings (
+                id            TEXT PRIMARY KEY,
+                idp_group     TEXT NOT NULL,
+                rush_group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                provider_id   TEXT NOT NULL DEFAULT 'default',
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                UNIQUE(idp_group, rush_group_id, provider_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS sso_state (
+                state      TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS setup_tokens (
+                token      TEXT PRIMARY KEY,
+                purpose    TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used       INTEGER NOT NULL DEFAULT 0,
+                provider   TEXT NOT NULL DEFAULT '',
+                hostname   TEXT NOT NULL DEFAULT ''
+            );
+
+            -- ── Core configuration ──────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                key_hash   TEXT NOT NULL UNIQUE,
+                prefix     TEXT NOT NULL,
+                tenant_id  TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS custom_skills (
+                id            TEXT PRIMARY KEY,
+                name          TEXT NOT NULL UNIQUE,
+                title         TEXT NOT NULL,
+                description   TEXT NOT NULL,
+                content       TEXT NOT NULL,
+                allowed_tools TEXT NOT NULL DEFAULT '[]',
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                created_by    TEXT NOT NULL DEFAULT '',
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS service_links (
+                service_name   TEXT PRIMARY KEY,
+                github_repo    TEXT NOT NULL,
+                default_branch TEXT NOT NULL DEFAULT 'main',
+                root_path      TEXT NOT NULL DEFAULT '',
+                updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            -- ── Dashboards ──────────────────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS dashboards (
                 id          TEXT PRIMARY KEY,
                 name        TEXT NOT NULL,
@@ -32,6 +171,7 @@ impl ConfigDb {
                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
                 updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+
             CREATE TABLE IF NOT EXISTS widgets (
                 id             TEXT PRIMARY KEY,
                 dashboard_id   TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
@@ -45,7 +185,20 @@ impl ConfigDb {
             );
             CREATE INDEX IF NOT EXISTS idx_widgets_dashboard ON widgets(dashboard_id);
 
-            DROP TABLE IF EXISTS notification_channels;
+            CREATE TABLE IF NOT EXISTS dashboard_templates (
+                id            TEXT PRIMARY KEY,
+                name          TEXT NOT NULL,
+                description   TEXT NOT NULL DEFAULT '',
+                category      TEXT NOT NULL DEFAULT 'general',
+                is_builtin    INTEGER NOT NULL DEFAULT 0,
+                template_json TEXT NOT NULL,
+                tags          TEXT NOT NULL DEFAULT '[]',
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_templates_category ON dashboard_templates(category);
+            CREATE INDEX IF NOT EXISTS idx_templates_builtin   ON dashboard_templates(is_builtin);
+
+            -- ── Notifications ───────────────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS notification_channels (
                 id           TEXT PRIMARY KEY,
                 tenant_id    TEXT NOT NULL DEFAULT 'default',
@@ -58,34 +211,36 @@ impl ConfigDb {
             CREATE INDEX IF NOT EXISTS idx_notif_channels_tenant ON notification_channels(tenant_id, enabled);
 
             CREATE TABLE IF NOT EXISTS notification_log (
-                id          TEXT PRIMARY KEY,
-                channel_id  TEXT NOT NULL,
-                tenant_id   TEXT NOT NULL,
-                alert_type  TEXT NOT NULL,
-                alert_name  TEXT NOT NULL,
-                severity    TEXT NOT NULL DEFAULT '',
-                status      TEXT NOT NULL,
-                error       TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                id         TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                tenant_id  TEXT NOT NULL,
+                alert_type TEXT NOT NULL,
+                alert_name TEXT NOT NULL,
+                severity   TEXT NOT NULL DEFAULT '',
+                status     TEXT NOT NULL,
+                error      TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_notif_log_tenant ON notification_log(tenant_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_notif_log_tenant  ON notification_log(tenant_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_notif_log_channel ON notification_log(channel_id, created_at DESC);
 
+            -- ── Alerting ────────────────────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS alert_rules (
-                id                      TEXT PRIMARY KEY,
-                name                    TEXT NOT NULL,
-                description             TEXT NOT NULL DEFAULT '',
-                enabled                 INTEGER NOT NULL DEFAULT 1,
-                query_config            TEXT NOT NULL,
-                condition_op            TEXT NOT NULL CHECK(condition_op IN ('>','>=','<','<=','=','!=')),
-                condition_threshold     REAL NOT NULL,
-                eval_interval_secs      INTEGER NOT NULL DEFAULT 60,
+                id                       TEXT PRIMARY KEY,
+                name                     TEXT NOT NULL,
+                description              TEXT NOT NULL DEFAULT '',
+                enabled                  INTEGER NOT NULL DEFAULT 1,
+                signal_type              TEXT NOT NULL DEFAULT 'apm',
+                query_config             TEXT NOT NULL,
+                condition_op             TEXT NOT NULL CHECK(condition_op IN ('>','>=','<','<=','=','!=')),
+                condition_threshold      REAL NOT NULL,
+                eval_interval_secs       INTEGER NOT NULL DEFAULT 60,
                 notification_channel_ids TEXT NOT NULL DEFAULT '[]',
-                state                   TEXT NOT NULL DEFAULT 'ok' CHECK(state IN ('ok','alerting','no_data')),
-                last_eval_at            TEXT,
-                last_triggered_at       TEXT,
-                created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                state                    TEXT NOT NULL DEFAULT 'ok' CHECK(state IN ('ok','alerting','no_data')),
+                last_eval_at             TEXT,
+                last_triggered_at        TEXT,
+                created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_alert_rules_state ON alert_rules(state, enabled);
 
@@ -98,89 +253,30 @@ impl ConfigDb {
                 message    TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events(rule_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_alert_events_rule  ON alert_events(rule_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_alert_events_state ON alert_events(state, created_at DESC);
 
-            CREATE TABLE IF NOT EXISTS deploy_markers (
-                id           TEXT PRIMARY KEY,
-                service_name TEXT NOT NULL,
-                version      TEXT NOT NULL DEFAULT '',
-                commit_sha   TEXT NOT NULL DEFAULT '',
-                description  TEXT NOT NULL DEFAULT '',
-                environment  TEXT NOT NULL DEFAULT '',
-                deployed_by  TEXT NOT NULL DEFAULT '',
-                deployed_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_deploy_service ON deploy_markers(service_name, deployed_at DESC);
-
-            CREATE TABLE IF NOT EXISTS slos (
-                id                      TEXT PRIMARY KEY,
-                name                    TEXT NOT NULL,
-                description             TEXT NOT NULL DEFAULT '',
-                enabled                 INTEGER NOT NULL DEFAULT 1,
-                tenant_id               TEXT NOT NULL DEFAULT 'default',
-                slo_type                TEXT NOT NULL DEFAULT 'trace' CHECK(slo_type IN ('trace','metric')),
-                service_name            TEXT NOT NULL,
-                metric_name             TEXT NOT NULL DEFAULT '',
-                window_type             TEXT NOT NULL CHECK(window_type IN ('rolling_1h','rolling_24h','rolling_7d','rolling_30d')),
-                target_percentage       REAL NOT NULL,
-                error_filters            TEXT NOT NULL,
-                total_filters           TEXT NOT NULL,
-                eval_interval_secs      INTEGER NOT NULL DEFAULT 60,
-                notification_channel_ids TEXT NOT NULL DEFAULT '[]',
-                state                   TEXT NOT NULL DEFAULT 'compliant' CHECK(state IN ('compliant','breaching','no_data')),
-                error_budget_remaining  REAL,
-                error_count              INTEGER,
-                total_count             INTEGER,
-                last_eval_at            TEXT,
-                last_breached_at        TEXT,
-                created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_slos_service ON slos(service_name);
-            CREATE INDEX IF NOT EXISTS idx_slos_tenant_state ON slos(tenant_id, state, enabled);
-
-            CREATE TABLE IF NOT EXISTS slo_events (
-                id         TEXT PRIMARY KEY,
-                slo_id     TEXT NOT NULL REFERENCES slos(id) ON DELETE CASCADE,
-                state      TEXT NOT NULL,
-                error_count INTEGER NOT NULL,
-                total_count INTEGER NOT NULL,
-                error_budget_remaining REAL NOT NULL,
-                message    TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_slo_events_slo ON slo_events(slo_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_slo_events_state ON slo_events(state, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS api_keys (
-                id         TEXT PRIMARY KEY,
-                name       TEXT NOT NULL,
-                key_hash   TEXT NOT NULL UNIQUE,
-                prefix     TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-
             CREATE TABLE IF NOT EXISTS anomaly_rules (
-                id                      TEXT PRIMARY KEY,
-                name                    TEXT NOT NULL,
-                description             TEXT NOT NULL DEFAULT '',
-                enabled                 INTEGER NOT NULL DEFAULT 1,
-                source                  TEXT NOT NULL CHECK(source IN ('prometheus','apm')),
-                pattern                 TEXT NOT NULL DEFAULT '',
-                query                   TEXT NOT NULL DEFAULT '',
-                service_name            TEXT NOT NULL DEFAULT '',
-                apm_metric              TEXT NOT NULL DEFAULT '',
-                sensitivity             REAL NOT NULL DEFAULT 3.0,
-                alpha                   REAL NOT NULL DEFAULT 0.25,
-                eval_interval_secs      INTEGER NOT NULL DEFAULT 300,
-                window_secs             INTEGER NOT NULL DEFAULT 3600,
+                id                       TEXT PRIMARY KEY,
+                name                     TEXT NOT NULL,
+                description              TEXT NOT NULL DEFAULT '',
+                enabled                  INTEGER NOT NULL DEFAULT 1,
+                source                   TEXT NOT NULL CHECK(source IN ('prometheus','apm')),
+                pattern                  TEXT NOT NULL DEFAULT '',
+                query                    TEXT NOT NULL DEFAULT '',
+                service_name             TEXT NOT NULL DEFAULT '',
+                apm_metric               TEXT NOT NULL DEFAULT '',
+                sensitivity              REAL NOT NULL DEFAULT 3.0,
+                alpha                    REAL NOT NULL DEFAULT 0.25,
+                eval_interval_secs       INTEGER NOT NULL DEFAULT 300,
+                window_secs              INTEGER NOT NULL DEFAULT 3600,
                 notification_channel_ids TEXT NOT NULL DEFAULT '[]',
-                state                   TEXT NOT NULL DEFAULT 'normal' CHECK(state IN ('normal','anomalous','no_data')),
-                last_eval_at            TEXT,
-                last_triggered_at       TEXT,
-                created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                split_labels             TEXT NOT NULL DEFAULT '[]',
+                state                    TEXT NOT NULL DEFAULT 'normal' CHECK(state IN ('normal','anomalous','no_data')),
+                last_eval_at             TEXT,
+                last_triggered_at        TEXT,
+                created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
 
             CREATE TABLE IF NOT EXISTS anomaly_events (
@@ -194,547 +290,225 @@ impl ConfigDb {
                 message    TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_anomaly_events_rule ON anomaly_events(rule_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_anomaly_events_rule  ON anomaly_events(rule_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_anomaly_events_state ON anomaly_events(state, created_at DESC);
 
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS monitors (
+                id                    TEXT PRIMARY KEY,
+                tenant_id             TEXT NOT NULL DEFAULT 'default',
+                name                  TEXT NOT NULL,
+                type                  TEXT NOT NULL CHECK(type IN ('metric','log','apm','composite')),
+                query_config          TEXT NOT NULL,
+                critical              REAL,
+                critical_recovery     REAL,
+                warning               REAL,
+                warning_recovery      REAL,
+                comparator            TEXT NOT NULL DEFAULT 'above' CHECK(comparator IN ('above','below')),
+                eval_window_secs      INTEGER NOT NULL DEFAULT 300,
+                eval_interval_secs    INTEGER NOT NULL DEFAULT 60,
+                group_by              TEXT NOT NULL DEFAULT '[]',
+                state                 TEXT NOT NULL DEFAULT 'ok' CHECK(state IN ('ok','warn','alert','no_data')),
+                group_states          TEXT NOT NULL DEFAULT '{}',
+                no_data_action        TEXT NOT NULL DEFAULT 'show' CHECK(no_data_action IN ('show','notify','resolve')),
+                no_data_timeframe     INTEGER NOT NULL DEFAULT 600,
+                auto_resolve_hours    INTEGER,
+                message               TEXT NOT NULL DEFAULT '',
+                notification_channels TEXT NOT NULL DEFAULT '[]',
+                renotify_interval     INTEGER,
+                tags                  TEXT NOT NULL DEFAULT '[]',
+                priority              INTEGER CHECK(priority BETWEEN 1 AND 5),
+                enabled               INTEGER NOT NULL DEFAULT 1,
+                composite_formula     TEXT NOT NULL DEFAULT '',
+                composite_monitor_ids TEXT NOT NULL DEFAULT '[]',
+                last_eval_at          TEXT,
+                last_triggered_at     TEXT,
+                created_by            TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+            CREATE INDEX IF NOT EXISTS idx_monitors_tenant  ON monitors(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_monitors_state   ON monitors(state);
+            CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled);
 
-            CREATE TABLE IF NOT EXISTS custom_skills (
-                id              TEXT PRIMARY KEY,
-                name            TEXT NOT NULL UNIQUE,
-                title           TEXT NOT NULL,
-                description     TEXT NOT NULL,
-                content         TEXT NOT NULL,
-                allowed_tools   TEXT NOT NULL DEFAULT '[]',
-                enabled         INTEGER NOT NULL DEFAULT 1,
-                created_by      TEXT NOT NULL DEFAULT '',
-                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            CREATE TABLE IF NOT EXISTS monitor_events (
+                id         TEXT PRIMARY KEY,
+                monitor_id TEXT NOT NULL REFERENCES monitors(id) ON DELETE CASCADE,
+                tenant_id  TEXT NOT NULL,
+                group_key  TEXT NOT NULL DEFAULT '',
+                prev_state TEXT NOT NULL,
+                new_state  TEXT NOT NULL,
+                value      REAL,
+                threshold  REAL,
+                message    TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+            CREATE INDEX IF NOT EXISTS idx_monitor_events_monitor ON monitor_events(monitor_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_monitor_events_tenant  ON monitor_events(tenant_id, created_at DESC);
 
-            CREATE TABLE IF NOT EXISTS tenants (
-                id          TEXT PRIMARY KEY,
-                name        TEXT NOT NULL UNIQUE,
-                enabled     INTEGER NOT NULL DEFAULT 1,
-                auth_required INTEGER NOT NULL DEFAULT 1,
-                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            -- ── SLOs ────────────────────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS slos (
+                id                       TEXT PRIMARY KEY,
+                name                     TEXT NOT NULL,
+                description              TEXT NOT NULL DEFAULT '',
+                enabled                  INTEGER NOT NULL DEFAULT 1,
+                tenant_id                TEXT NOT NULL DEFAULT 'default',
+                slo_type                 TEXT NOT NULL DEFAULT 'trace' CHECK(slo_type IN ('trace','metric')),
+                service_name             TEXT NOT NULL,
+                metric_name              TEXT NOT NULL DEFAULT '',
+                window_type              TEXT NOT NULL CHECK(window_type IN ('rolling_1h','rolling_24h','rolling_7d','rolling_30d')),
+                target_percentage        REAL NOT NULL,
+                error_filters            TEXT NOT NULL,
+                total_filters            TEXT NOT NULL,
+                eval_interval_secs       INTEGER NOT NULL DEFAULT 60,
+                notification_channel_ids TEXT NOT NULL DEFAULT '[]',
+                indicator_type           TEXT NOT NULL DEFAULT 'availability',
+                threshold_ms             REAL,
+                threshold_value          REAL,
+                threshold_op             TEXT,
+                state                    TEXT NOT NULL DEFAULT 'compliant' CHECK(state IN ('compliant','breaching','no_data')),
+                error_budget_remaining   REAL,
+                error_count              INTEGER,
+                total_count              INTEGER,
+                last_eval_at             TEXT,
+                last_breached_at         TEXT,
+                created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+            CREATE INDEX IF NOT EXISTS idx_slos_service ON slos(service_name);
 
-            CREATE TABLE IF NOT EXISTS users (
-                id            TEXT PRIMARY KEY,
-                username      TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                display_name  TEXT NOT NULL DEFAULT '',
-                tenant_id     TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id),
-                role          TEXT NOT NULL DEFAULT 'admin',
-                enabled       INTEGER NOT NULL DEFAULT 1,
-                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            CREATE TABLE IF NOT EXISTS slo_events (
+                id                     TEXT PRIMARY KEY,
+                slo_id                 TEXT NOT NULL REFERENCES slos(id) ON DELETE CASCADE,
+                state                  TEXT NOT NULL,
+                error_count            INTEGER NOT NULL,
+                total_count            INTEGER NOT NULL,
+                error_budget_remaining REAL NOT NULL,
+                message                TEXT NOT NULL,
+                created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+            CREATE INDEX IF NOT EXISTS idx_slo_events_slo   ON slo_events(slo_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_slo_events_state ON slo_events(state, created_at DESC);
 
-            CREATE TABLE IF NOT EXISTS sessions (
-                token       TEXT PRIMARY KEY,
-                user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                expires_at  TEXT NOT NULL
+            -- ── Deploy markers ──────────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS deploy_markers (
+                id           TEXT PRIMARY KEY,
+                service_name TEXT NOT NULL,
+                version      TEXT NOT NULL DEFAULT '',
+                commit_sha   TEXT NOT NULL DEFAULT '',
+                description  TEXT NOT NULL DEFAULT '',
+                environment  TEXT NOT NULL DEFAULT '',
+                deployed_by  TEXT NOT NULL DEFAULT '',
+                deployed_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_deploy_service ON deploy_markers(service_name, deployed_at DESC);
 
-            CREATE TABLE IF NOT EXISTS groups (
-                id          TEXT PRIMARY KEY,
-                name        TEXT NOT NULL UNIQUE,
-                description TEXT NOT NULL DEFAULT '',
-                scopes      TEXT NOT NULL DEFAULT '[\"all\"]',
-                permissions TEXT NOT NULL DEFAULT '[\"read\"]',
-                system      INTEGER NOT NULL DEFAULT 0,
-                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS group_tenants (
-                group_id    TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-                tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-                PRIMARY KEY (group_id, tenant_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS user_groups (
-                user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                group_id    TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-                PRIMARY KEY (user_id, group_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS sso_providers (
-                id              TEXT PRIMARY KEY,
-                name            TEXT NOT NULL,
-                protocol        TEXT NOT NULL,
-                enabled         INTEGER NOT NULL DEFAULT 0,
-                client_id       TEXT NOT NULL DEFAULT '',
-                client_secret   TEXT NOT NULL DEFAULT '',
-                issuer_url      TEXT NOT NULL DEFAULT '',
-                oidc_scopes     TEXT NOT NULL DEFAULT 'openid profile email groups',
-                groups_claim      TEXT NOT NULL DEFAULT 'groups',
-                email_claim       TEXT NOT NULL DEFAULT 'email',
-                first_name_claim  TEXT NOT NULL DEFAULT 'given_name',
-                last_name_claim   TEXT NOT NULL DEFAULT 'family_name',
-                jit_provisioning INTEGER NOT NULL DEFAULT 1,
-                default_group_id TEXT NOT NULL DEFAULT '',
-                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS idp_group_mappings (
-                id              TEXT PRIMARY KEY,
-                idp_group       TEXT NOT NULL,
-                rush_group_id   TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-                provider_id     TEXT NOT NULL DEFAULT 'default',
-                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                UNIQUE(idp_group, rush_group_id, provider_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS setup_tokens (
-                token       TEXT PRIMARY KEY,
-                purpose     TEXT NOT NULL,
-                created_by  TEXT NOT NULL,
-                expires_at  TEXT NOT NULL,
-                used        INTEGER NOT NULL DEFAULT 0,
-                provider    TEXT NOT NULL DEFAULT '',
-                hostname    TEXT NOT NULL DEFAULT ''
-            );
-            ",
-        )?;
-
-        // Add split_labels column if it doesn't exist yet
-        {
-            let has_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('anomaly_rules') WHERE name = 'split_labels'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_col {
-                conn.execute_batch(
-                    "ALTER TABLE anomaly_rules ADD COLUMN split_labels TEXT NOT NULL DEFAULT '[]';",
-                )?;
-            }
-        }
-
-        // Add signal_type column to alert_rules if it doesn't exist yet
-        {
-            let has_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('alert_rules') WHERE name = 'signal_type'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_col {
-                conn.execute_batch(
-                    "ALTER TABLE alert_rules ADD COLUMN signal_type TEXT NOT NULL DEFAULT 'apm';",
-                )?;
-            }
-        }
-
-        // Add slo_type and metric_name columns to slos if they don't exist yet
-        {
-            let has_slo_type: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'slo_type'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_slo_type {
-                conn.execute_batch(
-                    "ALTER TABLE slos ADD COLUMN slo_type TEXT NOT NULL DEFAULT 'trace';",
-                )?;
-            }
-        }
-        {
-            let has_metric_name: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'metric_name'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_metric_name {
-                conn.execute_batch(
-                    "ALTER TABLE slos ADD COLUMN metric_name TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-        }
-
-        // Rename good_filters -> error_filters and good_count -> error_count in slos
-        {
-            let has_good_filters: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'good_filters'")?
-                .query_row([], |row| row.get(0))?;
-            if has_good_filters {
-                conn.execute_batch(
-                    "ALTER TABLE slos RENAME COLUMN good_filters TO error_filters;",
-                )?;
-            }
-        }
-        {
-            let has_good_count: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'good_count'")?
-                .query_row([], |row| row.get(0))?;
-            if has_good_count {
-                conn.execute_batch(
-                    "ALTER TABLE slos RENAME COLUMN good_count TO error_count;",
-                )?;
-            }
-        }
-
-        // Rename good_count -> error_count in slo_events
-        {
-            let has_good_count: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slo_events') WHERE name = 'good_count'")?
-                .query_row([], |row| row.get(0))?;
-            if has_good_count {
-                conn.execute_batch(
-                    "ALTER TABLE slo_events RENAME COLUMN good_count TO error_count;",
-                )?;
-            }
-        }
-
-        // Create service_links table for mapping services to GitHub repos
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS service_links (
-                service_name   TEXT PRIMARY KEY,
-                github_repo    TEXT NOT NULL,
-                default_branch TEXT NOT NULL DEFAULT 'main',
-                root_path      TEXT NOT NULL DEFAULT '',
-                updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );",
-        )?;
-
-        // Add indicator_type, threshold_ms, threshold_value, threshold_op columns to slos
-        {
-            let has_indicator_type: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'indicator_type'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_indicator_type {
-                conn.execute_batch(
-                    "ALTER TABLE slos ADD COLUMN indicator_type TEXT NOT NULL DEFAULT 'availability';",
-                )?;
-            }
-        }
-        {
-            let has_threshold_ms: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'threshold_ms'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_threshold_ms {
-                conn.execute_batch(
-                    "ALTER TABLE slos ADD COLUMN threshold_ms REAL;",
-                )?;
-            }
-        }
-        {
-            let has_threshold_value: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'threshold_value'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_threshold_value {
-                conn.execute_batch(
-                    "ALTER TABLE slos ADD COLUMN threshold_value REAL;",
-                )?;
-            }
-        }
-        {
-            let has_threshold_op: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'threshold_op'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_threshold_op {
-                conn.execute_batch(
-                    "ALTER TABLE slos ADD COLUMN threshold_op TEXT;",
-                )?;
-            }
-        }
-
-        // Add tenant_id column to api_keys if it doesn't exist yet
-        {
-            let has_tenant_id: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'tenant_id'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_tenant_id {
-                conn.execute_batch(
-                    "ALTER TABLE api_keys ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id);",
-                )?;
-            }
-        }
-
-        // Add tenant_id column to slos if it doesn't exist yet
-        {
-            let has_tenant_id: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('slos') WHERE name = 'tenant_id'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_tenant_id {
-                conn.execute_batch(
-                    "ALTER TABLE slos ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';\
-                     CREATE INDEX IF NOT EXISTS idx_slos_tenant_state ON slos(tenant_id, state, enabled);",
-                )?;
-            }
-        }
-
-        // Add enabled column to tenants if it doesn't exist yet
-        {
-            let has_enabled: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('tenants') WHERE name = 'enabled'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_enabled {
-                conn.execute_batch(
-                    "ALTER TABLE tenants ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
-                )?;
-            }
-        }
-
-        // Add auth_required column to tenants if it doesn't exist yet
-        {
-            let has_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('tenants') WHERE name = 'auth_required'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_col {
-                conn.execute_batch(
-                    "ALTER TABLE tenants ADD COLUMN auth_required INTEGER NOT NULL DEFAULT 1;",
-                )?;
-            }
-        }
-
-        // Add SAML-specific columns to sso_providers if they don't exist yet
-        {
-            let has_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('sso_providers') WHERE name = 'saml_idp_metadata_url'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_col {
-                conn.execute_batch(
-                    "ALTER TABLE sso_providers ADD COLUMN saml_idp_metadata_url TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-        }
-        {
-            let has_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('sso_providers') WHERE name = 'saml_idp_sso_url'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_col {
-                conn.execute_batch(
-                    "ALTER TABLE sso_providers ADD COLUMN saml_idp_sso_url TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-        }
-        {
-            let has_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('sso_providers') WHERE name = 'saml_idp_cert'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_col {
-                conn.execute_batch(
-                    "ALTER TABLE sso_providers ADD COLUMN saml_idp_cert TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-        }
-        {
-            let has_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('sso_providers') WHERE name = 'saml_sp_entity_id'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_col {
-                conn.execute_batch(
-                    "ALTER TABLE sso_providers ADD COLUMN saml_sp_entity_id TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-        }
-
-        // Add claim mapping columns to sso_providers if they don't exist yet
-        for (col, default) in [
-            ("email_claim", "email"),
-            ("first_name_claim", "given_name"),
-            ("last_name_claim", "family_name"),
-        ] {
-            let has: bool = conn
-                .prepare(&format!("SELECT COUNT(*) FROM pragma_table_info('sso_providers') WHERE name = '{col}'"))?
-                .query_row([], |row| row.get(0))?;
-            if !has {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE sso_providers ADD COLUMN {col} TEXT NOT NULL DEFAULT '{default}';"
-                ))?;
-            }
-        }
-
-        // Add auth_provider and external_id columns to users if they don't exist yet (SSO support)
-        {
-            let has_auth_provider: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_provider'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_auth_provider {
-                conn.execute_batch(
-                    "ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local';",
-                )?;
-            }
-        }
-        {
-            let has_external_id: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'external_id'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_external_id {
-                conn.execute_batch(
-                    "ALTER TABLE users ADD COLUMN external_id TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-        }
-
-        // Add sso_state table for CSRF protection during OIDC flow
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sso_state (
-                state       TEXT PRIMARY KEY,
-                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );",
-        )?;
-
-        // Add provider and hostname columns to setup_tokens if they don't exist yet
-        {
-            let has_provider: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('setup_tokens') WHERE name = 'provider'")?
-                .query_row([], |row| row.get(0))?;
-            if !has_provider {
-                conn.execute_batch(
-                    "ALTER TABLE setup_tokens ADD COLUMN provider TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE setup_tokens ADD COLUMN hostname TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-        }
-
-        // SIEM detection rules and events
-        conn.execute_batch(
-            "
+            -- ── Detection / SIEM ────────────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS detection_rules (
-                id              TEXT PRIMARY KEY,
-                tenant_id       TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id),
-                name            TEXT NOT NULL,
-                description     TEXT NOT NULL DEFAULT '',
-                query_sql       TEXT NOT NULL,
-                interval_secs   INTEGER NOT NULL DEFAULT 300,
-                threshold       INTEGER NOT NULL DEFAULT 1,
-                severity        TEXT NOT NULL DEFAULT 'medium',
-                window_secs     INTEGER NOT NULL DEFAULT 300,
-                enabled         INTEGER NOT NULL DEFAULT 1,
-                channels        TEXT NOT NULL DEFAULT '[]',
-                created_by      TEXT NOT NULL DEFAULT '',
-                last_eval_at    TEXT,
+                id                TEXT PRIMARY KEY,
+                tenant_id         TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id),
+                name              TEXT NOT NULL,
+                description       TEXT NOT NULL DEFAULT '',
+                query_sql         TEXT NOT NULL,
+                interval_secs     INTEGER NOT NULL DEFAULT 300,
+                threshold         INTEGER NOT NULL DEFAULT 1,
+                severity          TEXT NOT NULL DEFAULT 'medium',
+                window_secs       INTEGER NOT NULL DEFAULT 300,
+                enabled           INTEGER NOT NULL DEFAULT 1,
+                channels          TEXT NOT NULL DEFAULT '[]',
+                created_by        TEXT NOT NULL DEFAULT '',
+                last_eval_at      TEXT,
                 last_triggered_at TEXT,
-                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_detection_rules_tenant ON detection_rules(tenant_id);
 
             CREATE TABLE IF NOT EXISTS detection_events (
-                id              TEXT PRIMARY KEY,
-                rule_id         TEXT NOT NULL REFERENCES detection_rules(id) ON DELETE CASCADE,
-                tenant_id       TEXT NOT NULL,
-                severity        TEXT NOT NULL,
-                match_count     INTEGER NOT NULL DEFAULT 0,
-                sample_data     TEXT NOT NULL DEFAULT '[]',
-                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                id          TEXT PRIMARY KEY,
+                rule_id     TEXT NOT NULL REFERENCES detection_rules(id) ON DELETE CASCADE,
+                tenant_id   TEXT NOT NULL,
+                severity    TEXT NOT NULL,
+                match_count INTEGER NOT NULL DEFAULT 0,
+                sample_data TEXT NOT NULL DEFAULT '[]',
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_detection_events_rule ON detection_events(rule_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_detection_events_rule   ON detection_events(rule_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_detection_events_tenant ON detection_events(tenant_id, created_at DESC);
-            ",
-        )?;
 
-        // Per-tenant retention overrides
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tenant_retention (
+            -- ── Retention ───────────────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS tenant_retention (
                 tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
                 signal      TEXT NOT NULL,
                 retain_days INTEGER NOT NULL,
                 PRIMARY KEY (tenant_id, signal)
-            );",
-        )?;
+            );
+        ")?;
 
-        // ── Dashboard v2: tenant scoping, visibility, templates ──
+        // ── Backward-compat column additions for existing databases ──────────
+        // Each block is a no-op on fresh installs (column already in CREATE TABLE).
 
-        // Migrate existing dashboards table: add new columns if missing
-        {
-            let has_tenant_id: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('dashboards') WHERE name = 'tenant_id'")?
+        for (table, col, def) in [
+            ("anomaly_rules", "split_labels",         "TEXT NOT NULL DEFAULT '[]'"),
+            ("alert_rules",   "signal_type",          "TEXT NOT NULL DEFAULT 'apm'"),
+            ("slos",          "slo_type",             "TEXT NOT NULL DEFAULT 'trace'"),
+            ("slos",          "metric_name",          "TEXT NOT NULL DEFAULT ''"),
+            ("slos",          "indicator_type",       "TEXT NOT NULL DEFAULT 'availability'"),
+            ("slos",          "threshold_ms",         "REAL"),
+            ("slos",          "threshold_value",      "REAL"),
+            ("slos",          "threshold_op",         "TEXT"),
+            ("slos",          "tenant_id",            "TEXT NOT NULL DEFAULT 'default'"),
+            ("api_keys",      "tenant_id",            "TEXT NOT NULL DEFAULT 'default'"),
+            ("tenants",       "enabled",              "INTEGER NOT NULL DEFAULT 1"),
+            ("tenants",       "auth_required",        "INTEGER NOT NULL DEFAULT 1"),
+            ("users",         "auth_provider",        "TEXT NOT NULL DEFAULT 'local'"),
+            ("users",         "external_id",          "TEXT NOT NULL DEFAULT ''"),
+            ("sso_providers", "saml_idp_metadata_url","TEXT NOT NULL DEFAULT ''"),
+            ("sso_providers", "saml_idp_sso_url",     "TEXT NOT NULL DEFAULT ''"),
+            ("sso_providers", "saml_idp_cert",        "TEXT NOT NULL DEFAULT ''"),
+            ("sso_providers", "saml_sp_entity_id",    "TEXT NOT NULL DEFAULT ''"),
+            ("sso_providers", "email_claim",          "TEXT NOT NULL DEFAULT 'email'"),
+            ("sso_providers", "first_name_claim",     "TEXT NOT NULL DEFAULT 'given_name'"),
+            ("sso_providers", "last_name_claim",      "TEXT NOT NULL DEFAULT 'family_name'"),
+            ("setup_tokens",  "provider",             "TEXT NOT NULL DEFAULT ''"),
+            ("setup_tokens",  "hostname",             "TEXT NOT NULL DEFAULT ''"),
+            ("dashboards",    "tenant_id",            "TEXT NOT NULL DEFAULT 'default'"),
+            ("dashboards",    "owner_id",             "TEXT NOT NULL DEFAULT ''"),
+            ("dashboards",    "visibility",           "TEXT NOT NULL DEFAULT 'tenant'"),
+            ("dashboards",    "tags",                 "TEXT NOT NULL DEFAULT '[]'"),
+        ] {
+            let has: bool = conn
+                .prepare(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"))?
                 .query_row([], |row| row.get(0))?;
-            if !has_tenant_id {
-                conn.execute_batch(
-                    "ALTER TABLE dashboards ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';
-                     ALTER TABLE dashboards ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE dashboards ADD COLUMN visibility TEXT NOT NULL DEFAULT 'tenant';
-                     ALTER TABLE dashboards ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
-                     CREATE INDEX IF NOT EXISTS idx_dashboards_tenant ON dashboards(tenant_id);
-                     CREATE INDEX IF NOT EXISTS idx_dashboards_owner ON dashboards(owner_id);
-                     CREATE INDEX IF NOT EXISTS idx_dashboards_visibility ON dashboards(visibility);",
-                )?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {def};"))?;
             }
         }
-        // Unconditionally create dashboard indexes (safe: IF NOT EXISTS)
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_dashboards_tenant ON dashboards(tenant_id);
-             CREATE INDEX IF NOT EXISTS idx_dashboards_owner ON dashboards(owner_id);
-             CREATE INDEX IF NOT EXISTS idx_dashboards_visibility ON dashboards(visibility);",
-        )?;
 
-        // Dashboard templates table
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS dashboard_templates (
-                id            TEXT PRIMARY KEY,
-                name          TEXT NOT NULL,
-                description   TEXT NOT NULL DEFAULT '',
-                category      TEXT NOT NULL DEFAULT 'general',
-                is_builtin    INTEGER NOT NULL DEFAULT 0,
-                template_json TEXT NOT NULL,
-                tags          TEXT NOT NULL DEFAULT '[]',
-                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_templates_category ON dashboard_templates(category);
-            CREATE INDEX IF NOT EXISTS idx_templates_builtin ON dashboard_templates(is_builtin);",
-        )?;
+        // Rename old column names to their current names.
+        for (table, old_col, new_col) in [
+            ("slos",       "good_filters", "error_filters"),
+            ("slos",       "good_count",   "error_count"),
+            ("slo_events", "good_count",   "error_count"),
+        ] {
+            let has_old: bool = conn
+                .prepare(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{old_col}'"))?
+                .query_row([], |row| row.get(0))?;
+            if has_old {
+                conn.execute_batch(&format!("ALTER TABLE {table} RENAME COLUMN {old_col} TO {new_col};"))?;
+            }
+        }
 
-        // ── Monitors v2 (Datadog-style) ──
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS monitors (
-                id                  TEXT PRIMARY KEY,
-                tenant_id           TEXT NOT NULL DEFAULT 'default',
-                name                TEXT NOT NULL,
-                type                TEXT NOT NULL CHECK(type IN (
-                    'metric', 'log', 'apm', 'composite'
-                )),
-                query_config        TEXT NOT NULL,
-                critical            REAL,
-                critical_recovery   REAL,
-                warning             REAL,
-                warning_recovery    REAL,
-                comparator          TEXT NOT NULL DEFAULT 'above' CHECK(comparator IN ('above','below')),
-                eval_window_secs    INTEGER NOT NULL DEFAULT 300,
-                eval_interval_secs  INTEGER NOT NULL DEFAULT 60,
-                group_by            TEXT NOT NULL DEFAULT '[]',
-                state               TEXT NOT NULL DEFAULT 'ok' CHECK(state IN ('ok','warn','alert','no_data')),
-                group_states        TEXT NOT NULL DEFAULT '{}',
-                no_data_action      TEXT NOT NULL DEFAULT 'show' CHECK(no_data_action IN ('show','notify','resolve')),
-                no_data_timeframe   INTEGER NOT NULL DEFAULT 600,
-                auto_resolve_hours  INTEGER,
-                message             TEXT NOT NULL DEFAULT '',
-                notification_channels TEXT NOT NULL DEFAULT '[]',
-                renotify_interval   INTEGER,
-                tags                TEXT NOT NULL DEFAULT '[]',
-                priority            INTEGER CHECK(priority BETWEEN 1 AND 5),
-                enabled             INTEGER NOT NULL DEFAULT 1,
-                composite_formula   TEXT NOT NULL DEFAULT '',
-                composite_monitor_ids TEXT NOT NULL DEFAULT '[]',
-                last_eval_at        TEXT,
-                last_triggered_at   TEXT,
-                created_by          TEXT NOT NULL DEFAULT '',
-                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-                updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_monitors_tenant ON monitors(tenant_id);
-            CREATE INDEX IF NOT EXISTS idx_monitors_state ON monitors(state);
-            CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled);
-
-            CREATE TABLE IF NOT EXISTS monitor_events (
-                id          TEXT PRIMARY KEY,
-                monitor_id  TEXT NOT NULL REFERENCES monitors(id) ON DELETE CASCADE,
-                tenant_id   TEXT NOT NULL,
-                group_key   TEXT NOT NULL DEFAULT '',
-                prev_state  TEXT NOT NULL,
-                new_state   TEXT NOT NULL,
-                value       REAL,
-                threshold   REAL,
-                message     TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_monitor_events_monitor ON monitor_events(monitor_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_monitor_events_tenant ON monitor_events(tenant_id, created_at DESC);",
-        )?;
+        // Ensure indexes that depend on migrated columns exist.
+        conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_slos_tenant_state  ON slos(tenant_id, state, enabled);
+            CREATE INDEX IF NOT EXISTS idx_dashboards_tenant  ON dashboards(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_dashboards_owner   ON dashboards(owner_id);
+            CREATE INDEX IF NOT EXISTS idx_dashboards_visibility ON dashboards(visibility);
+        ")?;
 
         Ok(())
     }
+
 
     // ── Dashboard operations ──
 
