@@ -161,6 +161,7 @@ fn build_filter_conditions(filters: &[Filter], signal: &str) -> String {
             FilterOp::In => format!("{field} IN {}", format_array_value(&filter.value)),
             FilterOp::NotIn => format!("{field} NOT IN {}", format_array_value(&filter.value)),
         };
+        // Prefixed with AND so it appends cleanly after "WHERE TRUE"
         parts.push(format!("AND {condition}"));
     }
 
@@ -229,6 +230,9 @@ pub async fn bubbleup(
     let additional_filters = build_filter_conditions(&req.filters, &req.signal);
 
     // ── Total counts query ──
+    // PREWHERE on tenant_id + time range: ClickHouse reads only those compact columns
+    // first, discards non-matching rows, then loads the remaining columns — reducing I/O
+    // significantly for multi-tenant tables.
     let totals_sql = format!(
         "SELECT \
             countIf({ts_col} >= parseDateTimeBestEffort('{sel_from}') \
@@ -236,10 +240,10 @@ pub async fn bubbleup(
             countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
                 AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS baseline_count \
          FROM {table} \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
            AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
-           {additional_filters}"
+         WHERE TRUE {additional_filters}"
     );
 
     // ── Dimension queries ──
@@ -255,10 +259,10 @@ pub async fn bubbleup(
                     countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
                         AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS base_count \
                  FROM {table} \
-                 WHERE tenant_id = '{escaped_tenant}' \
+                 PREWHERE tenant_id = '{escaped_tenant}' \
                    AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
                    AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
-                   {additional_filters} \
+                 WHERE TRUE {additional_filters} \
                  GROUP BY value \
                  HAVING sel_count > 0 OR base_count > 0 \
                  ORDER BY sel_count DESC \

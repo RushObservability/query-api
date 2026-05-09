@@ -106,7 +106,9 @@ pub async fn service_graph(
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     let minutes = params.minutes.min(10080); // max 7d
 
-    // Node metrics: per-service aggregate
+    // Node metrics: per-service aggregate.
+    // PREWHERE on tenant_id + timestamp: ClickHouse reads only those compact columns first,
+    // eliminating non-matching granules before loading the wider row data.
     let node_sql = format!(
         "SELECT \
             service_name, \
@@ -117,29 +119,40 @@ pub async fn service_graph(
             quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
             quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
          FROM wide_events \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
             AND timestamp >= now() - INTERVAL {minutes} MINUTE \
          GROUP BY service_name \
          ORDER BY request_count DESC"
     );
 
-    // Edge metrics: join child spans to parent spans across services
+    // Edge metrics: join child spans to parent spans across services.
+    // Each side of the JOIN uses a subquery with PREWHERE so tenant + time filtering
+    // happens before the full row is read, avoiding an unfiltered cross-table scan.
     let edge_sql = format!(
         "SELECT \
-            parent.service_name as source, \
-            child.service_name as target, \
+            parent_svc as source, \
+            child_svc as target, \
             count() as request_count, \
-            countIf(child.http_status_code >= 500 OR child.status = 'ERROR') as error_count, \
-            avg(child.duration_ns) / 1000000.0 as avg_duration_ms \
-         FROM wide_events child \
-         INNER JOIN wide_events parent \
+            countIf(child_err) as error_count, \
+            avg(child_dur) / 1000000.0 as avg_duration_ms \
+         FROM ( \
+            SELECT \
+                trace_id, span_id, service_name AS child_svc, parent_span_id, \
+                (http_status_code >= 500 OR status = 'ERROR') AS child_err, \
+                duration_ns AS child_dur \
+            FROM wide_events \
+            PREWHERE tenant_id = '{escaped_tenant}' \
+                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+         ) child \
+         INNER JOIN ( \
+            SELECT trace_id, span_id, service_name AS parent_svc \
+            FROM wide_events \
+            PREWHERE tenant_id = '{escaped_tenant}' \
+                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+         ) parent \
             ON child.trace_id = parent.trace_id \
             AND child.parent_span_id = parent.span_id \
-         WHERE child.tenant_id = '{escaped_tenant}' \
-            AND parent.tenant_id = '{escaped_tenant}' \
-            AND child.timestamp >= now() - INTERVAL {minutes} MINUTE \
-            AND parent.timestamp >= now() - INTERVAL {minutes} MINUTE \
-            AND parent.service_name != child.service_name \
+         WHERE parent_svc != child_svc \
          GROUP BY source, target \
          ORDER BY request_count DESC"
     );

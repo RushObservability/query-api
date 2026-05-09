@@ -485,7 +485,7 @@ SETTINGS index_granularity = 8192",
 ENGINE = MergeTree
 PARTITION BY toDate(TimestampTime)
 PRIMARY KEY (tenant_id, AppName, EventType, TimestampTime)
-ORDER BY (tenant_id, AppName, EventType, TimestampTime, Timestamp)
+ORDER BY (tenant_id, AppName, EventType, TimestampTime, PagePath, Timestamp)
 TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
