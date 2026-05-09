@@ -93,13 +93,17 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     `link_span_ids` Array(String),
     INDEX idx_trace_id trace_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_span_id span_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_parent_span_id parent_span_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_service_name service_name TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_span_name span_name TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_http_method http_method TYPE set(16) GRANULARITY 4,
     INDEX idx_status status TYPE set(8) GRANULARITY 4,
-    INDEX idx_http_status http_status_code TYPE set(50) GRANULARITY 4,
+    INDEX idx_http_status http_status_code TYPE minmax GRANULARITY 1,
     INDEX idx_duration duration_ns TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(timestamp)
-ORDER BY (tenant_id, toDate(timestamp), timestamp, service_name, trace_id, span_id)
+ORDER BY (tenant_id, timestamp, service_name, trace_id, span_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -194,7 +198,7 @@ GROUP BY tenant_id, service_name, http_path, http_method",
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -235,7 +239,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -281,7 +285,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -331,7 +335,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -367,7 +371,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
-ORDER BY (tenant_id, ServiceName, MetricName, toUnixTimestamp64Nano(TimeUnix))
+ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
@@ -402,7 +406,9 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     `mat_user_id` String MATERIALIZED LogAttributes['enduser.id'],
     `mat_action` LowCardinality(String) MATERIALIZED LogAttributes['audit.action'],
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_service_name ServiceName TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_body lower(Body) TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
+    INDEX idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1,
     INDEX idx_severity SeverityText TYPE set(8) GRANULARITY 4,
     INDEX idx_source_ip mat_source_ip TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_user_id mat_user_id TYPE bloom_filter(0.01) GRANULARITY 1,
@@ -480,7 +486,7 @@ ENGINE = MergeTree
 PARTITION BY toDate(TimestampTime)
 PRIMARY KEY (tenant_id, AppName, EventType, TimestampTime)
 ORDER BY (tenant_id, AppName, EventType, TimestampTime, Timestamp)
-TTL toDateTime(Timestamp) + INTERVAL 14 DAY DELETE
+TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── Tenant usage metering (per-tenant ingest volume tracking) ──

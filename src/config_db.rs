@@ -55,6 +55,7 @@ impl ConfigDb {
                 enabled      INTEGER NOT NULL DEFAULT 1,
                 created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+            CREATE INDEX IF NOT EXISTS idx_notif_channels_tenant ON notification_channels(tenant_id, enabled);
 
             CREATE TABLE IF NOT EXISTS notification_log (
                 id          TEXT PRIMARY KEY,
@@ -86,6 +87,7 @@ impl ConfigDb {
                 created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
                 updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+            CREATE INDEX IF NOT EXISTS idx_alert_rules_state ON alert_rules(state, enabled);
 
             CREATE TABLE IF NOT EXISTS alert_events (
                 id         TEXT PRIMARY KEY,
@@ -97,6 +99,7 @@ impl ConfigDb {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events(rule_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_alert_events_state ON alert_events(state, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS deploy_markers (
                 id           TEXT PRIMARY KEY,
@@ -134,6 +137,7 @@ impl ConfigDb {
                 updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_slos_service ON slos(service_name);
+            CREATE INDEX IF NOT EXISTS idx_slos_tenant_state ON slos(tenant_id, state, enabled);
 
             CREATE TABLE IF NOT EXISTS slo_events (
                 id         TEXT PRIMARY KEY,
@@ -146,6 +150,7 @@ impl ConfigDb {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_slo_events_slo ON slo_events(slo_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_slo_events_state ON slo_events(state, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS api_keys (
                 id         TEXT PRIMARY KEY,
@@ -189,6 +194,7 @@ impl ConfigDb {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_anomaly_events_rule ON anomaly_events(rule_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_anomaly_events_state ON anomaly_events(state, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -233,6 +239,8 @@ impl ConfigDb {
                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
                 expires_at  TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
             CREATE TABLE IF NOT EXISTS groups (
                 id          TEXT PRIMARY KEY,
