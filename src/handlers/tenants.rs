@@ -1,12 +1,13 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::handlers::users::require_admin;
 
 #[derive(serde::Deserialize)]
 pub struct CreateTenantRequest {
@@ -34,7 +35,9 @@ pub struct TenantResponse {
 
 pub async fn list_tenants(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let rows = state
         .config_db
         .list_tenants()
@@ -56,8 +59,10 @@ pub async fn list_tenants(
 
 pub async fn create_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let name = req.name.trim().to_string();
     if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
@@ -94,9 +99,11 @@ pub async fn create_tenant(
 
 pub async fn toggle_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<ToggleTenantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let updated = state
         .config_db
         .set_tenant_enabled(&id, req.enabled)
@@ -122,8 +129,10 @@ pub async fn toggle_tenant(
 
 pub async fn delete_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     if id == "default" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -145,9 +154,11 @@ pub async fn delete_tenant(
 
 pub async fn set_auth_required(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<SetAuthRequiredRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let updated = state
         .config_db
         .set_tenant_auth_required(&id, req.auth_required)

@@ -1,5 +1,25 @@
 use crate::models::query::{Filter, FilterOp};
 
+/// Sanitize a datetime string for safe embedding in SQL string literals.
+/// Restricts to characters valid in ISO 8601 / ClickHouse datetime formats,
+/// preventing single-quote injection in PREWHERE time-range conditions.
+fn sanitize_datetime(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.' | '+' | ' '))
+        .collect()
+}
+
+/// Return true if `s` is a safe SQL column identifier (letter/underscore start,
+/// followed by alphanumerics and underscores only). Rejects any injection attempt.
+fn is_safe_column_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Split SQL clauses for ClickHouse PREWHERE optimization.
 ///
 /// `prewhere` holds conditions evaluated at the granule level before reading column data
@@ -66,9 +86,10 @@ impl QueryClauses {
 /// so we try the flat key first, falling back to nested path extraction.
 pub fn resolve_field(field: &str) -> String {
     if let Some(attr_path) = field.strip_prefix("attributes.") {
-        // OTel stores flat dotted keys like "gateway.route" — try flat first, then nested
-        let flat = format!("JSONExtractString(attributes, '{attr_path}')");
-        let parts: Vec<&str> = attr_path.split('.').collect();
+        // Escape single quotes in every path segment to prevent SQL injection
+        let flat_key = attr_path.replace('\'', "\\'");
+        let flat = format!("JSONExtractString(attributes, '{flat_key}')");
+        let parts: Vec<String> = attr_path.split('.').map(|p| p.replace('\'', "\\'")).collect();
         if parts.len() == 1 {
             return flat;
         }
@@ -80,8 +101,11 @@ pub fn resolve_field(field: &str) -> String {
             .join(", ");
         let nested = format!("JSONExtractString(attributes, {nested_args})");
         format!("if({flat} != '', {flat}, {nested})")
-    } else {
+    } else if is_safe_column_name(field) {
         field.to_string()
+    } else {
+        // Unknown field — return NULL so the condition is always false/NULL-safe
+        "NULL".to_string()
     }
 }
 
@@ -99,6 +123,8 @@ pub fn build_where_clause_with_search(
     to: &str,
     search: Option<&str>,
 ) -> QueryClauses {
+    let from = sanitize_datetime(from);
+    let to = sanitize_datetime(to);
     let prewhere = format!(
         "timestamp >= parseDateTimeBestEffort('{from}') AND timestamp <= parseDateTimeBestEffort('{to}')"
     );
@@ -484,14 +510,16 @@ pub fn format_array_value(value: &serde_json::Value) -> String {
 /// Metric tables use Map columns: `Attributes['key']`, `ResourceAttributes['key']`.
 fn resolve_metric_field(field: &str) -> String {
     if let Some(attr_key) = field.strip_prefix("attributes.") {
-        format!("Attributes['{attr_key}']")
+        let safe_key = attr_key.replace('\'', "\\'");
+        format!("Attributes['{safe_key}']")
     } else if let Some(res_key) = field.strip_prefix("resource.") {
-        format!("ResourceAttributes['{res_key}']")
+        let safe_key = res_key.replace('\'', "\\'");
+        format!("ResourceAttributes['{safe_key}']")
     } else {
         match field {
             "metric_name" | "MetricName" => "MetricName".to_string(),
             "service_name" | "ServiceName" => "ServiceName".to_string(),
-            _ => field.to_string(),
+            _ => if is_safe_column_name(field) { field.to_string() } else { "NULL".to_string() },
         }
     }
 }
@@ -499,6 +527,8 @@ fn resolve_metric_field(field: &str) -> String {
 /// Build query clauses for metric tables (otel_metrics_gauge, _sum, etc.).
 /// Time column is `TimeUnix`. Time range goes into PREWHERE; filters go into WHERE.
 pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
+    let from = sanitize_datetime(from);
+    let to = sanitize_datetime(to);
     let prewhere = format!(
         "toDateTime(TimeUnix) >= parseDateTimeBestEffort('{from}') AND toDateTime(TimeUnix) <= parseDateTimeBestEffort('{to}')"
     );
@@ -531,15 +561,17 @@ pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> Q
 /// Log tables use Map columns: `LogAttributes['key']`, `ResourceAttributes['key']`.
 fn resolve_log_field(field: &str) -> String {
     if let Some(attr_key) = field.strip_prefix("attributes.") {
-        format!("LogAttributes['{attr_key}']")
+        let safe_key = attr_key.replace('\'', "\\'");
+        format!("LogAttributes['{safe_key}']")
     } else if let Some(res_key) = field.strip_prefix("resource.") {
-        format!("ResourceAttributes['{res_key}']")
+        let safe_key = res_key.replace('\'', "\\'");
+        format!("ResourceAttributes['{safe_key}']")
     } else {
         match field {
             "service_name" | "ServiceName" => "ServiceName".to_string(),
             "severity" | "SeverityText" => "SeverityText".to_string(),
             "body" | "Body" => "Body".to_string(),
-            _ => field.to_string(),
+            _ => if is_safe_column_name(field) { field.to_string() } else { "NULL".to_string() },
         }
     }
 }
@@ -547,6 +579,8 @@ fn resolve_log_field(field: &str) -> String {
 /// Build query clauses for the otel_logs table. Time column is `Timestamp`.
 /// Time range goes into PREWHERE; filters go into WHERE.
 pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
+    let from = sanitize_datetime(from);
+    let to = sanitize_datetime(to);
     let prewhere = format!(
         "Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
     );

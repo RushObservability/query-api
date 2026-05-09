@@ -212,7 +212,7 @@ impl ConfigDb {
                 id          TEXT PRIMARY KEY,
                 name        TEXT NOT NULL UNIQUE,
                 enabled     INTEGER NOT NULL DEFAULT 1,
-                auth_required INTEGER NOT NULL DEFAULT 0,
+                auth_required INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
 
@@ -459,7 +459,7 @@ impl ConfigDb {
                 .query_row([], |row| row.get(0))?;
             if !has_col {
                 conn.execute_batch(
-                    "ALTER TABLE tenants ADD COLUMN auth_required INTEGER NOT NULL DEFAULT 0;",
+                    "ALTER TABLE tenants ADD COLUMN auth_required INTEGER NOT NULL DEFAULT 1;",
                 )?;
             }
         }
