@@ -79,6 +79,13 @@ struct RateResult {
     rate: f64,
 }
 
+/// Combined total + rate in a single query to save a round-trip per signal.
+#[derive(Debug, Clone, Deserialize, Row)]
+struct TotalRateResult {
+    total: u64,
+    rate: f64,
+}
+
 #[derive(Debug, Clone, Deserialize, Row)]
 struct UsageRow {
     signal: String,
@@ -102,116 +109,142 @@ pub async fn get_stats(
     };
 
     let today_start = chrono::Utc::now().date_naive().to_string();
+    let range_secs = format!(
+        "greatest(1, dateDiff('second', parseDateTimeBestEffort('{from}'), parseDateTimeBestEffort('{to}')))"
+    );
 
-    let err = |e: clickhouse::error::Error| {
-        tracing::error!("stats query failed: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
-    };
+    // ── Build all query futures ──
+    // Combined total + rate in one query per signal to halve span/log round-trips.
+    let span_stats_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as total, count() / {range_secs} as rate \
+         FROM otel_traces \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND Timestamp >= parseDateTimeBestEffort('{from}') \
+           AND Timestamp <= parseDateTimeBestEffort('{to}')"
+    ), tenant_id).fetch_one::<TotalRateResult>();
 
-    // ── Span stats ──
-    let span_total: u64 = crate::tenant_query(&state.ch, &format!(
-            "SELECT count() as count FROM otel_traces WHERE tenant_id = '{escaped_tenant}' AND Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
-        ), tenant_id)
-        .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
+    let span_today_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as count FROM otel_traces \
+         WHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    let span_rate: f64 = crate::tenant_query(&state.ch, &format!(
-            "SELECT count() / greatest(1, dateDiff('second', parseDateTimeBestEffort('{from}'), parseDateTimeBestEffort('{to}'))) as rate FROM otel_traces WHERE tenant_id = '{escaped_tenant}' AND Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
-        ), tenant_id)
-        .fetch_one::<RateResult>().await.map(|r| r.rate).unwrap_or(0.0);
+    let log_stats_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as total, count() / {range_secs} as rate \
+         FROM otel_logs \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND Timestamp >= parseDateTimeBestEffort('{from}') \
+           AND Timestamp <= parseDateTimeBestEffort('{to}')"
+    ), tenant_id).fetch_one::<TotalRateResult>();
 
-    let span_today: u64 = crate::tenant_query(&state.ch, &format!(
-            "SELECT count() as count FROM otel_traces WHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
-        ), tenant_id)
-        .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
+    let log_today_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as count FROM otel_logs \
+         WHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    // ── Log stats ──
-    let log_total: u64 = crate::tenant_query(&state.ch, &format!(
-            "SELECT count() as count FROM otel_logs WHERE tenant_id = '{escaped_tenant}' AND Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
-        ), tenant_id)
-        .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
+    let mg_total_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as count FROM otel_metrics_gauge \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
+           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    let log_rate: f64 = crate::tenant_query(&state.ch, &format!(
-            "SELECT count() / greatest(1, dateDiff('second', parseDateTimeBestEffort('{from}'), parseDateTimeBestEffort('{to}'))) as rate FROM otel_logs WHERE tenant_id = '{escaped_tenant}' AND Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
-        ), tenant_id)
-        .fetch_one::<RateResult>().await.map(|r| r.rate).unwrap_or(0.0);
+    let ms_total_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as count FROM otel_metrics_sum \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
+           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    let log_today: u64 = crate::tenant_query(&state.ch, &format!(
-            "SELECT count() as count FROM otel_logs WHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
-        ), tenant_id)
-        .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
+    let mh_total_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as count FROM otel_metrics_histogram \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
+           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    // ── Metric stats ──
-    let metric_total: u64 = {
-        let g: u64 = crate::tenant_query(&state.ch, &format!(
-                "SELECT count() as count FROM otel_metrics_gauge WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= parseDateTimeBestEffort('{from}') AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-            ), tenant_id)
-            .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
-        let s: u64 = crate::tenant_query(&state.ch, &format!(
-                "SELECT count() as count FROM otel_metrics_sum WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= parseDateTimeBestEffort('{from}') AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-            ), tenant_id)
-            .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
-        let h: u64 = crate::tenant_query(&state.ch, &format!(
-                "SELECT count() as count FROM otel_metrics_histogram WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= parseDateTimeBestEffort('{from}') AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-            ), tenant_id)
-            .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
-        g + s + h
-    };
+    let mg_rate_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() / {range_secs} as rate FROM otel_metrics_gauge \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
+           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
+    ), tenant_id).fetch_one::<RateResult>();
 
-    let metric_rate: f64 = {
-        let range_secs = format!(
-            "greatest(1, dateDiff('second', parseDateTimeBestEffort('{from}'), parseDateTimeBestEffort('{to}')))"
-        );
-        let g: f64 = crate::tenant_query(&state.ch, &format!(
-                "SELECT count() / {range_secs} as rate FROM otel_metrics_gauge WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= parseDateTimeBestEffort('{from}') AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-            ), tenant_id)
-            .fetch_one::<RateResult>().await.map(|r| r.rate).unwrap_or(0.0);
-        let s: f64 = crate::tenant_query(&state.ch, &format!(
-                "SELECT count() / {range_secs} as rate FROM otel_metrics_sum WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= parseDateTimeBestEffort('{from}') AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-            ), tenant_id)
-            .fetch_one::<RateResult>().await.map(|r| r.rate).unwrap_or(0.0);
-        g + s
-    };
+    let ms_rate_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() / {range_secs} as rate FROM otel_metrics_sum \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
+           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
+    ), tenant_id).fetch_one::<RateResult>();
 
-    let metric_today: u64 = {
-        let g: u64 = crate::tenant_query(&state.ch, &format!("SELECT count() as count FROM otel_metrics_gauge WHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"), tenant_id)
-            .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
-        let s: u64 = crate::tenant_query(&state.ch, &format!("SELECT count() as count FROM otel_metrics_sum WHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"), tenant_id)
-            .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
-        g + s
-    };
+    let mg_today_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as count FROM otel_metrics_gauge \
+         WHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    let unique_series: u64 = crate::tenant_query(&state.ch, &format!("SELECT uniq(MetricName, Attributes) as count FROM otel_metrics_gauge WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR"), tenant_id)
-        .fetch_one::<CountResult>().await.map(|r| r.count).unwrap_or(0);
+    let ms_today_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as count FROM otel_metrics_sum \
+         WHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    // ── Storage stats from system.parts ──
-    let storage: Vec<TableStorage> = state.ch
-        .query(
-            "SELECT \
-                 table as table_name, \
-                 sum(rows) as total_rows, \
-                 sum(bytes_on_disk) as bytes_on_disk, \
-                 sum(data_compressed_bytes) as compressed_bytes, \
-                 sum(data_uncompressed_bytes) as uncompressed_bytes \
-             FROM system.parts \
-             WHERE database = 'observability' AND active \
-             GROUP BY table \
-             ORDER BY bytes_on_disk DESC"
-        )
-        .fetch_all::<TableStorage>()
-        .await
-        .unwrap_or_default();
+    let unique_series_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT uniq(MetricName, Attributes) as count FROM otel_metrics_gauge \
+         WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR"
+    ), tenant_id).fetch_one::<CountResult>();
 
-    // ── Per-tenant ingest usage from tenant_usage table ──
-    let usage_rows: Vec<UsageRow> = state.ch
-        .query(&format!(
-            "SELECT signal, sum(events_count) AS events, sum(bytes_count) AS bytes \
-             FROM observability.tenant_usage \
-             WHERE tenant_id = '{escaped_tenant}' AND bucket >= toStartOfDay(now()) \
-             GROUP BY signal"
-        ))
-        .fetch_all::<UsageRow>()
-        .await
-        .unwrap_or_default();
+    let storage_fut = state.ch.query(
+        "SELECT \
+             table as table_name, \
+             sum(rows) as total_rows, \
+             sum(bytes_on_disk) as bytes_on_disk, \
+             sum(data_compressed_bytes) as compressed_bytes, \
+             sum(data_uncompressed_bytes) as uncompressed_bytes \
+         FROM system.parts \
+         WHERE database = 'observability' AND active \
+         GROUP BY table \
+         ORDER BY bytes_on_disk DESC"
+    ).fetch_all::<TableStorage>();
+
+    let usage_fut = state.ch.query(&format!(
+        "SELECT signal, sum(events_count) AS events, sum(bytes_count) AS bytes \
+         FROM observability.tenant_usage \
+         WHERE tenant_id = '{escaped_tenant}' AND bucket >= toStartOfDay(now()) \
+         GROUP BY signal"
+    )).fetch_all::<UsageRow>();
+
+    // ── Fire all 14 queries concurrently ──
+    let (
+        span_stats_res, span_today_res,
+        log_stats_res, log_today_res,
+        mg_total_res, ms_total_res, mh_total_res,
+        mg_rate_res, ms_rate_res,
+        mg_today_res, ms_today_res,
+        unique_series_res,
+        storage_res, usage_rows_res,
+    ) = tokio::join!(
+        span_stats_fut, span_today_fut,
+        log_stats_fut, log_today_fut,
+        mg_total_fut, ms_total_fut, mh_total_fut,
+        mg_rate_fut, ms_rate_fut,
+        mg_today_fut, ms_today_fut,
+        unique_series_fut,
+        storage_fut, usage_fut,
+    );
+
+    // ── Unpack results (failures fall back to zero rather than failing the whole request) ──
+    let span_stats = span_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
+    let span_today = span_today_res.map(|r| r.count).unwrap_or(0);
+    let log_stats = log_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
+    let log_today = log_today_res.map(|r| r.count).unwrap_or(0);
+    let metric_total = mg_total_res.map(|r| r.count).unwrap_or(0)
+        + ms_total_res.map(|r| r.count).unwrap_or(0)
+        + mh_total_res.map(|r| r.count).unwrap_or(0);
+    let metric_rate = mg_rate_res.map(|r| r.rate).unwrap_or(0.0)
+        + ms_rate_res.map(|r| r.rate).unwrap_or(0.0);
+    let metric_today = mg_today_res.map(|r| r.count).unwrap_or(0)
+        + ms_today_res.map(|r| r.count).unwrap_or(0);
+    let unique_series = unique_series_res.map(|r| r.count).unwrap_or(0);
+    let storage: Vec<TableStorage> = storage_res.unwrap_or_default();
+    let usage_rows: Vec<UsageRow> = usage_rows_res.unwrap_or_default();
 
     let mut usage_traces = UsageSignalStats { events_count: 0, bytes_count: 0 };
     let mut usage_logs = UsageSignalStats { events_count: 0, bytes_count: 0 };
@@ -241,13 +274,13 @@ pub async fn get_stats(
 
     Ok(Json(StatsResponse {
         spans: SignalStats {
-            total_events: span_total,
-            events_per_sec: span_rate,
+            total_events: span_stats.total,
+            events_per_sec: span_stats.rate,
             events_today: span_today,
         },
         logs: SignalStats {
-            total_events: log_total,
-            events_per_sec: log_rate,
+            total_events: log_stats.total,
+            events_per_sec: log_stats.rate,
             events_today: log_today,
         },
         metrics: MetricStats {
