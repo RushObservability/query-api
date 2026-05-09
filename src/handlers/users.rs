@@ -13,7 +13,6 @@ pub struct CreateUserRequest {
     pub username: String,
     pub password: String,
     pub display_name: Option<String>,
-    pub tenant_id: Option<String>,
     pub role: Option<String>,
 }
 
@@ -117,16 +116,11 @@ pub async fn create_user(
     }
 
     let display_name = req.display_name.as_deref().unwrap_or("").to_string();
-    let tenant_id = req
-        .tenant_id
-        .as_deref()
-        .unwrap_or("default")
-        .to_string();
     let role = req.role.as_deref().unwrap_or("viewer").to_string();
 
     let id = state
         .config_db
-        .create_user(&username, &password, &display_name, &tenant_id, &role)
+        .create_user(&username, &password, &display_name, "default", &role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let row = state
