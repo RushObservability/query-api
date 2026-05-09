@@ -16,6 +16,7 @@ pub mod health;
 pub mod logs;
 pub mod metrics;
 pub mod monitors;
+pub mod parse_query;
 pub mod query;
 pub mod remote_write;
 pub mod retention;
