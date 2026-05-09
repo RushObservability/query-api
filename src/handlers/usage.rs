@@ -3,10 +3,12 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::TenantContext;
 
 #[derive(Debug, Deserialize)]
 pub struct UsageQuery {
@@ -50,8 +52,11 @@ pub struct CardinalityEntry {
 /// Get signal usage data — which metrics/spans/logs are being queried.
 pub async fn get_usage(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(params): Query<UsageQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let days = params.days.unwrap_or(30);
     let limit = params.limit.unwrap_or(100).min(1000);
 
@@ -67,15 +72,13 @@ pub async fn get_usage(
          toString(toUnixTimestamp64Milli(last_queried_at)) as last_queried_at, query_count \
          FROM ( \
              SELECT * FROM signal_usage FINAL \
-             WHERE last_queried_at >= now() - INTERVAL {days} DAY {type_filter} \
+             WHERE tenant_id = '{escaped_tenant}' AND last_queried_at >= now() - INTERVAL {days} DAY {type_filter} \
          ) \
          ORDER BY last_queried_at DESC \
          LIMIT {limit}"
     );
 
-    let usage = state
-        .ch
-        .query(&sql)
+    let usage = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<UsageRow>()
         .await
         .map_err(|e| {
@@ -86,7 +89,7 @@ pub async fn get_usage(
     // Count total tracked signals
     let count_sql = format!(
         "SELECT count() as count FROM signal_usage FINAL \
-         WHERE last_queried_at >= now() - INTERVAL {days} DAY {type_filter}"
+         WHERE tenant_id = '{escaped_tenant}' AND last_queried_at >= now() - INTERVAL {days} DAY {type_filter}"
     );
 
     #[derive(serde::Deserialize, clickhouse::Row)]
@@ -94,9 +97,7 @@ pub async fn get_usage(
         count: u64,
     }
 
-    let total = state
-        .ch
-        .query(&count_sql)
+    let total = crate::tenant_query(&state.ch, &count_sql, tenant_id)
         .fetch_one::<CountRow>()
         .await
         .map(|r| r.count)
@@ -107,52 +108,49 @@ pub async fn get_usage(
         "SELECT metric_name \
          FROM ( \
              SELECT DISTINCT MetricName as metric_name FROM otel_metrics_gauge \
-             WHERE TimeUnix >= now() - INTERVAL 1 DAY \
+             WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 DAY \
              UNION DISTINCT \
              SELECT DISTINCT MetricName as metric_name FROM otel_metrics_sum \
-             WHERE TimeUnix >= now() - INTERVAL 1 DAY \
+             WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 DAY \
          ) AS all_metrics \
          LEFT JOIN ( \
              SELECT signal_name FROM signal_usage FINAL \
-             WHERE signal_type = 'metric' AND last_queried_at >= now() - INTERVAL {days} DAY \
+             WHERE tenant_id = '{escaped_tenant}' AND signal_type = 'metric' AND last_queried_at >= now() - INTERVAL {days} DAY \
          ) AS used ON all_metrics.metric_name = used.signal_name \
          WHERE used.signal_name IS NULL OR used.signal_name = '' \
          ORDER BY metric_name \
          LIMIT 200"
     );
 
-    let unused = state
-        .ch
-        .query(&unused_sql)
+    let unused = crate::tenant_query(&state.ch, &unused_sql, tenant_id)
         .fetch_all::<UnusedMetric>()
         .await
         .unwrap_or_default();
 
     // Cardinality explorer — count unique series (label combos) per metric
-    let cardinality_sql =
+    let cardinality_sql = format!(
         "SELECT metric_name, sum(series_count) as series_count, max(label_count) as label_count \
          FROM ( \
              SELECT MetricName as metric_name, \
                     uniq(ServiceName, Attributes) as series_count, \
                     max(length(mapKeys(Attributes))) as label_count \
              FROM otel_metrics_gauge \
-             WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              GROUP BY metric_name \
              UNION ALL \
              SELECT MetricName as metric_name, \
                     uniq(ServiceName, Attributes) as series_count, \
                     max(length(mapKeys(Attributes))) as label_count \
              FROM otel_metrics_sum \
-             WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              GROUP BY metric_name \
          ) \
          GROUP BY metric_name \
          ORDER BY series_count DESC \
-         LIMIT 100";
+         LIMIT 100"
+    );
 
-    let cardinality = state
-        .ch
-        .query(cardinality_sql)
+    let cardinality = crate::tenant_query(&state.ch, &cardinality_sql, tenant_id)
         .fetch_all::<CardinalityEntry>()
         .await
         .unwrap_or_default();
@@ -183,8 +181,11 @@ pub struct LabelBreakdownResponse {
 /// Get label cardinality breakdown for a specific metric.
 pub async fn get_label_breakdown(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(metric): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let escaped = metric.replace('\'', "\\'");
 
     // Count distinct values per label key across both gauge and sum tables.
@@ -193,29 +194,27 @@ pub async fn get_label_breakdown(
         "SELECT label_key, uniq(label_value) as unique_values FROM ( \
              SELECT 'service_name' as label_key, ServiceName as label_value \
              FROM otel_metrics_gauge \
-             WHERE MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT 'service_name' as label_key, ServiceName as label_value \
              FROM otel_metrics_sum \
-             WHERE MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT k as label_key, v as label_value \
              FROM otel_metrics_gauge \
              ARRAY JOIN mapKeys(Attributes) AS k, mapValues(Attributes) AS v \
-             WHERE MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT k as label_key, v as label_value \
              FROM otel_metrics_sum \
              ARRAY JOIN mapKeys(Attributes) AS k, mapValues(Attributes) AS v \
-             WHERE MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
          ) \
          GROUP BY label_key \
          ORDER BY unique_values DESC"
     );
 
-    let labels = state
-        .ch
-        .query(&sql)
+    let labels = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<LabelCardinality>()
         .await
         .unwrap_or_default();
@@ -225,11 +224,11 @@ pub async fn get_label_breakdown(
         "SELECT 'total' as label_key, sum(sc) as unique_values FROM ( \
              SELECT uniq(ServiceName, Attributes) as sc \
              FROM otel_metrics_gauge \
-             WHERE MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT uniq(ServiceName, Attributes) as sc \
              FROM otel_metrics_sum \
-             WHERE MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
          )"
     );
 
@@ -239,9 +238,7 @@ pub async fn get_label_breakdown(
         unique_values: u64,
     }
 
-    let total_series = state
-        .ch
-        .query(&total_sql)
+    let total_series = crate::tenant_query(&state.ch, &total_sql, tenant_id)
         .fetch_one::<TotalRow>()
         .await
         .map(|r| r.unique_values)

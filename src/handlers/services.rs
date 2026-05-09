@@ -1,8 +1,9 @@
-use axum::{Json, extract::{Query, State}, http::StatusCode, response::IntoResponse};
+use axum::{Json, extract::{Query, State}, http::StatusCode, response::IntoResponse, Extension};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::TenantContext;
 
 #[derive(Debug, Serialize, Deserialize, Row)]
 pub struct ServiceEntry {
@@ -20,28 +21,40 @@ pub struct ServicesResponse {
 
 pub async fn list_services(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let rows = state
-        .ch
-        .query(
-            "SELECT
-                service_name,
-                http_path,
-                http_method,
-                toString(last_seen) as last_seen,
-                request_count
-            FROM service_catalog
-            ORDER BY service_name, http_path",
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let rows = crate::tenant_query(
+            &state.ch,
+            &format!(
+                "SELECT
+                    service_name,
+                    http_path,
+                    http_method,
+                    toString(last_seen) as last_seen,
+                    request_count
+                FROM service_catalog
+                WHERE tenant_id = '{escaped_tenant}'
+                ORDER BY service_name, http_path",
+            ),
+            tenant_id,
         )
         .fetch_all::<ServiceEntry>()
         .await
         .map_err(|e| {
-            tracing::error!("Failed to list services: {e}");
+            tracing::error!(error = %e, handler = "list_services", "query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("query failed: {e}"),
             )
         })?;
+
+    tracing::info!(
+        tenant_id = %tenant_id,
+        services = rows.len(),
+        "listed services"
+    );
 
     Ok(Json(ServicesResponse { services: rows }))
 }
@@ -86,8 +99,11 @@ pub struct ServiceGraph {
 
 pub async fn service_graph(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(params): Query<GraphParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let minutes = params.minutes.min(10080); // max 7d
 
     // Node metrics: per-service aggregate
@@ -101,7 +117,8 @@ pub async fn service_graph(
             quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
             quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
          FROM wide_events \
-         WHERE timestamp >= now() - INTERVAL {minutes} MINUTE \
+         WHERE tenant_id = '{escaped_tenant}' \
+            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
          GROUP BY service_name \
          ORDER BY request_count DESC"
     );
@@ -118,7 +135,9 @@ pub async fn service_graph(
          INNER JOIN wide_events parent \
             ON child.trace_id = parent.trace_id \
             AND child.parent_span_id = parent.span_id \
-         WHERE child.timestamp >= now() - INTERVAL {minutes} MINUTE \
+         WHERE child.tenant_id = '{escaped_tenant}' \
+            AND parent.tenant_id = '{escaped_tenant}' \
+            AND child.timestamp >= now() - INTERVAL {minutes} MINUTE \
             AND parent.timestamp >= now() - INTERVAL {minutes} MINUTE \
             AND parent.service_name != child.service_name \
          GROUP BY source, target \
@@ -126,17 +145,17 @@ pub async fn service_graph(
     );
 
     let (nodes_result, edges_result) = tokio::join!(
-        state.ch.query(&node_sql).fetch_all::<GraphNode>(),
-        state.ch.query(&edge_sql).fetch_all::<GraphEdge>(),
+        crate::tenant_query(&state.ch, &node_sql, tenant_id).fetch_all::<GraphNode>(),
+        crate::tenant_query(&state.ch, &edge_sql, tenant_id).fetch_all::<GraphEdge>(),
     );
 
     let nodes = nodes_result.map_err(|e| {
-        tracing::error!("Service graph nodes query failed: {e}");
+        tracing::error!(error = %e, handler = "service_graph", "nodes query failed");
         (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
     })?;
 
     let edges = edges_result.map_err(|e| {
-        tracing::error!("Service graph edges query failed: {e}");
+        tracing::error!(error = %e, handler = "service_graph", "edges query failed");
         (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
     })?;
 

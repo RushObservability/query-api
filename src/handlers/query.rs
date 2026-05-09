@@ -3,9 +3,11 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::models::query::{
     CountBucket, CountQueryRequest, CountRow, GroupedTimeseriesBucket, QueryRequest,
     TimeseriesBucket, TimeseriesRequest,
@@ -16,9 +18,14 @@ use crate::query_builder::{resolve_field, build_where_clause_with_search};
 /// Execute a structured query against wide_events.
 pub async fn execute_query(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<QueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let start = std::time::Instant::now();
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
 
     let sql = format!(
         "SELECT * FROM wide_events WHERE {where_clause} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
@@ -30,12 +37,12 @@ pub async fn execute_query(
 
     // P0: Run data fetch and count in parallel
     let (rows_result, count_result) = tokio::join!(
-        state.ch.query(&sql).fetch_all::<WideEvent>(),
-        state.ch.query(&count_sql).fetch_one::<CountRow>(),
+        crate::tenant_query(&state.ch, &sql, tenant_id).fetch_all::<WideEvent>(),
+        crate::tenant_query(&state.ch, &count_sql, tenant_id).fetch_one::<CountRow>(),
     );
 
     let rows = rows_result.map_err(|e| {
-        tracing::error!("Query failed: {e}");
+        tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
         (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
     })?;
 
@@ -50,6 +57,17 @@ pub async fn execute_query(
         state.usage.track_many(signals, "span", "explore");
     }
 
+    tracing::info!(
+        signal = "traces",
+        tenant_id = %tenant_id,
+        query = "explore",
+        rows = rows.len(),
+        total = total,
+        duration_ms = start.elapsed().as_millis() as u64,
+        filters = req.filters.len(),
+        "query completed"
+    );
+
     // P7: Serialize typed structs directly — no intermediate serde_json::Value
     Ok(Json(serde_json::json!({ "rows": rows, "total": total })))
 }
@@ -57,9 +75,13 @@ pub async fn execute_query(
 /// Count events bucketed by time interval.
 pub async fn count_query(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CountQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
 
     let interval_fn = match req.interval.as_str() {
         "1s" => "toStartOfSecond(timestamp)",
@@ -81,13 +103,11 @@ pub async fn count_query(
          ORDER BY bucket ASC"
     );
 
-    let buckets = state
-        .ch
-        .query(&sql)
+    let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<CountBucket>()
         .await
         .map_err(|e| {
-            tracing::error!("Count query failed: {e}");
+            tracing::error!(error = %e, signal = "traces", handler = "count_query", "query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("query failed: {e}"),
@@ -100,6 +120,7 @@ pub async fn count_query(
 /// Group-by query for breakdowns.
 pub async fn group_query(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<QueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if req.group_by.is_empty() {
@@ -109,7 +130,10 @@ pub async fn group_query(
         ));
     }
 
-    let where_clause = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
 
     let group_cols: Vec<String> = req
         .group_by
@@ -140,13 +164,11 @@ pub async fn group_query(
             count: u64,
         }
 
-        let rows = state
-            .ch
-            .query(&sql)
+        let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
             .fetch_all::<SingleGroupRow>()
             .await
             .map_err(|e| {
-                tracing::error!("Group query failed: {e}");
+                tracing::error!(error = %e, signal = "traces", handler = "group_query", "query failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("query failed: {e}"),
@@ -175,9 +197,13 @@ pub async fn group_query(
 /// Timeseries query — returns time-bucketed RED metrics (Rate, Errors, Duration percentiles).
 pub async fn timeseries_query(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<TimeseriesRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let where_clause = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let base_where = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref());
+    let where_clause = format!("tenant_id = '{escaped_tenant}' AND {base_where}");
 
     let interval_fn = match req.interval.as_str() {
         "1s" => "toStartOfSecond(timestamp)",
@@ -208,13 +234,11 @@ pub async fn timeseries_query(
              ORDER BY bucket ASC, count DESC"
         );
 
-        let buckets = state
-            .ch
-            .query(&sql)
+        let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
             .fetch_all::<GroupedTimeseriesBucket>()
             .await
             .map_err(|e| {
-                tracing::error!("Grouped timeseries query failed: {e}");
+                tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", "query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
             })?;
 
@@ -244,13 +268,11 @@ pub async fn timeseries_query(
              ORDER BY bucket ASC"
         );
 
-        let buckets = state
-            .ch
-            .query(&sql)
+        let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
             .fetch_all::<TimeseriesBucket>()
             .await
             .map_err(|e| {
-                tracing::error!("Timeseries query failed: {e}");
+                tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", "query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
             })?;
 

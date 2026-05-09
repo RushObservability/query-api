@@ -3,16 +3,20 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 use std::collections::HashMap;
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::models::trace::{nanos_to_string, SpanEvent, SpanNode, TraceResponse, WideEvent};
 
 pub async fn get_trace(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(trace_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     // Validate trace_id is hex and correct length
     if trace_id.len() != 32 || !trace_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err((
@@ -21,11 +25,14 @@ pub async fn get_trace(
         ));
     }
 
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     // Use FINAL to deduplicate (MergeTree may have duplicate span_ids from MV + direct insert)
-    let rows = state
-        .ch
-        .query(
-            "SELECT * FROM wide_events WHERE trace_id = ? ORDER BY timestamp ASC",
+    let rows = crate::tenant_query(
+            &state.ch,
+            &format!(
+                "SELECT * FROM wide_events WHERE tenant_id = '{escaped_tenant}' AND trace_id = ? ORDER BY timestamp ASC"
+            ),
+            tenant_id,
         )
         .bind(&trace_id)
         .fetch_all::<WideEvent>()
@@ -48,18 +55,10 @@ pub async fn get_trace(
 
 /// Build the span tree from a flat list of wide events.
 fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
-    // Deduplicate by span_id, preferring rows with more complete data
-    // (e.g. non-empty service_version over empty)
+    // Deduplicate by span_id, keeping the first occurrence
     let mut best: std::collections::HashMap<String, WideEvent> = std::collections::HashMap::new();
     for e in events {
-        best.entry(e.span_id.clone())
-            .and_modify(|existing| {
-                // Prefer the row with non-empty service_version
-                if existing.service_version.is_empty() && !e.service_version.is_empty() {
-                    *existing = e.clone();
-                }
-            })
-            .or_insert(e);
+        best.entry(e.span_id.clone()).or_insert(e);
     }
     let events: Vec<WideEvent> = best.into_values().collect();
 
@@ -96,7 +95,7 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
                 span_id: e.span_id.clone(),
                 parent_span_id: e.parent_span_id.clone(),
                 service_name: e.service_name.clone(),
-                service_version: e.service_version.clone(),
+                service_version: String::new(),
                 http_method: e.http_method.clone(),
                 http_path: e.http_path.clone(),
                 http_status_code: e.http_status_code,

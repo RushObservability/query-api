@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 /// A single RUM event from the rum_events table.
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct RumRecord {
+    pub tenant_id: String,
     #[serde(rename = "Timestamp")]
     pub timestamp: i64,
     #[serde(rename = "AppName")]

@@ -101,15 +101,15 @@ pub async fn run_anomaly_engine(
     let http_client = reqwest::Client::new();
     let smtp_transport = build_smtp_transport(&smtp_config);
     if smtp_transport.is_some() {
-        tracing::info!("anomaly engine: SMTP configured for email notifications");
+        tracing::info!(engine = "anomaly", "SMTP configured for email notifications");
     }
-    tracing::info!("anomaly engine: started (30s tick, prom_base_url={prom_base_url})");
+    tracing::info!(engine = "anomaly", interval_secs = 30, prom_base_url = %prom_base_url, "anomaly engine started");
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
         if let Err(e) = eval_anomaly_rules(&config_db, &ch, &http_client, &smtp_config, &smtp_transport, &prom_base_url).await {
-            tracing::error!("anomaly engine error: {e}");
+            tracing::error!(error = %e, engine = "anomaly", "anomaly engine error");
         }
     }
 }
@@ -127,22 +127,25 @@ async fn eval_anomaly_rules(
     let due_rules = config_db.get_due_anomaly_rules(&now_str)?;
 
     if due_rules.is_empty() {
-        tracing::debug!("anomaly engine: tick — no rules due");
+        tracing::debug!(engine = "anomaly", "tick -- no rules due");
     } else {
-        tracing::info!("anomaly engine: tick — evaluating {} rule(s)", due_rules.len());
+        tracing::debug!(engine = "anomaly", rules_due = due_rules.len(), "tick -- evaluating rules");
     }
 
     for rule in due_rules {
-        tracing::info!(
-            "anomaly engine: evaluating '{}' (source={}, state={})",
-            rule.name, rule.source, rule.state
+        tracing::debug!(
+            engine = "anomaly",
+            rule_name = %rule.name,
+            source = %rule.source,
+            state = %rule.state,
+            "evaluating rule"
         );
 
         let all_series = match rule.source.as_str() {
             "apm" => fetch_apm_data(ch, &rule, &now).await,
             "prometheus" => fetch_prom_data(http_client, prom_base_url, &rule, &now).await,
             _ => {
-                tracing::warn!("anomaly rule {}: unknown source '{}'", rule.id, rule.source);
+                tracing::warn!(engine = "anomaly", rule_id = %rule.id, source = %rule.source, "unknown data source");
                 continue;
             }
         };
@@ -150,20 +153,22 @@ async fn eval_anomaly_rules(
         let series_list = match all_series {
             Ok(s) if !s.is_empty() => s,
             Ok(_) => {
-                tracing::info!("anomaly engine: '{}' — no data points returned", rule.name);
+                tracing::debug!(engine = "anomaly", rule_name = %rule.name, "no data points returned");
                 config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None)?;
                 continue;
             }
             Err(e) => {
-                tracing::warn!("anomaly rule {}: data fetch failed: {e}", rule.id);
+                tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "data fetch failed");
                 config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None)?;
                 continue;
             }
         };
 
-        tracing::info!(
-            "anomaly engine: '{}' — {} series to evaluate",
-            rule.name, series_list.len()
+        tracing::debug!(
+            engine = "anomaly",
+            rule_name = %rule.name,
+            series_count = series_list.len(),
+            "series to evaluate"
         );
 
         // Evaluate each series independently; if ANY is anomalous the rule triggers
@@ -180,14 +185,21 @@ async fn eval_anomaly_rules(
 
             let series_state = if result.anomalous { "anomalous" } else { "normal" };
 
-            tracing::info!(
-                "anomaly engine: '{}' [{}] — {} pts, latest={:.2}, ewma={:.2}, dev={:.1}σ, anomalous={}",
-                rule.name, metric_label, values.len(), latest_val, result.mean, result.deviation, result.anomalous
+            tracing::debug!(
+                engine = "anomaly",
+                rule_name = %rule.name,
+                metric = %metric_label,
+                data_points = values.len(),
+                latest_value = format_args!("{:.2}", latest_val),
+                ewma_mean = format_args!("{:.2}", result.mean),
+                deviation_sigma = format_args!("{:.1}", result.deviation),
+                anomalous = result.anomalous,
+                "series evaluated"
             );
 
             // Write a log per series evaluation to ClickHouse
             if let Err(e) = insert_anomaly_log(ch, &now, &rule, series_state, metric_label, latest_val, result.mean, result.deviation).await {
-                tracing::warn!("anomaly '{}': failed to write eval log: {e}", rule.name);
+                tracing::warn!(error = %e, engine = "anomaly", rule_name = %rule.name, "failed to write eval log");
             }
 
             if result.anomalous {
@@ -233,7 +245,15 @@ async fn eval_anomaly_rules(
             // Send notifications
             send_notifications(config_db, http_client, smtp_config, smtp_transport, &rule, &message, any_anomalous).await;
 
-            tracing::info!("anomaly '{}' state: {} -> {}", rule.name, old_state, new_state);
+            tracing::info!(
+                engine = "anomaly",
+                rule_name = %rule.name,
+                old_state = %old_state,
+                new_state = %new_state,
+                metric = %worst_metric,
+                deviation_sigma = format_args!("{:.1}", worst_deviation),
+                "anomaly state changed"
+            );
         } else {
             config_db.update_anomaly_state(&rule.id, new_state, &now_str, None)?;
         }
@@ -414,7 +434,7 @@ async fn send_notifications(
     let channel_ids: Vec<String> = serde_json::from_str(&rule.notification_channel_ids)
         .unwrap_or_default();
     for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel(channel_id) {
+        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
             let config: serde_json::Value = serde_json::from_str(&channel.config)
                 .unwrap_or(serde_json::json!({}));
 
@@ -436,11 +456,11 @@ async fn send_notifications(
                             {
                                 Ok(email) => {
                                     if let Err(e) = transport.send(email).await {
-                                        tracing::warn!("anomaly {}: email to {} failed: {e}", rule.id, to_addr);
+                                        tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "email", "notification failed");
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("anomaly {}: failed to build email: {e}", rule.id);
+                                    tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "failed to build email");
                                 }
                             }
                         }
@@ -450,7 +470,7 @@ async fn send_notifications(
                     if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
                         let payload = serde_json::json!({ "text": message });
                         if let Err(e) = http_client.post(url).json(&payload).send().await {
-                            tracing::warn!("anomaly {}: slack notification failed: {e}", rule.id);
+                            tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "slack", "notification failed");
                         }
                     }
                 }
@@ -463,7 +483,7 @@ async fn send_notifications(
                             "message": message,
                         });
                         if let Err(e) = http_client.post(url).json(&payload).send().await {
-                            tracing::warn!("anomaly {}: webhook notification failed: {e}", rule.id);
+                            tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "webhook", "notification failed");
                         }
                     }
                 }

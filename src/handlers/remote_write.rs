@@ -2,12 +2,14 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
+    Extension,
 };
 use clickhouse::Row;
 use prost::Message;
 use serde::Serialize;
 
 use crate::AppState;
+use crate::TenantContext;
 
 // ═══ Prometheus remote write protobuf types ═══
 // Defined manually to avoid requiring protoc at build time.
@@ -73,6 +75,7 @@ pub enum MetricType {
 
 #[derive(Debug, Clone, Serialize, Row)]
 struct GaugeRow {
+    tenant_id: String,
     #[serde(rename = "ResourceAttributes")]
     resource_attributes: Vec<(String, String)>,
     #[serde(rename = "ResourceSchemaUrl")]
@@ -125,9 +128,11 @@ struct GaugeRow {
 /// samples into `otel_metrics_gauge` in ClickHouse.
 pub async fn prom_remote_write(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     // Verify content type (optional — some clients don't set it)
     if let Some(ct) = headers.get("content-type") {
         let ct_str = ct.to_str().unwrap_or("");
@@ -192,9 +197,11 @@ pub async fn prom_remote_write(
         .map(|ts| ts.samples.len())
         .sum();
     tracing::debug!(
-        "remote write: {} timeseries, {} samples",
-        write_req.timeseries.len(),
-        sample_count
+        signal = "metrics",
+        source = "prometheus",
+        timeseries = write_req.timeseries.len(),
+        samples = sample_count,
+        "remote write payload decoded"
     );
 
     // Insert into otel_metrics_gauge
@@ -230,6 +237,7 @@ pub async fn prom_remote_write(
 
         // P1: Build template row once per timeseries, only update time+value per sample
         let template = GaugeRow {
+            tenant_id: tenant_id.clone(),
             resource_attributes: Vec::new(),
             resource_schema_url: String::new(),
             scope_name: "prometheus".to_string(),
@@ -274,7 +282,17 @@ pub async fn prom_remote_write(
         )
     })?;
 
-    tracing::info!("remote write: inserted {sample_count} samples");
+    // Record usage for per-tenant ingest metering (use decompressed size for bytes)
+    state.usage_accumulator.record(tenant_id, "metrics", sample_count as u64, decompressed.len() as u64);
+
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        series_count = write_req.timeseries.len(),
+        samples = sample_count,
+        source = "prometheus",
+        "ingested remote write"
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }

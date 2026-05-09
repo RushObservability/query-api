@@ -3,11 +3,13 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::models::metrics::*;
 use crate::promql;
 
@@ -23,22 +25,26 @@ pub struct InstantQueryParams {
 
 pub async fn prom_query(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(params): Query<InstantQueryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    prom_query_inner(state, params).await
+    prom_query_inner(state, params, &tenant.tenant_id).await
 }
 
 pub async fn prom_query_post(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Form(params): Form<InstantQueryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    prom_query_inner(state, params).await
+    prom_query_inner(state, params, &tenant.tenant_id).await
 }
 
 async fn prom_query_inner(
     state: AppState,
     params: InstantQueryParams,
+    tenant_id: &str,
 ) -> Result<Json<PromResponse<VectorData>>, (StatusCode, String)> {
+    let start = std::time::Instant::now();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -49,7 +55,7 @@ async fn prom_query_inner(
         .and_then(|t| t.parse::<f64>().ok())
         .unwrap_or(now);
 
-    let series = promql::evaluate_instant_query(&state.ch, &params.query, eval_time, 300.0)
+    let series = promql::evaluate_instant_query(&state.ch, &params.query, eval_time, 300.0, tenant_id)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("PromQL error: {e}")))?;
 
@@ -76,6 +82,16 @@ async fn prom_query_inner(
         }
     }
 
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        query = "promql",
+        promql = %params.query,
+        series_count = result.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "promql instant query completed"
+    );
+
     Ok(Json(PromResponse {
         status: "success",
         data: VectorData {
@@ -97,22 +113,26 @@ pub struct RangeQueryParams {
 
 pub async fn prom_query_range(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(params): Query<RangeQueryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    prom_query_range_inner(state, params).await
+    prom_query_range_inner(state, params, &tenant.tenant_id).await
 }
 
 pub async fn prom_query_range_post(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Form(params): Form<RangeQueryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    prom_query_range_inner(state, params).await
+    prom_query_range_inner(state, params, &tenant.tenant_id).await
 }
 
 async fn prom_query_range_inner(
     state: AppState,
     params: RangeQueryParams,
+    tenant_id: &str,
 ) -> Result<Json<PromResponse<MatrixData>>, (StatusCode, String)> {
+    let query_start = std::time::Instant::now();
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
     let step = params
@@ -121,7 +141,7 @@ async fn prom_query_range_inner(
         .and_then(|s| parse_step(s).ok())
         .unwrap_or(15.0);
 
-    let series = promql::evaluate_range_query(&state.ch, &params.query, start, end, step)
+    let series = promql::evaluate_range_query(&state.ch, &params.query, start, end, step, tenant_id)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("PromQL error: {e}")))?;
 
@@ -145,6 +165,16 @@ async fn prom_query_range_inner(
         }
     }
 
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        query = "promql_range",
+        promql = %params.query,
+        series_count = result.len(),
+        duration_ms = query_start.elapsed().as_millis() as u64,
+        "promql range query completed"
+    );
+
     Ok(Json(PromResponse {
         status: "success",
         data: MatrixData {
@@ -166,21 +196,24 @@ pub struct SeriesParams {
 
 pub async fn prom_series(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(params): Query<SeriesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    prom_series_inner(state, params).await
+    prom_series_inner(state, params, &tenant.tenant_id).await
 }
 
 pub async fn prom_series_post(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Form(params): Form<SeriesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    prom_series_inner(state, params).await
+    prom_series_inner(state, params, &tenant.tenant_id).await
 }
 
 async fn prom_series_inner(
     state: AppState,
     params: SeriesParams,
+    tenant_id: &str,
 ) -> Result<Json<PromResponse<Vec<BTreeMap<String, String>>>>, (StatusCode, String)> {
     let match_exprs = params.match_exprs.unwrap_or_default();
     if match_exprs.is_empty() {
@@ -197,6 +230,7 @@ async fn prom_series_inner(
     let start_secs = params.start.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(now_secs - 3600.0);
     let end_secs = params.end.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(now_secs);
 
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let mut all_series = Vec::new();
 
     for expr_str in &match_exprs {
@@ -212,6 +246,7 @@ async fn prom_series_inner(
         };
 
         let mut where_parts = vec![
+            format!("tenant_id = '{escaped_tenant}'"),
             format!("TimeUnix >= toDateTime64({}, 9)", start_secs as i64),
             format!("TimeUnix <= toDateTime64({}, 9)", end_secs as i64),
         ];
@@ -238,9 +273,7 @@ async fn prom_series_inner(
                  LIMIT 1000"
             );
 
-            let rows: Vec<SeriesRow> = state
-                .ch
-                .query(&sql)
+            let rows: Vec<SeriesRow> = crate::tenant_query(&state.ch, &sql, tenant_id)
                 .fetch_all()
                 .await
                 .unwrap_or_default();
@@ -276,8 +309,11 @@ pub struct LabelsParams {
 
 pub async fn prom_labels(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     // Return well-known labels plus discovered attribute keys
     let mut labels = vec![
         "__name__".to_string(),
@@ -313,16 +349,15 @@ pub async fn prom_labels(
         let sql = format!(
             "SELECT DISTINCT arrayJoin(mapKeys(Attributes)) AS name \
              FROM {table} \
-             WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+             WHERE tenant_id = '{escaped_tenant}' \
+             AND TimeUnix >= now() - INTERVAL 1 HOUR \
              {filter} \
              ORDER BY name \
              LIMIT 200",
             filter = metric_filter.as_deref().unwrap_or("")
         );
 
-        let rows: Vec<LabelNameRow> = state
-            .ch
-            .query(&sql)
+        let rows: Vec<LabelNameRow> = crate::tenant_query(&state.ch, &sql, tenant_id)
             .fetch_all()
             .await
             .unwrap_or_default();
@@ -347,9 +382,12 @@ pub async fn prom_labels(
 
 pub async fn prom_label_values(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(label_name): Path<String>,
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     let mut values = Vec::new();
 
     let metric_filter = params.match_expr.as_ref().and_then(|m| {
@@ -374,13 +412,15 @@ pub async fn prom_label_values(
         let sql = match label_name.as_str() {
             "__name__" => format!(
                 "SELECT DISTINCT MetricName AS value FROM {table} \
-                 WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+                 WHERE tenant_id = '{escaped_tenant}' \
+                 AND TimeUnix >= now() - INTERVAL 1 HOUR \
                  {filter} \
                  ORDER BY value LIMIT 500"
             ),
             "service_name" | "job" => format!(
                 "SELECT DISTINCT ServiceName AS value FROM {table} \
-                 WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+                 WHERE tenant_id = '{escaped_tenant}' \
+                 AND TimeUnix >= now() - INTERVAL 1 HOUR \
                  {filter} \
                  ORDER BY value LIMIT 500"
             ),
@@ -388,7 +428,8 @@ pub async fn prom_label_values(
                 let escaped = label_name.replace('\'', "\\'");
                 format!(
                     "SELECT DISTINCT Attributes['{escaped}'] AS value FROM {table} \
-                     WHERE TimeUnix >= now() - INTERVAL 1 HOUR \
+                     WHERE tenant_id = '{escaped_tenant}' \
+                     AND TimeUnix >= now() - INTERVAL 1 HOUR \
                        AND value != '' \
                      {filter} \
                      ORDER BY value LIMIT 500"
@@ -396,9 +437,7 @@ pub async fn prom_label_values(
             }
         };
 
-        let rows: Vec<LabelValueRow> = state
-            .ch
-            .query(&sql)
+        let rows: Vec<LabelValueRow> = crate::tenant_query(&state.ch, &sql, tenant_id)
             .fetch_all()
             .await
             .unwrap_or_default();

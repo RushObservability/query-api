@@ -1,26 +1,27 @@
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
-/// A single wide event span as stored in ClickHouse.
+/// A single wide event span as stored in ClickHouse (v2 schema).
+/// Column order must match the `wide_events` table exactly for `SELECT *`.
 /// timestamp/event_timestamps are i64 nanoseconds since epoch (DateTime64(9)).
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct WideEvent {
+    pub tenant_id: String,
     pub timestamp: i64,
     pub trace_id: String,
     pub span_id: String,
     pub parent_span_id: String,
     pub service_name: String,
-    pub service_version: String,
-    pub environment: String,
-    pub host_name: String,
+    pub span_name: String,
+    pub kind: String,
+    pub status: String,
+    pub duration_ns: u64,
     pub http_method: String,
     pub http_path: String,
     pub http_status_code: u16,
-    pub duration_ns: u64,
-    pub status: String,
     pub attributes: String,
-    pub event_timestamps: Vec<i64>,
     pub event_names: Vec<String>,
+    pub event_timestamps: Vec<i64>,
     pub event_attributes: Vec<String>,
     pub link_trace_ids: Vec<String>,
     pub link_span_ids: Vec<String>,
@@ -29,6 +30,7 @@ pub struct WideEvent {
 /// A lightweight span row from the trace_index materialized view.
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct TraceIndexRow {
+    pub tenant_id: String,
     pub trace_id: String,
     pub span_id: String,
     pub parent_span_id: String,

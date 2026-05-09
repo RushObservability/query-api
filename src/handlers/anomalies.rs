@@ -3,17 +3,22 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Extension,
 };
 use std::collections::HashMap;
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::models::anomaly::*;
 
 pub async fn analyze_anomaly_event(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(event_id): Path<String>,
     Json(req): Json<AnalyzeAnomalyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     // 1. Look up event
     let event = state
         .config_db
@@ -51,14 +56,15 @@ pub async fn analyze_anomaly_event(
                             toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) as bucket, \
                             count() as count \
                      FROM wide_events \
-                     WHERE timestamp >= '{}' AND timestamp <= '{}' \
+                     WHERE tenant_id = '{escaped_tenant}' \
+                       AND timestamp >= '{}' AND timestamp <= '{}' \
                        AND http_status_code = {} \
                      GROUP BY service_name, bucket \
                      ORDER BY service_name, bucket",
                     from_str, to_str, status_code
                 );
 
-                if let Ok(rows) = state.ch.query(&svc_query).fetch_all::<CorrelatedBucket>().await {
+                if let Ok(rows) = crate::tenant_query(&state.ch, &svc_query, tenant_id).fetch_all::<CorrelatedBucket>().await {
                     let mut svc_totals: HashMap<String, u64> = HashMap::new();
                     for row in &rows {
                         *svc_totals.entry(row.service_name.clone()).or_default() += row.count;
@@ -78,7 +84,8 @@ pub async fn analyze_anomaly_event(
                                     Body as body, \
                                     TraceId as trace_id \
                              FROM otel_logs \
-                             WHERE Timestamp >= parseDateTimeBestEffort('{}') \
+                             WHERE tenant_id = '{escaped_tenant}' \
+                               AND Timestamp >= parseDateTimeBestEffort('{}') \
                                AND Timestamp <= parseDateTimeBestEffort('{}') \
                                AND ServiceName IN ({}) \
                              ORDER BY Timestamp DESC \
@@ -86,7 +93,7 @@ pub async fn analyze_anomaly_event(
                             from_str, to_str, svc_names.join(", ")
                         );
 
-                        if let Ok(logs) = state.ch.query(&log_query).fetch_all::<CorrelationLog>().await {
+                        if let Ok(logs) = crate::tenant_query(&state.ch, &log_query, tenant_id).fetch_all::<CorrelationLog>().await {
                             corr_logs = logs;
                         }
                     }
@@ -371,8 +378,11 @@ pub async fn get_anomaly_event(
 
 pub async fn get_event_correlations(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(event_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
     // 1. Look up the event
     let event = state
         .config_db
@@ -413,16 +423,15 @@ pub async fn get_event_correlations(
                 toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) as bucket, \
                 count() as count \
          FROM wide_events \
-         WHERE timestamp >= '{}' AND timestamp <= '{}' \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND timestamp >= '{}' AND timestamp <= '{}' \
            AND http_status_code = {} \
          GROUP BY service_name, bucket \
          ORDER BY service_name, bucket",
         from_str, to_str, status_code
     );
 
-    let bucket_rows: Vec<CorrelatedBucket> = state
-        .ch
-        .query(&bucket_query)
+    let bucket_rows: Vec<CorrelatedBucket> = crate::tenant_query(&state.ch, &bucket_query, tenant_id)
         .fetch_all()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -461,7 +470,8 @@ pub async fn get_event_correlations(
                     Body as body, \
                     TraceId as trace_id \
              FROM otel_logs \
-             WHERE Timestamp >= parseDateTimeBestEffort('{}') \
+             WHERE tenant_id = '{escaped_tenant}' \
+               AND Timestamp >= parseDateTimeBestEffort('{}') \
                AND Timestamp <= parseDateTimeBestEffort('{}') \
                AND ServiceName IN ({}) \
              ORDER BY Timestamp DESC \
@@ -469,9 +479,7 @@ pub async fn get_event_correlations(
             from_str, to_str, svc_list.join(", ")
         );
 
-        state
-            .ch
-            .query(&log_query)
+        crate::tenant_query(&state.ch, &log_query, tenant_id)
             .fetch_all::<CorrelationLog>()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?

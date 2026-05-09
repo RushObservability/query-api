@@ -60,6 +60,205 @@ pub fn spawn_alert_engine(config_db: Arc<ConfigDb>, ch: Client, smtp_config: Smt
     });
 }
 
+/// Send a notification to a channel and log the result.
+/// Returns Ok(()) on success or Err with the error message.
+pub async fn send_channel_notification(
+    channel: &crate::models::alert::NotificationChannel,
+    message: &str,
+    alert_name: &str,
+    alert_state: &str,
+    value: f64,
+    threshold: f64,
+    http_client: &reqwest::Client,
+    smtp_config: &SmtpConfig,
+    smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+) -> Result<(), String> {
+    let config: serde_json::Value = serde_json::from_str(&channel.config)
+        .unwrap_or(serde_json::json!({}));
+
+    match channel.channel_type.as_str() {
+        "email" => {
+            let recipients = config.get("recipients")
+                .and_then(|r| r.as_str())
+                .or_else(|| config.get("to").and_then(|t| t.as_str()))
+                .ok_or_else(|| "email channel config missing recipients".to_string())?;
+
+            let transport = smtp_transport.as_ref()
+                .ok_or_else(|| "email channel configured but SMTP not set up".to_string())?;
+
+            let subject = format!(
+                "[Rush Alert] {} - {}",
+                alert_name,
+                alert_state,
+            );
+
+            // Send to each recipient
+            for to_addr in recipients.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                match Message::builder()
+                    .from(smtp_config.from.parse().unwrap_or_else(|_| "wide@localhost".parse().unwrap()))
+                    .to(to_addr.parse().unwrap_or_else(|_| "noreply@localhost".parse().unwrap()))
+                    .subject(&subject)
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(message.to_string())
+                {
+                    Ok(email) => {
+                        if let Err(e) = transport.send(email).await {
+                            return Err(format!("email to {to_addr} failed: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!("failed to build email: {e}"));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "slack" => {
+            let url = config.get("webhook_url")
+                .or_else(|| config.get("url"))
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| "slack channel config missing webhook_url".to_string())?;
+
+            let payload = serde_json::json!({ "text": message });
+            http_client.post(url).json(&payload).send().await
+                .map_err(|e| format!("slack notification failed: {e}"))?;
+            Ok(())
+        }
+        "webhook" => {
+            let url = config.get("url")
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| "webhook channel config missing url".to_string())?;
+
+            let method = config.get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("POST");
+
+            let payload = serde_json::json!({
+                "alert": alert_name,
+                "state": alert_state,
+                "value": value,
+                "threshold": threshold,
+                "message": message,
+            });
+
+            let mut req_builder = match method.to_uppercase().as_str() {
+                "PUT" => http_client.put(url),
+                _ => http_client.post(url),
+            };
+
+            // Apply custom headers
+            if let Some(headers) = config.get("headers").and_then(|h| h.as_object()) {
+                for (k, v) in headers {
+                    if let Some(vs) = v.as_str() {
+                        req_builder = req_builder.header(k, vs);
+                    }
+                }
+            }
+
+            req_builder.json(&payload).send().await
+                .map_err(|e| format!("webhook notification failed: {e}"))?;
+            Ok(())
+        }
+        "pagerduty" => {
+            let routing_key = config.get("routing_key")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| "pagerduty channel config missing routing_key".to_string())?;
+
+            let event_action = if alert_state == "ok" || alert_state == "RESOLVED" {
+                "resolve"
+            } else {
+                "trigger"
+            };
+
+            let pd_severity = config.get("severity_mapping")
+                .and_then(|m| m.get("critical"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("critical");
+
+            let payload = serde_json::json!({
+                "routing_key": routing_key,
+                "event_action": event_action,
+                "dedup_key": format!("rush-alert-{}", alert_name.replace(' ', "-").to_lowercase()),
+                "payload": {
+                    "summary": message,
+                    "severity": pd_severity,
+                    "source": "rush-observability",
+                    "custom_details": {
+                        "value": value,
+                        "threshold": threshold,
+                    }
+                }
+            });
+
+            http_client
+                .post("https://events.pagerduty.com/v2/enqueue")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| format!("pagerduty notification failed: {e}"))?;
+            Ok(())
+        }
+        "opsgenie" => {
+            let api_key = config.get("api_key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| "opsgenie channel config missing api_key".to_string())?;
+
+            if alert_state == "ok" || alert_state == "RESOLVED" {
+                // Close the alert
+                let alias = format!("rush-alert-{}", alert_name.replace(' ', "-").to_lowercase());
+                let close_url = format!("https://api.opsgenie.com/v2/alerts/{}/close", alias);
+                let payload = serde_json::json!({
+                    "source": "rush-observability",
+                    "note": message,
+                });
+                http_client
+                    .post(&close_url)
+                    .header("Authorization", format!("GenieKey {api_key}"))
+                    .query(&[("identifierType", "alias")])
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|e| format!("opsgenie close failed: {e}"))?;
+            } else {
+                let priority = config.get("priority_mapping")
+                    .and_then(|m| m.get("critical"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("P1");
+
+                let mut og_payload = serde_json::json!({
+                    "message": message,
+                    "alias": format!("rush-alert-{}", alert_name.replace(' ', "-").to_lowercase()),
+                    "priority": priority,
+                    "source": "rush-observability",
+                    "details": {
+                        "value": value,
+                        "threshold": threshold,
+                    }
+                });
+
+                if let Some(responders) = config.get("responders") {
+                    og_payload["responders"] = responders.clone();
+                }
+                if let Some(tags) = config.get("tags") {
+                    og_payload["tags"] = tags.clone();
+                }
+
+                http_client
+                    .post("https://api.opsgenie.com/v2/alerts")
+                    .header("Authorization", format!("GenieKey {api_key}"))
+                    .json(&og_payload)
+                    .send()
+                    .await
+                    .map_err(|e| format!("opsgenie notification failed: {e}"))?;
+            }
+            Ok(())
+        }
+        other => {
+            Err(format!("unsupported channel type: {other}"))
+        }
+    }
+}
+
 async fn eval_alerts(
     config_db: &ConfigDb,
     ch: &Client,
@@ -157,65 +356,41 @@ async fn eval_alerts(
             // Send notifications
             let channel_ids: Vec<String> = serde_json::from_str(&rule.notification_channel_ids)
                 .unwrap_or_default();
+            let alert_state_str = if triggered { "FIRING" } else { "RESOLVED" };
             for channel_id in &channel_ids {
-                if let Ok(Some(channel)) = config_db.get_channel(channel_id) {
-                    let config: serde_json::Value = serde_json::from_str(&channel.config)
-                        .unwrap_or(serde_json::json!({}));
-
-                    match channel.channel_type.as_str() {
-                        "email" => {
-                            if let Some(to_addr) = config.get("to").and_then(|t| t.as_str()) {
-                                if let Some(transport) = smtp_transport {
-                                    let subject = format!(
-                                        "[Wide Alert] {} - {}",
-                                        rule.name,
-                                        if triggered { "FIRING" } else { "RESOLVED" }
-                                    );
-                                    match Message::builder()
-                                        .from(smtp_config.from.parse().unwrap_or_else(|_| "wide@localhost".parse().unwrap()))
-                                        .to(to_addr.parse().unwrap_or_else(|_| "noreply@localhost".parse().unwrap()))
-                                        .subject(subject)
-                                        .header(ContentType::TEXT_PLAIN)
-                                        .body(message.clone())
-                                    {
-                                        Ok(email) => {
-                                            if let Err(e) = transport.send(email).await {
-                                                tracing::warn!("alert {}: email to {} failed: {e}", rule.id, to_addr);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("alert {}: failed to build email: {e}", rule.id);
-                                        }
-                                    }
-                                } else {
-                                    tracing::warn!("alert {}: email channel configured but SMTP not set up", rule.id);
-                                }
-                            }
-                        }
-                        "slack" => {
-                            if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                                let payload = serde_json::json!({ "text": message });
-                                if let Err(e) = http_client.post(url).json(&payload).send().await {
-                                    tracing::warn!("alert {}: notification to {} failed: {e}", rule.id, channel.name);
-                                }
-                            }
-                        }
-                        _ => {
-                            // webhook
-                            if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                                let payload = serde_json::json!({
-                                    "alert": rule.name,
-                                    "state": new_state,
-                                    "value": value,
-                                    "threshold": threshold,
-                                    "message": message,
-                                });
-                                if let Err(e) = http_client.post(url).json(&payload).send().await {
-                                    tracing::warn!("alert {}: notification to {} failed: {e}", rule.id, channel.name);
-                                }
-                            }
-                        }
+                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
+                    if !channel.enabled {
+                        continue;
                     }
+                    let result = send_channel_notification(
+                        &channel,
+                        &message,
+                        &rule.name,
+                        alert_state_str,
+                        value,
+                        threshold,
+                        http_client,
+                        smtp_config,
+                        smtp_transport,
+                    ).await;
+
+                    let (status, error_msg) = match &result {
+                        Ok(()) => ("sent", String::new()),
+                        Err(e) => {
+                            tracing::warn!("alert {}: notification to {} failed: {e}", rule.id, channel.name);
+                            ("failed", e.clone())
+                        }
+                    };
+
+                    let _ = config_db.create_notification_log(
+                        channel_id,
+                        &channel.tenant_id,
+                        "alert_rule",
+                        &rule.name,
+                        "",
+                        status,
+                        &error_msg,
+                    );
                 }
             }
 

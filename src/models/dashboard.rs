@@ -5,6 +5,10 @@ pub struct Dashboard {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub tenant_id: String,
+    pub owner_id: String,
+    pub visibility: String,
+    pub tags: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -58,11 +62,56 @@ impl From<Widget> for WidgetResponse {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardTemplate {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub is_builtin: bool,
+    pub template_json: serde_json::Value,
+    pub tags: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardExport {
+    pub format_version: String,
+    pub exported_at: String,
+    pub dashboard: DashboardExportMeta,
+    pub widgets: Vec<WidgetExport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardExportMeta {
+    pub name: String,
+    pub description: String,
+    pub visibility: String,
+    pub tags: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetExport {
+    pub title: String,
+    pub widget_type: String,
+    pub query_config: serde_json::Value,
+    pub position: serde_json::Value,
+    pub display_config: serde_json::Value,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateDashboardRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+fn default_visibility() -> String {
+    "tenant".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +119,10 @@ pub struct UpdateDashboardRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +143,18 @@ pub struct UpdateWidgetRequest {
     pub position: serde_json::Value,
     #[serde(default = "default_empty_object")]
     pub display_config: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportDashboardRequest {
+    pub format_version: String,
+    pub dashboard: DashboardExportMeta,
+    pub widgets: Vec<WidgetExport>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateFromTemplateRequest {
+    pub name: String,
 }
 
 fn default_empty_object() -> serde_json::Value {

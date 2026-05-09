@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
+    Extension,
 };
 use clickhouse::Row;
 use prost::Message;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::AppState;
+use crate::TenantContext;
 use super::dd_common::{validate_api_key, decompress_body};
 
 // ═══ DD Agent protobuf types (AgentPayload) ═══
@@ -120,6 +122,7 @@ struct DdSpan {
 /// Row for otel_traces table.
 #[derive(Debug, Clone, Serialize, Row)]
 struct TraceInsertRow {
+    tenant_id: String,
     #[serde(rename = "Timestamp")]
     timestamp: i64,
     #[serde(rename = "TraceId")]
@@ -190,6 +193,7 @@ fn convert_span(
     span: &DdSpan,
     env: &str,
     hostname: &str,
+    tenant_id: &str,
 ) -> TraceInsertRow {
     let trace_id = id_to_hex(span.trace_id, 32);
     let span_id = id_to_hex(span.span_id, 16);
@@ -234,6 +238,7 @@ fn convert_span(
     }
 
     TraceInsertRow {
+        tenant_id: tenant_id.to_string(),
         timestamp: span.start,
         trace_id,
         span_id,
@@ -264,9 +269,11 @@ fn convert_span(
 /// Payload: array of traces, each trace is array of spans (msgpack-encoded).
 pub async fn ingest_v04(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     // DD trace libs don't send DD-API-KEY (they send to the local agent)
     // but we still accept it if present
     let _ = validate_api_key(&headers);
@@ -291,7 +298,7 @@ pub async fn ingest_v04(
             let env = span.meta.get("env").cloned().unwrap_or_default();
             let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
 
-            let trace_row = convert_span(span, &env, &hostname);
+            let trace_row = convert_span(span, &env, &hostname, tenant_id);
             trace_insert.write(&trace_row).await.map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("trace write: {e}"))
             })?;
@@ -302,7 +309,18 @@ pub async fn ingest_v04(
         (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert end: {e}"))
     })?;
 
-    tracing::info!("datadog traces v0.4: ingested {span_count} spans from {} traces", traces.len());
+    // Record usage for per-tenant ingest metering
+    state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
+
+    tracing::info!(
+        signal = "traces",
+        tenant_id = %tenant_id,
+        spans_count = span_count,
+        traces_count = traces.len(),
+        source = "datadog",
+        endpoint = "v0.4",
+        "ingested spans"
+    );
 
     // Return empty rate_by_service (Rush doesn't do agent-side sampling)
     Ok(Json(serde_json::json!({"rate_by_service": {}})))
@@ -311,11 +329,12 @@ pub async fn ingest_v04(
 /// PUT /datadog/v0.3/traces — Accept traces (JSON or msgpack, legacy format).
 pub async fn ingest_v03(
     state: State<AppState>,
+    tenant: Extension<TenantContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // v0.3 uses the same span format as v0.4, just with different response
-    ingest_v04(state, headers, body).await
+    ingest_v04(state, tenant, headers, body).await
 }
 
 /// /datadog/api/v0.2/traces — Accept traces from the DD agent trace writer.
@@ -324,21 +343,28 @@ pub async fn ingest_v03(
 /// We try protobuf first, then msgpack as fallback.
 pub async fn ingest_agent(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
     let _ = validate_api_key(&headers);
     let raw = decompress_body(&headers, body)?;
 
     // Log content-type for debugging
     let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none");
-    tracing::debug!("datadog traces v0.2: {} bytes, content-type={ct}", raw.len());
+    tracing::debug!(
+        endpoint = "v0.2",
+        bytes = raw.len(),
+        content_type = ct,
+        "datadog traces payload received"
+    );
 
 
     // Try protobuf AgentPayload first
     match AgentPayload::decode(raw.as_slice()) {
         Err(e) => {
-            tracing::debug!("datadog traces v0.2: protobuf decode failed: {e}, trying msgpack");
+            tracing::debug!(error = %e, endpoint = "v0.2", "protobuf decode failed, trying msgpack");
         }
         Ok(payload) => {
         let env = payload.env.clone();
@@ -351,7 +377,13 @@ pub async fn ingest_agent(
             .map(|c| c.spans.len())
             .sum();
         tracing::debug!(
-            "datadog traces v0.2: protobuf decoded: host={hostname} env={env} tracer_payloads={tp_count} chunks={chunk_count} spans={total_spans}"
+            endpoint = "v0.2",
+            host = %hostname,
+            env = %env,
+            tracer_payloads = tp_count,
+            chunks = chunk_count,
+            spans = total_spans,
+            "protobuf payload decoded"
         );
         let mut span_count = 0usize;
         // Collect all spans from the protobuf payload
@@ -403,7 +435,7 @@ pub async fn ingest_agent(
         for span in &all_spans {
             let span_env = span.meta.get("env").cloned().unwrap_or_default();
             let span_host = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-            let trace_row = convert_span(span, &span_env, &span_host);
+            let trace_row = convert_span(span, &span_env, &span_host, tenant_id);
             trace_insert.write(&trace_row).await.map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("trace write: {e}"))
             })?;
@@ -413,7 +445,18 @@ pub async fn ingest_agent(
             (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert end: {e}"))
         })?;
 
-        tracing::info!("datadog traces v0.2 (protobuf): ingested {span_count} spans");
+        // Record usage for per-tenant ingest metering (protobuf path)
+        state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
+
+        tracing::info!(
+            signal = "traces",
+            tenant_id = %tenant_id,
+            spans_count = span_count,
+            source = "datadog",
+            endpoint = "v0.2",
+            encoding = "protobuf",
+            "ingested spans"
+        );
         return Ok(Json(serde_json::json!({"rate_by_service": {}})));
         }
     }
@@ -433,7 +476,7 @@ pub async fn ingest_agent(
                 for span in trace {
                     let env = span.meta.get("env").cloned().unwrap_or_default();
                     let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-                    let trace_row = convert_span(span, &env, &hostname);
+                    let trace_row = convert_span(span, &env, &hostname, tenant_id);
                     trace_insert.write(&trace_row).await.map_err(|e| {
                         (StatusCode::INTERNAL_SERVER_ERROR, format!("trace write: {e}"))
                     })?;
@@ -444,13 +487,29 @@ pub async fn ingest_agent(
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert end: {e}"))
             })?;
 
-            tracing::info!("datadog traces v0.2 (msgpack): ingested {span_count} spans from {} traces", traces.len());
+            // Record usage for per-tenant ingest metering (msgpack fallback path)
+            state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
+
+            tracing::info!(
+                signal = "traces",
+                tenant_id = %tenant_id,
+                spans_count = span_count,
+                traces_count = traces.len(),
+                source = "datadog",
+                endpoint = "v0.2",
+                encoding = "msgpack",
+                "ingested spans"
+            );
             Ok(Json(serde_json::json!({"rate_by_service": {}})))
         }
         Err(e) => {
             tracing::warn!(
-                "datadog traces v0.2: failed to decode payload ({} bytes): {e}",
-                raw.len()
+                error = %e,
+                signal = "traces",
+                handler = "dd_traces",
+                endpoint = "v0.2",
+                bytes = raw.len(),
+                "payload decode failed"
             );
             Ok(Json(serde_json::json!({})))
         }

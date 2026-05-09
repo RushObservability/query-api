@@ -3,14 +3,31 @@ use clickhouse::Client;
 use crate::config::RushConfig;
 
 /// Ordered list of DDL statements to ensure the observability schema exists.
-/// Every statement is idempotent (`IF NOT EXISTS`) so safe to run on every startup.
+/// v2: Multi-tenant schema — every table carries tenant_id as the first ORDER BY column.
+/// Starts with DROP TABLE IF EXISTS for all v1 tables, then recreates with v2 schemas.
 const MIGRATIONS: &[&str] = &[
     // ── Database ──
     "CREATE DATABASE IF NOT EXISTS observability",
 
-    // ── OTel traces (collector exporter target) ──
+    // ── DROP v1 tables (MVs first, then base tables) ──
+    "DROP TABLE IF EXISTS observability.service_catalog",
+    "DROP TABLE IF EXISTS observability.trace_index",
+    "DROP TABLE IF EXISTS observability.otel_to_wide",
+    "DROP TABLE IF EXISTS observability.wide_events",
+    "DROP TABLE IF EXISTS observability.otel_traces",
+    "DROP TABLE IF EXISTS observability.otel_logs",
+    "DROP TABLE IF EXISTS observability.otel_metrics_gauge",
+    "DROP TABLE IF EXISTS observability.otel_metrics_sum",
+    "DROP TABLE IF EXISTS observability.otel_metrics_histogram",
+    "DROP TABLE IF EXISTS observability.otel_metrics_exponential_histogram",
+    "DROP TABLE IF EXISTS observability.otel_metrics_summary",
+    "DROP TABLE IF EXISTS observability.rum_events",
+    "DROP TABLE IF EXISTS observability.signal_usage",
+
+    // ── OTel traces (v2: multi-tenant with materialized HTTP columns) ──
     r"CREATE TABLE IF NOT EXISTS observability.otel_traces
 (
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
     `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
     `TraceId` String CODEC(ZSTD(1)),
     `SpanId` String CODEC(ZSTD(1)),
@@ -22,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
     `ScopeName` String CODEC(ZSTD(1)),
     `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
     `SpanAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
     `Duration` UInt64 CODEC(ZSTD(1)),
     `StatusCode` LowCardinality(String) CODEC(ZSTD(1)),
@@ -33,59 +51,70 @@ const MIGRATIONS: &[&str] = &[
     `Links.SpanId` Array(String) CODEC(ZSTD(1)),
     `Links.TraceState` Array(String) CODEC(ZSTD(1)),
     `Links.Attributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+    `mat_http_method` LowCardinality(String) MATERIALIZED SpanAttributes['http.request.method'],
+    `mat_http_path` String MATERIALIZED SpanAttributes['url.path'],
+    `mat_http_status` UInt16 MATERIALIZED toUInt16OrZero(SpanAttributes['http.response.status_code']),
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_span_id SpanId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_status_code StatusCode TYPE set(4) GRANULARITY 4,
+    INDEX idx_http_status mat_http_status TYPE minmax GRANULARITY 1,
+    INDEX idx_duration Duration TYPE minmax GRANULARITY 1,
     INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_span_attr_key mapKeys(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_span_attr_value mapValues(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_duration Duration TYPE minmax GRANULARITY 1
+    INDEX idx_span_attr_value mapValues(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY toDate(Timestamp)
-ORDER BY (ServiceName, SpanName, toDateTime(Timestamp))
+ORDER BY (tenant_id, ServiceName, SpanName, toDateTime(Timestamp))
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── Wide events (flattened query-friendly schema) ──
+    // ── Wide events (v2: multi-tenant flattened query-friendly schema) ──
     r"CREATE TABLE IF NOT EXISTS observability.wide_events
 (
-    timestamp          DateTime64(9, 'UTC') CODEC(Delta, ZSTD(1)),
-    trace_id           String,
-    span_id            String,
-    parent_span_id     String,
-    service_name       LowCardinality(String),
-    service_version    LowCardinality(String),
-    environment        LowCardinality(String),
-    host_name          LowCardinality(String),
-    http_method        LowCardinality(String),
-    http_path          String,
-    http_status_code   UInt16,
-    duration_ns        UInt64,
-    status             LowCardinality(String),
-    attributes         String,
-    event_timestamps   Array(DateTime64(9, 'UTC')),
-    event_names        Array(String),
-    event_attributes   Array(String),
-    link_trace_ids     Array(String),
-    link_span_ids      Array(String)
+    `tenant_id` LowCardinality(String),
+    `timestamp` DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
+    `trace_id` String CODEC(ZSTD(1)),
+    `span_id` String CODEC(ZSTD(1)),
+    `parent_span_id` String CODEC(ZSTD(1)),
+    `service_name` LowCardinality(String) CODEC(ZSTD(1)),
+    `span_name` LowCardinality(String) CODEC(ZSTD(1)),
+    `kind` LowCardinality(String) CODEC(ZSTD(1)),
+    `status` LowCardinality(String) CODEC(ZSTD(1)),
+    `duration_ns` UInt64 CODEC(ZSTD(1)),
+    `http_method` LowCardinality(String) CODEC(ZSTD(1)),
+    `http_path` String CODEC(ZSTD(1)),
+    `http_status_code` UInt16 CODEC(ZSTD(1)),
+    `attributes` String CODEC(ZSTD(1)),
+    `event_names` Array(LowCardinality(String)),
+    `event_timestamps` Array(DateTime64(9, 'UTC')),
+    `event_attributes` Array(String),
+    `link_trace_ids` Array(String),
+    `link_span_ids` Array(String),
+    INDEX idx_trace_id trace_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_span_id span_id TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_duration duration_ns TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(timestamp)
-ORDER BY (service_name, http_path, timestamp, trace_id)
+ORDER BY (tenant_id, service_name, http_path, timestamp, trace_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE
-SETTINGS index_granularity = 8192",
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── MV: OTel traces → wide events ──
+    // ── MV: OTel traces → wide events (v2: passes tenant_id through) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.otel_to_wide
 TO observability.wide_events
 AS SELECT
+    tenant_id,
     Timestamp AS timestamp,
     TraceId AS trace_id,
     SpanId AS span_id,
     ParentSpanId AS parent_span_id,
     ServiceName AS service_name,
-    ResourceAttributes['service.version'] AS service_version,
-    ResourceAttributes['deployment.environment'] AS environment,
-    ResourceAttributes['host.name'] AS host_name,
+    SpanName AS span_name,
+    SpanKind AS kind,
+    StatusCode AS status,
+    Duration AS duration_ns,
     SpanAttributes['http.method'] AS http_method,
     COALESCE(
         nullIf(SpanAttributes['http.route'], ''),
@@ -98,344 +127,339 @@ AS SELECT
         nullIf(SpanAttributes['http.response.status_code'], ''),
         '0'
     )) AS http_status_code,
-    Duration AS duration_ns,
-    StatusCode AS status,
     toJSONString(SpanAttributes) AS attributes,
-    `Events.Timestamp` AS event_timestamps,
     `Events.Name` AS event_names,
+    `Events.Timestamp` AS event_timestamps,
     arrayMap(x -> toJSONString(x), `Events.Attributes`) AS event_attributes,
     `Links.TraceId` AS link_trace_ids,
     `Links.SpanId` AS link_span_ids
 FROM observability.otel_traces",
 
-    // ── MV: trace index for fast trace-id lookups ──
+    // ── MV: trace index for fast trace-id lookups (v2: tenant-scoped) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.trace_index
 ENGINE = MergeTree()
 PARTITION BY toDate(timestamp)
-ORDER BY (trace_id, timestamp)
+ORDER BY (tenant_id, trace_id, timestamp)
 AS SELECT
-    trace_id, span_id, parent_span_id, service_name,
+    tenant_id, trace_id, span_id, parent_span_id, service_name,
     http_method, http_path, http_status_code,
     duration_ns, status, timestamp
 FROM observability.wide_events",
 
-    // ── MV: service catalog ──
+    // ── MV: service catalog (v2: tenant-scoped) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.service_catalog
 ENGINE = ReplacingMergeTree(last_seen)
-ORDER BY (service_name, http_path, http_method)
+ORDER BY (tenant_id, service_name, http_path, http_method)
 AS SELECT
-    service_name, http_path, http_method,
+    tenant_id, service_name, http_path, http_method,
     max(timestamp) AS last_seen,
     count() AS request_count
 FROM observability.wide_events
-GROUP BY service_name, http_path, http_method",
+GROUP BY tenant_id, service_name, http_path, http_method",
 
-    // ── Gauge metrics ──
+    // ── Gauge metrics (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_gauge
 (
-    ResourceAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ResourceSchemaUrl     String CODEC(ZSTD(1)),
-    ScopeName             String CODEC(ZSTD(1)),
-    ScopeVersion          String CODEC(ZSTD(1)),
-    ScopeAttributes       Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ScopeDroppedAttrCount UInt32 CODEC(ZSTD(1)),
-    ScopeSchemaUrl        String CODEC(ZSTD(1)),
-    ServiceName           LowCardinality(String) CODEC(ZSTD(1)),
-    MetricName            LowCardinality(String) CODEC(ZSTD(1)),
-    MetricDescription     String CODEC(ZSTD(1)),
-    MetricUnit            String CODEC(ZSTD(1)),
-    Attributes            Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    StartTimeUnix         DateTime64(9) CODEC(Delta, ZSTD(1)),
-    TimeUnix              DateTime64(9) CODEC(Delta, ZSTD(1)),
-    Value                 Float64 CODEC(Gorilla, ZSTD(1)),
-    Flags                 UInt32 CODEC(ZSTD(1)),
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ResourceSchemaUrl` String CODEC(ZSTD(1)),
+    `ScopeName` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ScopeDroppedAttrCount` UInt32 CODEC(ZSTD(1)),
+    `ScopeSchemaUrl` String CODEC(ZSTD(1)),
+    `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricDescription` String CODEC(ZSTD(1)),
+    `MetricUnit` String CODEC(ZSTD(1)),
+    `Attributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `StartTimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `TimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `Value` Float64 CODEC(Gorilla, ZSTD(1)),
+    `Flags` UInt32 CODEC(ZSTD(1)),
     `Exemplars.FilteredAttributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
-    `Exemplars.TimeUnix`           Array(DateTime64(9)) CODEC(ZSTD(1)),
-    `Exemplars.Value`              Array(Float64) CODEC(ZSTD(1)),
-    `Exemplars.SpanId`             Array(String) CODEC(ZSTD(1)),
-    `Exemplars.TraceId`            Array(String) CODEC(ZSTD(1)),
-    INDEX idx_res_attr_key    mapKeys(ResourceAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_res_attr_value  mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_key  mapKeys(ScopeAttributes)     TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_value mapValues(ScopeAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_key        mapKeys(Attributes)          TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value      mapValues(Attributes)        TYPE bloom_filter(0.01) GRANULARITY 1
-)
-ENGINE = MergeTree()
-PARTITION BY toDate(TimeUnix)
-ORDER BY (ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
-TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
-    // ── Sum metrics (counters, cumulative sums) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_sum
-(
-    ResourceAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ResourceSchemaUrl     String CODEC(ZSTD(1)),
-    ScopeName             String CODEC(ZSTD(1)),
-    ScopeVersion          String CODEC(ZSTD(1)),
-    ScopeAttributes       Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ScopeDroppedAttrCount UInt32 CODEC(ZSTD(1)),
-    ScopeSchemaUrl        String CODEC(ZSTD(1)),
-    ServiceName           LowCardinality(String) CODEC(ZSTD(1)),
-    MetricName            LowCardinality(String) CODEC(ZSTD(1)),
-    MetricDescription     String CODEC(ZSTD(1)),
-    MetricUnit            String CODEC(ZSTD(1)),
-    Attributes            Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    StartTimeUnix         DateTime64(9) CODEC(Delta, ZSTD(1)),
-    TimeUnix              DateTime64(9) CODEC(Delta, ZSTD(1)),
-    Value                 Float64 CODEC(Gorilla, ZSTD(1)),
-    Flags                 UInt32 CODEC(ZSTD(1)),
-    `Exemplars.FilteredAttributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
-    `Exemplars.TimeUnix`           Array(DateTime64(9)) CODEC(ZSTD(1)),
-    `Exemplars.Value`              Array(Float64) CODEC(ZSTD(1)),
-    `Exemplars.SpanId`             Array(String) CODEC(ZSTD(1)),
-    `Exemplars.TraceId`            Array(String) CODEC(ZSTD(1)),
-    AggregationTemporality Int32 CODEC(ZSTD(1)),
-    IsMonotonic            Boolean CODEC(Delta, ZSTD(1)),
-    INDEX idx_res_attr_key    mapKeys(ResourceAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_res_attr_value  mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_key  mapKeys(ScopeAttributes)     TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_value mapValues(ScopeAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_key        mapKeys(Attributes)          TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value      mapValues(Attributes)        TYPE bloom_filter(0.01) GRANULARITY 1
-)
-ENGINE = MergeTree()
-PARTITION BY toDate(TimeUnix)
-ORDER BY (ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
-TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
-    // ── Histogram metrics ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_histogram
-(
-    ResourceAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ResourceSchemaUrl     String CODEC(ZSTD(1)),
-    ScopeName             String CODEC(ZSTD(1)),
-    ScopeVersion          String CODEC(ZSTD(1)),
-    ScopeAttributes       Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ScopeDroppedAttrCount UInt32 CODEC(ZSTD(1)),
-    ScopeSchemaUrl        String CODEC(ZSTD(1)),
-    ServiceName           LowCardinality(String) CODEC(ZSTD(1)),
-    MetricName            LowCardinality(String) CODEC(ZSTD(1)),
-    MetricDescription     String CODEC(ZSTD(1)),
-    MetricUnit            String CODEC(ZSTD(1)),
-    Attributes            Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    StartTimeUnix         DateTime64(9) CODEC(Delta, ZSTD(1)),
-    TimeUnix              DateTime64(9) CODEC(Delta, ZSTD(1)),
-    Count                 UInt64 CODEC(Delta, ZSTD(1)),
-    Sum                   Float64 CODEC(ZSTD(1)),
-    BucketCounts          Array(UInt64) CODEC(ZSTD(1)),
-    ExplicitBounds        Array(Float64) CODEC(ZSTD(1)),
-    Flags                 UInt32 CODEC(ZSTD(1)),
-    Min                   Float64 CODEC(ZSTD(1)),
-    Max                   Float64 CODEC(ZSTD(1)),
-    AggregationTemporality Int32 CODEC(ZSTD(1)),
-    `Exemplars.FilteredAttributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
-    `Exemplars.TimeUnix`           Array(DateTime64(9)) CODEC(ZSTD(1)),
-    `Exemplars.Value`              Array(Float64) CODEC(ZSTD(1)),
-    `Exemplars.SpanId`             Array(String) CODEC(ZSTD(1)),
-    `Exemplars.TraceId`            Array(String) CODEC(ZSTD(1)),
-    INDEX idx_res_attr_key    mapKeys(ResourceAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_res_attr_value  mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_key  mapKeys(ScopeAttributes)     TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_value mapValues(ScopeAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_key        mapKeys(Attributes)          TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value      mapValues(Attributes)        TYPE bloom_filter(0.01) GRANULARITY 1
-)
-ENGINE = MergeTree()
-PARTITION BY toDate(TimeUnix)
-ORDER BY (ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
-TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
-    // ── Exponential Histogram metrics ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_exponential_histogram
-(
-    ResourceAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ResourceSchemaUrl     String CODEC(ZSTD(1)),
-    ScopeName             String CODEC(ZSTD(1)),
-    ScopeVersion          String CODEC(ZSTD(1)),
-    ScopeAttributes       Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ScopeDroppedAttrCount UInt32 CODEC(ZSTD(1)),
-    ScopeSchemaUrl        String CODEC(ZSTD(1)),
-    ServiceName           LowCardinality(String) CODEC(ZSTD(1)),
-    MetricName            LowCardinality(String) CODEC(ZSTD(1)),
-    MetricDescription     String CODEC(ZSTD(1)),
-    MetricUnit            String CODEC(ZSTD(1)),
-    Attributes            Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    StartTimeUnix         DateTime64(9) CODEC(Delta, ZSTD(1)),
-    TimeUnix              DateTime64(9) CODEC(Delta, ZSTD(1)),
-    Count                 UInt64 CODEC(Delta, ZSTD(1)),
-    Sum                   Float64 CODEC(ZSTD(1)),
-    Scale                 Int32 CODEC(ZSTD(1)),
-    ZeroCount             UInt64 CODEC(ZSTD(1)),
-    PositiveOffset        Int32 CODEC(ZSTD(1)),
-    PositiveBucketCounts  Array(UInt64) CODEC(ZSTD(1)),
-    NegativeOffset        Int32 CODEC(ZSTD(1)),
-    NegativeBucketCounts  Array(UInt64) CODEC(ZSTD(1)),
-    Flags                 UInt32 CODEC(ZSTD(1)),
-    Min                   Float64 CODEC(ZSTD(1)),
-    Max                   Float64 CODEC(ZSTD(1)),
-    AggregationTemporality Int32 CODEC(ZSTD(1)),
-    `Exemplars.FilteredAttributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
-    `Exemplars.TimeUnix`           Array(DateTime64(9)) CODEC(ZSTD(1)),
-    `Exemplars.Value`              Array(Float64) CODEC(ZSTD(1)),
-    `Exemplars.SpanId`             Array(String) CODEC(ZSTD(1)),
-    `Exemplars.TraceId`            Array(String) CODEC(ZSTD(1)),
-    INDEX idx_res_attr_key    mapKeys(ResourceAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_res_attr_value  mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_key  mapKeys(ScopeAttributes)     TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_value mapValues(ScopeAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_key        mapKeys(Attributes)          TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value      mapValues(Attributes)        TYPE bloom_filter(0.01) GRANULARITY 1
-)
-ENGINE = MergeTree()
-PARTITION BY toDate(TimeUnix)
-ORDER BY (ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
-TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
-    // ── Summary metrics (drop first to fix Nested column schema) ──
-    "DROP TABLE IF EXISTS observability.otel_metrics_summary",
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_summary
-(
-    ResourceAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ResourceSchemaUrl     String CODEC(ZSTD(1)),
-    ScopeName             String CODEC(ZSTD(1)),
-    ScopeVersion          String CODEC(ZSTD(1)),
-    ScopeAttributes       Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ScopeDroppedAttrCount UInt32 CODEC(ZSTD(1)),
-    ScopeSchemaUrl        String CODEC(ZSTD(1)),
-    ServiceName           LowCardinality(String) CODEC(ZSTD(1)),
-    MetricName            LowCardinality(String) CODEC(ZSTD(1)),
-    MetricDescription     String CODEC(ZSTD(1)),
-    MetricUnit            String CODEC(ZSTD(1)),
-    Attributes            Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    StartTimeUnix         DateTime64(9) CODEC(Delta, ZSTD(1)),
-    TimeUnix              DateTime64(9) CODEC(Delta, ZSTD(1)),
-    Count                 UInt64 CODEC(Delta, ZSTD(1)),
-    Sum                   Float64 CODEC(ZSTD(1)),
-    ValueAtQuantiles Nested(Quantile Float64, Value Float64) CODEC(ZSTD(1)),
-    Flags                 UInt32 CODEC(ZSTD(1)),
-    INDEX idx_res_attr_key    mapKeys(ResourceAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_res_attr_value  mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_key  mapKeys(ScopeAttributes)     TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_scope_attr_value mapValues(ScopeAttributes)  TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_key        mapKeys(Attributes)          TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_attr_value      mapValues(Attributes)        TYPE bloom_filter(0.01) GRANULARITY 1
-)
-ENGINE = MergeTree()
-PARTITION BY toDate(TimeUnix)
-ORDER BY (ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
-TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
-    // ── Signal usage tracking ──
-    r"CREATE TABLE IF NOT EXISTS observability.signal_usage
-(
-    signal_name     LowCardinality(String),
-    signal_type     LowCardinality(String),
-    source          LowCardinality(String),
-    last_queried_at DateTime64(3) DEFAULT now64(3),
-    query_count     UInt64 DEFAULT 1
-)
-ENGINE = ReplacingMergeTree(last_queried_at)
-ORDER BY (signal_type, signal_name, source)
-TTL toDateTime(last_queried_at) + INTERVAL 90 DAY DELETE
-SETTINGS index_granularity = 8192",
-
-    // ── OTel Logs table (matches otel-collector-contrib clickhouse exporter schema) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_logs
-(
-    Timestamp          DateTime64(9) CODEC(Delta(8), ZSTD(1)),
-    TimestampTime      DateTime DEFAULT toDateTime(Timestamp),
-    TraceId            String CODEC(ZSTD(1)),
-    SpanId             String CODEC(ZSTD(1)),
-    TraceFlags         UInt8,
-    SeverityText       LowCardinality(String) CODEC(ZSTD(1)),
-    SeverityNumber     UInt8,
-    ServiceName        LowCardinality(String) CODEC(ZSTD(1)),
-    Body               String CODEC(ZSTD(1)),
-    ResourceSchemaUrl  LowCardinality(String) CODEC(ZSTD(1)),
-    ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    ScopeSchemaUrl     LowCardinality(String) CODEC(ZSTD(1)),
-    ScopeName          String CODEC(ZSTD(1)),
-    ScopeVersion       LowCardinality(String) CODEC(ZSTD(1)),
-    ScopeAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    LogAttributes      Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    EventName          String CODEC(ZSTD(1)),
-    INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
+    `Exemplars.TimeUnix` Array(DateTime64(9)) CODEC(ZSTD(1)),
+    `Exemplars.Value` Array(Float64) CODEC(ZSTD(1)),
+    `Exemplars.SpanId` Array(String) CODEC(ZSTD(1)),
+    `Exemplars.TraceId` Array(String) CODEC(ZSTD(1)),
     INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_log_attr_key mapKeys(LogAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_log_attr_value mapValues(LogAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_body Body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 8
+    INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
 )
-ENGINE = MergeTree
-PARTITION BY toDate(TimestampTime)
-PRIMARY KEY (ServiceName, TimestampTime)
-ORDER BY (ServiceName, TimestampTime, Timestamp)
-TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
+ENGINE = MergeTree()
+PARTITION BY toDate(TimeUnix)
+ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── Replace Body tokenbf_v1 index: lower(Body) + GRANULARITY 1 for hasToken(lower(Body), ...) ──
-    "ALTER TABLE observability.otel_logs DROP INDEX IF EXISTS idx_body",
-    "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS idx_body lower(Body) TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1",
-    "ALTER TABLE observability.otel_logs MATERIALIZE INDEX idx_body",
+    // ── Sum metrics (v2: multi-tenant) ──
+    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_sum
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ResourceSchemaUrl` String CODEC(ZSTD(1)),
+    `ScopeName` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ScopeDroppedAttrCount` UInt32 CODEC(ZSTD(1)),
+    `ScopeSchemaUrl` String CODEC(ZSTD(1)),
+    `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricDescription` String CODEC(ZSTD(1)),
+    `MetricUnit` String CODEC(ZSTD(1)),
+    `Attributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `StartTimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `TimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `Value` Float64 CODEC(Gorilla, ZSTD(1)),
+    `Flags` UInt32 CODEC(ZSTD(1)),
+    `Exemplars.FilteredAttributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+    `Exemplars.TimeUnix` Array(DateTime64(9)) CODEC(ZSTD(1)),
+    `Exemplars.Value` Array(Float64) CODEC(ZSTD(1)),
+    `Exemplars.SpanId` Array(String) CODEC(ZSTD(1)),
+    `Exemplars.TraceId` Array(String) CODEC(ZSTD(1)),
+    `AggregationTemporality` Int32 CODEC(ZSTD(1)),
+    `IsMonotonic` Boolean CODEC(Delta, ZSTD(1)),
+    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+)
+ENGINE = MergeTree()
+PARTITION BY toDate(TimeUnix)
+ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── Add ngrambf_v1 on lower(Body) for substring LIKE searches ──
-    "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
-    "ALTER TABLE observability.otel_logs MATERIALIZE INDEX idx_body_ngram",
+    // ── Histogram metrics (v2: multi-tenant) ──
+    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_histogram
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ResourceSchemaUrl` String CODEC(ZSTD(1)),
+    `ScopeName` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ScopeDroppedAttrCount` UInt32 CODEC(ZSTD(1)),
+    `ScopeSchemaUrl` String CODEC(ZSTD(1)),
+    `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricDescription` String CODEC(ZSTD(1)),
+    `MetricUnit` String CODEC(ZSTD(1)),
+    `Attributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `StartTimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `TimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `Count` UInt64 CODEC(Delta, ZSTD(1)),
+    `Sum` Float64 CODEC(ZSTD(1)),
+    `BucketCounts` Array(UInt64) CODEC(ZSTD(1)),
+    `ExplicitBounds` Array(Float64) CODEC(ZSTD(1)),
+    `Flags` UInt32 CODEC(ZSTD(1)),
+    `Min` Float64 CODEC(ZSTD(1)),
+    `Max` Float64 CODEC(ZSTD(1)),
+    `AggregationTemporality` Int32 CODEC(ZSTD(1)),
+    `Exemplars.FilteredAttributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+    `Exemplars.TimeUnix` Array(DateTime64(9)) CODEC(ZSTD(1)),
+    `Exemplars.Value` Array(Float64) CODEC(ZSTD(1)),
+    `Exemplars.SpanId` Array(String) CODEC(ZSTD(1)),
+    `Exemplars.TraceId` Array(String) CODEC(ZSTD(1)),
+    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+)
+ENGINE = MergeTree()
+PARTITION BY toDate(TimeUnix)
+ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── Materialized columns for frequently filtered resource attributes ──
-    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_namespace` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.namespace.name'] CODEC(ZSTD(1))",
-    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_pod` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.pod.name'] CODEC(ZSTD(1))",
-    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_container` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.container.name'] CODEC(ZSTD(1))",
-    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_k8s_deployment` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.deployment.name'] CODEC(ZSTD(1))",
-    "ALTER TABLE observability.otel_logs ADD COLUMN IF NOT EXISTS `mat_environment` LowCardinality(String) MATERIALIZED ResourceAttributes['deployment.environment'] CODEC(ZSTD(1))",
+    // ── Exponential Histogram metrics (v2: multi-tenant) ──
+    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_exponential_histogram
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ResourceSchemaUrl` String CODEC(ZSTD(1)),
+    `ScopeName` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ScopeDroppedAttrCount` UInt32 CODEC(ZSTD(1)),
+    `ScopeSchemaUrl` String CODEC(ZSTD(1)),
+    `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricDescription` String CODEC(ZSTD(1)),
+    `MetricUnit` String CODEC(ZSTD(1)),
+    `Attributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `StartTimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `TimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `Count` UInt64 CODEC(Delta, ZSTD(1)),
+    `Sum` Float64 CODEC(ZSTD(1)),
+    `Scale` Int32 CODEC(ZSTD(1)),
+    `ZeroCount` UInt64 CODEC(ZSTD(1)),
+    `PositiveOffset` Int32 CODEC(ZSTD(1)),
+    `PositiveBucketCounts` Array(UInt64) CODEC(ZSTD(1)),
+    `NegativeOffset` Int32 CODEC(ZSTD(1)),
+    `NegativeBucketCounts` Array(UInt64) CODEC(ZSTD(1)),
+    `Flags` UInt32 CODEC(ZSTD(1)),
+    `Min` Float64 CODEC(ZSTD(1)),
+    `Max` Float64 CODEC(ZSTD(1)),
+    `AggregationTemporality` Int32 CODEC(ZSTD(1)),
+    `Exemplars.FilteredAttributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+    `Exemplars.TimeUnix` Array(DateTime64(9)) CODEC(ZSTD(1)),
+    `Exemplars.Value` Array(Float64) CODEC(ZSTD(1)),
+    `Exemplars.SpanId` Array(String) CODEC(ZSTD(1)),
+    `Exemplars.TraceId` Array(String) CODEC(ZSTD(1)),
+    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+)
+ENGINE = MergeTree()
+PARTITION BY toDate(TimeUnix)
+ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── P5+P6: Bloom filter indexes on wide_events for trace_id and span_id lookups ──
-    "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS idx_trace_id trace_id TYPE bloom_filter(0.001) GRANULARITY 1",
-    "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS idx_span_id span_id TYPE bloom_filter(0.001) GRANULARITY 1",
+    // ── Summary metrics (v2: multi-tenant) ──
+    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_summary
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ResourceSchemaUrl` String CODEC(ZSTD(1)),
+    `ScopeName` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ScopeDroppedAttrCount` UInt32 CODEC(ZSTD(1)),
+    `ScopeSchemaUrl` String CODEC(ZSTD(1)),
+    `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricName` LowCardinality(String) CODEC(ZSTD(1)),
+    `MetricDescription` String CODEC(ZSTD(1)),
+    `MetricUnit` String CODEC(ZSTD(1)),
+    `Attributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `StartTimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `TimeUnix` DateTime64(9) CODEC(Delta, ZSTD(1)),
+    `Count` UInt64 CODEC(Delta, ZSTD(1)),
+    `Sum` Float64 CODEC(ZSTD(1)),
+    `ValueAtQuantiles` Nested(Quantile Float64, Value Float64) CODEC(ZSTD(1)),
+    `Flags` UInt32 CODEC(ZSTD(1)),
+    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_key mapKeys(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
+)
+ENGINE = MergeTree()
+PARTITION BY toDate(TimeUnix)
+ORDER BY (tenant_id, ServiceName, MetricName, Attributes, toUnixTimestamp64Nano(TimeUnix))
+TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── RUM (Real User Monitoring) events ──
+    // ── OTel Logs (v2: multi-tenant with SIEM materialized columns) ──
+    r"CREATE TABLE IF NOT EXISTS observability.otel_logs
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    `TimestampDate` Date DEFAULT toDate(Timestamp),
+    `TimestampTime` DateTime DEFAULT toDateTime(Timestamp),
+    `TraceId` String CODEC(ZSTD(1)),
+    `SpanId` String CODEC(ZSTD(1)),
+    `TraceFlags` UInt32 CODEC(ZSTD(1)),
+    `SeverityText` LowCardinality(String) CODEC(ZSTD(1)),
+    `SeverityNumber` UInt8 CODEC(ZSTD(1)),
+    `Body` String CODEC(ZSTD(3)),
+    `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
+    `ResourceSchemaUrl` String CODEC(ZSTD(1)),
+    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `ScopeSchemaUrl` String CODEC(ZSTD(1)),
+    `ScopeName` String CODEC(ZSTD(1)),
+    `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `LogAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    `EventName` LowCardinality(String) CODEC(ZSTD(1)),
+    `mat_k8s_namespace` String MATERIALIZED ResourceAttributes['k8s.namespace.name'],
+    `mat_k8s_pod` String MATERIALIZED ResourceAttributes['k8s.pod.name'],
+    `mat_k8s_container` String MATERIALIZED ResourceAttributes['k8s.container.name'],
+    `mat_k8s_deployment` String MATERIALIZED ResourceAttributes['k8s.deployment.name'],
+    `mat_environment` LowCardinality(String) MATERIALIZED ResourceAttributes['deployment.environment'],
+    `mat_source_ip` String MATERIALIZED LogAttributes['net.peer.ip'],
+    `mat_user_id` String MATERIALIZED LogAttributes['enduser.id'],
+    `mat_action` LowCardinality(String) MATERIALIZED LogAttributes['audit.action'],
+    INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_body lower(Body) TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
+    INDEX idx_severity SeverityText TYPE set(8) GRANULARITY 4,
+    INDEX idx_source_ip mat_source_ip TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_user_id mat_user_id TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_log_attr_key mapKeys(LogAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_log_attr_value mapValues(LogAttributes) TYPE bloom_filter(0.01) GRANULARITY 1
+)
+ENGINE = MergeTree
+PARTITION BY TimestampDate
+PRIMARY KEY (tenant_id, ServiceName, SeverityText, TimestampTime, Timestamp)
+ORDER BY (tenant_id, ServiceName, SeverityText, TimestampTime, Timestamp)
+TTL TimestampDate + toIntervalDay(30)
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+
+    // ── Signal usage tracking (v2: multi-tenant) ──
+    r"CREATE TABLE IF NOT EXISTS observability.signal_usage
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `signal_name` LowCardinality(String),
+    `signal_type` LowCardinality(String),
+    `source` LowCardinality(String),
+    `last_queried_at` DateTime64(3) DEFAULT now64(3),
+    `query_count` UInt64 DEFAULT 1
+)
+ENGINE = ReplacingMergeTree(last_queried_at)
+ORDER BY (tenant_id, signal_type, signal_name, source)
+TTL toDateTime(last_queried_at) + INTERVAL 90 DAY DELETE
+SETTINGS index_granularity = 8192",
+
+    // ── RUM (Real User Monitoring) events (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.rum_events
 (
-    Timestamp          DateTime64(9) CODEC(Delta(8), ZSTD(1)),
-    TimestampTime      DateTime DEFAULT toDateTime(Timestamp),
-    AppName            LowCardinality(String) CODEC(ZSTD(1)),
-    AppVersion         LowCardinality(String) CODEC(ZSTD(1)),
-    Environment        LowCardinality(String) CODEC(ZSTD(1)),
-    SessionId          String CODEC(ZSTD(1)),
-    UserId             String CODEC(ZSTD(1)),
-    PageUrl            String CODEC(ZSTD(1)),
-    PagePath           String CODEC(ZSTD(1)),
-    ViewName           String CODEC(ZSTD(1)),
-    Referrer           String CODEC(ZSTD(1)),
-    BrowserName        LowCardinality(String) CODEC(ZSTD(1)),
-    BrowserVersion     LowCardinality(String) CODEC(ZSTD(1)),
-    OsName             LowCardinality(String) CODEC(ZSTD(1)),
-    OsVersion          LowCardinality(String) CODEC(ZSTD(1)),
-    DeviceType         LowCardinality(String) CODEC(ZSTD(1)),
-    ScreenWidth        UInt16 CODEC(ZSTD(1)),
-    ScreenHeight       UInt16 CODEC(ZSTD(1)),
-    EventType          LowCardinality(String) CODEC(ZSTD(1)),
-    EventName          String CODEC(ZSTD(1)),
-    VitalName          LowCardinality(String) CODEC(ZSTD(1)),
-    VitalValue         Float64 CODEC(Gorilla, ZSTD(1)),
-    VitalRating        LowCardinality(String) CODEC(ZSTD(1)),
-    ErrorMessage       String CODEC(ZSTD(1)),
-    ErrorStack         String CODEC(ZSTD(1)),
-    ErrorType          LowCardinality(String) CODEC(ZSTD(1)),
-    InteractionTarget  String CODEC(ZSTD(1)),
-    InteractionType    LowCardinality(String) CODEC(ZSTD(1)),
-    DurationMs         Float64 CODEC(Gorilla, ZSTD(1)),
-    TraceId            String CODEC(ZSTD(1)),
-    SpanId             String CODEC(ZSTD(1)),
-    Attributes         String CODEC(ZSTD(1)),
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    `TimestampTime` DateTime DEFAULT toDateTime(Timestamp),
+    `AppName` LowCardinality(String) CODEC(ZSTD(1)),
+    `AppVersion` LowCardinality(String) CODEC(ZSTD(1)),
+    `Environment` LowCardinality(String) CODEC(ZSTD(1)),
+    `SessionId` String CODEC(ZSTD(1)),
+    `UserId` String CODEC(ZSTD(1)),
+    `PageUrl` String CODEC(ZSTD(1)),
+    `PagePath` String CODEC(ZSTD(1)),
+    `ViewName` String CODEC(ZSTD(1)),
+    `Referrer` String CODEC(ZSTD(1)),
+    `BrowserName` LowCardinality(String) CODEC(ZSTD(1)),
+    `BrowserVersion` LowCardinality(String) CODEC(ZSTD(1)),
+    `OsName` LowCardinality(String) CODEC(ZSTD(1)),
+    `OsVersion` LowCardinality(String) CODEC(ZSTD(1)),
+    `DeviceType` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScreenWidth` UInt16 CODEC(ZSTD(1)),
+    `ScreenHeight` UInt16 CODEC(ZSTD(1)),
+    `EventType` LowCardinality(String) CODEC(ZSTD(1)),
+    `EventName` String CODEC(ZSTD(1)),
+    `VitalName` LowCardinality(String) CODEC(ZSTD(1)),
+    `VitalValue` Float64 CODEC(Gorilla, ZSTD(1)),
+    `VitalRating` LowCardinality(String) CODEC(ZSTD(1)),
+    `ErrorMessage` String CODEC(ZSTD(1)),
+    `ErrorStack` String CODEC(ZSTD(1)),
+    `ErrorType` LowCardinality(String) CODEC(ZSTD(1)),
+    `InteractionTarget` String CODEC(ZSTD(1)),
+    `InteractionType` LowCardinality(String) CODEC(ZSTD(1)),
+    `DurationMs` Float64 CODEC(Gorilla, ZSTD(1)),
+    `TraceId` String CODEC(ZSTD(1)),
+    `SpanId` String CODEC(ZSTD(1)),
+    `Attributes` String CODEC(ZSTD(1)),
     INDEX idx_session_id SessionId TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_user_id UserId TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
@@ -443,11 +467,62 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 )
 ENGINE = MergeTree
 PARTITION BY toDate(TimestampTime)
-PRIMARY KEY (AppName, EventType, TimestampTime)
-ORDER BY (AppName, EventType, TimestampTime, Timestamp)
+PRIMARY KEY (tenant_id, AppName, EventType, TimestampTime)
+ORDER BY (tenant_id, AppName, EventType, TimestampTime, Timestamp)
 TTL toDateTime(Timestamp) + INTERVAL 14 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+
+    // ── Tenant usage metering (per-tenant ingest volume tracking) ──
+    r"CREATE TABLE IF NOT EXISTS observability.tenant_usage
+(
+    `tenant_id` LowCardinality(String),
+    `signal` LowCardinality(String),
+    `bucket` DateTime DEFAULT toStartOfHour(now()),
+    `events_count` UInt64,
+    `bytes_count` UInt64
+)
+ENGINE = SummingMergeTree()
+ORDER BY (tenant_id, signal, bucket)
+TTL bucket + INTERVAL 400 DAY DELETE
+SETTINGS index_granularity = 8192",
+
 ];
+
+/// Row-level security policies for tenant isolation (defense-in-depth).
+///
+/// These are applied ONLY when ClickHouse is configured with
+/// `custom_settings_prefixes = 'rush_'`. Without that server config,
+/// `getSetting('rush_tenant_id')` is a hard error that breaks all queries.
+///
+/// Call `apply_row_policies()` after `probe_row_policy_support()` confirms
+/// the custom setting is accepted.
+const ROW_POLICY_TABLES: &[&str] = &[
+    "otel_traces",
+    "otel_logs",
+    "wide_events",
+    "otel_metrics_gauge",
+    "otel_metrics_sum",
+    "otel_metrics_histogram",
+    "otel_metrics_exponential_histogram",
+    "otel_metrics_summary",
+    "rum_events",
+];
+
+/// Create row policies on all tenant-scoped tables. Only safe to call when
+/// ClickHouse supports the `rush_tenant_id` custom setting.
+pub async fn apply_row_policies(client: &Client) {
+    tracing::info!("applying row-level security policies ({} tables)", ROW_POLICY_TABLES.len());
+    for table in ROW_POLICY_TABLES {
+        let sql = format!(
+            "CREATE ROW POLICY IF NOT EXISTS tenant_isolation ON observability.{table} \
+             FOR SELECT USING tenant_id = getSetting('rush_tenant_id') OR getSetting('rush_tenant_id') = '' \
+             TO ALL"
+        );
+        if let Err(e) = client.query(&sql).execute().await {
+            tracing::warn!("failed to create row policy on {table}: {e}");
+        }
+    }
+}
 
 /// Run all migrations against ClickHouse.
 ///

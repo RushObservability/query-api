@@ -1,13 +1,15 @@
 use clickhouse::Client;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{MetricRetentionRule, TraceRetentionRule, RushConfig};
+use crate::config_db::ConfigDb;
 
 /// Spawn the retention enforcer as a background task (fire-and-forget).
 /// Follows the same pattern as `alert_engine::spawn_alert_engine`.
-pub fn spawn_retention_enforcer(ch: Client, config: RushConfig) {
+pub fn spawn_retention_enforcer(ch: Client, config: RushConfig, config_db: Arc<ConfigDb>) {
     if !config.retention.enforcer.enabled {
-        tracing::info!("retention enforcer: disabled by config");
+        tracing::info!(engine = "retention", "retention enforcer disabled by config");
         return;
     }
 
@@ -18,14 +20,20 @@ pub fn spawn_retention_enforcer(ch: Client, config: RushConfig) {
         // Wait 60s on startup to let tables settle
         tokio::time::sleep(Duration::from_secs(60)).await;
         tracing::info!(
-            "retention enforcer: started (interval={interval_secs}s, dry_run={dry_run})"
+            engine = "retention",
+            interval_secs = interval_secs,
+            dry_run = dry_run,
+            "retention enforcer started"
         );
 
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
             if let Err(e) = enforce_retention(&ch, &config).await {
-                tracing::error!("retention enforcer error: {e}");
+                tracing::error!(error = %e, engine = "retention", "global retention enforcement failed");
+            }
+            if let Err(e) = enforce_tenant_retention(&ch, &config, &config_db).await {
+                tracing::error!(error = %e, engine = "retention", "tenant retention enforcement failed");
             }
         }
     });
@@ -157,11 +165,124 @@ fn build_trace_where_wide(rule: &TraceRetentionRule) -> Option<String> {
 
 async fn execute_or_log(ch: &Client, sql: &str, dry_run: bool) {
     if dry_run {
-        tracing::info!("retention enforcer [DRY RUN]: {sql}");
+        tracing::info!(engine = "retention", dry_run = true, "would execute retention delete");
         return;
     }
-    tracing::debug!("retention enforcer: {sql}");
+    tracing::debug!(engine = "retention", "executing retention delete");
     if let Err(e) = ch.query(sql).execute().await {
-        tracing::warn!("retention enforcer delete failed: {e}");
+        tracing::warn!(error = %e, engine = "retention", "retention delete failed");
     }
+}
+
+/// Enforce per-tenant retention overrides via active DELETE mutations.
+///
+/// ClickHouse TTLs are table-level and cannot vary per tenant_id. For tenants
+/// with SHORTER retention than the global TTL, we issue
+/// `ALTER TABLE ... DELETE WHERE tenant_id = '...' AND toDate(ts) < today() - N`.
+///
+/// Tenants wanting LONGER retention than global are not supported (the global
+/// TTL will have already removed the data).
+async fn enforce_tenant_retention(
+    ch: &Client,
+    config: &RushConfig,
+    config_db: &ConfigDb,
+) -> anyhow::Result<()> {
+    let dry_run = config.retention.enforcer.dry_run;
+
+    let overrides = config_db.list_all_tenant_retention()?;
+    if overrides.is_empty() {
+        return Ok(());
+    }
+
+    tracing::debug!(
+        engine = "retention",
+        tenant_overrides = overrides.len(),
+        "processing tenant retention overrides"
+    );
+
+    let global_metrics = config.effective_metrics_ttl_days() as i32;
+    let global_traces = config.effective_traces_ttl_days() as i32;
+    let global_logs = config.effective_logs_ttl_days() as i32;
+
+    for (tenant_id, signal, retain_days) in &overrides {
+        let global_days = match signal.as_str() {
+            "metrics" => global_metrics,
+            "traces" => global_traces,
+            "logs" => global_logs,
+            other => {
+                tracing::warn!(
+                    engine = "retention",
+                    tenant_id = %tenant_id,
+                    signal = %other,
+                    "unknown signal type, skipping"
+                );
+                continue;
+            }
+        };
+
+        // Only enforce if the tenant wants SHORTER retention than global.
+        // Longer retention is not possible — the global TTL already dropped the data.
+        if *retain_days >= global_days {
+            tracing::debug!(
+                engine = "retention",
+                tenant_id = %tenant_id,
+                signal = %signal,
+                retain_days = retain_days,
+                global_days = global_days,
+                "tenant retention >= global, skipping"
+            );
+            continue;
+        }
+
+        // Escape single quotes in tenant_id to prevent SQL injection
+        let safe_tenant_id = tenant_id.replace('\'', "''");
+
+        match signal.as_str() {
+            "metrics" => {
+                let metric_tables = [
+                    "otel_metrics_gauge",
+                    "otel_metrics_sum",
+                    "otel_metrics_histogram",
+                    "otel_metrics_exponential_histogram",
+                    "otel_metrics_summary",
+                ];
+                for table in metric_tables {
+                    let sql = format!(
+                        "ALTER TABLE observability.{table} DELETE \
+                         WHERE tenant_id = '{safe_tenant_id}' \
+                         AND toDate(TimeUnix) < today() - {retain_days}"
+                    );
+                    execute_or_log(ch, &sql, dry_run).await;
+                }
+            }
+            "traces" => {
+                // otel_traces
+                let sql = format!(
+                    "ALTER TABLE observability.otel_traces DELETE \
+                     WHERE tenant_id = '{safe_tenant_id}' \
+                     AND toDate(Timestamp) < today() - {retain_days}"
+                );
+                execute_or_log(ch, &sql, dry_run).await;
+
+                // wide_events
+                let sql = format!(
+                    "ALTER TABLE observability.wide_events DELETE \
+                     WHERE tenant_id = '{safe_tenant_id}' \
+                     AND toDate(timestamp) < today() - {retain_days}"
+                );
+                execute_or_log(ch, &sql, dry_run).await;
+            }
+            "logs" => {
+                let sql = format!(
+                    "ALTER TABLE observability.otel_logs DELETE \
+                     WHERE tenant_id = '{safe_tenant_id}' \
+                     AND toDate(Timestamp) < today() - {retain_days}"
+                );
+                execute_or_log(ch, &sql, dry_run).await;
+            }
+            _ => {} // already handled above
+        }
+    }
+
+    Ok(())
 }

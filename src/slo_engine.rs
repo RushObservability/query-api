@@ -329,7 +329,7 @@ async fn eval_slos(
             let channel_ids: Vec<String> = serde_json::from_str(&slo.notification_channel_ids)
                 .unwrap_or_default();
             for channel_id in &channel_ids {
-                if let Ok(Some(channel)) = config_db.get_channel(channel_id) {
+                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
                     let config: serde_json::Value = serde_json::from_str(&channel.config)
                         .unwrap_or(serde_json::json!({}));
                     if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
