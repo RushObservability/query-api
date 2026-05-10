@@ -534,6 +534,8 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/service-links/{service_name}",
             delete(handlers::service_links::delete_service_link),
         )
+        // Feature flags (public — no auth)
+        .route("/api/v1/features", get(handlers::settings::get_features))
         // API Keys (settings)
         .route(
             "/api/v1/api-keys",
