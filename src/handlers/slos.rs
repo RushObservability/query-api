@@ -1,11 +1,12 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 
 use crate::AppState;
+use crate::handlers::users::require_write;
 use crate::models::slo::*;
 
 const VALID_WINDOWS: [&str; 4] = ["rolling_1h", "rolling_24h", "rolling_7d", "rolling_30d"];
@@ -26,8 +27,10 @@ pub async fn list_slos(
 
 pub async fn create_slo(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateSloRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid slo_type: {}", req.slo_type)));
     }
@@ -123,9 +126,11 @@ pub async fn get_slo(
 
 pub async fn update_slo(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateSloRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid slo_type: {}", req.slo_type)));
     }
@@ -201,8 +206,10 @@ pub async fn update_slo(
 
 pub async fn delete_slo(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_slo(&id)

@@ -2552,8 +2552,12 @@ impl ConfigDb {
         let mut stmt = conn
             .prepare(
                 "SELECT u.id, u.username, u.password_hash, u.display_name, u.tenant_id, \
-                 CASE WHEN EXISTS(SELECT 1 FROM user_groups WHERE user_id = u.id AND group_id = 'admins') \
-                      THEN 'admin' ELSE 'viewer' END as role \
+                 CASE \
+                   WHEN EXISTS(SELECT 1 FROM user_groups ug JOIN groups g ON ug.group_id = g.id \
+                               WHERE ug.user_id = u.id AND g.permissions LIKE '%\"admin\"%') THEN 'admin' \
+                   WHEN EXISTS(SELECT 1 FROM user_groups ug JOIN groups g ON ug.group_id = g.id \
+                               WHERE ug.user_id = u.id AND g.permissions LIKE '%\"write\"%') THEN 'write' \
+                   ELSE 'viewer' END as role \
                  FROM users u WHERE u.username = ?1 AND u.enabled = 1",
             )
             .ok()?;
@@ -2608,8 +2612,12 @@ impl ConfigDb {
         let mut stmt = conn
             .prepare(
                 "SELECT u.id, u.username, u.display_name, u.tenant_id, \
-                 CASE WHEN EXISTS(SELECT 1 FROM user_groups WHERE user_id = u.id AND group_id = 'admins') \
-                      THEN 'admin' ELSE 'viewer' END as role \
+                 CASE \
+                   WHEN EXISTS(SELECT 1 FROM user_groups ug JOIN groups g ON ug.group_id = g.id \
+                               WHERE ug.user_id = u.id AND g.permissions LIKE '%\"admin\"%') THEN 'admin' \
+                   WHEN EXISTS(SELECT 1 FROM user_groups ug JOIN groups g ON ug.group_id = g.id \
+                               WHERE ug.user_id = u.id AND g.permissions LIKE '%\"write\"%') THEN 'write' \
+                   ELSE 'viewer' END as role \
                  FROM sessions s \
                  JOIN users u ON s.user_id = u.id \
                  WHERE s.token = ?1 \

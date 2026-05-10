@@ -2,12 +2,13 @@ use axum::{
     Extension,
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::handlers::users::require_write;
 use crate::models::alert::*;
 
 pub async fn list_channels(
@@ -24,9 +25,11 @@ pub async fn list_channels(
 
 pub async fn create_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateChannelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let valid_types = ["webhook", "slack", "email", "pagerduty", "opsgenie"];
     if !valid_types.contains(&req.channel_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid channel_type: {}", req.channel_type)));
@@ -55,10 +58,12 @@ pub async fn create_channel(
 
 pub async fn update_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
     Json(req): Json<UpdateChannelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let config = serde_json::to_string(&req.config)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
@@ -81,9 +86,11 @@ pub async fn update_channel(
 
 pub async fn delete_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_channel(&id, &tenant.tenant_id)
@@ -213,8 +220,10 @@ pub async fn list_alerts(
 
 pub async fn create_alert(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateAlertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let valid_ops = [">", ">=", "<", "<=", "=", "!="];
     if !valid_ops.contains(&req.condition_op.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid condition_op: {}", req.condition_op)));
@@ -277,9 +286,11 @@ pub async fn get_alert(
 
 pub async fn update_alert(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateAlertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let valid_ops = [">", ">=", "<", "<=", "=", "!="];
     if !valid_ops.contains(&req.condition_op.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid condition_op: {}", req.condition_op)));
@@ -324,8 +335,10 @@ pub async fn update_alert(
 
 pub async fn delete_alert(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_alert(&id)

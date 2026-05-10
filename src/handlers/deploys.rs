@@ -1,17 +1,20 @@
 use axum::{
     Json,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 
 use crate::AppState;
+use crate::handlers::users::require_write;
 use crate::models::deploy::*;
 
 pub async fn create_deploy(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateDeployMarkerRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let id = uuid::Uuid::new_v4().to_string();
     state
         .config_db

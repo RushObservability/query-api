@@ -2,12 +2,13 @@ use axum::{
     Extension,
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::handlers::users::require_write;
 use crate::models::monitor::*;
 use crate::monitor_engine;
 
@@ -37,9 +38,11 @@ pub async fn list_monitors(
 /// POST /api/v1/monitors — create monitor
 pub async fn create_monitor(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -171,10 +174,12 @@ pub async fn get_monitor(
 /// PUT /api/v1/monitors/{id} — update monitor
 pub async fn update_monitor(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
     Json(req): Json<UpdateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -280,9 +285,11 @@ pub async fn update_monitor(
 /// DELETE /api/v1/monitors/{id} — delete monitor
 pub async fn delete_monitor(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_monitor(&id, &tenant.tenant_id)
@@ -336,9 +343,11 @@ pub async fn preview_monitor(
 /// POST /api/v1/monitors/{id}/mute — mute (disable) a monitor
 pub async fn mute_monitor(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let updated = state
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, false)
@@ -352,9 +361,11 @@ pub async fn mute_monitor(
 /// POST /api/v1/monitors/{id}/unmute — unmute (enable) a monitor
 pub async fn unmute_monitor(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let updated = state
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, true)

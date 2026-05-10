@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension,
 };
@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::handlers::users::require_write;
 use crate::models::anomaly::*;
 
 pub async fn analyze_anomaly_event(
@@ -229,8 +230,10 @@ pub async fn list_anomaly_rules(
 
 pub async fn create_anomaly_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid source: {}", req.source)));
@@ -294,9 +297,11 @@ pub async fn get_anomaly_rule(
 
 pub async fn update_anomaly_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid source: {}", req.source)));
@@ -342,8 +347,10 @@ pub async fn update_anomaly_rule(
 
 pub async fn delete_anomaly_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_anomaly_rule(&id)
