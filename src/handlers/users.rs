@@ -13,7 +13,6 @@ pub struct CreateUserRequest {
     pub username: String,
     pub password: String,
     pub display_name: Option<String>,
-    pub role: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -32,7 +31,6 @@ pub struct UserResponse {
     pub username: String,
     pub display_name: String,
     pub tenant_id: String,
-    pub role: String,
     pub enabled: bool,
     pub created_at: String,
 }
@@ -69,15 +67,14 @@ pub(crate) fn require_admin(
     Ok(caller)
 }
 
-fn user_response(row: (String, String, String, String, String, bool, String)) -> UserResponse {
+fn user_response(row: (String, String, String, String, bool, String)) -> UserResponse {
     UserResponse {
         id: row.0,
         username: row.1,
         display_name: row.2,
         tenant_id: row.3,
-        role: row.4,
-        enabled: row.5,
-        created_at: row.6,
+        enabled: row.4,
+        created_at: row.5,
     }
 }
 
@@ -116,12 +113,16 @@ pub async fn create_user(
     }
 
     let display_name = req.display_name.as_deref().unwrap_or("").to_string();
-    let role = req.role.as_deref().unwrap_or("viewer").to_string();
 
     let id = state
         .config_db
-        .create_user(&username, &password, &display_name, "default", &role)
+        .create_user(&username, &password, &display_name)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+    // New users default to the viewers group
+    let _ = state
+        .config_db
+        .set_user_groups(&id, &["viewers".to_string()]);
 
     let row = state
         .config_db

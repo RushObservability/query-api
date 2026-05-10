@@ -107,28 +107,45 @@ fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
         let tenant = val.trim();
         if !tenant.is_empty() {
             if state.config_db.is_tenant_enabled(tenant) {
-                if state.config_db.is_tenant_auth_required(tenant) {
-                    // Locked tenant: header alone isn't enough. Check if we have
-                    // a valid session (authenticated user can switch to any tenant).
-                    let has_session = req.headers().get("cookie")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|c| c.contains("rush_session="))
-                        .unwrap_or(false);
-                    if has_session {
-                        if let Some(token) = handlers::auth::extract_session_cookie(req.headers()) {
-                            if state.config_db.get_session_user(&token).is_some() {
-                                return tenant.to_string();
+                // If the request carries a session cookie, validate the user has
+                // group-based access to the requested tenant.
+                if let Some(token) = handlers::auth::extract_session_cookie(req.headers()) {
+                    if let Some((user_id, _username, _display_name, _tid, role)) =
+                        state.config_db.get_session_user(&token)
+                    {
+                        if role == "admin" {
+                            // Admins can access any enabled tenant
+                            return tenant.to_string();
+                        }
+                        // Non-admins: resolve accessible tenant IDs and check
+                        if let Ok((_, _, accessible_ids)) =
+                            state.config_db.resolve_user_permissions(&user_id)
+                        {
+                            // accessible_ids are UUIDs; resolve the requested
+                            // tenant name to an ID for comparison
+                            if let Ok(Some(tenant_id)) =
+                                state.config_db.get_tenant_id_by_name(tenant)
+                            {
+                                if accessible_ids.contains(&tenant_id) {
+                                    return tenant.to_string();
+                                }
                             }
                         }
+                        tracing::debug!(
+                            tenant = %tenant,
+                            "X-Rush-Tenant rejected: user lacks group access"
+                        );
+                        // Fall through to session default tenant
                     }
+                } else if !state.config_db.is_tenant_auth_required(tenant) {
+                    // No session + open tenant: header is enough (for collectors)
+                    return tenant.to_string();
+                } else {
                     tracing::debug!(
                         tenant_id = %tenant,
                         method = "header",
                         "tenant requires auth — X-Rush-Tenant header rejected without valid session/API key"
                     );
-                } else {
-                    // Open tenant: header is enough
-                    return tenant.to_string();
                 }
             } else {
                 tracing::debug!(tenant_id = %tenant, method = "header", "tenant disabled or missing, falling through");
