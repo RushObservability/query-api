@@ -67,6 +67,18 @@ pub(crate) fn require_admin(
     Ok(caller)
 }
 
+/// Require that the caller has write access (admin or write role).
+pub(crate) fn require_write(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String, String, String, String), (StatusCode, String)> {
+    let caller = require_auth(state, headers)?;
+    if caller.4 != "admin" && caller.4 != "write" {
+        return Err((StatusCode::FORBIDDEN, "write role required".to_string()));
+    }
+    Ok(caller)
+}
+
 fn user_response(row: (String, String, String, String, bool, String)) -> UserResponse {
     UserResponse {
         id: row.0,

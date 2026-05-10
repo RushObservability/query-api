@@ -8,6 +8,7 @@ use axum::{
 use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::auth::extract_session_cookie;
+use crate::handlers::users::require_write;
 use crate::models::dashboard::*;
 
 /// Extract the calling user from the session cookie.
@@ -46,6 +47,7 @@ pub async fn create_dashboard(
     headers: HeaderMap,
     Json(req): Json<CreateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant);
 
     // Validate visibility
@@ -260,6 +262,7 @@ pub async fn import_dashboard(
     headers: HeaderMap,
     Json(req): Json<ImportDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let (user_id, _, _, _, role) = resolve_caller(&state, &headers, &tenant);
     let dashboard = state
         .config_db
@@ -287,6 +290,7 @@ pub async fn create_from_template(
     Path(template_id): Path<String>,
     Json(req): Json<CreateFromTemplateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant);
 
     let template = state

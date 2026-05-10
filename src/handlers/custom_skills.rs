@@ -1,12 +1,13 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use regex::Regex;
 
 use crate::AppState;
+use crate::handlers::users::require_write;
 use crate::models::custom_skills::{
     CreateCustomSkillRequest, CustomSkill, UpdateCustomSkillRequest,
 };
@@ -147,8 +148,10 @@ pub async fn get_custom_skill(
 
 pub async fn create_custom_skill(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     validate_skill_fields(
         &req.name,
         &req.title,
@@ -180,9 +183,11 @@ pub async fn create_custom_skill(
 
 pub async fn update_custom_skill(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     // Fetch the existing skill so we can validate against its immutable name.
     let existing = state
         .config_db
@@ -210,8 +215,10 @@ pub async fn update_custom_skill(
 
 pub async fn delete_custom_skill(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_custom_skill(&id)

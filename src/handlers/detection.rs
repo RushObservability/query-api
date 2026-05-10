@@ -1,13 +1,14 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension,
 };
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::handlers::users::require_write;
 use crate::models::detection::*;
 
 #[derive(Debug, serde::Deserialize)]
@@ -39,9 +40,11 @@ pub async fn list_detection_rules(
 /// Create a detection rule under the caller's tenant.
 pub async fn create_detection_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateDetectionRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let valid_severities = ["critical", "high", "medium", "low", "info"];
     if !valid_severities.contains(&req.severity.as_str()) {
         return Err((
@@ -115,10 +118,12 @@ pub async fn get_detection_rule(
 /// Update a detection rule.
 pub async fn update_detection_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDetectionRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     let valid_severities = ["critical", "high", "medium", "low", "info"];
     if !valid_severities.contains(&req.severity.as_str()) {
         return Err((
@@ -181,9 +186,11 @@ pub async fn update_detection_rule(
 /// Delete a detection rule.
 pub async fn delete_detection_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers)?;
     // Verify ownership
     let existing = state
         .config_db
