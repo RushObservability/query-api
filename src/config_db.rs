@@ -2397,6 +2397,15 @@ impl ConfigDb {
         Ok(rows.next().transpose()?)
     }
 
+    pub fn get_tenant_id_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tenants WHERE name = ?1 AND enabled = 1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |row| row.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn set_tenant_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count = conn.execute(
@@ -2542,8 +2551,10 @@ impl ConfigDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, username, password_hash, display_name, tenant_id, role \
-                 FROM users WHERE username = ?1 AND enabled = 1",
+                "SELECT u.id, u.username, u.password_hash, u.display_name, u.tenant_id, \
+                 CASE WHEN EXISTS(SELECT 1 FROM user_groups WHERE user_id = u.id AND group_id = 'admins') \
+                      THEN 'admin' ELSE 'viewer' END as role \
+                 FROM users u WHERE u.username = ?1 AND u.enabled = 1",
             )
             .ok()?;
         let mut rows = stmt
@@ -2588,6 +2599,7 @@ impl ConfigDb {
 
     /// Look up a session token, verify it has not expired, and return the
     /// associated user info: (user_id, username, display_name, tenant_id, role).
+    /// Role is derived from group membership (admins group = "admin", else "viewer").
     pub fn get_session_user(
         &self,
         token: &str,
@@ -2595,7 +2607,9 @@ impl ConfigDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT u.id, u.username, u.display_name, u.tenant_id, u.role \
+                "SELECT u.id, u.username, u.display_name, u.tenant_id, \
+                 CASE WHEN EXISTS(SELECT 1 FROM user_groups WHERE user_id = u.id AND group_id = 'admins') \
+                      THEN 'admin' ELSE 'viewer' END as role \
                  FROM sessions s \
                  JOIN users u ON s.user_id = u.id \
                  WHERE s.token = ?1 \
@@ -2623,14 +2637,14 @@ impl ConfigDb {
         let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![token]);
     }
 
-    /// List all users. Returns (id, username, display_name, tenant_id, role, enabled, created_at).
-    /// Does NOT return password_hash.
+    /// List all users. Returns (id, username, display_name, tenant_id, enabled, created_at).
+    /// Does NOT return password_hash or role (role is derived from group membership).
     pub fn list_users(
         &self,
-    ) -> anyhow::Result<Vec<(String, String, String, String, String, bool, String)>> {
+    ) -> anyhow::Result<Vec<(String, String, String, String, bool, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, username, display_name, tenant_id, role, enabled, created_at \
+            "SELECT id, username, display_name, tenant_id, enabled, created_at \
              FROM users ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -2640,9 +2654,8 @@ impl ConfigDb {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, bool>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2655,8 +2668,6 @@ impl ConfigDb {
         username: &str,
         password: &str,
         display_name: &str,
-        tenant_id: &str,
-        role: &str,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let password_hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
@@ -2664,9 +2675,9 @@ impl ConfigDb {
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO users (id, username, password_hash, display_name, tenant_id, role) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, username, password_hash, display_name, tenant_id, role],
+            "INSERT INTO users (id, username, password_hash, display_name) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, username, password_hash, display_name],
         )?;
         Ok(id)
     }
@@ -2680,14 +2691,14 @@ impl ConfigDb {
         Ok(count > 0)
     }
 
-    /// Get a single user by id. Returns (id, username, display_name, tenant_id, role, enabled, created_at).
+    /// Get a single user by id. Returns (id, username, display_name, tenant_id, enabled, created_at).
     pub fn get_user(
         &self,
         id: &str,
-    ) -> anyhow::Result<Option<(String, String, String, String, String, bool, String)>> {
+    ) -> anyhow::Result<Option<(String, String, String, String, bool, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, username, display_name, tenant_id, role, enabled, created_at \
+            "SELECT id, username, display_name, tenant_id, enabled, created_at \
              FROM users WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -2696,9 +2707,8 @@ impl ConfigDb {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, bool>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         Ok(rows.next().transpose()?)
@@ -2756,7 +2766,16 @@ impl ConfigDb {
             [],
         )?;
 
-        // Bind both groups to all existing tenants
+        // Remove any stale auto-bindings of viewers to tenants (legacy behavior).
+        // viewers group should have no tenant access by default.
+        conn.execute(
+            "DELETE FROM group_tenants WHERE group_id = 'viewers'",
+            [],
+        )?;
+
+        // Bind only the admins group to all existing tenants.
+        // The viewers group intentionally has no default tenant bindings — tenant access
+        // must be granted explicitly so non-admin users only see their assigned tenants.
         let tenant_ids: Vec<String> = {
             let mut stmt = conn.prepare("SELECT id FROM tenants")?;
             stmt.query_map([], |row| row.get::<_, String>(0))?
@@ -2768,13 +2787,10 @@ impl ConfigDb {
                 "INSERT OR IGNORE INTO group_tenants (group_id, tenant_id) VALUES ('admins', ?1)",
                 params![tid],
             )?;
-            conn.execute(
-                "INSERT OR IGNORE INTO group_tenants (group_id, tenant_id) VALUES ('viewers', ?1)",
-                params![tid],
-            )?;
         }
 
-        // Add existing admin users to admins group, all others to viewers group
+        // Assign a default group only to users who have no group memberships yet.
+        // Users with explicit group assignments are left untouched.
         let users: Vec<(String, String)> = {
             let mut stmt = conn.prepare("SELECT id, role FROM users")?;
             stmt.query_map([], |row| {
@@ -2784,16 +2800,24 @@ impl ConfigDb {
         };
 
         for (uid, role) in &users {
-            if role == "admin" {
-                conn.execute(
-                    "INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?1, 'admins')",
-                    params![uid],
-                )?;
-            } else {
-                conn.execute(
-                    "INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?1, 'viewers')",
-                    params![uid],
-                )?;
+            let already_assigned: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM user_groups WHERE user_id = ?1",
+                params![uid],
+                |row| row.get(0),
+            ).unwrap_or(0);
+
+            if already_assigned == 0 {
+                if role == "admin" {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?1, 'admins')",
+                        params![uid],
+                    )?;
+                } else {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?1, 'viewers')",
+                        params![uid],
+                    )?;
+                }
             }
         }
 

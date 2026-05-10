@@ -7,7 +7,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::handlers::users::require_admin;
+use crate::handlers::users::{require_admin, require_auth};
 
 #[derive(serde::Deserialize)]
 pub struct CreateTenantRequest {
@@ -37,22 +37,44 @@ pub async fn list_tenants(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    let caller = require_auth(&state, &headers)?;
+
     let rows = state
         .config_db
         .list_tenants()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
-    let tenants: Vec<TenantResponse> = rows
-        .into_iter()
-        .map(|(id, name, enabled, auth_required, created_at)| TenantResponse {
-            id,
-            name,
-            enabled,
-            auth_required,
-            created_at,
-        })
-        .collect();
+    let tenants: Vec<TenantResponse> = if caller.4 == "admin" {
+        // Admins see all tenants
+        rows.into_iter()
+            .map(|(id, name, enabled, auth_required, created_at)| TenantResponse {
+                id,
+                name,
+                enabled,
+                auth_required,
+                created_at,
+            })
+            .collect()
+    } else {
+        // Non-admins see only tenants accessible via their groups
+        let (_, _, accessible_ids) = state
+            .config_db
+            .resolve_user_permissions(&caller.0)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        tracing::info!(user_id = %caller.0, username = %caller.1, accessible_tenant_ids = ?accessible_ids, "list_tenants: non-admin user");
+
+        rows.into_iter()
+            .filter(|(id, _, enabled, _, _)| *enabled && accessible_ids.contains(id))
+            .map(|(id, name, enabled, auth_required, created_at)| TenantResponse {
+                id,
+                name,
+                enabled,
+                auth_required,
+                created_at,
+            })
+            .collect()
+    };
 
     Ok(Json(serde_json::json!({ "tenants": tenants })))
 }
