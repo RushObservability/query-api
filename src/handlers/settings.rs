@@ -80,6 +80,35 @@ pub async fn create_api_key(
     }))
 }
 
+/// GET /api/v1/features — public, no auth required.
+/// Returns which optional integrations are enabled so the UI can hide/show nav items.
+pub async fn get_features(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let argocd_enabled = std::env::var("ARGOCD_NAMESPACE").is_ok()
+        || state
+            .config_db
+            .get_setting("argocd_enabled")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+    let sre_agent_enabled = std::env::var("LLM_API_KEY").is_ok()
+        || state
+            .config_db
+            .get_setting("sre_agent_enabled")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "argocd": argocd_enabled,
+        "sre_agent": sre_agent_enabled,
+    }))
+}
+
 pub async fn delete_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
