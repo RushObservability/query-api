@@ -104,6 +104,9 @@ pub async fn create_group(
     if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
+    if name.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "name must not exceed 100 characters".to_string()));
+    }
 
     let description = req.description.unwrap_or_default();
     let scopes = serde_json::to_string(&req.scopes.unwrap_or_else(|| vec!["all".to_string()]))

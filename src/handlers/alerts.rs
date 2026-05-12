@@ -30,6 +30,12 @@ pub async fn create_channel(
     Json(req): Json<CreateChannelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers)?;
+    if req.name.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
+    }
+    if req.name.len() > 255 {
+        return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
+    }
     let valid_types = ["webhook", "slack", "email", "pagerduty", "opsgenie"];
     if !valid_types.contains(&req.channel_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid channel_type: {}", req.channel_type)));
@@ -224,6 +230,15 @@ pub async fn create_alert(
     Json(req): Json<CreateAlertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers)?;
+    if req.name.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
+    }
+    if req.name.len() > 255 {
+        return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
+    }
+    if req.description.len() > 1024 {
+        return Err((StatusCode::BAD_REQUEST, "description must not exceed 1024 characters".to_string()));
+    }
     let valid_ops = [">", ">=", "<", "<=", "=", "!="];
     if !valid_ops.contains(&req.condition_op.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid condition_op: {}", req.condition_op)));

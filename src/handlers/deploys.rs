@@ -15,6 +15,21 @@ pub async fn create_deploy(
     Json(req): Json<CreateDeployMarkerRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers)?;
+    if req.service_name.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "service_name must not be empty".to_string()));
+    }
+    if req.service_name.len() > 255 {
+        return Err((StatusCode::BAD_REQUEST, "service_name must not exceed 255 characters".to_string()));
+    }
+    if req.version.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "version must not exceed 100 characters".to_string()));
+    }
+    if req.commit_sha.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "commit_sha must not exceed 100 characters".to_string()));
+    }
+    if req.description.len() > 1024 {
+        return Err((StatusCode::BAD_REQUEST, "description must not exceed 1024 characters".to_string()));
+    }
     let id = uuid::Uuid::new_v4().to_string();
     state
         .config_db

@@ -73,7 +73,10 @@ pub async fn analyze_anomaly_event(
                     let mut sorted: Vec<(String, u64)> = svc_totals.into_iter().collect();
                     sorted.sort_by(|a, b| b.1.cmp(&a.1));
                     sorted.truncate(10);
-                    let svc_names: Vec<String> = sorted.iter().map(|(n, _)| format!("'{}'", n.replace('\'', "''"))).collect();
+                    let svc_names: Vec<String> = sorted.iter()
+                        .filter(|(n, _)| n.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':')))
+                        .map(|(n, _)| format!("'{n}'"))
+                        .collect();
                     corr_services = sorted;
 
                     // Fetch logs for top services
@@ -469,7 +472,10 @@ pub async fn get_event_correlations(
 
     // 6. ClickHouse query — logs for top services
     let logs = if !services.is_empty() {
-        let svc_list: Vec<String> = services.iter().map(|s| format!("'{}'", s.name.replace('\'', "''"))).collect();
+        let svc_list: Vec<String> = services.iter()
+            .filter(|s| s.name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':')))
+            .map(|s| format!("'{}'", s.name))
+            .collect();
         let log_query = format!(
             "SELECT toString(Timestamp) as timestamp, \
                     ServiceName as service_name, \
