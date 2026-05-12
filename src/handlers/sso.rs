@@ -7,6 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::handlers::users::require_admin;
 use crate::saml;
 
 // ── SSO Types ──
@@ -433,8 +434,10 @@ pub async fn list_sso_providers(
 /// POST /api/v1/sso/providers -- Create or update an SSO provider
 pub async fn save_sso_provider(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<SaveSsoProviderRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // If updating and no new secret provided, keep the existing one
@@ -479,8 +482,10 @@ pub async fn save_sso_provider(
 /// DELETE /api/v1/sso/providers/{id} -- Delete an SSO provider
 pub async fn delete_sso_provider(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_sso_provider(&id)
@@ -521,8 +526,10 @@ pub async fn list_idp_group_mappings(
 /// POST /api/v1/sso/mappings -- Create a mapping
 pub async fn create_idp_group_mapping(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateMappingRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let provider_id = req.provider_id.as_deref().unwrap_or("default");
 
     let id = state
@@ -536,8 +543,10 @@ pub async fn create_idp_group_mapping(
 /// DELETE /api/v1/sso/mappings/{id} -- Delete a mapping
 pub async fn delete_idp_group_mapping(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
     let deleted = state
         .config_db
         .delete_idp_group_mapping(&id)

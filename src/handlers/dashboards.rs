@@ -50,6 +50,16 @@ pub async fn create_dashboard(
     require_write(&state, &headers)?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant);
 
+    if req.name.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
+    }
+    if req.name.len() > 255 {
+        return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
+    }
+    if req.description.len() > 1024 {
+        return Err((StatusCode::BAD_REQUEST, "description must not exceed 1024 characters".to_string()));
+    }
+
     // Validate visibility
     let visibility = match req.visibility.as_str() {
         "private" | "tenant" | "global" => &req.visibility,

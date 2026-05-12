@@ -119,12 +119,21 @@ pub async fn create_user(
     if username.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "username must not be empty".to_string()));
     }
+    if username.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "username must not exceed 100 characters".to_string()));
+    }
     let password = req.password.clone();
     if password.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "password must not be empty".to_string()));
     }
+    if password.len() > 1024 {
+        return Err((StatusCode::BAD_REQUEST, "password must not exceed 1024 characters".to_string()));
+    }
 
     let display_name = req.display_name.as_deref().unwrap_or("").to_string();
+    if display_name.len() > 255 {
+        return Err((StatusCode::BAD_REQUEST, "display_name must not exceed 255 characters".to_string()));
+    }
 
     let id = state
         .config_db
