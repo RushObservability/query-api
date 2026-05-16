@@ -395,6 +395,19 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/alerts/{id}/events",
             get(handlers::alerts::list_alert_events),
         )
+        // Trace Funnels
+        .route(
+            "/api/v1/funnels",
+            get(handlers::funnels::list_funnels).post(handlers::funnels::create_funnel),
+        )
+        .route(
+            "/api/v1/funnels/{id}",
+            delete(handlers::funnels::delete_funnel),
+        )
+        .route(
+            "/api/v1/funnels/{id}/run",
+            post(handlers::funnels::run_funnel),
+        )
         // Maintenance Windows
         .route(
             "/api/v1/maintenance-windows",

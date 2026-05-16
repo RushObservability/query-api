@@ -13,6 +13,7 @@ pub mod deploys;
 pub mod detection;
 pub mod groups;
 pub mod health;
+pub mod funnels;
 pub mod logs;
 pub mod maintenance;
 pub mod metrics;
