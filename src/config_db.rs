@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, OptionalExtension};
 use std::sync::Mutex;
 
 pub struct ConfigDb {
@@ -441,6 +441,24 @@ impl ConfigDb {
                 signal      TEXT NOT NULL,
                 retain_days INTEGER NOT NULL,
                 PRIMARY KEY (tenant_id, signal)
+            );
+
+            -- ── Alert Maintenance Windows ────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS alert_maintenance_windows (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                scope       TEXT NOT NULL DEFAULT 'all',
+                starts_at   TEXT NOT NULL,
+                ends_at     TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+
+            -- ── Trace Funnels ────────────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS trace_funnels (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                steps_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
         ")?;
 
@@ -4388,5 +4406,91 @@ impl ConfigDb {
             params![id, tenant_id, enabled],
         )?;
         Ok(count > 0)
+    }
+
+    // ── Alert Maintenance Windows ─────────────────────────────────────────────
+
+    pub fn create_maintenance_window(
+        &self, id: &str, name: &str, scope: &str, starts_at: &str, ends_at: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO alert_maintenance_windows (id, name, scope, starts_at, ends_at) VALUES (?1,?2,?3,?4,?5)",
+            params![id, name, scope, starts_at, ends_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_maintenance_windows(&self) -> anyhow::Result<Vec<(String,String,String,String,String,String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, scope, starts_at, ends_at, created_at FROM alert_maintenance_windows ORDER BY starts_at DESC"
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_maintenance_window(&self, id: &str) -> anyhow::Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "DELETE FROM alert_maintenance_windows WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Returns true if `now_str` (ISO 8601) falls within any active maintenance window
+    /// that covers this alert_id (or all alerts if scope = 'all').
+    pub fn is_in_maintenance(&self, now_str: &str, alert_id: Option<&str>) -> bool {
+        let conn = self.conn.lock().unwrap();
+        let alert_scope = alert_id.map(|id| format!("alert:{id}")).unwrap_or_default();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM alert_maintenance_windows
+                 WHERE starts_at <= ?1 AND ends_at >= ?1
+                   AND (scope = 'all' OR scope = ?2)",
+                params![now_str, alert_scope],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    // ── Trace Funnels ─────────────────────────────────────────────────────────
+
+    pub fn create_funnel(&self, id: &str, name: &str, steps_json: &str) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO trace_funnels (id, name, steps_json) VALUES (?1,?2,?3)",
+            params![id, name, steps_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_funnels(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, steps_json, created_at FROM trace_funnels ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_funnel(&self, id: &str) -> anyhow::Result<Option<(String, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, steps_json, created_at FROM trace_funnels WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn delete_funnel(&self, id: &str) -> anyhow::Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "DELETE FROM trace_funnels WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n > 0)
     }
 }
