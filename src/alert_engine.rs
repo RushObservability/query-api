@@ -354,6 +354,12 @@ async fn eval_alerts(
             let triggered_at = if triggered { Some(now_str.as_str()) } else { None };
             config_db.update_alert_state(&rule.id, new_state, &now_str, triggered_at)?;
 
+            // Skip notifications during active maintenance windows
+            if config_db.is_in_maintenance(&now_str, Some(&rule.id)) {
+                tracing::debug!("alert '{}': skipping notification — maintenance window active", rule.id);
+                continue;
+            }
+
             // Send notifications
             let channel_ids: Vec<String> = serde_json::from_str(&rule.notification_channel_ids)
                 .unwrap_or_default();

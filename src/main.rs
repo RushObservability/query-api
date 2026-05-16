@@ -395,6 +395,15 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/alerts/{id}/events",
             get(handlers::alerts::list_alert_events),
         )
+        // Maintenance Windows
+        .route(
+            "/api/v1/maintenance-windows",
+            get(handlers::maintenance::list_windows).post(handlers::maintenance::create_window),
+        )
+        .route(
+            "/api/v1/maintenance-windows/{id}",
+            delete(handlers::maintenance::delete_window),
+        )
         // Monitors (Datadog-style v2 alerting)
         .route(
             "/api/v1/monitors",

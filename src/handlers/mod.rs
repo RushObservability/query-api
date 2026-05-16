@@ -14,6 +14,7 @@ pub mod detection;
 pub mod groups;
 pub mod health;
 pub mod logs;
+pub mod maintenance;
 pub mod metrics;
 pub mod monitors;
 pub mod parse_query;
