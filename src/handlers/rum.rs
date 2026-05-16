@@ -622,3 +622,100 @@ pub async fn session_detail(
 
     Ok(Json(serde_json::json!({ "events": json_rows })))
 }
+
+// ── Session Replay ──
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ReplayIngestPayload {
+    pub session_id: String,
+    pub app_name: String,
+    pub chunk_idx: u32,
+    /// JSON-serialised array of rrweb `eventWithTime` objects
+    pub events: serde_json::Value,
+}
+
+#[derive(Debug, clickhouse::Row, serde::Serialize, serde::Deserialize)]
+struct ReplayChunkRow {
+    pub tenant_id: String,
+    pub session_id: String,
+    pub app_name: String,
+    pub chunk_idx: u32,
+    /// Millisecond unix timestamp of when this chunk was received
+    pub chunk_ts: i64,
+    pub events_json: String,
+}
+
+/// POST /api/v1/rum/replay/ingest — SDK sends batched rrweb events
+pub async fn ingest_replay(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(payload): Json<ReplayIngestPayload>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if payload.session_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
+    }
+
+    let events_json = serde_json::to_string(&payload.events)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid events: {e}")))?;
+
+    let chunk_ts = chrono::Utc::now().timestamp_millis();
+
+    let row = ReplayChunkRow {
+        tenant_id: tenant.tenant_id.clone(),
+        session_id: payload.session_id.clone(),
+        app_name: payload.app_name.clone(),
+        chunk_idx: payload.chunk_idx,
+        chunk_ts,
+        events_json,
+    };
+
+    let mut insert = state
+        .ch
+        .insert("rum_replay_chunks")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+    insert.write(&row).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+    })?;
+    insert.end().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+    })?;
+
+    Ok(StatusCode::OK)
+}
+
+/// GET /api/v1/rum/replay/{session_id} — fetch all chunks for replay player
+pub async fn get_replay(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_sid = session_id.replace('\'', "\\'");
+
+    let sql = format!(
+        "SELECT tenant_id, session_id, app_name, chunk_idx, chunk_ts, events_json \
+         FROM rum_replay_chunks \
+         WHERE tenant_id = '{escaped_tenant}' AND session_id = '{escaped_sid}' \
+         ORDER BY chunk_idx ASC \
+         LIMIT 500"
+    );
+
+    let chunks = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<ReplayChunkRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "rum", handler = "get_replay", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+        })?;
+
+    // Concatenate all events across chunks in order
+    let mut all_events: Vec<serde_json::Value> = Vec::new();
+    for chunk in chunks {
+        if let Ok(serde_json::Value::Array(evts)) = serde_json::from_str(&chunk.events_json) {
+            all_events.extend(evts);
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "events": all_events })))
+}
