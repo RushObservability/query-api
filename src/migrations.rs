@@ -489,6 +489,21 @@ ORDER BY (tenant_id, AppName, EventType, TimestampTime, PagePath, Timestamp)
 TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
+    // ── Session replay chunks (rrweb DOM snapshot + mutation events) ──
+    r"CREATE TABLE IF NOT EXISTS observability.rum_replay_chunks
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `session_id` String CODEC(ZSTD(1)),
+    `app_name` LowCardinality(String) CODEC(ZSTD(1)),
+    `chunk_idx` UInt32,
+    `chunk_ts` DateTime64(3) CODEC(Delta(8), ZSTD(1)),
+    `events_json` String CODEC(ZSTD(1))
+)
+ENGINE = MergeTree
+ORDER BY (tenant_id, session_id, chunk_idx)
+TTL toDateTime(chunk_ts) + INTERVAL 7 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+
     // ── Tenant usage metering (per-tenant ingest volume tracking) ──
     r"CREATE TABLE IF NOT EXISTS observability.tenant_usage
 (
@@ -523,6 +538,7 @@ const ROW_POLICY_TABLES: &[&str] = &[
     "otel_metrics_exponential_histogram",
     "otel_metrics_summary",
     "rum_events",
+    "rum_replay_chunks",
 ];
 
 /// Create row policies on all tenant-scoped tables. Only safe to call when
