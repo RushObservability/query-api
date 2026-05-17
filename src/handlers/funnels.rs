@@ -80,8 +80,9 @@ fn step_where_clause(step: &FunnelStep, from: &str, to: &str) -> String {
 
 pub async fn list_funnels(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let rows = state.config_db.list_funnels()
+    let rows = state.config_db.list_funnels(&tenant.tenant_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let funnels: Vec<FunnelResponse> = rows.into_iter().filter_map(|(id, name, steps_json, created_at)| {
         let steps: Vec<FunnelStep> = serde_json::from_str(&steps_json).ok()?;
@@ -92,6 +93,7 @@ pub async fn list_funnels(
 
 pub async fn create_funnel(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Json(req): Json<CreateFunnelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -111,18 +113,19 @@ pub async fn create_funnel(
     let steps_json = serde_json::to_string(&req.steps)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let id = uuid::Uuid::new_v4().to_string();
-    state.config_db.create_funnel(&id, &req.name, &steps_json)
+    state.config_db.create_funnel(&id, &req.name, &steps_json, &tenant.tenant_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id, "ok": true }))))
 }
 
 pub async fn delete_funnel(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers)?;
-    let deleted = state.config_db.delete_funnel(&id)
+    let deleted = state.config_db.delete_funnel(&id, &tenant.tenant_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "funnel not found".to_string()));
@@ -136,7 +139,7 @@ pub async fn run_funnel(
     Path(id): Path<String>,
     Json(req): Json<RunFunnelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let row = state.config_db.get_funnel(&id)
+    let row = state.config_db.get_funnel(&id, &tenant.tenant_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "funnel not found".to_string()))?;
 

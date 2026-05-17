@@ -9,21 +9,6 @@ const MIGRATIONS: &[&str] = &[
     // ── Database ──
     "CREATE DATABASE IF NOT EXISTS observability",
 
-    // ── DROP v1 tables (MVs first, then base tables) ──
-    "DROP TABLE IF EXISTS observability.service_catalog",
-    "DROP TABLE IF EXISTS observability.trace_index",
-    "DROP TABLE IF EXISTS observability.otel_to_wide",
-    "DROP TABLE IF EXISTS observability.wide_events",
-    "DROP TABLE IF EXISTS observability.otel_traces",
-    "DROP TABLE IF EXISTS observability.otel_logs",
-    "DROP TABLE IF EXISTS observability.otel_metrics_gauge",
-    "DROP TABLE IF EXISTS observability.otel_metrics_sum",
-    "DROP TABLE IF EXISTS observability.otel_metrics_histogram",
-    "DROP TABLE IF EXISTS observability.otel_metrics_exponential_histogram",
-    "DROP TABLE IF EXISTS observability.otel_metrics_summary",
-    "DROP TABLE IF EXISTS observability.rum_events",
-    "DROP TABLE IF EXISTS observability.signal_usage",
-
     // ── OTel traces (v2: multi-tenant with materialized HTTP columns) ──
     r"CREATE TABLE IF NOT EXISTS observability.otel_traces
 (
