@@ -493,6 +493,7 @@ impl ConfigDb {
             ("dashboards",    "owner_id",             "TEXT NOT NULL DEFAULT ''"),
             ("dashboards",    "visibility",           "TEXT NOT NULL DEFAULT 'tenant'"),
             ("dashboards",    "tags",                 "TEXT NOT NULL DEFAULT '[]'"),
+            ("trace_funnels", "tenant_id",            "TEXT NOT NULL DEFAULT 'default'"),
         ] {
             let has: bool = conn
                 .prepare(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"))?
@@ -4458,38 +4459,38 @@ impl ConfigDb {
 
     // ── Trace Funnels ─────────────────────────────────────────────────────────
 
-    pub fn create_funnel(&self, id: &str, name: &str, steps_json: &str) -> anyhow::Result<()> {
+    pub fn create_funnel(&self, id: &str, name: &str, steps_json: &str, tenant_id: &str) -> anyhow::Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO trace_funnels (id, name, steps_json) VALUES (?1,?2,?3)",
-            params![id, name, steps_json],
+            "INSERT INTO trace_funnels (id, name, steps_json, tenant_id) VALUES (?1,?2,?3,?4)",
+            params![id, name, steps_json, tenant_id],
         )?;
         Ok(())
     }
 
-    pub fn list_funnels(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
+    pub fn list_funnels(&self, tenant_id: &str) -> anyhow::Result<Vec<(String, String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, steps_json, created_at FROM trace_funnels ORDER BY created_at DESC"
+            "SELECT id, name, steps_json, created_at FROM trace_funnels WHERE tenant_id = ?1 ORDER BY created_at DESC"
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![tenant_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    pub fn get_funnel(&self, id: &str) -> anyhow::Result<Option<(String, String, String, String)>> {
+    pub fn get_funnel(&self, id: &str, tenant_id: &str) -> anyhow::Result<Option<(String, String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, steps_json, created_at FROM trace_funnels WHERE id = ?1",
-            params![id],
+            "SELECT id, name, steps_json, created_at FROM trace_funnels WHERE id = ?1 AND tenant_id = ?2",
+            params![id, tenant_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         ).optional().map_err(Into::into)
     }
 
-    pub fn delete_funnel(&self, id: &str) -> anyhow::Result<bool> {
+    pub fn delete_funnel(&self, id: &str, tenant_id: &str) -> anyhow::Result<bool> {
         let n = self.conn.lock().unwrap().execute(
-            "DELETE FROM trace_funnels WHERE id = ?1",
-            params![id],
+            "DELETE FROM trace_funnels WHERE id = ?1 AND tenant_id = ?2",
+            params![id, tenant_id],
         )?;
         Ok(n > 0)
     }

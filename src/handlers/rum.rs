@@ -645,6 +645,32 @@ struct ReplayChunkRow {
     pub events_json: String,
 }
 
+/// GET /api/v1/rum/replay/available/{app_name} — session IDs that have replay data
+pub async fn list_replay_sessions(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(app_name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_app = app_name.replace('\'', "\\'");
+    let sql = format!(
+        "SELECT DISTINCT session_id FROM rum_replay_chunks \
+         WHERE tenant_id = '{escaped_tenant}' AND app_name = '{escaped_app}'"
+    );
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<ReplaySessionRow>()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}")))?;
+    let ids: Vec<String> = rows.into_iter().map(|r| r.session_id).collect();
+    Ok(Json(serde_json::json!({ "session_ids": ids })))
+}
+
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct ReplaySessionRow {
+    pub session_id: String,
+}
+
 /// POST /api/v1/rum/replay/ingest — SDK sends batched rrweb events
 pub async fn ingest_replay(
     State(state): State<AppState>,

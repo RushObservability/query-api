@@ -656,6 +656,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/rum/sessions", post(handlers::rum::sessions))
         .route("/api/v1/rum/session/{id}", get(handlers::rum::session_detail))
         .route("/api/v1/rum/replay/ingest", post(handlers::rum::ingest_replay))
+        .route("/api/v1/rum/replay/available/{app_name}", get(handlers::rum::list_replay_sessions))
         .route("/api/v1/rum/replay/{id}", get(handlers::rum::get_replay))
         // ArgoCD integration
         .route("/api/v1/argocd/applications", get(handlers::argocd::list_applications))
