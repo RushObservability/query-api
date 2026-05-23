@@ -19,6 +19,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod monitors;
 pub mod parse_query;
+pub mod parse_promql;
 pub mod query;
 pub mod remote_write;
 pub mod retention;

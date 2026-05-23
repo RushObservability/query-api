@@ -313,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/services/graph", get(handlers::services::service_graph))
         // Natural language query parsing (LLM-powered)
         .route("/api/v1/parse-query", post(handlers::parse_query::parse_query))
+        .route("/api/v1/parse-promql", post(handlers::parse_promql::parse_promql))
         // Field suggestions
         .route(
             "/api/v1/suggest/{field}",
