@@ -65,7 +65,19 @@ pub async fn create_slo(
     }
 
     let id = uuid::Uuid::new_v4().to_string();
-    let error_filters = serde_json::to_string(&req.error_filters)
+
+    // For trace/availability SLOs with no error_filters, default to http_status_code >= 500.
+    // Without this, error_filters == total_filters == all requests, causing 100% error rate.
+    let effective_error_filters = if req.slo_type == "trace"
+        && req.indicator_type == "availability"
+        && req.error_filters.as_array().map_or(true, |a| a.is_empty())
+    {
+        serde_json::json!([{"field": "http_status_code", "op": ">=", "value": 500}])
+    } else {
+        req.error_filters.clone()
+    };
+
+    let error_filters = serde_json::to_string(&effective_error_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let total_filters = serde_json::to_string(&req.total_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -162,7 +174,16 @@ pub async fn update_slo(
         }
     }
 
-    let error_filters = serde_json::to_string(&req.error_filters)
+    let effective_error_filters = if req.slo_type == "trace"
+        && req.indicator_type == "availability"
+        && req.error_filters.as_array().map_or(true, |a| a.is_empty())
+    {
+        serde_json::json!([{"field": "http_status_code", "op": ">=", "value": 500}])
+    } else {
+        req.error_filters.clone()
+    };
+
+    let error_filters = serde_json::to_string(&effective_error_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let total_filters = serde_json::to_string(&req.total_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
