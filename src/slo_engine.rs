@@ -306,7 +306,12 @@ async fn eval_slos(
         } else {
             let error_budget = 1.0 - slo.target_percentage / 100.0;
             let consumed = error_count as f64 / total_count as f64;
-            let remaining = error_budget - consumed;
+            // Express remaining as fraction of the allowed budget (1.0 = 100% remaining, 0 = exhausted).
+            let remaining = if error_budget <= 0.0 {
+                0.0
+            } else {
+                (error_budget - consumed) / error_budget
+            };
             let state = if remaining > 0.0 { "compliant" } else { "breaching" };
             (state, remaining)
         };
