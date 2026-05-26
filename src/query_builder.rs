@@ -464,12 +464,11 @@ fn log_term_match_sql(term: &str) -> String {
         } else if tokens.len() == 1 {
             parts.push(format!("hasToken(lower(Body), '{}')", tokens[0]));
         } else {
-            // Multiple sub-tokens (e.g. UUID with hyphens) — AND them all
-            let token_conds: Vec<String> = tokens
-                .iter()
-                .map(|t| format!("hasToken(lower(Body), '{t}')"))
-                .collect();
-            parts.push(format!("({})", token_conds.join(" AND ")));
+            // Multi-token term (e.g. UUID with hyphens): hasToken matches whole tokens
+            // only, so "f7d156a" won't match "2f7d156a". Use LIKE for the full term
+            // so substring matches within tokens are found correctly.
+            let lower_like = lower_term.replace('%', "\\%").replace('_', "\\_");
+            parts.push(format!("lower(Body) LIKE '%{lower_like}%'"));
         }
 
         format!("({})", parts.join(" OR "))

@@ -13,6 +13,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/rush-api /usr/local/bin/rush-api
+COPY --from=builder /app/target/release/rush-anomaly-engine /usr/local/bin/anomaly_engine
 
 EXPOSE 8080
 

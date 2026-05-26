@@ -276,11 +276,11 @@ async fn fetch_apm_data(
         "SELECT toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL '1' MINUTE)) as bucket, \
          count() as count, \
          countIf(status = 'error') as error_count, \
-         quantile(0.50)(duration_ms) as p50, \
-         quantile(0.95)(duration_ms) as p95, \
-         quantile(0.99)(duration_ms) as p99 \
+         quantile(0.50)(duration_ns) as p50, \
+         quantile(0.95)(duration_ns) as p95, \
+         quantile(0.99)(duration_ns) as p99 \
          FROM wide_events \
-         WHERE service_name = '{}' AND timestamp >= '{}' AND timestamp <= '{}' \
+         WHERE service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp <= parseDateTimeBestEffort('{}') \
          GROUP BY bucket ORDER BY bucket",
         rule.service_name.replace('\'', "''"),
         from,
