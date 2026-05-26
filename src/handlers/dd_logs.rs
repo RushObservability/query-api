@@ -98,7 +98,7 @@ pub async fn ingest_logs_with_tenant(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state.config_db.is_tenant_enabled(&tenant_override) {
+    if !state.config_db.is_tenant_enabled(&tenant_override).await {
         return Err((StatusCode::BAD_REQUEST, format!("tenant '{}' not found or disabled", tenant_override)));
     }
     ingest_logs_inner(state, tenant_override, headers, body).await

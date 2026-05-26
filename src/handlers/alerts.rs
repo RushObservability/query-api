@@ -17,7 +17,7 @@ pub async fn list_channels(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let channels = state
         .config_db
-        .list_channels(&tenant.tenant_id)
+        .list_channels(&tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<NotificationChannelResponse> = channels.into_iter().map(NotificationChannelResponse::from).collect();
     Ok(Json(serde_json::json!({ "channels": responses })))
@@ -29,7 +29,7 @@ pub async fn create_channel(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateChannelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
@@ -50,12 +50,12 @@ pub async fn create_channel(
 
     state
         .config_db
-        .create_channel(&id, &tenant.tenant_id, &req.name, &req.channel_type, &config)
+        .create_channel(&id, &tenant.tenant_id, &req.name, &req.channel_type, &config).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let channel = state
         .config_db
-        .get_channel(&id, &tenant.tenant_id)
+        .get_channel(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created channel".to_string()))?;
 
@@ -69,13 +69,13 @@ pub async fn update_channel(
     Path(id): Path<String>,
     Json(req): Json<UpdateChannelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let config = serde_json::to_string(&req.config)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let updated = state
         .config_db
-        .update_channel(&id, &tenant.tenant_id, &req.name, &config, req.enabled)
+        .update_channel(&id, &tenant.tenant_id, &req.name, &config, req.enabled).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "channel not found".to_string()));
@@ -83,7 +83,7 @@ pub async fn update_channel(
 
     let channel = state
         .config_db
-        .get_channel(&id, &tenant.tenant_id)
+        .get_channel(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read updated channel".to_string()))?;
 
@@ -96,10 +96,10 @@ pub async fn delete_channel(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_channel(&id, &tenant.tenant_id)
+        .delete_channel(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "channel not found".to_string()));
@@ -114,7 +114,7 @@ pub async fn test_channel(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let channel = state
         .config_db
-        .get_channel(&id, &tenant.tenant_id)
+        .get_channel(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "channel not found".to_string()))?;
 
@@ -163,7 +163,7 @@ pub async fn test_channel(
         "",
         status,
         &error_msg,
-    );
+    ).await;
 
     match result {
         Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "message": "Test notification sent successfully" }))),
@@ -179,7 +179,7 @@ pub async fn notify_channel(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let channel = state
         .config_db
-        .get_channel(&id, &tenant.tenant_id)
+        .get_channel(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "channel not found".to_string()))?;
 
@@ -208,7 +208,7 @@ pub async fn list_notification_log(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let entries = state
         .config_db
-        .list_notification_log(&tenant.tenant_id, 200)
+        .list_notification_log(&tenant.tenant_id, 200).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
@@ -218,7 +218,7 @@ pub async fn list_alerts(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let alerts = state
         .config_db
-        .list_alerts()
+        .list_alerts().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<AlertRuleResponse> = alerts.into_iter().map(AlertRuleResponse::from).collect();
     Ok(Json(serde_json::json!({ "alerts": responses })))
@@ -229,7 +229,7 @@ pub async fn create_alert(
     headers: HeaderMap,
     Json(req): Json<CreateAlertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
@@ -267,12 +267,12 @@ pub async fn create_alert(
             req.condition_threshold,
             req.eval_interval_secs,
             &channel_ids,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let alert = state
         .config_db
-        .get_alert(&id)
+        .get_alert(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created alert".to_string()))?;
 
@@ -285,12 +285,12 @@ pub async fn get_alert(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let alert = state
         .config_db
-        .get_alert(&id)
+        .get_alert(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "alert not found".to_string()))?;
     let events = state
         .config_db
-        .list_alert_events(&id, 20)
+        .list_alert_events(&id, 20).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -305,7 +305,7 @@ pub async fn update_alert(
     Path(id): Path<String>,
     Json(req): Json<UpdateAlertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let valid_ops = [">", ">=", "<", "<=", "=", "!="];
     if !valid_ops.contains(&req.condition_op.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid condition_op: {}", req.condition_op)));
@@ -333,7 +333,7 @@ pub async fn update_alert(
             req.condition_threshold,
             req.eval_interval_secs,
             &channel_ids,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "alert not found".to_string()));
@@ -341,7 +341,7 @@ pub async fn update_alert(
 
     let alert = state
         .config_db
-        .get_alert(&id)
+        .get_alert(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read alert".to_string()))?;
 
@@ -353,10 +353,10 @@ pub async fn delete_alert(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_alert(&id)
+        .delete_alert(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "alert not found".to_string()));
@@ -370,7 +370,7 @@ pub async fn list_alert_events(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let events = state
         .config_db
-        .list_alert_events(&id, 100)
+        .list_alert_events(&id, 100).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }
@@ -380,7 +380,7 @@ pub async fn list_all_alert_events(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let events = state
         .config_db
-        .list_all_alert_events(200)
+        .list_all_alert_events(200).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }

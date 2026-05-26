@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use crate::config_db::ConfigDb;
-use crate::models::query::Filter;
+use crate::clickhouse_config::ConfigDb;
+use crate::models::query::{Filter, FilterOp};
 use crate::query_builder::{build_where_clause, build_metrics_where_clause};
 use clickhouse::Client;
 
@@ -224,7 +224,7 @@ async fn eval_slos(
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let due_slos = config_db.get_due_slos(&now_str)?;
+    let due_slos = config_db.get_due_slos(&now_str).await?;
 
     for slo in due_slos {
         let minutes = window_minutes(&slo.window_type);
@@ -233,20 +233,32 @@ async fn eval_slos(
             .to_string();
 
         // Parse filters
-        let error_filters: Vec<Filter> = match serde_json::from_str(&slo.error_filters) {
+        let mut error_filters: Vec<Filter> = match serde_json::from_str(&slo.error_filters) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("slo {}: bad error_filters: {e}", slo.id);
                 continue;
             }
         };
-        let total_filters: Vec<Filter> = match serde_json::from_str(&slo.total_filters) {
+        let mut total_filters: Vec<Filter> = match serde_json::from_str(&slo.total_filters) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("slo {}: bad total_filters: {e}", slo.id);
                 continue;
             }
         };
+
+        // Inject service_name filter if set — the field is stored separately from
+        // the user-defined filters but must scope every evaluation query.
+        if !slo.service_name.is_empty() {
+            let sn_filter = Filter {
+                field: "service_name".to_string(),
+                op: FilterOp::Eq,
+                value: serde_json::Value::String(slo.service_name.clone()),
+            };
+            error_filters.insert(0, sn_filter.clone());
+            total_filters.insert(0, sn_filter);
+        }
 
         // Evaluate based on (slo_type, indicator_type)
         let eval_result = match (slo.slo_type.as_str(), slo.indicator_type.as_str()) {
@@ -271,7 +283,7 @@ async fn eval_slos(
             }
             _ => {
                 tracing::warn!("slo {}: unsupported type/indicator: {}/{}", slo.id, slo.slo_type, slo.indicator_type);
-                config_db.update_slo_state(&slo.id, "no_data", 0.0, 0, 0, &now_str, None)?;
+                config_db.update_slo_state(&slo.id, "no_data", 0.0, 0, 0, &now_str, None).await?;
                 continue;
             }
         };
@@ -280,7 +292,7 @@ async fn eval_slos(
             Ok(counts) => counts,
             Err(e) => {
                 tracing::warn!("slo {}: evaluation failed: {e}", slo.id);
-                config_db.update_slo_state(&slo.id, "no_data", 0.0, 0, 0, &now_str, None)?;
+                config_db.update_slo_state(&slo.id, "no_data", 0.0, 0, 0, &now_str, None).await?;
                 continue;
             }
         };
@@ -325,19 +337,19 @@ async fn eval_slos(
                 total_count,
                 error_budget_remaining,
                 &message,
-            )?;
+            ).await?;
 
             let breached_at = if new_state == "breaching" { Some(now_str.as_str()) } else { None };
             config_db.update_slo_state(
                 &slo.id, new_state, error_budget_remaining,
                 error_count, total_count, &now_str, breached_at,
-            )?;
+            ).await?;
 
             // Send notifications
             let channel_ids: Vec<String> = serde_json::from_str(&slo.notification_channel_ids)
                 .unwrap_or_default();
             for channel_id in &channel_ids {
-                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
+                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
                     let config: serde_json::Value = serde_json::from_str(&channel.config)
                         .unwrap_or(serde_json::json!({}));
                     if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
@@ -364,7 +376,7 @@ async fn eval_slos(
             config_db.update_slo_state(
                 &slo.id, new_state, error_budget_remaining,
                 error_count, total_count, &now_str, None,
-            )?;
+            ).await?;
         }
 
         // Write SLO gauge metrics for graphing

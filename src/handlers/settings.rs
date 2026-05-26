@@ -44,8 +44,8 @@ pub async fn list_api_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
-    let rows = state.config_db.list_api_keys().map_err(|e| {
+    require_admin(&state, &headers).await?;
+    let rows = state.config_db.list_api_keys().await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
     })?;
     let keys: Vec<ApiKeyListEntry> = rows
@@ -60,13 +60,13 @@ pub async fn create_api_key(
     headers: HeaderMap,
     Json(req): Json<CreateApiKeyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let key = generate_api_key();
     let key_hash = hash_key(&key);
     let prefix = key[..8].to_string();
 
-    state.config_db.create_api_key(&id, &req.name, &key_hash, &prefix).map_err(|e| {
+    state.config_db.create_api_key(&id, &req.name, &key_hash, &prefix).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
     })?;
 
@@ -88,7 +88,7 @@ pub async fn get_features(
     let argocd_enabled = std::env::var("ARGOCD_NAMESPACE").is_ok()
         || state
             .config_db
-            .get_setting("argocd_enabled")
+            .get_setting("argocd_enabled").await
             .ok()
             .flatten()
             .map(|v| v == "true")
@@ -97,7 +97,7 @@ pub async fn get_features(
     let sre_agent_enabled = std::env::var("LLM_API_KEY").is_ok()
         || state
             .config_db
-            .get_setting("sre_agent_enabled")
+            .get_setting("sre_agent_enabled").await
             .ok()
             .flatten()
             .map(|v| v == "true")
@@ -114,8 +114,8 @@ pub async fn delete_api_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
-    let deleted = state.config_db.delete_api_key(&id).map_err(|e| {
+    require_admin(&state, &headers).await?;
+    let deleted = state.config_db.delete_api_key(&id).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
     })?;
     if !deleted {

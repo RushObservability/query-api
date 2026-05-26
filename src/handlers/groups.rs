@@ -10,7 +10,7 @@ use crate::handlers::auth::extract_session_cookie;
 
 /// Extract the calling user from the session cookie.
 /// Returns (user_id, username, display_name, tenant_id, role) or 401.
-fn require_auth(
+async fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
@@ -19,7 +19,7 @@ fn require_auth(
     })?;
     state
         .config_db
-        .get_session_user(&token)
+        .get_session_user(&token).await
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -29,11 +29,11 @@ fn require_auth(
 }
 
 /// Require that the caller is an admin.
-fn require_admin(
+async fn require_admin(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
-    let caller = require_auth(state, headers)?;
+    let caller = require_auth(state, headers).await?;
     if caller.4 != "admin" {
         return Err((StatusCode::FORBIDDEN, "admin role required".to_string()));
     }
@@ -72,11 +72,11 @@ pub async fn list_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers)?;
+    require_auth(&state, &headers).await?;
 
     let rows = state
         .config_db
-        .list_groups()
+        .list_groups().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let groups: Vec<GroupResponse> = rows.into_iter().map(group_response).collect();
@@ -98,7 +98,7 @@ pub async fn create_group(
     headers: HeaderMap,
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     let name = req.name.trim().to_string();
     if name.is_empty() {
@@ -116,12 +116,12 @@ pub async fn create_group(
 
     let id = state
         .config_db
-        .create_group(&name, &description, &scopes, &permissions)
+        .create_group(&name, &description, &scopes, &permissions).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let row = state
         .config_db
-        .get_group(&id)
+        .get_group(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| {
             (
@@ -147,12 +147,12 @@ pub async fn update_group(
     Path(id): Path<String>,
     Json(req): Json<UpdateGroupRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     // Get current group to use as defaults
     let current = state
         .config_db
-        .get_group(&id)
+        .get_group(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
@@ -168,7 +168,7 @@ pub async fn update_group(
 
     let updated = state
         .config_db
-        .update_group(&id, &description, &scopes, &permissions)
+        .update_group(&id, &description, &scopes, &permissions).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !updated {
@@ -177,7 +177,7 @@ pub async fn update_group(
 
     let row = state
         .config_db
-        .get_group(&id)
+        .get_group(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
@@ -190,11 +190,11 @@ pub async fn delete_group(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     match state
         .config_db
-        .delete_group(&id)
+        .delete_group(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
     {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
@@ -215,23 +215,23 @@ pub async fn set_group_tenants(
     Path(id): Path<String>,
     Json(req): Json<SetGroupTenantsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     // Verify group exists
     state
         .config_db
-        .get_group(&id)
+        .get_group(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
     state
         .config_db
-        .set_group_tenants(&id, &req.tenant_ids)
+        .set_group_tenants(&id, &req.tenant_ids).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let row = state
         .config_db
-        .get_group(&id)
+        .get_group(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
@@ -244,11 +244,11 @@ pub async fn get_user_groups(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers)?;
+    require_auth(&state, &headers).await?;
 
     let group_ids = state
         .config_db
-        .get_user_groups(&user_id)
+        .get_user_groups(&user_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     Ok(Json(serde_json::json!({ "group_ids": group_ids })))
@@ -266,16 +266,16 @@ pub async fn set_user_groups(
     Path(user_id): Path<String>,
     Json(req): Json<SetUserGroupsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     state
         .config_db
-        .set_user_groups(&user_id, &req.group_ids)
+        .set_user_groups(&user_id, &req.group_ids).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let group_ids = state
         .config_db
-        .get_user_groups(&user_id)
+        .get_user_groups(&user_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     Ok(Json(serde_json::json!({ "group_ids": group_ids })))

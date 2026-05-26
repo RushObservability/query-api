@@ -37,11 +37,11 @@ pub async fn list_tenants(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers)?;
+    let caller = require_auth(&state, &headers).await?;
 
     let rows = state
         .config_db
-        .list_tenants()
+        .list_tenants().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let tenants: Vec<TenantResponse> = if caller.4 == "admin" {
@@ -59,7 +59,7 @@ pub async fn list_tenants(
         // Non-admins see only tenants accessible via their groups
         let (_, _, accessible_ids) = state
             .config_db
-            .resolve_user_permissions(&caller.0)
+            .resolve_user_permissions(&caller.0).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
         tracing::info!(user_id = %caller.0, username = %caller.1, accessible_tenant_ids = ?accessible_ids, "list_tenants: non-admin user");
@@ -84,7 +84,7 @@ pub async fn create_tenant(
     headers: HeaderMap,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let name = req.name.trim().to_string();
     if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
@@ -94,12 +94,12 @@ pub async fn create_tenant(
 
     state
         .config_db
-        .create_tenant(&id, &name)
+        .create_tenant(&id, &name).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let tenant = state
         .config_db
-        .get_tenant(&id)
+        .get_tenant(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| {
             (
@@ -125,10 +125,10 @@ pub async fn toggle_tenant(
     Path(id): Path<String>,
     Json(req): Json<ToggleTenantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_tenant_enabled(&id, req.enabled)
+        .set_tenant_enabled(&id, req.enabled).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !updated {
@@ -137,7 +137,7 @@ pub async fn toggle_tenant(
 
     let tenant = state
         .config_db
-        .get_tenant(&id)
+        .get_tenant(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
@@ -154,7 +154,7 @@ pub async fn delete_tenant(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     if id == "default" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -164,7 +164,7 @@ pub async fn delete_tenant(
 
     let deleted = state
         .config_db
-        .delete_tenant(&id)
+        .delete_tenant(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !deleted {
@@ -180,10 +180,10 @@ pub async fn set_auth_required(
     Path(id): Path<String>,
     Json(req): Json<SetAuthRequiredRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_tenant_auth_required(&id, req.auth_required)
+        .set_tenant_auth_required(&id, req.auth_required).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !updated {
@@ -192,7 +192,7 @@ pub async fn set_auth_required(
 
     let tenant = state
         .config_db
-        .get_tenant(&id)
+        .get_tenant(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 

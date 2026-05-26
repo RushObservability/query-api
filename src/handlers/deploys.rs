@@ -14,7 +14,7 @@ pub async fn create_deploy(
     headers: HeaderMap,
     Json(req): Json<CreateDeployMarkerRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     if req.service_name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "service_name must not be empty".to_string()));
     }
@@ -41,7 +41,7 @@ pub async fn create_deploy(
             &req.description,
             &req.environment,
             &req.deployed_by,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
@@ -57,7 +57,7 @@ pub async fn list_deploys(
             query.service_name.as_deref(),
             query.from.as_deref(),
             query.to.as_deref(),
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "deploys": markers })))
 }

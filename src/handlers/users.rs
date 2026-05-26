@@ -37,7 +37,7 @@ pub struct UserResponse {
 
 /// Extract the calling user from the session cookie.
 /// Returns (user_id, username, display_name, tenant_id, role) or 401.
-pub(crate) fn require_auth(
+pub(crate) async fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
@@ -46,7 +46,7 @@ pub(crate) fn require_auth(
     })?;
     state
         .config_db
-        .get_session_user(&token)
+        .get_session_user(&token).await
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -56,11 +56,11 @@ pub(crate) fn require_auth(
 }
 
 /// Require that the caller is an admin.
-pub(crate) fn require_admin(
+pub(crate) async fn require_admin(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
-    let caller = require_auth(state, headers)?;
+    let caller = require_auth(state, headers).await?;
     if caller.4 != "admin" {
         return Err((StatusCode::FORBIDDEN, "admin role required".to_string()));
     }
@@ -68,11 +68,11 @@ pub(crate) fn require_admin(
 }
 
 /// Require that the caller has write access (admin or write role).
-pub(crate) fn require_write(
+pub(crate) async fn require_write(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
-    let caller = require_auth(state, headers)?;
+    let caller = require_auth(state, headers).await?;
     if caller.4 != "admin" && caller.4 != "write" {
         return Err((StatusCode::FORBIDDEN, "write role required".to_string()));
     }
@@ -95,11 +95,11 @@ pub async fn list_users(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     let rows = state
         .config_db
-        .list_users()
+        .list_users().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let users: Vec<UserResponse> = rows.into_iter().map(user_response).collect();
@@ -113,7 +113,7 @@ pub async fn create_user(
     headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     let username = req.username.trim().to_string();
     if username.is_empty() {
@@ -137,7 +137,7 @@ pub async fn create_user(
 
     let id = state
         .config_db
-        .create_user(&username, &password, &display_name)
+        .create_user(&username, &password, &display_name).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     // New users default to the viewers group
@@ -147,7 +147,7 @@ pub async fn create_user(
 
     let row = state
         .config_db
-        .get_user(&id)
+        .get_user(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| {
             (
@@ -165,12 +165,12 @@ pub async fn delete_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     // Refuse to delete the user named "admin"
     let username = state
         .config_db
-        .get_username(&id)
+        .get_username(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
 
@@ -183,7 +183,7 @@ pub async fn delete_user(
 
     let deleted = state
         .config_db
-        .delete_user(&id)
+        .delete_user(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !deleted {
@@ -200,7 +200,7 @@ pub async fn change_password(
     Path(id): Path<String>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers)?;
+    let caller = require_auth(&state, &headers).await?;
 
     // Admin can change any user's password; non-admin can only change their own.
     if caller.4 != "admin" && caller.0 != id {
@@ -216,7 +216,7 @@ pub async fn change_password(
 
     let updated = state
         .config_db
-        .change_password(&id, &req.password)
+        .change_password(&id, &req.password).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !updated {
@@ -233,11 +233,11 @@ pub async fn toggle_user(
     Path(id): Path<String>,
     Json(req): Json<ToggleUserRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
 
     let updated = state
         .config_db
-        .set_user_enabled(&id, req.enabled)
+        .set_user_enabled(&id, req.enabled).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !updated {
@@ -246,7 +246,7 @@ pub async fn toggle_user(
 
     let row = state
         .config_db
-        .get_user(&id)
+        .get_user(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
 

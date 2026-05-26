@@ -30,7 +30,7 @@ pub async fn list_windows(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let rows = state.config_db
-        .list_maintenance_windows()
+        .list_maintenance_windows().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let windows: Vec<MaintenanceWindowResponse> = rows.into_iter().map(|r| MaintenanceWindowResponse {
         id: r.0, name: r.1, scope: r.2, starts_at: r.3, ends_at: r.4, created_at: r.5,
@@ -43,7 +43,7 @@ pub async fn create_window(
     headers: HeaderMap,
     Json(req): Json<CreateWindowRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name required".to_string()));
     }
@@ -56,7 +56,7 @@ pub async fn create_window(
     let id = uuid::Uuid::new_v4().to_string();
     let scope = req.scope.unwrap_or_else(|| "all".to_string());
     state.config_db
-        .create_maintenance_window(&id, &req.name, &scope, &req.starts_at, &req.ends_at)
+        .create_maintenance_window(&id, &req.name, &scope, &req.starts_at, &req.ends_at).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id, "ok": true }))))
 }
@@ -66,9 +66,9 @@ pub async fn delete_window(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let deleted = state.config_db
-        .delete_maintenance_window(&id)
+        .delete_maintenance_window(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "window not found".to_string()));

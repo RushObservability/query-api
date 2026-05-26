@@ -5,7 +5,7 @@ use std::time::Instant;
 use clickhouse::Client;
 
 use crate::alert_engine;
-use crate::config_db::ConfigDb;
+use crate::clickhouse_config::ConfigDb;
 use crate::models::monitor::{ApmQueryConfig, LogQueryConfig, MetricQueryConfig, Monitor};
 use crate::promql;
 
@@ -85,7 +85,7 @@ async fn run_evaluation_cycle(
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    let monitors = config_db.list_enabled_monitors()?;
+    let monitors = config_db.list_enabled_monitors().await?;
     let mut evaluated: u64 = 0;
     let mut state_changes: u64 = 0;
 
@@ -219,7 +219,7 @@ async fn evaluate_monitor(
                 Some(*value),
                 threshold,
                 &event_msg,
-            );
+            ).await;
 
             // Fire notifications
             fire_notifications(
@@ -236,7 +236,7 @@ async fn evaluate_monitor(
             .await;
 
             if new_state == "alert" || new_state == "warn" {
-                let _ = config_db.update_monitor_triggered(&monitor.id, now_str);
+                let _ = config_db.update_monitor_triggered(&monitor.id, now_str).await;
             }
 
             group_states.insert(group_key.clone(), new_state.to_string());
@@ -259,7 +259,7 @@ async fn evaluate_monitor(
     };
 
     let group_states_json = serde_json::to_string(&group_states).unwrap_or_else(|_| "{}".to_string());
-    config_db.update_monitor_state(&monitor.id, overall, &group_states_json, now_str)?;
+    config_db.update_monitor_state(&monitor.id, overall, &group_states_json, now_str).await?;
 
     Ok(changes)
 }
@@ -385,7 +385,7 @@ async fn handle_no_data(
             None,
             None,
             &event_msg,
-        );
+        ).await;
 
         if action == "notify" {
             fire_notifications(
@@ -403,7 +403,7 @@ async fn handle_no_data(
         }
     }
 
-    let _ = config_db.update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str);
+    let _ = config_db.update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str).await;
     if new_state != old_state.as_str() { 1 } else { 0 }
 }
 
@@ -423,7 +423,7 @@ async fn fire_notifications(
         serde_json::from_str(&monitor.notification_channels).unwrap_or_default();
 
     for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
+        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
             if !channel.enabled {
                 continue;
             }
@@ -462,7 +462,7 @@ async fn fire_notifications(
                 alert_state,
                 status,
                 &error_msg,
-            );
+            ).await;
         }
     }
 }
@@ -481,7 +481,7 @@ async fn evaluate_composite(
     let formula = &monitor.composite_formula;
 
     if monitor_ids.is_empty() || formula.is_empty() {
-        let _ = config_db.update_monitor_state(&monitor.id, "no_data", "{}", now_str);
+        let _ = config_db.update_monitor_state(&monitor.id, "no_data", "{}", now_str).await;
         return Ok(0);
     }
 
@@ -489,7 +489,7 @@ async fn evaluate_composite(
     let mut letter_states: HashMap<char, bool> = HashMap::new();
     for (i, mid) in monitor_ids.iter().enumerate() {
         let letter = (b'A' + i as u8) as char;
-        let is_alerting = match config_db.get_monitor_by_id(mid) {
+        let is_alerting = match config_db.get_monitor_by_id(mid).await {
             Ok(Some(m)) => m.state == "alert" || m.state == "warn",
             _ => false,
         };
@@ -518,7 +518,7 @@ async fn evaluate_composite(
             None,
             None,
             &event_msg,
-        );
+        ).await;
 
         fire_notifications(
             config_db,
@@ -534,11 +534,11 @@ async fn evaluate_composite(
         .await;
 
         if new_state == "alert" {
-            let _ = config_db.update_monitor_triggered(&monitor.id, now_str);
+            let _ = config_db.update_monitor_triggered(&monitor.id, now_str).await;
         }
     }
 
-    let _ = config_db.update_monitor_state(&monitor.id, new_state, "{}", now_str);
+    let _ = config_db.update_monitor_state(&monitor.id, new_state, "{}", now_str).await;
     Ok(changes)
 }
 
