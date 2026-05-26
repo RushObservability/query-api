@@ -4,7 +4,7 @@ use tracing_subscriber::EnvFilter;
 use rush_api::alert_engine::SmtpConfig;
 use rush_api::anomaly_engine;
 use rush_api::config::RushConfig;
-use rush_api::config_db::ConfigDb;
+use rush_api::clickhouse_config::ConfigDb;
 use rush_api::migrations;
 
 #[tokio::main]
@@ -36,10 +36,10 @@ async fn main() -> anyhow::Result<()> {
         .with_user(&clickhouse_user)
         .with_password(&clickhouse_password);
 
-    let config_db_path =
-        std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());
-    let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
-    tracing::info!("config db opened at {config_db_path}");
+    let config_db = Arc::new(
+        ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?
+    );
+    tracing::info!("config db opened");
 
     let smtp_config = SmtpConfig {
         host: std::env::var("RUSH_SMTP_HOST").ok(),

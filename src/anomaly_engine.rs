@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use crate::alert_engine::SmtpConfig;
-use crate::config_db::ConfigDb;
+use crate::clickhouse_config::ConfigDb;
 use crate::models::anomaly::AnomalyRule;
 use clickhouse::Client;
 use lettre::message::header::ContentType;
@@ -124,7 +124,7 @@ async fn eval_anomaly_rules(
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let due_rules = config_db.get_due_anomaly_rules(&now_str)?;
+    let due_rules = config_db.get_due_anomaly_rules(&now_str).await?;
 
     if due_rules.is_empty() {
         tracing::debug!(engine = "anomaly", "tick -- no rules due");
@@ -154,12 +154,12 @@ async fn eval_anomaly_rules(
             Ok(s) if !s.is_empty() => s,
             Ok(_) => {
                 tracing::debug!(engine = "anomaly", rule_name = %rule.name, "no data points returned");
-                config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None)?;
+                config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None).await?;
                 continue;
             }
             Err(e) => {
                 tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "data fetch failed");
-                config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None)?;
+                config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None).await?;
                 continue;
             }
         };
@@ -237,10 +237,10 @@ async fn eval_anomaly_rules(
                 worst_expected,
                 worst_deviation,
                 &message,
-            )?;
+            ).await?;
 
             let triggered_at = if any_anomalous { Some(now_str.as_str()) } else { None };
-            config_db.update_anomaly_state(&rule.id, new_state, &now_str, triggered_at)?;
+            config_db.update_anomaly_state(&rule.id, new_state, &now_str, triggered_at).await?;
 
             // Send notifications
             send_notifications(config_db, http_client, smtp_config, smtp_transport, &rule, &message, any_anomalous).await;
@@ -255,7 +255,7 @@ async fn eval_anomaly_rules(
                 "anomaly state changed"
             );
         } else {
-            config_db.update_anomaly_state(&rule.id, new_state, &now_str, None)?;
+            config_db.update_anomaly_state(&rule.id, new_state, &now_str, None).await?;
         }
     }
 
@@ -434,7 +434,7 @@ async fn send_notifications(
     let channel_ids: Vec<String> = serde_json::from_str(&rule.notification_channel_ids)
         .unwrap_or_default();
     for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
+        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
             let config: serde_json::Value = serde_json::from_str(&channel.config)
                 .unwrap_or(serde_json::json!({}));
 

@@ -23,14 +23,14 @@ pub async fn analyze_anomaly_event(
     // 1. Look up event
     let event = state
         .config_db
-        .get_anomaly_event(&event_id)
+        .get_anomaly_event(&event_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
 
     // 2. Look up rule
     let rule = state
         .config_db
-        .get_anomaly_rule(&event.rule_id)
+        .get_anomaly_rule(&event.rule_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly rule not found".to_string()))?;
 
@@ -225,7 +225,7 @@ pub async fn list_anomaly_rules(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let rules = state
         .config_db
-        .list_anomaly_rules()
+        .list_anomaly_rules().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<AnomalyRuleResponse> = rules.into_iter().map(AnomalyRuleResponse::from).collect();
     Ok(Json(serde_json::json!({ "rules": responses })))
@@ -236,7 +236,7 @@ pub async fn create_anomaly_rule(
     headers: HeaderMap,
     Json(req): Json<CreateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid source: {}", req.source)));
@@ -266,12 +266,12 @@ pub async fn create_anomaly_rule(
             req.window_secs,
             &split_labels,
             &channel_ids,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let rule = state
         .config_db
-        .get_anomaly_rule(&id)
+        .get_anomaly_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created rule".to_string()))?;
 
@@ -284,12 +284,12 @@ pub async fn get_anomaly_rule(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let rule = state
         .config_db
-        .get_anomaly_rule(&id)
+        .get_anomaly_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly rule not found".to_string()))?;
     let events = state
         .config_db
-        .list_anomaly_events(&id, 20)
+        .list_anomaly_events(&id, 20).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -304,7 +304,7 @@ pub async fn update_anomaly_rule(
     Path(id): Path<String>,
     Json(req): Json<UpdateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid source: {}", req.source)));
@@ -333,7 +333,7 @@ pub async fn update_anomaly_rule(
             req.window_secs,
             &split_labels,
             &channel_ids,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "anomaly rule not found".to_string()));
@@ -341,7 +341,7 @@ pub async fn update_anomaly_rule(
 
     let rule = state
         .config_db
-        .get_anomaly_rule(&id)
+        .get_anomaly_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read rule".to_string()))?;
 
@@ -353,10 +353,10 @@ pub async fn delete_anomaly_rule(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_anomaly_rule(&id)
+        .delete_anomaly_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "anomaly rule not found".to_string()));
@@ -369,7 +369,7 @@ pub async fn list_all_anomaly_events(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let events = state
         .config_db
-        .list_all_anomaly_events(200)
+        .list_all_anomaly_events(200).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }
@@ -380,7 +380,7 @@ pub async fn get_anomaly_event(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let event = state
         .config_db
-        .get_anomaly_event(&event_id)
+        .get_anomaly_event(&event_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
     Ok(Json(event))
@@ -396,7 +396,7 @@ pub async fn get_event_correlations(
     // 1. Look up the event
     let event = state
         .config_db
-        .get_anomaly_event(&event_id)
+        .get_anomaly_event(&event_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
 

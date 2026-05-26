@@ -129,7 +129,7 @@ pub async fn list_custom_skills(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let skills = state
         .config_db
-        .list_custom_skills()
+        .list_custom_skills().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
     Ok(Json(serde_json::json!({ "skills": skills })))
 }
@@ -140,7 +140,7 @@ pub async fn get_custom_skill(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let skill = state
         .config_db
-        .get_custom_skill(&id)
+        .get_custom_skill(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
     Ok(Json(skill))
@@ -151,7 +151,7 @@ pub async fn create_custom_skill(
     headers: HeaderMap,
     Json(req): Json<CreateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     validate_skill_fields(
         &req.name,
         &req.title,
@@ -164,7 +164,7 @@ pub async fn create_custom_skill(
     // Uniqueness on name (friendlier than the raw SQLite constraint error)
     let existing = state
         .config_db
-        .get_custom_skill_by_name(&req.name)
+        .get_custom_skill_by_name(&req.name).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
     if existing.is_some() {
         return Err((
@@ -175,7 +175,7 @@ pub async fn create_custom_skill(
 
     let created = state
         .config_db
-        .create_custom_skill(&req, "")
+        .create_custom_skill(&req, "").await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     Ok((StatusCode::CREATED, Json::<CustomSkill>(created)))
@@ -187,11 +187,11 @@ pub async fn update_custom_skill(
     Path(id): Path<String>,
     Json(req): Json<UpdateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     // Fetch the existing skill so we can validate against its immutable name.
     let existing = state
         .config_db
-        .get_custom_skill(&id)
+        .get_custom_skill(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
 
@@ -206,7 +206,7 @@ pub async fn update_custom_skill(
 
     let updated = state
         .config_db
-        .update_custom_skill(&id, &req)
+        .update_custom_skill(&id, &req).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
 
@@ -218,10 +218,10 @@ pub async fn delete_custom_skill(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_custom_skill(&id)
+        .delete_custom_skill(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "custom skill not found".to_string()));

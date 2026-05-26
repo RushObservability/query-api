@@ -29,7 +29,7 @@ pub async fn list_detection_rules(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let rules = state
         .config_db
-        .list_detection_rules(Some(&tenant.tenant_id))
+        .list_detection_rules(Some(&tenant.tenant_id)).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<DetectionRuleResponse> =
         rules.into_iter().map(DetectionRuleResponse::from).collect();
@@ -44,7 +44,7 @@ pub async fn create_detection_rule(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateDetectionRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
@@ -88,12 +88,12 @@ pub async fn create_detection_rule(
             req.enabled,
             &channels,
             "", // created_by (can be enriched from session later)
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let rule = state
         .config_db
-        .get_detection_rule(&id)
+        .get_detection_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -114,7 +114,7 @@ pub async fn get_detection_rule(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let rule = state
         .config_db
-        .get_detection_rule(&id)
+        .get_detection_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
 
@@ -135,7 +135,7 @@ pub async fn update_detection_rule(
     Path(id): Path<String>,
     Json(req): Json<UpdateDetectionRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
@@ -163,7 +163,7 @@ pub async fn update_detection_rule(
     // Verify ownership
     let existing = state
         .config_db
-        .get_detection_rule(&id)
+        .get_detection_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
     if existing.tenant_id != tenant.tenant_id {
@@ -186,7 +186,7 @@ pub async fn update_detection_rule(
             req.window_secs,
             req.enabled,
             &channels,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
@@ -194,7 +194,7 @@ pub async fn update_detection_rule(
 
     let rule = state
         .config_db
-        .get_detection_rule(&id)
+        .get_detection_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -214,11 +214,11 @@ pub async fn delete_detection_rule(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     // Verify ownership
     let existing = state
         .config_db
-        .get_detection_rule(&id)
+        .get_detection_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
     if existing.tenant_id != tenant.tenant_id {
@@ -227,7 +227,7 @@ pub async fn delete_detection_rule(
 
     let deleted = state
         .config_db
-        .delete_detection_rule(&id)
+        .delete_detection_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
@@ -244,7 +244,7 @@ pub async fn test_detection_rule(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let rule = state
         .config_db
-        .get_detection_rule(&id)
+        .get_detection_rule(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
 
@@ -284,7 +284,7 @@ pub async fn list_detection_events(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let events = state
         .config_db
-        .list_detection_events(&tenant.tenant_id, params.limit)
+        .list_detection_events(&tenant.tenant_id, params.limit).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }

@@ -1,7 +1,7 @@
 pub mod alert_engine;
 pub mod anomaly_engine;
+pub mod clickhouse_config;
 pub mod config;
-pub mod config_db;
 pub mod handlers;
 pub mod migrations;
 pub mod models;
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use config::RushConfig;
-use config_db::ConfigDb;
+use clickhouse_config::ConfigDb;
 use usage_accumulator::UsageAccumulator;
 use usage_tracker::UsageTracker;
 

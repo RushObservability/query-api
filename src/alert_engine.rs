@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use crate::config_db::ConfigDb;
+use crate::clickhouse_config::ConfigDb;
 use crate::models::query::Filter;
 use crate::query_builder::{build_where_clause, build_metrics_where_clause, build_logs_where_clause};
 use clickhouse::Client;
@@ -268,7 +268,7 @@ async fn eval_alerts(
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let due_alerts = config_db.get_due_alerts(&now_str)?;
+    let due_alerts = config_db.get_due_alerts(&now_str).await?;
 
     for rule in due_alerts {
         let query_config: AlertQueryConfig = match serde_json::from_str(&rule.query_config) {
@@ -311,7 +311,7 @@ async fn eval_alerts(
             Ok(row) => row.count as f64,
             Err(e) => {
                 tracing::warn!("alert {}: query failed: {e}", rule.id);
-                config_db.update_alert_state(&rule.id, "no_data", &now_str, None)?;
+                config_db.update_alert_state(&rule.id, "no_data", &now_str, None).await?;
                 continue;
             }
         };
@@ -349,13 +349,13 @@ async fn eval_alerts(
                 value,
                 threshold,
                 &message,
-            )?;
+            ).await?;
 
             let triggered_at = if triggered { Some(now_str.as_str()) } else { None };
-            config_db.update_alert_state(&rule.id, new_state, &now_str, triggered_at)?;
+            config_db.update_alert_state(&rule.id, new_state, &now_str, triggered_at).await?;
 
             // Skip notifications during active maintenance windows
-            if config_db.is_in_maintenance(&now_str, Some(&rule.id)) {
+            if config_db.is_in_maintenance(&now_str, Some(&rule.id)).await {
                 tracing::debug!("alert '{}': skipping notification — maintenance window active", rule.id);
                 continue;
             }
@@ -365,7 +365,7 @@ async fn eval_alerts(
                 .unwrap_or_default();
             let alert_state_str = if triggered { "FIRING" } else { "RESOLVED" };
             for channel_id in &channel_ids {
-                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
+                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
                     if !channel.enabled {
                         continue;
                     }
@@ -397,13 +397,13 @@ async fn eval_alerts(
                         "",
                         status,
                         &error_msg,
-                    );
+                    ).await;
                 }
             }
 
             tracing::info!("alert '{}' state: {} -> {}", rule.name, old_state, new_state);
         } else {
-            config_db.update_alert_state(&rule.id, new_state, &now_str, None)?;
+            config_db.update_alert_state(&rule.id, new_state, &now_str, None).await?;
         }
     }
 

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use crate::config_db::ConfigDb;
+use crate::clickhouse_config::ConfigDb;
 use crate::models::detection::DetectionRule;
 use clickhouse::Client;
 
@@ -34,7 +34,7 @@ async fn run_detection_cycle(
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    let rules = config_db.list_enabled_detection_rules()?;
+    let rules = config_db.list_enabled_detection_rules().await?;
     if rules.is_empty() {
         tracing::debug!(engine = "siem", "tick -- no enabled detection rules");
         return Ok(());
@@ -65,7 +65,7 @@ async fn run_detection_cycle(
                     "rule evaluation failed"
                 );
                 // Still update last_eval_at so we don't retry every tick
-                let _ = config_db.update_detection_rule_eval(&rule.id, &now_str, None);
+                let _ = config_db.update_detection_rule_eval(&rule.id, &now_str, None).await;
             }
         }
     }
@@ -145,9 +145,9 @@ async fn evaluate_rule(
 
     if did_fire {
         fire_detection(config_db, http_client, rule, match_count, "[]", now_str).await;
-        config_db.update_detection_rule_eval(&rule.id, now_str, Some(now_str))?;
+        config_db.update_detection_rule_eval(&rule.id, now_str, Some(now_str)).await?;
     } else {
-        config_db.update_detection_rule_eval(&rule.id, now_str, None)?;
+        config_db.update_detection_rule_eval(&rule.id, now_str, None).await?;
     }
 
     Ok(did_fire)
@@ -218,7 +218,7 @@ async fn fire_detection(
         &rule.severity,
         match_count,
         sample_data,
-    ) {
+    ).await {
         tracing::error!(error = %e, engine = "siem", rule_name = %rule.name, "failed to create detection event");
     }
 
@@ -234,7 +234,7 @@ async fn fire_detection(
     );
 
     for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id) {
+        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
             let config: serde_json::Value =
                 serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
 

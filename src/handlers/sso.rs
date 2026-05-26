@@ -107,7 +107,7 @@ pub async fn sso_login(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let provider = state
         .config_db
-        .get_enabled_sso_provider()
+        .get_enabled_sso_provider().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| {
             (
@@ -147,14 +147,16 @@ pub async fn sso_login(
         }
         _ => {
             // OIDC flow
-            use rand::Rng;
-            let mut rng = rand::rng();
-            let bytes: [u8; 16] = rng.random();
-            let csrf_state: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let csrf_state: String = {
+                use rand::Rng;
+                let mut rng = rand::rng();
+                let bytes: [u8; 16] = rng.random();
+                bytes.iter().map(|b| format!("{b:02x}")).collect()
+            };
 
             state
                 .config_db
-                .store_sso_state(&csrf_state)
+                .store_sso_state(&csrf_state).await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("state error: {e}")))?;
 
             let scopes_encoded = oidc_scopes
@@ -185,7 +187,7 @@ pub async fn sso_callback(
     // 1. Verify CSRF state
     let valid = state
         .config_db
-        .validate_sso_state(&params.state)
+        .validate_sso_state(&params.state).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("state error: {e}")))?;
 
     if !valid {
@@ -195,7 +197,7 @@ pub async fn sso_callback(
     // 2. Load the enabled SSO provider
     let provider = state
         .config_db
-        .get_enabled_sso_provider()
+        .get_enabled_sso_provider().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| {
             (
@@ -296,7 +298,7 @@ pub async fn sso_callback(
     // 7. Map IdP groups to Rush groups
     let mut mapped_group_ids = state
         .config_db
-        .resolve_idp_groups(&idp_groups, &provider_id)
+        .resolve_idp_groups(&idp_groups, &provider_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("group mapping error: {e}")))?;
 
     // If no mappings match, use default_group_id from provider config
@@ -312,7 +314,7 @@ pub async fn sso_callback(
     // 8. JIT provision: find or create user
     let user_id = match state
         .config_db
-        .find_user_by_external_id(&external_id, "oidc")
+        .find_user_by_external_id(&external_id, "oidc").await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("user lookup error: {e}")))?
     {
         Some(uid) => uid,
@@ -325,7 +327,7 @@ pub async fn sso_callback(
             }
             state
                 .config_db
-                .create_sso_user(&username, &display_name, &external_id, "oidc", "default")
+                .create_sso_user(&username, &display_name, &external_id, "oidc", "default").await
                 .map_err(|e| {
                     (StatusCode::INTERNAL_SERVER_ERROR, format!("user creation error: {e}"))
                 })?
@@ -335,7 +337,7 @@ pub async fn sso_callback(
     // 9. Update the user's group memberships with the mapped set
     state
         .config_db
-        .update_user_groups_from_idp(&user_id, &mapped_group_ids)
+        .update_user_groups_from_idp(&user_id, &mapped_group_ids).await
         .map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("group update error: {e}"))
         })?;
@@ -343,7 +345,7 @@ pub async fn sso_callback(
     // 10. Create a session (same as local auth)
     let token = state
         .config_db
-        .create_session(&user_id)
+        .create_session(&user_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}")))?;
 
     // 11. Set the rush_session cookie and redirect to /
@@ -393,7 +395,7 @@ pub async fn list_sso_providers(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let rows = state
         .config_db
-        .list_sso_providers()
+        .list_sso_providers().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let providers: Vec<SsoProviderResponse> = rows
@@ -437,7 +439,7 @@ pub async fn save_sso_provider(
     headers: HeaderMap,
     Json(req): Json<SaveSsoProviderRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // If updating and no new secret provided, keep the existing one
@@ -447,7 +449,7 @@ pub async fn save_sso_provider(
             // Try to load existing secret
             state
                 .config_db
-                .get_sso_provider(&id)
+                .get_sso_provider(&id).await
                 .ok()
                 .flatten()
                 .map(|p| p.5)
@@ -473,7 +475,7 @@ pub async fn save_sso_provider(
             req.saml_idp_sso_url.as_deref().unwrap_or(""),
             req.saml_idp_cert.as_deref().unwrap_or(""),
             req.saml_sp_entity_id.as_deref().unwrap_or("")
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
@@ -485,10 +487,10 @@ pub async fn delete_sso_provider(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_sso_provider(&id)
+        .delete_sso_provider(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if deleted {
@@ -504,7 +506,7 @@ pub async fn list_idp_group_mappings(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let rows = state
         .config_db
-        .list_idp_group_mappings(None)
+        .list_idp_group_mappings(None).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let mappings: Vec<IdpGroupMappingResponse> = rows
@@ -529,12 +531,12 @@ pub async fn create_idp_group_mapping(
     headers: HeaderMap,
     Json(req): Json<CreateMappingRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let provider_id = req.provider_id.as_deref().unwrap_or("default");
 
     let id = state
         .config_db
-        .create_idp_group_mapping(&req.idp_group, &req.rush_group_id, provider_id)
+        .create_idp_group_mapping(&req.idp_group, &req.rush_group_id, provider_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
@@ -546,10 +548,10 @@ pub async fn delete_idp_group_mapping(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_idp_group_mapping(&id)
+        .delete_idp_group_mapping(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if deleted {
@@ -587,7 +589,7 @@ pub async fn sso_acs(
 
     let provider = state
         .config_db
-        .get_enabled_sso_provider()
+        .get_enabled_sso_provider().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| {
             (StatusCode::BAD_REQUEST, "no SSO provider configured".to_string())
@@ -643,7 +645,7 @@ pub async fn sso_acs(
 
     let mut mapped_group_ids = state
         .config_db
-        .resolve_idp_groups(&assertion.groups, &provider_id)
+        .resolve_idp_groups(&assertion.groups, &provider_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("group mapping error: {e}")))?;
 
     if mapped_group_ids.is_empty() {
@@ -659,7 +661,7 @@ pub async fn sso_acs(
 
     let user_id = match state
         .config_db
-        .find_user_by_external_id(external_id, auth_provider)
+        .find_user_by_external_id(external_id, auth_provider).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
     {
         Some(uid) => uid,
@@ -674,17 +676,17 @@ pub async fn sso_acs(
             let display = assertion.display_name.as_deref().unwrap_or(email);
             state
                 .config_db
-                .create_sso_user(email, display, external_id, auth_provider, "default")
+                .create_sso_user(email, display, external_id, auth_provider, "default").await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("user creation error: {e}")))?
         }
     };
 
     state
         .config_db
-        .update_user_groups_from_idp(&user_id, &mapped_group_ids)
+        .update_user_groups_from_idp(&user_id, &mapped_group_ids).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("group update error: {e}")))?;
 
-    let token = state.config_db.create_session(&user_id).map_err(|e| {
+    let token = state.config_db.create_session(&user_id).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}"))
     })?;
 
@@ -710,7 +712,7 @@ pub async fn sso_metadata(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let provider = state
         .config_db
-        .get_enabled_sso_provider()
+        .get_enabled_sso_provider().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let base_url = resolve_base_url(&headers);
@@ -735,7 +737,7 @@ pub async fn sso_status(
 ) -> Result<Json<SsoStatusResponse>, (StatusCode, String)> {
     match state
         .config_db
-        .get_enabled_sso_provider()
+        .get_enabled_sso_provider().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
     {
         Some((
@@ -780,7 +782,7 @@ pub async fn create_setup_token(
 
     let token = state
         .config_db
-        .create_setup_token(purpose, created_by, provider, hostname)
+        .create_setup_token(purpose, created_by, provider, hostname).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let base = if hostname.is_empty() {
@@ -800,7 +802,7 @@ pub async fn validate_setup_token(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let (valid, provider) = state
         .config_db
-        .validate_setup_token(&token, "sso_setup")
+        .validate_setup_token(&token, "sso_setup").await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     Ok(Json(serde_json::json!({ "valid": valid, "provider": provider })))
@@ -813,7 +815,7 @@ pub async fn complete_setup_token(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let marked = state
         .config_db
-        .mark_setup_token_used(&token)
+        .mark_setup_token_used(&token).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if marked {

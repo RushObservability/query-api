@@ -29,13 +29,13 @@ pub async fn get_tenant_retention(
     // Verify tenant exists
     state
         .config_db
-        .get_tenant(&id)
+        .get_tenant(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     let overrides = state
         .config_db
-        .get_tenant_retention(&id)
+        .get_tenant_retention(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     let mut resp = TenantRetentionResponse {
@@ -65,7 +65,7 @@ pub async fn set_tenant_retention(
     // Verify tenant exists
     state
         .config_db
-        .get_tenant(&id)
+        .get_tenant(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
@@ -97,13 +97,13 @@ pub async fn set_tenant_retention(
             Some(days) => {
                 state
                     .config_db
-                    .set_tenant_retention(&id, signal, days)
+                    .set_tenant_retention(&id, signal, days).await
                     .map_err(|e| {
                         (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
                     })?;
             }
             None => {
-                let _ = state.config_db.delete_tenant_retention(&id, signal);
+                let _ = state.config_db.delete_tenant_retention(&id, signal).await;
             }
         }
     }
@@ -128,13 +128,13 @@ pub async fn delete_tenant_retention(
     // Verify tenant exists
     state
         .config_db
-        .get_tenant(&id)
+        .get_tenant(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     let deleted = state
         .config_db
-        .delete_tenant_retention(&id, &signal)
+        .delete_tenant_retention(&id, &signal).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if !deleted {

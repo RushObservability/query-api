@@ -29,7 +29,7 @@ pub async fn list_monitors(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let monitors = state
         .config_db
-        .list_monitors(&tenant.tenant_id)
+        .list_monitors(&tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<MonitorResponse> = monitors.into_iter().map(MonitorResponse::from).collect();
     Ok(Json(serde_json::json!({ "monitors": responses })))
@@ -42,7 +42,7 @@ pub async fn create_monitor(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -131,12 +131,12 @@ pub async fn create_monitor(
             &req.composite_formula,
             &composite_monitor_ids,
             &req.created_by,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let monitor = state
         .config_db
-        .get_monitor(&id, &tenant.tenant_id)
+        .get_monitor(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -156,13 +156,13 @@ pub async fn get_monitor(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let monitor = state
         .config_db
-        .get_monitor(&id, &tenant.tenant_id)
+        .get_monitor(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "monitor not found".to_string()))?;
 
     let events = state
         .config_db
-        .list_monitor_events(&id, 20)
+        .list_monitor_events(&id, 20).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -179,7 +179,7 @@ pub async fn update_monitor(
     Path(id): Path<String>,
     Json(req): Json<UpdateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -261,7 +261,7 @@ pub async fn update_monitor(
             req.enabled,
             &req.composite_formula,
             &composite_monitor_ids,
-        )
+        ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if !updated {
@@ -270,7 +270,7 @@ pub async fn update_monitor(
 
     let monitor = state
         .config_db
-        .get_monitor(&id, &tenant.tenant_id)
+        .get_monitor(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -289,10 +289,10 @@ pub async fn delete_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_monitor(&id, &tenant.tenant_id)
+        .delete_monitor(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
@@ -308,7 +308,7 @@ pub async fn list_monitor_events(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let events = state
         .config_db
-        .list_monitor_events(&id, params.limit)
+        .list_monitor_events(&id, params.limit).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }
@@ -347,10 +347,10 @@ pub async fn mute_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_monitor_enabled(&id, &tenant.tenant_id, false)
+        .set_monitor_enabled(&id, &tenant.tenant_id, false).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
@@ -365,10 +365,10 @@ pub async fn unmute_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers)?;
+    require_write(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_monitor_enabled(&id, &tenant.tenant_id, true)
+        .set_monitor_enabled(&id, &tenant.tenant_id, true).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));

@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use rush_api::alert_engine;
 use rush_api::config::RushConfig;
-use rush_api::config_db::ConfigDb;
+use rush_api::clickhouse_config::ConfigDb;
 use rush_api::handlers;
 use rush_api::migrations;
 use rush_api::monitor_engine;
@@ -40,19 +40,41 @@ async fn tenant_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let tenant_id = resolve_tenant_from_request(&state, &req);
+    // Extract all header values we need before any await point so the
+    // &Request (whose Body is not Send) is not held across awaits.
+    let auth_header: Option<String> = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let dd_key: Option<String> = req
+        .headers()
+        .get("dd-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let rush_tenant: Option<String> = req
+        .headers()
+        .get("x-rush-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
+
+    let tenant_id = resolve_tenant_from_headers(
+        &state, auth_header, dd_key, rush_tenant, session_token,
+    ).await;
     req.extensions_mut().insert(TenantContext { tenant_id });
     next.run(req).await
 }
 
-fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
+async fn resolve_tenant_from_headers(
+    state: &AppState,
+    auth_header: Option<String>,
+    dd_key: Option<String>,
+    rush_tenant: Option<String>,
+    session_token: Option<String>,
+) -> String {
     // ── Priority 1: Bearer token → fixed to the key's tenant ──
     // API keys are scoped to one tenant (for collectors, CI, Grafana).
-    let auth_header = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-
     if let Some(val) = auth_header {
         if val.len() > 7 && val[..7].eq_ignore_ascii_case("bearer ") {
             let key = val[7..].trim();
@@ -60,7 +82,7 @@ fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
             hasher.update(key.as_bytes());
             let key_hash = format!("{:x}", hasher.finalize());
 
-            match state.config_db.resolve_tenant_for_api_key(&key_hash) {
+            match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
                 Ok(Some(tid)) => return tid,
                 Ok(None) => {
                     tracing::debug!(method = "api_key", "tenant resolution: key not found, falling through");
@@ -75,14 +97,14 @@ fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
     // ── Priority 1b: DD-API-KEY header (Datadog agent) ──
     // The Datadog agent sends its API key in this header. Resolve it the
     // same way as a Bearer token so DD agents map to tenants via API keys.
-    if let Some(dd_key) = req.headers().get("dd-api-key").and_then(|v| v.to_str().ok()) {
-        let key = dd_key.trim();
+    if let Some(dd_key_val) = dd_key {
+        let key = dd_key_val.trim();
         if !key.is_empty() {
             let mut hasher = Sha256::new();
             hasher.update(key.as_bytes());
             let key_hash = format!("{:x}", hasher.finalize());
 
-            match state.config_db.resolve_tenant_for_api_key(&key_hash) {
+            match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
                 Ok(Some(tid)) => return tid,
                 Ok(None) => {
                     tracing::debug!(method = "dd_api_key", "tenant resolution: DD key not found, falling through");
@@ -103,31 +125,31 @@ fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
     // alone is NOT enough — the request must also have been authenticated via
     // Bearer token, DD-API-KEY, or session cookie (priorities 1/1b above).
     // This prevents unauthenticated ingest into locked tenants.
-    if let Some(val) = req.headers().get("x-rush-tenant").and_then(|v| v.to_str().ok()) {
-        let tenant = val.trim();
+    if let Some(tenant_header) = rush_tenant {
+        let tenant = tenant_header.trim().to_string();
         if !tenant.is_empty() {
-            if state.config_db.is_tenant_enabled(tenant) {
+            if state.config_db.is_tenant_enabled(&tenant).await {
                 // If the request carries a session cookie, validate the user has
                 // group-based access to the requested tenant.
-                if let Some(token) = handlers::auth::extract_session_cookie(req.headers()) {
+                if let Some(token) = &session_token {
                     if let Some((user_id, _username, _display_name, _tid, role)) =
-                        state.config_db.get_session_user(&token)
+                        state.config_db.get_session_user(token).await
                     {
                         if role == "admin" {
                             // Admins can access any enabled tenant
-                            return tenant.to_string();
+                            return tenant;
                         }
                         // Non-admins: resolve accessible tenant IDs and check
                         if let Ok((_, _, accessible_ids)) =
-                            state.config_db.resolve_user_permissions(&user_id)
+                            state.config_db.resolve_user_permissions(&user_id).await
                         {
                             // accessible_ids are UUIDs; resolve the requested
                             // tenant name to an ID for comparison
                             if let Ok(Some(tenant_id)) =
-                                state.config_db.get_tenant_id_by_name(tenant)
+                                state.config_db.get_tenant_id_by_name(&tenant).await
                             {
                                 if accessible_ids.contains(&tenant_id) {
-                                    return tenant.to_string();
+                                    return tenant;
                                 }
                             }
                         }
@@ -137,9 +159,9 @@ fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
                         );
                         // Fall through to session default tenant
                     }
-                } else if !state.config_db.is_tenant_auth_required(tenant) {
+                } else if !state.config_db.is_tenant_auth_required(&tenant).await {
                     // No session + open tenant: header is enough (for collectors)
-                    return tenant.to_string();
+                    return tenant;
                 } else {
                     tracing::debug!(
                         tenant_id = %tenant,
@@ -156,9 +178,9 @@ fn resolve_tenant_from_request(state: &AppState, req: &Request) -> String {
     // ── Priority 3: Session cookie → user's default tenant ──
     // Fallback when no explicit tenant header is sent (e.g., first page load
     // before the tenant switcher initializes).
-    if let Some(token) = handlers::auth::extract_session_cookie(req.headers()) {
+    if let Some(token) = session_token {
         if let Some((_user_id, _username, _display_name, tenant_id, _role)) =
-            state.config_db.get_session_user(&token)
+            state.config_db.get_session_user(&token).await
         {
             return tenant_id;
         }
@@ -242,17 +264,14 @@ async fn main() -> anyhow::Result<()> {
         migrations::apply_row_policies(&ch).await;
     }
 
-    let config_db_path =
-        std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());
-    let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
-    config_db.ensure_default_tenant()?;
-    config_db.ensure_default_admin()?;
-    config_db.ensure_default_groups()?;
-    config_db.ensure_default_templates()?;
-    tracing::info!(
-        config_db = %config_db_path,
-        "config db opened"
+    let config_db = Arc::new(
+        ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?
     );
+    config_db.ensure_default_tenant().await?;
+    config_db.ensure_default_admin().await?;
+    config_db.ensure_default_groups().await?;
+    config_db.ensure_default_templates().await?;
+    tracing::info!("config db opened");
 
     // SMTP config for email notifications (optional)
     let smtp_config = alert_engine::SmtpConfig {
@@ -277,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
     monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config);
 
     // Seed built-in SIEM detection rules and spawn the SIEM detection engine
-    config_db.ensure_default_detection_rules()?;
+    config_db.ensure_default_detection_rules().await?;
     siem_engine::spawn(ch.clone(), config_db.clone());
 
     // Spawn usage tracker (fire-and-forget signal usage tracking)
@@ -761,7 +780,6 @@ async fn main() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         port = port,
         clickhouse_url = %clickhouse_url,
-        config_db = %config_db_path,
         row_policies = rush_api::row_policy_supported(),
         "rush-api started"
     );

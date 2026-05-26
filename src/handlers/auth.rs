@@ -33,7 +33,7 @@ pub async fn login(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (user_id, username, display_name, tenant_id, role) = state
         .config_db
-        .authenticate(&req.username, &req.password)
+        .authenticate(&req.username, &req.password).await
         .ok_or_else(|| {
             tracing::warn!(
                 event = "login_failed",
@@ -49,7 +49,7 @@ pub async fn login(
 
     let token = state
         .config_db
-        .create_session(&user_id)
+        .create_session(&user_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}")))?;
 
     tracing::info!(
@@ -94,7 +94,7 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Some(token) = extract_session_cookie(&headers) {
-        state.config_db.delete_session(&token);
+        state.config_db.delete_session(&token).await;
     }
 
     let clear_cookie = "rush_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
@@ -122,7 +122,7 @@ pub async fn me(
 
     let (user_id, username, display_name, tenant_id, role) = state
         .config_db
-        .get_session_user(&token)
+        .get_session_user(&token).await
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,

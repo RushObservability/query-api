@@ -23,11 +23,11 @@ async fn get_kube_client() -> Result<Client, (StatusCode, String)> {
     })
 }
 
-fn check_argocd_enabled(state: &AppState) -> Result<(), (StatusCode, String)> {
+async fn check_argocd_enabled(state: &AppState) -> Result<(), (StatusCode, String)> {
     // Enabled if either the setting is true OR the ARGOCD_NAMESPACE env var is set (helm chart)
     let setting_enabled = state
         .config_db
-        .get_setting("argocd_enabled")
+        .get_setting("argocd_enabled").await
         .ok()
         .flatten()
         .map(|v| v == "true")
@@ -42,14 +42,14 @@ fn check_argocd_enabled(state: &AppState) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
-fn argocd_namespace(state: &AppState) -> String {
+async fn argocd_namespace(state: &AppState) -> String {
     // Check env var first (set by helm chart), then DB setting, then default
     if let Ok(ns) = std::env::var("ARGOCD_NAMESPACE") {
         return ns;
     }
     state
         .config_db
-        .get_setting("argocd_namespace")
+        .get_setting("argocd_namespace").await
         .ok()
         .flatten()
         .unwrap_or_else(|| "argocd".to_string())
@@ -190,8 +190,8 @@ fn summarise_app(obj: &DynamicObject) -> Value {
 pub async fn list_applications(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    check_argocd_enabled(&state)?;
-    let namespace = argocd_namespace(&state);
+    check_argocd_enabled(&state).await?;
+    let namespace = argocd_namespace(&state).await;
     let client = get_kube_client().await?;
 
     let apps: Api<DynamicObject> = Api::namespaced_with(client, &namespace, &application_ar());
@@ -211,8 +211,8 @@ pub async fn get_application(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    check_argocd_enabled(&state)?;
-    let namespace = argocd_namespace(&state);
+    check_argocd_enabled(&state).await?;
+    let namespace = argocd_namespace(&state).await;
     let client = get_kube_client().await?;
 
     let apps: Api<DynamicObject> = Api::namespaced_with(client, &namespace, &application_ar());
@@ -338,8 +338,8 @@ pub async fn get_application(
 pub async fn list_applicationsets(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    check_argocd_enabled(&state)?;
-    let namespace = argocd_namespace(&state);
+    check_argocd_enabled(&state).await?;
+    let namespace = argocd_namespace(&state).await;
     let client = get_kube_client().await?;
 
     let appsets: Api<DynamicObject> =

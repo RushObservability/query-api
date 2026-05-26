@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{MetricRetentionRule, TraceRetentionRule, RushConfig};
-use crate::config_db::ConfigDb;
+use crate::clickhouse_config::ConfigDb;
 
 /// Spawn the retention enforcer as a background task (fire-and-forget).
 /// Follows the same pattern as `alert_engine::spawn_alert_engine`.
@@ -189,7 +189,7 @@ async fn enforce_tenant_retention(
 ) -> anyhow::Result<()> {
     let dry_run = config.retention.enforcer.dry_run;
 
-    let overrides = config_db.list_all_tenant_retention()?;
+    let overrides = config_db.list_all_tenant_retention().await?;
     if overrides.is_empty() {
         return Ok(());
     }
