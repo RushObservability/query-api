@@ -49,7 +49,7 @@ async fn eval_trace_latency(
     // Count requests that exceeded the threshold (slow = errors for budget)
     let slow_sql = format!(
         "SELECT count() as count FROM wide_events {}",
-        total_clauses.with_where_extra(&format!("Duration > {threshold_ns}")).to_sql(),
+        total_clauses.with_where_extra(&format!("duration_ns > {threshold_ns}")).to_sql(),
     );
     let slow_count = ch.query(&slow_sql).fetch_one::<CountRow>().await?.count as i64;
 
