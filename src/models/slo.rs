@@ -117,6 +117,7 @@ pub struct CreateSloRequest {
     pub service_name: String,
     #[serde(default)]
     pub metric_name: String,
+    #[serde(default = "default_window_type")]
     pub window_type: String,
     pub target_percentage: f64,
     #[serde(default)]
@@ -149,6 +150,7 @@ pub struct UpdateSloRequest {
     pub service_name: String,
     #[serde(default)]
     pub metric_name: String,
+    #[serde(default = "default_window_type")]
     pub window_type: String,
     pub target_percentage: f64,
     #[serde(default)]
@@ -176,6 +178,10 @@ fn default_slo_type() -> String {
 
 fn default_indicator_type() -> String {
     "availability".to_string()
+}
+
+fn default_window_type() -> String {
+    "rolling_30d".to_string()
 }
 
 fn default_eval_interval() -> i64 {
