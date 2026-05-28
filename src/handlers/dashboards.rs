@@ -162,6 +162,7 @@ pub async fn create_widget(
     Path(dashboard_id): Path<String>,
     Json(req): Json<CreateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     // Verify dashboard exists and user has visibility
@@ -204,9 +205,11 @@ pub async fn create_widget(
 
 pub async fn update_widget(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((dashboard_id, widget_id)): Path<(String, String)>,
     Json(req): Json<UpdateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let valid_types = ["timeseries", "bar", "table", "counter"];
     if !valid_types.contains(&req.widget_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid widget_type: {}", req.widget_type)));
@@ -241,8 +244,10 @@ pub async fn update_widget(
 
 pub async fn delete_widget(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((dashboard_id, widget_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_widget(&widget_id, &dashboard_id).await
@@ -261,6 +266,7 @@ pub async fn export_dashboard(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let export = state
         .config_db

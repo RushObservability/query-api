@@ -37,7 +37,7 @@ pub async fn login(
         .get("x-forwarded-for")
         .or_else(|| headers.get("x-real-ip"))
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .map(|s| s.split(',').last().unwrap_or(s).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     {
         let now = std::time::Instant::now();
@@ -104,7 +104,6 @@ pub async fn login(
                 tenant_id,
                 role,
             },
-            "token": token,
         })),
     ))
 }

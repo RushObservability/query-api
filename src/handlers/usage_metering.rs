@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::users::{require_admin, require_auth};
+use crate::query_builder::{escape_string_literal, sanitize_datetime};
 
 // ── Query params ──
 
@@ -117,12 +118,12 @@ pub async fn usage_summary(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = escape_string_literal(tenant_id);
     let is_global = params.global.unwrap_or(false);
 
     let now = chrono::Utc::now();
-    let from = params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339());
-    let to = params.to.unwrap_or_else(|| now.to_rfc3339());
+    let from = sanitize_datetime(&params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()));
+    let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
 
     let tenant_filter = if is_global {
         String::new()
@@ -188,11 +189,11 @@ pub async fn usage_breakdown(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = escape_string_literal(tenant_id);
 
     let now = chrono::Utc::now();
-    let from = params.from.unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339());
-    let to = params.to.unwrap_or_else(|| now.to_rfc3339());
+    let from = sanitize_datetime(&params.from.unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339()));
+    let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
     let interval = params.interval.as_deref().unwrap_or("hour");
 
     let ts_expr = match interval {
@@ -213,7 +214,7 @@ pub async fn usage_breakdown(
     );
 
     if let Some(ref sig) = params.signal {
-        let escaped_signal = sig.replace('\'', "\\'");
+        let escaped_signal = escape_string_literal(sig);
         sql.push_str(&format!(" AND signal = '{escaped_signal}'"));
     }
 
@@ -268,8 +269,8 @@ pub async fn usage_tenants(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
     let now = chrono::Utc::now();
-    let from = params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339());
-    let to = params.to.unwrap_or_else(|| now.to_rfc3339());
+    let from = sanitize_datetime(&params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()));
+    let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
     let limit = params.limit.unwrap_or(50).min(500);
 
     let sql = format!(

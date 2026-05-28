@@ -20,11 +20,14 @@ fn validate_detection_sql(query_sql: &str) -> Result<(), (StatusCode, String)> {
         return Err((StatusCode::BAD_REQUEST, "query_sql must be a SELECT statement".to_string()));
     }
 
-    // Block DDL/DML and dangerous builtins
+    // Block DDL/DML, dangerous builtins, and ClickHouse data-exfiltration table functions
     const FORBIDDEN: &[&str] = &[
         "insert ", "update ", "delete ", "drop ", "create ", "alter ",
         "truncate ", "exec(", "execute(", "call ", "system(", "grant ", "revoke ",
         "file(", "load_file(", "into outfile", "into dumpfile",
+        // ClickHouse table functions that can reach external systems
+        "url(", "remote(", "remotesecure(", "s3(", "hdfs(", "mysql(", "postgresql(",
+        "jdbc(", "odbc(", "sqlite(",
     ];
     for kw in FORBIDDEN {
         if lower.contains(kw) {
@@ -80,7 +83,7 @@ pub async fn create_detection_rule(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateDetectionRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
@@ -124,7 +127,7 @@ pub async fn create_detection_rule(
             req.window_secs,
             req.enabled,
             &channels,
-            "", // created_by (can be enriched from session later)
+            &caller.1, // created_by: username from session
         ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -320,8 +323,10 @@ pub async fn test_detection_rule(
 pub async fn list_detection_events(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Query(params): Query<ListEventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let events = state
         .config_db
         .list_detection_events(&tenant.tenant_id, params.limit).await

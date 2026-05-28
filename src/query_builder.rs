@@ -3,7 +3,7 @@ use crate::models::query::{Filter, FilterOp};
 /// Sanitize a datetime string for safe embedding in SQL string literals.
 /// Restricts to characters valid in ISO 8601 / ClickHouse datetime formats,
 /// preventing single-quote injection in PREWHERE time-range conditions.
-fn sanitize_datetime(s: &str) -> String {
+pub(crate) fn sanitize_datetime(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.' | '+' | ' '))
         .collect()

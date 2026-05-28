@@ -114,7 +114,7 @@ pub async fn create_user(
     headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     let username = req.username.trim().to_string();
     if username.is_empty() {
@@ -157,6 +157,13 @@ pub async fn create_user(
             )
         })?;
 
+    tracing::info!(
+        event = "user_created",
+        new_user = %username,
+        admin = %caller.1,
+        "user created"
+    );
+
     Ok((StatusCode::CREATED, Json(user_response(row))))
 }
 
@@ -166,7 +173,7 @@ pub async fn delete_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     // Refuse to delete the user named "admin"
     let username = state
@@ -190,6 +197,13 @@ pub async fn delete_user(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
     }
+
+    tracing::info!(
+        event = "user_deleted",
+        deleted_user = %username,
+        admin = %caller.1,
+        "user deleted"
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }

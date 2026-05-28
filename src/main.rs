@@ -2,7 +2,6 @@ use axum::{Router, routing::any, routing::delete, routing::get, routing::post, r
 use axum::{extract::Request, middleware::Next, response::Response};
 use axum::http::{HeaderValue, header};
 use clickhouse::Client;
-use sha2::{Sha256, Digest};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
@@ -34,6 +33,13 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
     headers.insert(
         header::HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
+        ),
     );
     resp
 }
@@ -93,9 +99,7 @@ async fn resolve_tenant_from_headers(
     if let Some(val) = auth_header {
         if val.len() > 7 && val[..7].eq_ignore_ascii_case("bearer ") {
             let key = val[7..].trim();
-            let mut hasher = Sha256::new();
-            hasher.update(key.as_bytes());
-            let key_hash = format!("{:x}", hasher.finalize());
+            let key_hash = handlers::settings::hash_api_key(key);
 
             match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
                 Ok(Some(tid)) => return tid,
@@ -115,9 +119,7 @@ async fn resolve_tenant_from_headers(
     if let Some(dd_key_val) = dd_key {
         let key = dd_key_val.trim();
         if !key.is_empty() {
-            let mut hasher = Sha256::new();
-            hasher.update(key.as_bytes());
-            let key_hash = format!("{:x}", hasher.finalize());
+            let key_hash = handlers::settings::hash_api_key(key);
 
             match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
                 Ok(Some(tid)) => return tid,
@@ -797,7 +799,18 @@ async fn main() -> anyhow::Result<()> {
                     .allow_methods(AllowMethods::any())
                     .allow_headers(AllowHeaders::any())
                     .allow_credentials(true),
-                None => CorsLayer::permissive(),
+                None => {
+                    // No RUSH_ALLOWED_ORIGINS set — restrict to same-origin only.
+                    // Set RUSH_ALLOWED_ORIGINS=http://localhost:5173 for local dev.
+                    tracing::warn!(
+                        "RUSH_ALLOWED_ORIGINS not set; CORS restricted to same-origin. \
+                         Set this variable for cross-origin access."
+                    );
+                    CorsLayer::new()
+                        .allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")))
+                        .allow_methods(AllowMethods::any())
+                        .allow_headers(AllowHeaders::any())
+                }
             }
         })
         .layer(axum::middleware::from_fn(security_headers_middleware))
@@ -810,6 +823,18 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // FINDING-13: Warn when ClickHouse row policies are not active.
+    // Without row policies, tenant isolation is enforced only at the API layer.
+    // Configure `custom_settings_prefixes = 'rush_'` in ClickHouse for DB-layer isolation.
+    if !rush_api::row_policy_supported() {
+        tracing::warn!(
+            row_policies = rush_api::row_policy_supported(),
+            "ClickHouse row-level security policies are NOT active. \
+             Tenant isolation relies solely on API-layer WHERE injection. \
+             Set custom_settings_prefixes = 'rush_' in ClickHouse config to enable row policies."
+        );
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         port = port,
