@@ -9,6 +9,40 @@ use axum::{
 use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::users::require_write;
+
+/// Validate that a detection rule SQL is a safe SELECT-only statement.
+fn validate_detection_sql(query_sql: &str) -> Result<(), (StatusCode, String)> {
+    let trimmed = query_sql.trim();
+    let lower = trimmed.to_lowercase();
+
+    // Must start with SELECT
+    if !lower.starts_with("select ") && !lower.starts_with("select\n") && !lower.starts_with("select\t") {
+        return Err((StatusCode::BAD_REQUEST, "query_sql must be a SELECT statement".to_string()));
+    }
+
+    // Block DDL/DML and dangerous builtins
+    const FORBIDDEN: &[&str] = &[
+        "insert ", "update ", "delete ", "drop ", "create ", "alter ",
+        "truncate ", "exec(", "execute(", "call ", "system(", "grant ", "revoke ",
+        "file(", "load_file(", "into outfile", "into dumpfile",
+    ];
+    for kw in FORBIDDEN {
+        if lower.contains(kw) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("query_sql must not contain '{}'", kw.trim()),
+            ));
+        }
+    }
+
+    // No semicolons — prevents statement chaining
+    if trimmed.contains(';') {
+        return Err((StatusCode::BAD_REQUEST, "query_sql must not contain semicolons".to_string()));
+    }
+
+    Ok(()
+    )
+}
 use crate::models::detection::*;
 
 #[derive(Debug, serde::Deserialize)]
@@ -68,6 +102,7 @@ pub async fn create_detection_rule(
     if req.query_sql.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "query_sql cannot be empty".to_string()));
     }
+    validate_detection_sql(&req.query_sql)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let channels = serde_json::to_string(&req.channels)
@@ -159,6 +194,7 @@ pub async fn update_detection_rule(
     if req.query_sql.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "query_sql cannot be empty".to_string()));
     }
+    validate_detection_sql(&req.query_sql)?;
 
     // Verify ownership
     let existing = state
@@ -239,9 +275,11 @@ pub async fn delete_detection_rule(
 /// Dry-run a detection rule: execute the query and return results without creating an event.
 pub async fn test_detection_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let rule = state
         .config_db
         .get_detection_rule(&id).await
