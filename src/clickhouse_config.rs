@@ -866,8 +866,15 @@ impl ConfigDb {
             .await?;
         if row.n > 0 { return Ok(()); }
 
+        let initial_password = std::env::var("INITIAL_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| {
+                use rand::Rng;
+                let mut rng = rand::rng();
+                (0..24).map(|_| rng.sample(rand::distr::Alphanumeric) as char).collect()
+            });
+
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = hash_password("rushobservability")?;
+        let password_hash = hash_password(&initial_password)?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
@@ -882,7 +889,15 @@ impl ConfigDb {
             .bind(ver)
             .execute()
             .await?;
-        tracing::info!("default admin user created (admin/rushobservability)");
+
+        // Print once to stdout — do NOT log via tracing (which feeds into the SIEM pipeline)
+        println!("=============================================================");
+        println!(" Rush initial admin credentials");
+        println!(" Username : admin");
+        println!(" Password : {initial_password}");
+        println!(" Change this password immediately after first login.");
+        println!("=============================================================");
+        tracing::info!("default admin user created");
         Ok(())
     }
 

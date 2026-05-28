@@ -2553,7 +2553,8 @@ impl ConfigDb {
     // ── User & session operations ──
 
     /// On first boot, create a default admin user if no users exist.
-    /// Password is argon2id-hashed. Logs creation or silently skips.
+    /// Uses INITIAL_ADMIN_PASSWORD env var; generates a random password if not set.
+    /// Prints credentials once to stdout — never to structured logs.
     pub fn ensure_default_admin(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn
@@ -2563,8 +2564,15 @@ impl ConfigDb {
             return Ok(());
         }
 
+        let initial_password = std::env::var("INITIAL_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| {
+                use rand::Rng;
+                let mut rng = rand::rng();
+                (0..24).map(|_| rng.sample(rand::distr::Alphanumeric) as char).collect()
+            });
+
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = hash_password("rushobservability")?;
+        let password_hash = hash_password(&initial_password)?;
 
         conn.execute(
             "INSERT INTO users (id, username, password_hash, display_name, tenant_id, role) \
@@ -2572,7 +2580,14 @@ impl ConfigDb {
             params![id, "admin", password_hash, "Admin", "default", "admin"],
         )?;
 
-        tracing::info!("default admin user created (admin/rushobservability)");
+        // Print once to stdout — do NOT log via tracing (which feeds into the SIEM pipeline)
+        println!("=============================================================");
+        println!(" Rush initial admin credentials");
+        println!(" Username : admin");
+        println!(" Password : {initial_password}");
+        println!(" Change this password immediately after first login.");
+        println!("=============================================================");
+        tracing::info!("default admin user created");
         Ok(())
     }
 

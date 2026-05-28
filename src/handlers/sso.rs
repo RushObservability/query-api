@@ -245,9 +245,9 @@ pub async fn sso_callback(
         (StatusCode::BAD_GATEWAY, "no id_token in response".to_string())
     })?;
 
-    // 4. Decode the id_token JWT payload (base64 decode, not full verification for v1)
-    let claims = decode_jwt_payload(&id_token).map_err(|e| {
-        (StatusCode::BAD_GATEWAY, format!("failed to decode id_token: {e}"))
+    // 4. Verify the id_token JWT signature against the provider's JWKS and decode claims
+    let claims = verify_and_decode_jwt(&client, &id_token, &issuer_url).await.map_err(|e| {
+        (StatusCode::BAD_GATEWAY, format!("id_token verification failed: {e}"))
     })?;
 
     // 5. Extract claims
@@ -366,25 +366,78 @@ pub async fn sso_callback(
     Ok((StatusCode::FOUND, headers, ""))
 }
 
-/// Decode the payload portion of a JWT without signature verification.
-/// This is suitable for v1; production deployments should verify the signature
-/// against the IdP's JWKS endpoint.
-fn decode_jwt_payload(jwt: &str) -> anyhow::Result<serde_json::Value> {
-    use base64::Engine;
-    let parts: Vec<&str> = jwt.split('.').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("invalid JWT format");
+/// Verify an OIDC id_token JWT signature against the provider's JWKS endpoint and return claims.
+/// Fetches the OIDC discovery document to resolve the JWKS URI, then verifies the signature.
+/// Rejects `alg:none` and any token that fails signature validation.
+async fn verify_and_decode_jwt(
+    http_client: &reqwest::Client,
+    token: &str,
+    issuer_url: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+    use jsonwebtoken::jwk::JwkSet;
+
+    // Parse the JWT header to get `kid` and `alg` — does not verify signature
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|e| anyhow::anyhow!("invalid JWT header: {e}"))?;
+
+    // Explicitly reject alg:none
+    if matches!(header.alg, Algorithm::None) {
+        anyhow::bail!("JWT with algorithm 'none' is not accepted");
     }
 
-    // The payload is the second part, base64url-encoded
-    let payload_b64 = parts[1];
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64))
-        .map_err(|e| anyhow::anyhow!("base64 decode error: {e}"))?;
+    // Fetch the OIDC discovery document to get the JWKS URI
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer_url.trim_end_matches('/')
+    );
+    let discovery: serde_json::Value = http_client
+        .get(&discovery_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("OIDC discovery request failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("OIDC discovery parse error: {e}"))?;
 
-    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)?;
-    Ok(claims)
+    let jwks_uri = discovery["jwks_uri"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("OIDC discovery document missing jwks_uri"))?;
+
+    // Fetch the JSON Web Key Set
+    let jwks: JwkSet = http_client
+        .get(jwks_uri)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("JWKS fetch failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("JWKS parse error: {e}"))?;
+
+    // Select the matching key: prefer by kid, fall back to first key
+    let jwk = if let Some(kid) = header.kid.as_deref() {
+        jwks.find(kid)
+            .ok_or_else(|| anyhow::anyhow!("no JWK found for kid '{kid}'"))?
+    } else {
+        jwks.keys
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("JWKS is empty"))?
+    };
+
+    let decoding_key = DecodingKey::from_jwk(jwk)
+        .map_err(|e| anyhow::anyhow!("failed to build decoding key from JWK: {e}"))?;
+
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[issuer_url]);
+    // Skip audience validation — client_id varies by provider
+    validation.validate_aud = false;
+
+    let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)
+        .map_err(|e| anyhow::anyhow!("JWT signature verification failed: {e}"))?;
+
+    Ok(token_data.claims)
 }
 
 // ── SSO Config Admin Endpoints ──
@@ -773,8 +826,10 @@ pub struct CreateSetupTokenRequest {
 /// POST /api/v1/sso/setup-token -- Create a one-time setup link for security teams
 pub async fn create_setup_token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateSetupTokenRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::handlers::users::require_admin(&state, &headers).await?;
     let purpose = req.purpose.as_deref().unwrap_or("sso_setup");
     let created_by = req.created_by.as_deref().unwrap_or("admin");
     let provider = req.provider.as_deref().unwrap_or("");
