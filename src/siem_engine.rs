@@ -171,21 +171,63 @@ fn build_scoped_query(
 
 fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
     let escaped_tenant = tenant_id.replace('\'', "''");
-
-    // Find all WHERE positions (case-insensitive) and inject tenant_id after each one.
-    let mut result = String::with_capacity(sql.len() + 100);
+    let tenant_condition = format!("tenant_id = '{escaped_tenant}'");
     let lower = sql.to_lowercase();
-    let mut last_pos = 0;
 
-    for (idx, _) in lower.match_indices("where ") {
-        // Copy everything up to and including "WHERE "
-        result.push_str(&sql[last_pos..idx + 6]);
-        // Inject tenant_id filter
-        result.push_str(&format!("tenant_id = '{escaped_tenant}' AND "));
-        last_pos = idx + 6;
+    // Walk the SQL character-by-character, tracking whether we are inside a string
+    // literal so that occurrences of "WHERE" inside quoted strings are ignored.
+    // This avoids injecting a spurious tenant filter into query text like:
+    //   WHERE Body LIKE 'show me where errors occurred'
+    let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    let n = chars.len();
+    let mut result = String::with_capacity(sql.len() + 100);
+    let mut ci = 0usize;
+    let mut in_string = false;
+    let mut injections = 0usize;
+
+    while ci < n {
+        let (byte_pos, ch) = chars[ci];
+
+        if in_string {
+            result.push(ch);
+            ci += 1;
+            if ch == '\'' {
+                // '' is an escaped single-quote inside a string literal — stay in string
+                if ci < n && chars[ci].1 == '\'' {
+                    result.push('\'');
+                    ci += 1;
+                } else {
+                    in_string = false;
+                }
+            }
+        } else if ch == '\'' {
+            in_string = true;
+            result.push(ch);
+            ci += 1;
+        } else {
+            // "where " is 6 ASCII bytes; check lower-cased view outside string literals
+            let rest = &lower[byte_pos..];
+            if (rest.starts_with("where ") || rest.starts_with("where\n") || rest.starts_with("where\t"))
+                && ci + 6 <= n
+            {
+                // Push "WHERE " from original SQL preserving the caller's case
+                result.push_str(&sql[byte_pos..byte_pos + 6]);
+                result.push_str(&tenant_condition);
+                result.push_str(" AND ");
+                ci += 6;
+                injections += 1;
+            } else {
+                result.push(ch);
+                ci += 1;
+            }
+        }
     }
-    // Copy the remainder
-    result.push_str(&sql[last_pos..]);
+
+    // Safety net: if the query had no WHERE clause, append one so tenant isolation
+    // is always enforced even for bare "SELECT * FROM otel_logs" queries.
+    if injections == 0 {
+        result.push_str(&format!(" WHERE {tenant_condition}"));
+    }
 
     result
 }
@@ -343,5 +385,23 @@ mod tests {
         assert!(result.contains("tenant_id = 'default'"));
         assert!(!result.contains("@window_start"));
         assert!(!result.contains("@window_end"));
+    }
+
+    #[test]
+    fn test_inject_tenant_filter_ignores_where_in_string_literal() {
+        // "where" inside a quoted string should NOT get a tenant filter injected
+        let sql = "SELECT count() FROM otel_logs WHERE Body LIKE 'show where errors occurred'";
+        let result = inject_tenant_filter(sql, "sec");
+        // Should inject exactly once (the real WHERE), not twice
+        assert_eq!(result.matches("tenant_id = 'sec'").count(), 1, "got: {result}");
+        assert!(result.contains("show where errors occurred"), "string literal mangled: {result}");
+    }
+
+    #[test]
+    fn test_inject_tenant_filter_no_where_clause() {
+        // Queries without WHERE must still get a tenant filter appended
+        let sql = "SELECT count() FROM otel_logs";
+        let result = inject_tenant_filter(sql, "acme");
+        assert!(result.contains("WHERE tenant_id = 'acme'"), "missing tenant filter: {result}");
     }
 }
