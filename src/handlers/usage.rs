@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::users::require_auth;
+use crate::query_builder::escape_string_literal;
 
 #[derive(Debug, Deserialize)]
 pub struct UsageQuery {
@@ -59,12 +60,12 @@ pub async fn get_usage(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = escape_string_literal(tenant_id);
     let days = params.days.unwrap_or(30);
     let limit = params.limit.unwrap_or(100).min(1000);
 
     let type_filter = match &params.signal_type {
-        Some(t) => format!("AND signal_type = '{}'", t.replace('\'', "\\'")),
+        Some(t) => format!("AND signal_type = '{}'", escape_string_literal(t)),
         None => String::new(),
     };
 
@@ -190,8 +191,8 @@ pub async fn get_label_breakdown(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let escaped = metric.replace('\'', "\\'");
+    let escaped_tenant = escape_string_literal(tenant_id);
+    let escaped = escape_string_literal(&metric);
 
     // Count distinct values per label key across both gauge and sum tables.
     // We union the raw label key/value pairs first, then count distinct per key.

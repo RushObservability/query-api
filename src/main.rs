@@ -4,7 +4,7 @@ use axum::http::{HeaderValue, header};
 use clickhouse::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -796,8 +796,20 @@ async fn main() -> anyhow::Result<()> {
             match origins {
                 Some(list) => CorsLayer::new()
                     .allow_origin(AllowOrigin::list(list))
-                    .allow_methods(AllowMethods::any())
-                    .allow_headers(AllowHeaders::any())
+                    .allow_methods([
+                        axum::http::Method::GET,
+                        axum::http::Method::POST,
+                        axum::http::Method::PUT,
+                        axum::http::Method::DELETE,
+                        axum::http::Method::PATCH,
+                        axum::http::Method::OPTIONS,
+                    ])
+                    .allow_headers([
+                        header::CONTENT_TYPE,
+                        header::AUTHORIZATION,
+                        header::HeaderName::from_static("x-rush-tenant"),
+                        header::HeaderName::from_static("dd-api-key"),
+                    ])
                     .allow_credentials(true),
                 None => {
                     // No RUSH_ALLOWED_ORIGINS set — restrict to same-origin only.
@@ -808,8 +820,20 @@ async fn main() -> anyhow::Result<()> {
                     );
                     CorsLayer::new()
                         .allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")))
-                        .allow_methods(AllowMethods::any())
-                        .allow_headers(AllowHeaders::any())
+                        .allow_methods([
+                            axum::http::Method::GET,
+                            axum::http::Method::POST,
+                            axum::http::Method::PUT,
+                            axum::http::Method::DELETE,
+                            axum::http::Method::PATCH,
+                            axum::http::Method::OPTIONS,
+                        ])
+                        .allow_headers([
+                            header::CONTENT_TYPE,
+                            header::AUTHORIZATION,
+                            header::HeaderName::from_static("x-rush-tenant"),
+                            header::HeaderName::from_static("dd-api-key"),
+                        ])
                 }
             }
         })
@@ -833,6 +857,23 @@ async fn main() -> anyhow::Result<()> {
              Tenant isolation relies solely on API-layer WHERE injection. \
              Set custom_settings_prefixes = 'rush_' in ClickHouse config to enable row policies."
         );
+    }
+    // R01: Warn when RUSH_API_KEY_SECRET is unset or too short.
+    // An empty or short secret means HMAC-SHA256 provides no real keyed-hash protection.
+    match std::env::var("RUSH_API_KEY_SECRET") {
+        Ok(s) if s.len() >= 32 => {}
+        Ok(s) if s.is_empty() => tracing::warn!(
+            "RUSH_API_KEY_SECRET is not set. API key hashes are stored with an empty HMAC key. \
+             Set RUSH_API_KEY_SECRET to a random 32+ character secret before deployment."
+        ),
+        Ok(_) => tracing::warn!(
+            "RUSH_API_KEY_SECRET is shorter than 32 characters. \
+             Use a random secret of at least 32 characters for adequate HMAC security."
+        ),
+        Err(_) => tracing::warn!(
+            "RUSH_API_KEY_SECRET is not set. API key hashes are stored with an empty HMAC key. \
+             Set RUSH_API_KEY_SECRET to a random 32+ character secret before deployment."
+        ),
     }
 
     tracing::info!(

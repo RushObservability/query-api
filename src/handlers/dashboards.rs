@@ -295,7 +295,9 @@ pub async fn import_dashboard(
 
 pub async fn list_dashboard_templates(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let templates = state
         .config_db
         .list_dashboard_templates().await
