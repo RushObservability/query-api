@@ -232,6 +232,12 @@ fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
     result
 }
 
+/// Validate that a notification URL is safe to send HTTP requests to.
+/// Requires HTTPS scheme to prevent SSRF via plaintext channels.
+fn is_safe_notification_url(url: &str) -> bool {
+    url.starts_with("https://")
+}
+
 /// Fire a detection: create an event and send notifications.
 async fn fire_detection(
     config_db: &ConfigDb,
@@ -283,38 +289,58 @@ async fn fire_detection(
             match channel.channel_type.as_str() {
                 "slack" => {
                     if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                        let payload = serde_json::json!({ "text": message });
-                        if let Err(e) = http_client.post(url).json(&payload).send().await {
+                        if !is_safe_notification_url(url) {
                             tracing::warn!(
-                                error = %e,
                                 engine = "siem",
                                 rule_name = %rule.name,
                                 channel = "slack",
-                                "notification failed"
+                                url = %url,
+                                "notification URL rejected: must use HTTPS"
                             );
+                        } else {
+                            let payload = serde_json::json!({ "text": message });
+                            if let Err(e) = http_client.post(url).json(&payload).send().await {
+                                tracing::warn!(
+                                    error = %e,
+                                    engine = "siem",
+                                    rule_name = %rule.name,
+                                    channel = "slack",
+                                    "notification failed"
+                                );
+                            }
                         }
                     }
                 }
                 _ => {
                     // webhook (default)
                     if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                        let payload = serde_json::json!({
-                            "detection_rule": rule.name,
-                            "severity": rule.severity,
-                            "tenant_id": rule.tenant_id,
-                            "match_count": match_count,
-                            "message": message,
-                            "event_id": event_id,
-                            "fired_at": now_str,
-                        });
-                        if let Err(e) = http_client.post(url).json(&payload).send().await {
+                        if !is_safe_notification_url(url) {
                             tracing::warn!(
-                                error = %e,
                                 engine = "siem",
                                 rule_name = %rule.name,
                                 channel = "webhook",
-                                "notification failed"
+                                url = %url,
+                                "notification URL rejected: must use HTTPS"
                             );
+                        } else {
+                            let payload = serde_json::json!({
+                                "detection_rule": rule.name,
+                                "severity": rule.severity,
+                                "tenant_id": rule.tenant_id,
+                                "match_count": match_count,
+                                "message": message,
+                                "event_id": event_id,
+                                "fired_at": now_str,
+                            });
+                            if let Err(e) = http_client.post(url).json(&payload).send().await {
+                                tracing::warn!(
+                                    error = %e,
+                                    engine = "siem",
+                                    rule_name = %rule.name,
+                                    channel = "webhook",
+                                    "notification failed"
+                                );
+                            }
                         }
                     }
                 }

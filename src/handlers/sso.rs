@@ -246,7 +246,7 @@ pub async fn sso_callback(
     })?;
 
     // 4. Verify the id_token JWT signature against the provider's JWKS and decode claims
-    let claims = verify_and_decode_jwt(&client, &id_token, &issuer_url).await.map_err(|e| {
+    let claims = verify_and_decode_jwt(&client, &id_token, &issuer_url, &client_id).await.map_err(|e| {
         (StatusCode::BAD_GATEWAY, format!("id_token verification failed: {e}"))
     })?;
 
@@ -373,7 +373,12 @@ async fn verify_and_decode_jwt(
     http_client: &reqwest::Client,
     token: &str,
     issuer_url: &str,
+    client_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    // FINDING-05: Reject non-HTTPS issuer URLs to prevent SSRF via OIDC discovery.
+    if !issuer_url.starts_with("https://") {
+        anyhow::bail!("issuer_url must use HTTPS (got: {issuer_url})");
+    }
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     use jsonwebtoken::jwk::JwkSet;
 
@@ -435,8 +440,9 @@ async fn verify_and_decode_jwt(
 
     let mut validation = Validation::new(header.alg);
     validation.set_issuer(&[issuer_url]);
-    // Skip audience validation — client_id varies by provider
-    validation.validate_aud = false;
+    // Validate the audience claim against the registered client_id.
+    // This ensures tokens issued for other apps at the same IdP are rejected.
+    validation.set_audience(&[client_id]);
 
     let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)
         .map_err(|e| anyhow::anyhow!("JWT signature verification failed: {e}"))?;
@@ -498,7 +504,7 @@ pub async fn save_sso_provider(
     headers: HeaderMap,
     Json(req): Json<SaveSsoProviderRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // If updating and no new secret provided, keep the existing one
@@ -537,6 +543,14 @@ pub async fn save_sso_provider(
         ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
+    tracing::info!(
+        event = "sso_provider_saved",
+        provider_id = %id,
+        provider_name = %req.name,
+        admin = %caller.1,
+        "SSO provider saved"
+    );
+
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
 }
 
@@ -546,13 +560,19 @@ pub async fn delete_sso_provider(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_sso_provider(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if deleted {
+        tracing::info!(
+            event = "sso_provider_deleted",
+            provider_id = %id,
+            admin = %caller.1,
+            "SSO provider deleted"
+        );
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((StatusCode::NOT_FOUND, "provider not found".to_string()))
@@ -880,8 +900,10 @@ pub async fn validate_setup_token(
 /// POST /api/v1/sso/setup-token/{token}/complete -- Mark a setup token as used
 pub async fn complete_setup_token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let marked = state
         .config_db
         .mark_setup_token_used(&token).await
@@ -896,8 +918,18 @@ pub async fn complete_setup_token(
 
 // ── Helpers ──
 
-/// Resolve the base URL from request headers.
+/// Resolve the base URL for SAML ACS / SP entity ID construction.
+/// RUSH_BASE_URL env var takes precedence over request headers to prevent
+/// host-header injection attacks (FINDING-17).
 fn resolve_base_url(headers: &HeaderMap) -> String {
+    if let Ok(base) = std::env::var("RUSH_BASE_URL") {
+        if !base.is_empty() {
+            return base.trim_end_matches('/').to_string();
+        }
+    }
+
+    // Fallback: derive from request headers (dev/single-node only).
+    // Set RUSH_BASE_URL in production to prevent host-header injection.
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
