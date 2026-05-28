@@ -1,11 +1,11 @@
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{extract::Request, middleware::Next, response::Response};
+use axum::http::{HeaderValue, header};
 use clickhouse::Client;
 use sha2::{Sha256, Digest};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
-use axum::http::HeaderValue;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -23,6 +23,20 @@ use rush_api::usage_accumulator::UsageAccumulator;
 use rush_api::usage_tracker;
 use rush_api::AppState;
 use rush_api::TenantContext;
+
+/// Middleware that adds security response headers to every response.
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS,     HeaderValue::from_static("nosniff"));
+    headers.insert(header::X_FRAME_OPTIONS,            HeaderValue::from_static("DENY"));
+    headers.insert(header::REFERRER_POLICY,            HeaderValue::from_static("strict-origin-when-cross-origin"));
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    resp
+}
 
 /// Middleware that resolves the tenant for every request. Four methods,
 /// checked in priority order:
@@ -313,6 +327,7 @@ async fn main() -> anyhow::Result<()> {
         usage,
         usage_accumulator,
         config: wide_config,
+        login_limiter: std::sync::Arc::new(dashmap::DashMap::new()),
     };
 
     let app = Router::new()
@@ -785,6 +800,7 @@ async fn main() -> anyhow::Result<()> {
                 None => CorsLayer::permissive(),
             }
         })
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware))
         .with_state(state);

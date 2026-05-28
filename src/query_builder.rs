@@ -11,7 +11,7 @@ fn sanitize_datetime(s: &str) -> String {
 
 /// Return true if `s` is a safe SQL column identifier (letter/underscore start,
 /// followed by alphanumerics and underscores only). Rejects any injection attempt.
-fn is_safe_column_name(s: &str) -> bool {
+pub(crate) fn is_safe_column_name(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}

@@ -18,8 +18,10 @@ pub mod usage_tracker;
 
 use clickhouse::Client;
 use clickhouse::query::Query;
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
 
 use config::RushConfig;
 use clickhouse_config::ConfigDb;
@@ -87,4 +89,6 @@ pub struct AppState {
     pub usage: UsageTracker,
     pub usage_accumulator: UsageAccumulator,
     pub config: RushConfig,
+    /// Per-IP login attempt counter for rate limiting: (attempts, window_start).
+    pub login_limiter: Arc<DashMap<String, (u32, Instant)>>,
 }
