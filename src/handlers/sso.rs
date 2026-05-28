@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::handlers::users::require_admin;
+use crate::handlers::users::{require_admin, require_auth};
 use crate::saml;
 
 // ── SSO Types ──
@@ -350,7 +350,7 @@ pub async fn sso_callback(
 
     // 11. Set the rush_session cookie and redirect to /
     let cookie = format!(
-        "rush_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400"
+        "rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
     );
 
     let mut headers = HeaderMap::new();
@@ -449,7 +449,9 @@ async fn verify_and_decode_jwt(
 /// GET /api/v1/sso/providers -- List all SSO providers
 pub async fn list_sso_providers(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let rows = state
         .config_db
         .list_sso_providers().await
@@ -560,7 +562,9 @@ pub async fn delete_sso_provider(
 /// GET /api/v1/sso/mappings -- List IdP group mappings
 pub async fn list_idp_group_mappings(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
     let rows = state
         .config_db
         .list_idp_group_mappings(None).await
@@ -638,11 +642,17 @@ pub async fn sso_acs(
             (StatusCode::BAD_REQUEST, "missing SAMLResponse in POST body".to_string())
         })?;
 
-    let relay_state = params
+    let relay_state_raw = params
         .iter()
         .find(|(k, _)| k == "RelayState")
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| "/".to_string());
+    // Reject absolute URLs and protocol-relative URLs to prevent open redirect
+    let relay_state = if relay_state_raw.starts_with('/') && !relay_state_raw.starts_with("//") {
+        relay_state_raw
+    } else {
+        "/".to_string()
+    };
 
     let provider = state
         .config_db
@@ -747,7 +757,7 @@ pub async fn sso_acs(
         (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}"))
     })?;
 
-    let cookie = format!("rush_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400");
+    let cookie = format!("rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400");
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::SET_COOKIE, cookie.parse().unwrap());

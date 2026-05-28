@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension,
 };
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::handlers::users::require_auth;
 
 #[derive(Debug, Deserialize)]
 pub struct UsageQuery {
@@ -53,8 +54,10 @@ pub struct CardinalityEntry {
 pub async fn get_usage(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Query(params): Query<UsageQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     let days = params.days.unwrap_or(30);
@@ -182,8 +185,10 @@ pub struct LabelBreakdownResponse {
 pub async fn get_label_breakdown(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Path(metric): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     let escaped = metric.replace('\'', "\\'");

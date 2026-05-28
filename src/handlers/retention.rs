@@ -1,11 +1,12 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 
 use crate::AppState;
+use crate::handlers::users::require_admin;
 
 #[derive(serde::Deserialize)]
 pub struct SetRetentionRequest {
@@ -24,8 +25,10 @@ pub struct TenantRetentionResponse {
 /// GET /api/v1/tenants/{id}/retention
 pub async fn get_tenant_retention(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
     // Verify tenant exists
     state
         .config_db
@@ -59,9 +62,11 @@ pub async fn get_tenant_retention(
 /// PUT /api/v1/tenants/{id}/retention
 pub async fn set_tenant_retention(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<SetRetentionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
     // Verify tenant exists
     state
         .config_db
@@ -108,15 +113,17 @@ pub async fn set_tenant_retention(
         }
     }
 
-    // Return current state
-    get_tenant_retention(State(state), Path(id)).await
+    // Return current state (auth already verified above)
+    get_tenant_retention(State(state), headers, Path(id)).await
 }
 
 /// DELETE /api/v1/tenants/{id}/retention/{signal}
 pub async fn delete_tenant_retention(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((id, signal)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
     // Validate signal name
     if !["metrics", "traces", "logs"].contains(&signal.as_str()) {
         return Err((

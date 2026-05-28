@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::handlers::users::{require_admin, require_auth};
 
 // ── Query params ──
 
@@ -111,8 +112,10 @@ pub struct UsageTenantsResponse {
 pub async fn usage_summary(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Query(params): Query<SummaryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     let is_global = params.global.unwrap_or(false);
@@ -180,8 +183,10 @@ pub async fn usage_summary(
 pub async fn usage_breakdown(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Query(params): Query<BreakdownParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
 
@@ -258,8 +263,10 @@ pub async fn usage_breakdown(
 /// GET /api/v1/usage/tenants — Ranked list of all tenants by volume (admin only).
 pub async fn usage_tenants(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<TenantsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
     let now = chrono::Utc::now();
     let from = params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339());
     let to = params.to.unwrap_or_else(|| now.to_rfc3339());
