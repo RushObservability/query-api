@@ -34,7 +34,7 @@ anyhow = "1"
 reqwest = { version = "0.12", features = ["json"] }
 sha2 = "0.10"
 rand = "0.9"
-bcrypt = "0.17"
+argon2 = { version = "0.5", features = ["password-hash", "std"] }
 lettre = { version = "0.10", features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
 promql-parser = "0.7"
 regex = "1"

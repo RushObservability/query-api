@@ -1,5 +1,22 @@
 use rusqlite::{Connection, params, OptionalExtension};
 use std::sync::Mutex;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+
+fn hash_password(password: &str) -> anyhow::Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else { return false };
+    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+}
 
 pub struct ConfigDb {
     conn: Mutex<Connection>,
@@ -2536,7 +2553,7 @@ impl ConfigDb {
     // ── User & session operations ──
 
     /// On first boot, create a default admin user if no users exist.
-    /// Password is bcrypt-hashed. Logs creation or silently skips.
+    /// Password is argon2id-hashed. Logs creation or silently skips.
     pub fn ensure_default_admin(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn
@@ -2547,8 +2564,7 @@ impl ConfigDb {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = bcrypt::hash("rushobservability", bcrypt::DEFAULT_COST)
-            .map_err(|e| anyhow::anyhow!("bcrypt hash failed: {e}"))?;
+        let password_hash = hash_password("rushobservability")?;
 
         conn.execute(
             "INSERT INTO users (id, username, password_hash, display_name, tenant_id, role) \
@@ -2560,7 +2576,7 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// Verify username + password against the bcrypt hash stored in the users table.
+    /// Verify username + password against the argon2id hash stored in the users table.
     /// Returns (user_id, username, display_name, tenant_id, role) on success.
     pub fn authenticate(
         &self,
@@ -2596,7 +2612,7 @@ impl ConfigDb {
         let (user_id, uname, password_hash, display_name, tenant_id, role) =
             rows.next()?.ok()?;
 
-        if bcrypt::verify(password, &password_hash).unwrap_or(false) {
+        if verify_password(password, &password_hash) {
             Some((user_id, uname, display_name, tenant_id, role))
         } else {
             None
@@ -2689,7 +2705,7 @@ impl ConfigDb {
         Ok(rows)
     }
 
-    /// Create a new user with a bcrypt-hashed password. Returns the user id.
+    /// Create a new user with an argon2id-hashed password. Returns the user id.
     pub fn create_user(
         &self,
         username: &str,
@@ -2697,8 +2713,7 @@ impl ConfigDb {
         display_name: &str,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
-            .map_err(|e| anyhow::anyhow!("bcrypt hash failed: {e}"))?;
+        let password_hash = hash_password(password)?;
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -2741,10 +2756,9 @@ impl ConfigDb {
         Ok(rows.next().transpose()?)
     }
 
-    /// Change a user's password. Hashes the new password with bcrypt.
+    /// Change a user's password. Hashes the new password with argon2id.
     pub fn change_password(&self, user_id: &str, new_password: &str) -> anyhow::Result<bool> {
-        let password_hash = bcrypt::hash(new_password, bcrypt::DEFAULT_COST)
-            .map_err(|e| anyhow::anyhow!("bcrypt hash failed: {e}"))?;
+        let password_hash = hash_password(new_password)?;
         let conn = self.conn.lock().unwrap();
         let count = conn.execute(
             "UPDATE users SET password_hash = ?2 WHERE id = ?1",

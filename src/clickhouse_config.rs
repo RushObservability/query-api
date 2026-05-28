@@ -1,4 +1,21 @@
 use clickhouse::Client;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+
+fn hash_password(password: &str) -> anyhow::Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else { return false };
+    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+}
 
 // ── Module-level row types used by helper methods ─────────────────────────────
 
@@ -850,8 +867,7 @@ impl ConfigDb {
         if row.n > 0 { return Ok(()); }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = bcrypt::hash("rushobservability", bcrypt::DEFAULT_COST)
-            .map_err(|e| anyhow::anyhow!("bcrypt hash failed: {e}"))?;
+        let password_hash = hash_password("rushobservability")?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
@@ -889,7 +905,7 @@ impl ConfigDb {
             .fetch_one::<Row>()
             .await;
         let row = result.ok()?;
-        if !bcrypt::verify(password, &row.password_hash).unwrap_or(false) {
+        if !verify_password(password, &row.password_hash) {
             return None;
         }
         // Derive role from group membership
@@ -977,8 +993,7 @@ impl ConfigDb {
 
     pub async fn create_user(&self, username: &str, password: &str, display_name: &str) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
-            .map_err(|e| anyhow::anyhow!("bcrypt hash failed: {e}"))?;
+        let password_hash = hash_password(password)?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
@@ -1040,8 +1055,7 @@ impl ConfigDb {
             Some(u) => u,
             None => return Ok(false),
         };
-        let password_hash = bcrypt::hash(new_password, bcrypt::DEFAULT_COST)
-            .map_err(|e| anyhow::anyhow!("bcrypt hash failed: {e}"))?;
+        let password_hash = hash_password(new_password)?;
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'viewer', ?, 'local', '', ?, ?, 0)")
