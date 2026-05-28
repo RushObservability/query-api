@@ -101,11 +101,15 @@ pub fn resolve_field(field: &str) -> String {
             .join(", ");
         let nested = format!("JSONExtractString(attributes, {nested_args})");
         format!("if({flat} != '', {flat}, {nested})")
-    } else if is_safe_column_name(field) {
-        field.to_string()
     } else {
-        // Unknown field — return NULL so the condition is always false/NULL-safe
-        "NULL".to_string()
+        match field {
+            // `level` is a logs concept; in wide_events the equivalent is `status`
+            // (values: "Ok", "Error", "Unset"). Lower-case both sides so that
+            // `level=error`, `level=Error`, etc. all match correctly.
+            "level" => "lower(status)".to_string(),
+            _ if is_safe_column_name(field) => field.to_string(),
+            _ => "NULL".to_string(),
+        }
     }
 }
 
