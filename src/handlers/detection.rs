@@ -8,7 +8,7 @@ use axum::{
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 
 /// Validate that a detection rule SQL is a safe SELECT-only statement.
 fn validate_detection_sql(query_sql: &str) -> Result<(), (StatusCode, String)> {
@@ -60,7 +60,9 @@ fn default_limit() -> i64 {
 pub async fn list_detection_rules(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let rules = state
         .config_db
         .list_detection_rules(Some(&tenant.tenant_id)).await

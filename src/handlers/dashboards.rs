@@ -8,7 +8,7 @@ use axum::{
 use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::auth::extract_session_cookie;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 use crate::models::dashboard::*;
 
 /// Extract the calling user from the session cookie.
@@ -24,8 +24,8 @@ async fn resolve_caller(
             return info;
         }
     }
-    // Unauthenticated: treat as anonymous user in the resolved tenant
-    ("".to_string(), "".to_string(), "".to_string(), tenant.tenant_id.clone(), "admin".to_string())
+    // Unauthenticated: treat as anonymous user with viewer-only access
+    ("".to_string(), "".to_string(), "".to_string(), tenant.tenant_id.clone(), "viewer".to_string())
 }
 
 pub async fn list_dashboards(
@@ -33,6 +33,7 @@ pub async fn list_dashboards(
     Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let dashboards = state
         .config_db
@@ -88,6 +89,7 @@ pub async fn get_dashboard(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let dashboard = state
         .config_db
@@ -112,6 +114,7 @@ pub async fn update_dashboard(
     Path(id): Path<String>,
     Json(req): Json<UpdateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let (user_id, _, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
 
     let tags_json = serde_json::to_string(&req.tags)
@@ -138,6 +141,7 @@ pub async fn delete_dashboard(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let (user_id, _, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
     let deleted = state
         .config_db

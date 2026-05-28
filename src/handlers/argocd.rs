@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use kube::{Api, Client, api::ListParams};
 use kube::api::DynamicObject;
@@ -9,6 +9,7 @@ use kube::discovery::ApiResource;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::handlers::users::require_auth;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -189,7 +190,9 @@ fn summarise_app(obj: &DynamicObject) -> Value {
 // ---------------------------------------------------------------------------
 pub async fn list_applications(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     check_argocd_enabled(&state).await?;
     let namespace = argocd_namespace(&state).await;
     let client = get_kube_client().await?;
@@ -209,8 +212,10 @@ pub async fn list_applications(
 // ---------------------------------------------------------------------------
 pub async fn get_application(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     check_argocd_enabled(&state).await?;
     let namespace = argocd_namespace(&state).await;
     let client = get_kube_client().await?;
@@ -337,7 +342,9 @@ pub async fn get_application(
 // ---------------------------------------------------------------------------
 pub async fn list_applicationsets(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     check_argocd_enabled(&state).await?;
     let namespace = argocd_namespace(&state).await;
     let client = get_kube_client().await?;

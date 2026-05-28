@@ -4,7 +4,8 @@ use clickhouse::Client;
 use sha2::{Sha256, Digest};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use axum::http::HeaderValue;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -766,7 +767,24 @@ async fn main() -> anyhow::Result<()> {
             );
             (axum::http::StatusCode::NOT_FOUND, "not found")
         })
-        .layer(CorsLayer::permissive())
+        .layer({
+            let origins = std::env::var("RUSH_ALLOWED_ORIGINS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|o| o.trim().parse::<HeaderValue>().ok())
+                        .collect::<Vec<_>>()
+                });
+            match origins {
+                Some(list) => CorsLayer::new()
+                    .allow_origin(AllowOrigin::list(list))
+                    .allow_methods(AllowMethods::any())
+                    .allow_headers(AllowHeaders::any())
+                    .allow_credentials(true),
+                None => CorsLayer::permissive(),
+            }
+        })
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware))
         .with_state(state);

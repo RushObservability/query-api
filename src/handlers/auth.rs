@@ -62,7 +62,7 @@ pub async fn login(
     );
 
     let cookie = format!(
-        "rush_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400"
+        "rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
     );
 
     let mut headers = HeaderMap::new();
@@ -97,7 +97,7 @@ pub async fn logout(
         state.config_db.delete_session(&token).await;
     }
 
-    let clear_cookie = "rush_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+    let clear_cookie = "rush_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
