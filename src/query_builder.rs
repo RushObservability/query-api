@@ -9,6 +9,16 @@ fn sanitize_datetime(s: &str) -> String {
         .collect()
 }
 
+/// Escape a string value for safe embedding inside a SQL single-quoted literal.
+/// Uses the standard SQL double-quote convention (`'` → `''`) which ClickHouse
+/// supports unconditionally. Callers should still wrap the result in single quotes:
+///   `format!("col = '{}'", escape_string_literal(value))`
+/// Prefer parameterized queries via `.bind()` where the clickhouse driver supports
+/// it; use this helper only for dynamic values that cannot be bound.
+pub(crate) fn escape_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Return true if `s` is a safe SQL column identifier (letter/underscore start,
 /// followed by alphanumerics and underscores only). Rejects any injection attempt.
 pub(crate) fn is_safe_column_name(s: &str) -> bool {
