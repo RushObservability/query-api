@@ -381,9 +381,13 @@ async fn verify_and_decode_jwt(
     let header = jsonwebtoken::decode_header(token)
         .map_err(|e| anyhow::anyhow!("invalid JWT header: {e}"))?;
 
-    // Explicitly reject alg:none
-    if matches!(header.alg, Algorithm::None) {
-        anyhow::bail!("JWT with algorithm 'none' is not accepted");
+    // Only accept asymmetric algorithms — reject symmetric (HS*) which would require
+    // sharing the client_secret as the signing key, an unsafe pattern for OIDC.
+    match header.alg {
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
+        | Algorithm::PS256 | Algorithm::PS384 | Algorithm::PS512
+        | Algorithm::ES256 | Algorithm::ES384 => {}
+        alg => anyhow::bail!("JWT algorithm {alg:?} is not accepted for OIDC"),
     }
 
     // Fetch the OIDC discovery document to get the JWKS URI
