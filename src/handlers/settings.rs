@@ -94,14 +94,13 @@ pub async fn get_features(
             .map(|v| v == "true")
             .unwrap_or(false);
 
-    let sre_agent_enabled = std::env::var("LLM_API_KEY").is_ok()
-        || state
-            .config_db
-            .get_setting("sre_agent_enabled").await
-            .ok()
-            .flatten()
-            .map(|v| v == "true")
-            .unwrap_or(false);
+    let sre_agent_enabled = state
+        .config_db
+        .get_setting("sre_agent_enabled").await
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     Json(serde_json::json!({
         "argocd": argocd_enabled,

@@ -32,8 +32,12 @@ pub async fn suggest_values(
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     let col_expr = if let Some(attr_path) = field.strip_prefix("attributes.") {
-        // OTel attributes use flat dotted keys — try flat key first, nested as fallback
+        // OTel attributes use flat dotted keys — try flat key first, nested as fallback.
+        // Validate every dot-separated segment to prevent SQL injection via attr_path.
         let parts: Vec<&str> = attr_path.split('.').collect();
+        if parts.is_empty() || parts.iter().any(|p| !crate::query_builder::is_safe_column_name(p)) {
+            return Err((StatusCode::BAD_REQUEST, format!("invalid attribute path: {attr_path}")));
+        }
         if parts.len() == 1 {
             format!("JSONExtractString(attributes, '{attr_path}')")
         } else {

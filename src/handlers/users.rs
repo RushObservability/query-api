@@ -17,6 +17,7 @@ pub struct CreateUserRequest {
 
 #[derive(serde::Deserialize)]
 pub struct ChangePasswordRequest {
+    pub current_password: Option<String>,
     pub password: String,
 }
 
@@ -210,8 +211,19 @@ pub async fn change_password(
         ));
     }
 
-    if req.password.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "password must not be empty".to_string()));
+    if req.password.len() < 12 {
+        return Err((StatusCode::BAD_REQUEST, "password must be at least 12 characters".to_string()));
+    }
+
+    // Non-admin users must supply their current password to change it.
+    if caller.4 != "admin" {
+        let current = req.current_password.as_deref().unwrap_or("");
+        if current.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "current_password is required".to_string()));
+        }
+        if state.config_db.authenticate(&caller.1, current).await.is_none() {
+            return Err((StatusCode::FORBIDDEN, "current password is incorrect".to_string()));
+        }
     }
 
     let updated = state

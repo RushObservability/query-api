@@ -29,8 +29,31 @@ pub struct UserInfo {
 /// a `rush_session` HttpOnly cookie.
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Rate limit: max 10 attempts per IP per 60-second window
+    let ip = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    {
+        let now = std::time::Instant::now();
+        let current = state.login_limiter.get(&ip).map(|e| *e.value());
+        let (count, window_start) = current.unwrap_or((0u32, now));
+        let (new_count, new_window) = if now.duration_since(window_start).as_secs() >= 60 {
+            (1u32, now)
+        } else {
+            (count + 1, window_start)
+        };
+        state.login_limiter.insert(ip.clone(), (new_count, new_window));
+        if new_count > 10 {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "too many login attempts, try again later".to_string()));
+        }
+    }
+
     let (user_id, username, display_name, tenant_id, role) = state
         .config_db
         .authenticate(&req.username, &req.password).await
