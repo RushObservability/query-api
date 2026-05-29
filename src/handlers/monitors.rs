@@ -8,7 +8,7 @@ use axum::{
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 use crate::models::monitor::*;
 use crate::monitor_engine;
 
@@ -25,8 +25,10 @@ fn default_events_limit() -> i64 {
 /// GET /api/v1/monitors — list monitors (tenant-scoped)
 pub async fn list_monitors(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let monitors = state
         .config_db
         .list_monitors(&tenant.tenant_id).await
@@ -151,9 +153,11 @@ pub async fn create_monitor(
 /// GET /api/v1/monitors/{id} — get monitor with state
 pub async fn get_monitor(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let monitor = state
         .config_db
         .get_monitor(&id, &tenant.tenant_id).await
@@ -303,9 +307,11 @@ pub async fn delete_monitor(
 /// GET /api/v1/monitors/{id}/events — list state transition events
 pub async fn list_monitor_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<EventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let events = state
         .config_db
         .list_monitor_events(&id, params.limit).await
@@ -316,9 +322,11 @@ pub async fn list_monitor_events(
 /// POST /api/v1/monitors/preview — preview query results (for the live graph in creation wizard)
 pub async fn preview_monitor(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<PreviewMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let group_by: Vec<String> =
         serde_json::from_value(req.group_by.clone()).unwrap_or_default();
 
@@ -491,9 +499,11 @@ struct StringRow {
 /// services, endpoints, and log fields.
 pub async fn autocomplete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Query(params): Query<AutocompleteQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let prefix = escape_ch(&params.prefix);
     let tenant_id = escape_ch(&tenant.tenant_id);
 
@@ -674,8 +684,11 @@ pub async fn autocomplete(
 
 /// POST /api/v1/monitors/suggest — given a partial monitor config, suggest improvements.
 pub async fn suggest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<SuggestRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let mut suggestions: Vec<Suggestion> = Vec::new();
 
     match req.monitor_type.as_str() {

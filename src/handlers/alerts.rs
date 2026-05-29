@@ -8,13 +8,15 @@ use axum::{
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 use crate::models::alert::*;
 
 pub async fn list_channels(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let channels = state
         .config_db
         .list_channels(&tenant.tenant_id).await
@@ -36,7 +38,7 @@ pub async fn create_channel(
     if req.name.len() > 255 {
         return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
     }
-    let valid_types = ["webhook", "slack", "email", "pagerduty", "opsgenie"];
+    let valid_types = ["webhook", "slack", "slack_app", "email", "pagerduty", "opsgenie", "discord", "alertmanager"];
     if !valid_types.contains(&req.channel_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid channel_type: {}", req.channel_type)));
     }
@@ -109,9 +111,11 @@ pub async fn delete_channel(
 
 pub async fn test_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let channel = state
         .config_db
         .get_channel(&id, &tenant.tenant_id).await
@@ -145,6 +149,11 @@ pub async fn test_channel(
         "TEST",
         0.0,
         0.0,
+        "",
+        "",
+        "This is a test notification from Rush Observability.",
+        "",
+        "",
         &http_client,
         &smtp_config,
         &smtp_transport,
@@ -173,10 +182,12 @@ pub async fn test_channel(
 
 pub async fn notify_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let channel = state
         .config_db
         .get_channel(&id, &tenant.tenant_id).await
@@ -191,6 +202,10 @@ pub async fn notify_channel(
         .and_then(|v| v.as_str())
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "channel config missing url".to_string()))?;
 
+    if !url.starts_with("https://") {
+        return Err((StatusCode::BAD_REQUEST, format!("channel URL must use HTTPS (got: {})", url)));
+    }
+
     let client = reqwest::Client::new();
     client
         .post(url)
@@ -204,8 +219,10 @@ pub async fn notify_channel(
 
 pub async fn list_notification_log(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let entries = state
         .config_db
         .list_notification_log(&tenant.tenant_id, 200).await
@@ -215,7 +232,9 @@ pub async fn list_notification_log(
 
 pub async fn list_alerts(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let alerts = state
         .config_db
         .list_alerts().await
@@ -267,6 +286,7 @@ pub async fn create_alert(
             req.condition_threshold,
             req.eval_interval_secs,
             &channel_ids,
+            &req.runbook_url,
         ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -281,8 +301,10 @@ pub async fn create_alert(
 
 pub async fn get_alert(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let alert = state
         .config_db
         .get_alert(&id).await
@@ -333,6 +355,7 @@ pub async fn update_alert(
             req.condition_threshold,
             req.eval_interval_secs,
             &channel_ids,
+            &req.runbook_url,
         ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
@@ -366,8 +389,10 @@ pub async fn delete_alert(
 
 pub async fn list_alert_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let events = state
         .config_db
         .list_alert_events(&id, 100).await
@@ -377,7 +402,9 @@ pub async fn list_alert_events(
 
 pub async fn list_all_alert_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let events = state
         .config_db
         .list_all_alert_events(200).await
@@ -415,6 +442,24 @@ fn validate_channel_config(channel_type: &str, config: &serde_json::Value) -> Re
         "opsgenie" => {
             if config.get("api_key").and_then(|v| v.as_str()).is_none() {
                 return Err((StatusCode::BAD_REQUEST, "opsgenie channel requires 'api_key' in config".to_string()));
+            }
+        }
+        "slack_app" => {
+            if config.get("token").and_then(|v| v.as_str()).is_none() {
+                return Err((StatusCode::BAD_REQUEST, "slack_app channel requires 'token' in config".to_string()));
+            }
+            if config.get("channel").and_then(|v| v.as_str()).is_none() {
+                return Err((StatusCode::BAD_REQUEST, "slack_app channel requires 'channel' in config".to_string()));
+            }
+        }
+        "discord" => {
+            if config.get("webhook_url").and_then(|v| v.as_str()).is_none() {
+                return Err((StatusCode::BAD_REQUEST, "discord channel requires 'webhook_url' in config".to_string()));
+            }
+        }
+        "alertmanager" => {
+            if config.get("url").and_then(|v| v.as_str()).is_none() {
+                return Err((StatusCode::BAD_REQUEST, "alertmanager channel requires 'url' in config".to_string()));
             }
         }
         _ => {}

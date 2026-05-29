@@ -60,6 +60,120 @@ pub fn spawn_alert_engine(config_db: Arc<ConfigDb>, ch: Client, smtp_config: Smt
     });
 }
 
+/// Build a rich Slack payload with colored attachment, metadata fields, and action buttons.
+/// Follows the Grafana/Datadog pattern: legacy attachment title/text/fields for the card,
+/// plus a Block Kit `actions` block inside the attachment for clickable buttons.
+fn build_slack_payload(
+    alert_name: &str,
+    alert_state: &str,
+    value: f64,
+    threshold: f64,
+    signal_type: &str,
+    condition_op: &str,
+    description: &str,
+    alert_id: &str,
+    runbook_url: &str,
+) -> serde_json::Value {
+    let is_firing = !matches!(alert_state, "RESOLVED" | "ok" | "TEST");
+    let is_test   = alert_state == "TEST";
+
+    let (color, status_emoji, status_label) = if is_test {
+        ("#888888", "🔔", "TEST")
+    } else if is_firing {
+        ("#E53E3E", "🚨", "FIRING")
+    } else {
+        ("#38A169", "✅", "RESOLVED")
+    };
+
+    let signal_label = match signal_type {
+        "metrics"  => "Metrics",
+        "logs"     => "Logs",
+        "apm"      => "APM / Traces",
+        "monitors" => "Monitor",
+        s if s.is_empty() => "—",
+        s => s,
+    };
+
+    let fmt_num = |n: f64| -> String {
+        if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n:.2}") }
+    };
+    let value_str     = fmt_num(value);
+    let threshold_str = fmt_num(threshold);
+
+    let condition_str = if condition_op.is_empty() {
+        "—".to_string()
+    } else {
+        format!("{condition_op} {threshold_str}")
+    };
+
+    let ts = chrono::Utc::now().timestamp();
+    let fallback = format!("[{status_label}] {alert_name} — {value_str} {condition_op} {threshold_str}");
+
+    // Resolve base URL for deep links; fall back gracefully if unset
+    let base_url = std::env::var("RUSH_BASE_URL")
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+
+    // Build action buttons
+    let view_query_path = match signal_type {
+        "metrics"  => "/?mode=metrics",
+        "logs"     => "/?mode=logs",
+        "apm"      => "/?mode=traces",
+        "monitors" => "/monitors",
+        _          => "/",
+    };
+    let mut buttons: Vec<serde_json::Value> = Vec::new();
+    if !alert_id.is_empty() && !base_url.is_empty() {
+        buttons.push(serde_json::json!({
+            "type": "button",
+            "text": { "type": "plain_text", "text": "View Alert", "emoji": true },
+            "url": format!("{base_url}/alerts/{alert_id}"),
+            "style": "primary",
+        }));
+        buttons.push(serde_json::json!({
+            "type": "button",
+            "text": { "type": "plain_text", "text": "View Query", "emoji": true },
+            "url": format!("{base_url}{view_query_path}"),
+        }));
+    }
+    if !runbook_url.is_empty() {
+        buttons.push(serde_json::json!({
+            "type": "button",
+            "text": { "type": "plain_text", "text": "📖 Runbook", "emoji": true },
+            "url": runbook_url,
+        }));
+    }
+
+    // Metadata fields (hidden for test notifications)
+    let fields: Vec<serde_json::Value> = if is_test {
+        vec![]
+    } else {
+        vec![
+            serde_json::json!({ "title": "Signal",    "value": signal_label,  "short": true }),
+            serde_json::json!({ "title": "Value",     "value": value_str,     "short": true }),
+            serde_json::json!({ "title": "Condition", "value": condition_str, "short": true }),
+            serde_json::json!({ "title": "Status",    "value": format!("{status_emoji} {status_label}"), "short": true }),
+        ]
+    };
+
+    // Compose the attachment: legacy fields for the card + optional actions block
+    let mut attachment = serde_json::json!({
+        "color":    color,
+        "fallback": fallback,
+        "title":    format!("{status_emoji} [{status_label}] {alert_name}"),
+        "text":     description,
+        "fields":   fields,
+        "footer":   "Rush Observability",
+        "ts":       ts,
+    });
+    if !buttons.is_empty() {
+        attachment["actions"] = serde_json::json!(buttons);
+    }
+
+    serde_json::json!({ "attachments": [attachment] })
+}
+
 /// Send a notification to a channel and log the result.
 /// Returns Ok(()) on success or Err with the error message.
 pub async fn send_channel_notification(
@@ -69,6 +183,11 @@ pub async fn send_channel_notification(
     alert_state: &str,
     value: f64,
     threshold: f64,
+    signal_type: &str,
+    condition_op: &str,
+    description: &str,
+    alert_id: &str,
+    runbook_url: &str,
     http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
@@ -119,7 +238,11 @@ pub async fn send_channel_notification(
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "slack channel config missing webhook_url".to_string())?;
 
-            let payload = serde_json::json!({ "text": message });
+            if !url.starts_with("https://") {
+                return Err(format!("channel URL must use HTTPS (got: {url})"));
+            }
+
+            let payload = build_slack_payload(alert_name, alert_state, value, threshold, signal_type, condition_op, description, alert_id, runbook_url);
             http_client.post(url).json(&payload).send().await
                 .map_err(|e| format!("slack notification failed: {e}"))?;
             Ok(())
@@ -128,6 +251,10 @@ pub async fn send_channel_notification(
             let url = config.get("url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "webhook channel config missing url".to_string())?;
+
+            if !url.starts_with("https://") {
+                return Err(format!("channel URL must use HTTPS (got: {url})"));
+            }
 
             let method = config.get("method")
                 .and_then(|m| m.as_str())
@@ -253,6 +380,71 @@ pub async fn send_channel_notification(
             }
             Ok(())
         }
+        "slack_app" => {
+            let token = config.get("token")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| "slack_app channel config missing token".to_string())?;
+            let channel = config.get("channel")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| "slack_app channel config missing channel".to_string())?;
+            let mut payload = build_slack_payload(alert_name, alert_state, value, threshold, signal_type, condition_op, description, alert_id, runbook_url);
+            payload["channel"] = serde_json::json!(channel);
+            payload["username"] = serde_json::json!(config.get("username").and_then(|u| u.as_str()).unwrap_or("Rush Alerts"));
+            http_client
+                .post("https://slack.com/api/chat.postMessage")
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| format!("slack_app notification failed: {e}"))?;
+            Ok(())
+        }
+        "discord" => {
+            let url = config.get("webhook_url")
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| "discord channel config missing webhook_url".to_string())?;
+            if !url.starts_with("https://") {
+                return Err(format!("channel URL must use HTTPS (got: {url})"));
+            }
+            let color: u32 = if alert_state == "RESOLVED" || alert_state == "ok" { 0x57F287 } else { 0xED4245 };
+            let payload = serde_json::json!({
+                "embeds": [{
+                    "title": format!("[{}] {}", alert_state, alert_name),
+                    "description": message,
+                    "color": color,
+                    "fields": [
+                        { "name": "Value", "value": value.to_string(), "inline": true },
+                        { "name": "Threshold", "value": threshold.to_string(), "inline": true },
+                    ],
+                }]
+            });
+            http_client.post(url).json(&payload).send().await
+                .map_err(|e| format!("discord notification failed: {e}"))?;
+            Ok(())
+        }
+        "alertmanager" => {
+            let base_url = config.get("url")
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| "alertmanager channel config missing url".to_string())?;
+            if !base_url.starts_with("https://") {
+                return Err(format!("channel URL must use HTTPS (got: {base_url})"));
+            }
+            let api_url = format!("{}/api/v2/alerts", base_url.trim_end_matches('/'));
+            let status = if alert_state == "RESOLVED" || alert_state == "ok" { "resolved" } else { "firing" };
+            let extra_labels = config.get("labels").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let mut labels = serde_json::json!({ "alertname": alert_name, "severity": "critical" });
+            if let (Some(lobj), Some(eobj)) = (labels.as_object_mut(), extra_labels.as_object()) {
+                for (k, v) in eobj { lobj.insert(k.clone(), v.clone()); }
+            }
+            let payload = serde_json::json!([{
+                "labels": labels,
+                "annotations": { "summary": message, "value": value.to_string() },
+                "status": status,
+            }]);
+            http_client.post(&api_url).json(&payload).send().await
+                .map_err(|e| format!("alertmanager notification failed: {e}"))?;
+            Ok(())
+        }
         other => {
             Err(format!("unsupported channel type: {other}"))
         }
@@ -376,6 +568,11 @@ async fn eval_alerts(
                         alert_state_str,
                         value,
                         threshold,
+                        &rule.signal_type,
+                        &rule.condition_op,
+                        &rule.description,
+                        &rule.id,
+                        &rule.runbook_url,
                         http_client,
                         smtp_config,
                         smtp_transport,

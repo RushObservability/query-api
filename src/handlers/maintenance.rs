@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use crate::AppState;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateWindowRequest {
@@ -28,7 +28,9 @@ pub struct MaintenanceWindowResponse {
 
 pub async fn list_windows(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let rows = state.config_db
         .list_maintenance_windows().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

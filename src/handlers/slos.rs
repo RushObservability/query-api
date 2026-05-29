@@ -6,7 +6,7 @@ use axum::{
 };
 
 use crate::AppState;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 use crate::models::slo::*;
 
 const VALID_WINDOWS: [&str; 4] = ["rolling_1h", "rolling_24h", "rolling_7d", "rolling_30d"];
@@ -16,7 +16,9 @@ const VALID_THRESHOLD_OPS: [&str; 4] = ["lt", "lte", "gt", "gte"];
 
 pub async fn list_slos(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let slos = state
         .config_db
         .list_slos().await
@@ -118,8 +120,10 @@ pub async fn create_slo(
 
 pub async fn get_slo(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let slo = state
         .config_db
         .get_slo(&id).await
@@ -243,8 +247,10 @@ pub async fn delete_slo(
 
 pub async fn list_slo_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let events = state
         .config_db
         .list_slo_events(&id, 100).await

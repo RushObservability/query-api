@@ -2580,13 +2580,11 @@ impl ConfigDb {
             params![id, "admin", password_hash, "Admin", "default", "admin"],
         )?;
 
-        // Print once to stdout — do NOT log via tracing (which feeds into the SIEM pipeline)
-        println!("=============================================================");
-        println!(" Rush initial admin credentials");
-        println!(" Username : admin");
-        println!(" Password : {initial_password}");
-        println!(" Change this password immediately after first login.");
-        println!("=============================================================");
+        tracing::warn!(
+            username = "admin",
+            "Rush initial admin credentials — Username: admin, Password: {initial_password} — \
+             Change this password immediately after first login."
+        );
         tracing::info!("default admin user created");
         Ok(())
     }

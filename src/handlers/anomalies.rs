@@ -9,15 +9,17 @@ use std::collections::HashMap;
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 use crate::models::anomaly::*;
 
 pub async fn analyze_anomaly_event(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(event_id): Path<String>,
     Json(req): Json<AnalyzeAnomalyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     // 1. Look up event
@@ -222,7 +224,9 @@ pub async fn analyze_anomaly_event(
 
 pub async fn list_anomaly_rules(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let rules = state
         .config_db
         .list_anomaly_rules().await
@@ -280,8 +284,10 @@ pub async fn create_anomaly_rule(
 
 pub async fn get_anomaly_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let rule = state
         .config_db
         .get_anomaly_rule(&id).await
@@ -366,7 +372,9 @@ pub async fn delete_anomaly_rule(
 
 pub async fn list_all_anomaly_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let events = state
         .config_db
         .list_all_anomaly_events(200).await
@@ -376,8 +384,10 @@ pub async fn list_all_anomaly_events(
 
 pub async fn get_anomaly_event(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let event = state
         .config_db
         .get_anomaly_event(&event_id).await
@@ -388,9 +398,11 @@ pub async fn get_anomaly_event(
 
 pub async fn get_event_correlations(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(event_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     // 1. Look up the event
