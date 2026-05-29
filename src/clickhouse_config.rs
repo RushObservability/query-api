@@ -30,7 +30,7 @@ pub struct AlertRuleRow {
     pub id: String, pub name: String, pub description: String, pub enabled: u8,
     pub signal_type: String, pub query_config: String, pub condition_op: String,
     pub condition_threshold: f64, pub eval_interval_secs: i64,
-    pub notification_channel_ids: String, pub state: String,
+    pub notification_channel_ids: String, pub runbook_url: String, pub state: String,
     pub last_eval_at: String, pub last_triggered_at: String,
     pub created_at: String, pub updated_at: String,
 }
@@ -360,6 +360,7 @@ impl ConfigDb {
                 condition_threshold      Float64,
                 eval_interval_secs       Int64 DEFAULT 60,
                 notification_channel_ids String DEFAULT '[]',
+                runbook_url              String DEFAULT '',
                 state                    String DEFAULT 'ok',
                 last_eval_at             String DEFAULT '',
                 last_triggered_at        String DEFAULT '',
@@ -616,7 +617,7 @@ impl ConfigDb {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn now_str() -> String {
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 
     fn next_version() -> u64 {
@@ -890,13 +891,11 @@ impl ConfigDb {
             .execute()
             .await?;
 
-        // Print once to stdout — do NOT log via tracing (which feeds into the SIEM pipeline)
-        println!("=============================================================");
-        println!(" Rush initial admin credentials");
-        println!(" Username : admin");
-        println!(" Password : {initial_password}");
-        println!(" Change this password immediately after first login.");
-        println!("=============================================================");
+        tracing::warn!(
+            username = "admin",
+            "Rush initial admin credentials — Username: admin, Password: {initial_password} — \
+             Change this password immediately after first login."
+        );
         tracing::info!("default admin user created");
         Ok(())
     }
@@ -959,7 +958,7 @@ impl ConfigDb {
 
         let created_at = Self::now_str();
         let expires_at = (chrono::Utc::now() + chrono::Duration::hours(24))
-            .format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            .format("%Y-%m-%d %H:%M:%S").to_string();
         self.client
             .query("INSERT INTO config_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
             .bind(&token)
@@ -1087,6 +1086,15 @@ impl ConfigDb {
         Ok(true)
     }
 
+    pub async fn delete_sessions_for_user(&self, user_id: &str) -> anyhow::Result<()> {
+        self.client
+            .query("ALTER TABLE config_sessions DELETE WHERE user_id = ?")
+            .bind(user_id)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_user_enabled(&self, user_id: &str, enabled: bool) -> anyhow::Result<bool> {
         let existing = self.get_user(user_id).await?;
         let (_, username, display_name, tenant_id, _, created_at) = match existing {
@@ -1114,6 +1122,10 @@ impl ConfigDb {
             .bind(ver)
             .execute()
             .await?;
+        // Invalidate all sessions when disabling a user
+        if !enabled {
+            let _ = self.delete_sessions_for_user(user_id).await;
+        }
         Ok(true)
     }
 
@@ -1736,7 +1748,7 @@ impl ConfigDb {
         };
 
         let expires_at = (chrono::Utc::now() + chrono::Duration::hours(48))
-            .format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            .format("%Y-%m-%d %H:%M:%S").to_string();
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_setup_tokens (token, purpose, created_by, expires_at, used, provider, hostname, version, is_deleted) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0)")
@@ -2233,6 +2245,7 @@ impl ConfigDb {
             condition_threshold: r.condition_threshold,
             eval_interval_secs: r.eval_interval_secs,
             notification_channel_ids: r.notification_channel_ids,
+            runbook_url: r.runbook_url,
             state: r.state,
             last_eval_at: if r.last_eval_at.is_empty() { None } else { Some(r.last_eval_at) },
             last_triggered_at: if r.last_triggered_at.is_empty() { None } else { Some(r.last_triggered_at) },
@@ -2242,7 +2255,7 @@ impl ConfigDb {
 
     pub async fn list_alerts(&self) -> anyhow::Result<Vec<crate::models::alert::AlertRule>> {
         let rows = self.client
-            .query("SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_alert_rules FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
+            .query("SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_alert_rules FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
             .fetch_all::<AlertRuleRow>()
             .await?;
         Ok(rows.into_iter().map(Self::map_alert_row).collect())
@@ -2250,7 +2263,7 @@ impl ConfigDb {
 
     pub async fn get_alert(&self, id: &str) -> anyhow::Result<Option<crate::models::alert::AlertRule>> {
         let result = self.client
-            .query("SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_alert_rules FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_alert_rules FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
             .fetch_one::<AlertRuleRow>()
             .await;
@@ -2261,29 +2274,29 @@ impl ConfigDb {
         }
     }
 
-    pub async fn create_alert(&self, id: &str, name: &str, description: &str, enabled: bool, signal_type: &str, query_config: &str, condition_op: &str, condition_threshold: f64, eval_interval_secs: i64, notification_channel_ids: &str) -> anyhow::Result<()> {
+    pub async fn create_alert(&self, id: &str, name: &str, description: &str, enabled: bool, signal_type: &str, query_config: &str, condition_op: &str, condition_threshold: f64, eval_interval_secs: i64, notification_channel_ids: &str, runbook_url: &str) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', '', '', ?, ?, ?, 0)")
+            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', '', '', ?, ?, ?, 0)")
             .bind(id).bind(name).bind(description).bind(if enabled { 1u8 } else { 0u8 })
             .bind(signal_type).bind(query_config).bind(condition_op)
             .bind(condition_threshold).bind(eval_interval_secs).bind(notification_channel_ids)
-            .bind(&now).bind(&now).bind(ver)
+            .bind(runbook_url).bind(&now).bind(&now).bind(ver)
             .execute().await?;
         Ok(())
     }
 
-    pub async fn update_alert(&self, id: &str, name: &str, description: &str, enabled: bool, signal_type: &str, query_config: &str, condition_op: &str, condition_threshold: f64, eval_interval_secs: i64, notification_channel_ids: &str) -> anyhow::Result<bool> {
+    pub async fn update_alert(&self, id: &str, name: &str, description: &str, enabled: bool, signal_type: &str, query_config: &str, condition_op: &str, condition_threshold: f64, eval_interval_secs: i64, notification_channel_ids: &str, runbook_url: &str) -> anyhow::Result<bool> {
         let existing = match self.get_alert(id).await? { Some(r) => r, None => return Ok(false) };
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(description).bind(if enabled { 1u8 } else { 0u8 })
             .bind(signal_type).bind(query_config).bind(condition_op)
             .bind(condition_threshold).bind(eval_interval_secs).bind(notification_channel_ids)
-            .bind(&existing.state)
+            .bind(runbook_url).bind(&existing.state)
             .bind(existing.last_eval_at.unwrap_or_default())
             .bind(existing.last_triggered_at.unwrap_or_default())
             .bind(&existing.created_at).bind(&now).bind(ver)
@@ -2296,12 +2309,12 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
             .bind(id).bind(&existing.name).bind(&existing.description)
             .bind(if existing.enabled { 1u8 } else { 0u8 })
             .bind(&existing.signal_type).bind(&existing.query_config).bind(&existing.condition_op)
             .bind(existing.condition_threshold).bind(existing.eval_interval_secs)
-            .bind(&existing.notification_channel_ids).bind(&existing.state)
+            .bind(&existing.notification_channel_ids).bind(&existing.runbook_url).bind(&existing.state)
             .bind(existing.last_eval_at.unwrap_or_default())
             .bind(existing.last_triggered_at.unwrap_or_default())
             .bind(&existing.created_at).bind(&now).bind(ver)
@@ -2315,12 +2328,13 @@ impl ConfigDb {
         let ver = Self::next_version();
         let lta = last_triggered_at.map(|s| s.to_string()).unwrap_or_else(|| existing.last_triggered_at.clone().unwrap_or_default());
         self.client
-            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(&existing.name).bind(&existing.description)
             .bind(if existing.enabled { 1u8 } else { 0u8 })
             .bind(&existing.signal_type).bind(&existing.query_config).bind(&existing.condition_op)
             .bind(existing.condition_threshold).bind(existing.eval_interval_secs)
-            .bind(&existing.notification_channel_ids).bind(state).bind(last_eval_at).bind(&lta)
+            .bind(&existing.notification_channel_ids).bind(&existing.runbook_url)
+            .bind(state).bind(last_eval_at).bind(&lta)
             .bind(&existing.created_at).bind(&now).bind(ver)
             .execute().await?;
         Ok(())
@@ -2328,7 +2342,7 @@ impl ConfigDb {
 
     pub async fn get_due_alerts(&self, now: &str) -> anyhow::Result<Vec<crate::models::alert::AlertRule>> {
         let rows = self.client
-            .query("SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_alert_rules FINAL WHERE enabled = 1 AND is_deleted = 0 AND (last_eval_at = '' OR toUnixTimestamp(parseDateTimeBestEffort(?)) - toUnixTimestamp(parseDateTimeBestEffort(last_eval_at)) >= eval_interval_secs)")
+            .query("SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_alert_rules FINAL WHERE enabled = 1 AND is_deleted = 0 AND (last_eval_at = '' OR toUnixTimestamp(parseDateTimeBestEffort(?)) - toUnixTimestamp(parseDateTimeBestEffort(last_eval_at)) >= eval_interval_secs)")
             .bind(now)
             .fetch_all::<AlertRuleRow>()
             .await?;

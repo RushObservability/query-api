@@ -164,11 +164,13 @@ pub async fn sso_login(
                 .collect::<Vec<&str>>()
                 .join("+");
 
+            let base = resolve_base_url(&headers);
+            let redirect_uri = format!("{base}/auth/sso/callback");
             let authorize_url = format!(
                 "{issuer_url}/authorize?client_id={client_id}&redirect_uri={redirect}&response_type=code&scope={scopes}&state={csrf_state}",
                 issuer_url = issuer_url.trim_end_matches('/'),
                 client_id = urlencoding::encode(&client_id),
-                redirect = urlencoding::encode("/auth/sso/callback"),
+                redirect = urlencoding::encode(&redirect_uri),
                 scopes = scopes_encoded,
             );
 
@@ -182,6 +184,7 @@ pub async fn sso_login(
 /// GET /auth/sso/callback?code=...&state=... -- Exchange code for tokens, JIT provision user
 pub async fn sso_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<SsoCallbackQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // 1. Verify CSRF state
@@ -215,6 +218,8 @@ pub async fn sso_callback(
 
     // 3. Exchange authorization code for tokens
     let token_url = format!("{}/token", issuer_url.trim_end_matches('/'));
+    let base = resolve_base_url(&headers);
+    let redirect_uri = format!("{base}/auth/sso/callback");
 
     let client = reqwest::Client::new();
     let token_res = client
@@ -222,7 +227,7 @@ pub async fn sso_callback(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", &params.code),
-            ("redirect_uri", "/auth/sso/callback"),
+            ("redirect_uri", &redirect_uri),
             ("client_id", &client_id),
             ("client_secret", &client_secret),
         ])
@@ -698,6 +703,14 @@ pub async fn sso_acs(
     let xml = String::from_utf8_lossy(&xml_bytes);
 
     // If the provider has a certificate configured, verify the XML signature
+    if saml_cert.is_empty() {
+        tracing::warn!(
+            event = "saml_sig_skip",
+            provider_id = %provider_id,
+            "SAML signature verification skipped — no certificate configured. \
+             Configure a signing certificate to prevent forged assertion attacks."
+        );
+    }
     if !saml_cert.is_empty() {
         match saml::verify_signature(&xml, &saml_cert) {
             Ok(true) => tracing::info!("SAML signature verified"),

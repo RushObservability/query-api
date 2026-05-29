@@ -28,6 +28,8 @@ fn validate_detection_sql(query_sql: &str) -> Result<(), (StatusCode, String)> {
         // ClickHouse table functions that can reach external systems
         "url(", "remote(", "remotesecure(", "s3(", "hdfs(", "mysql(", "postgresql(",
         "jdbc(", "odbc(", "sqlite(",
+        // ClickHouse cluster/input functions and SQL comment sequences
+        "clusterallreplicas(", "input(", "--", "/*",
     ];
     for kw in FORBIDDEN {
         if lower.contains(kw) {
@@ -149,9 +151,11 @@ pub async fn create_detection_rule(
 /// Get a single detection rule.
 pub async fn get_detection_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let rule = state
         .config_db
         .get_detection_rule(&id).await

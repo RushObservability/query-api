@@ -38,6 +38,7 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
         header::HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; font-src 'self'; connect-src 'self'; \
              object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
         ),
     );
@@ -323,13 +324,28 @@ async fn main() -> anyhow::Result<()> {
     let usage_accumulator = UsageAccumulator::new();
     usage_accumulator.spawn_flusher(ch.clone());
 
+    let login_limiter: std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant)>> =
+        std::sync::Arc::new(dashmap::DashMap::new());
+
+    // Spawn background task to evict stale rate-limiter entries (M7)
+    {
+        let limiter_clone = login_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                limiter_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+            }
+        });
+    }
+
     let state = AppState {
         ch,
         config_db,
         usage,
         usage_accumulator,
         config: wide_config,
-        login_limiter: std::sync::Arc::new(dashmap::DashMap::new()),
+        login_limiter,
     };
 
     let app = Router::new()
@@ -858,6 +874,15 @@ async fn main() -> anyhow::Result<()> {
              Set custom_settings_prefixes = 'rush_' in ClickHouse config to enable row policies."
         );
     }
+    // L3: Warn when RUSH_BASE_URL is unset — SAML/OIDC redirect URIs derived from Host header.
+    if std::env::var("RUSH_BASE_URL").map(|s| s.is_empty()).unwrap_or(true) {
+        tracing::warn!(
+            "RUSH_BASE_URL is not set. SAML ACS and OIDC redirect URIs will be derived from \
+             the Host request header, which can be spoofed. Set RUSH_BASE_URL to your \
+             public hostname for production deployments."
+        );
+    }
+
     // R01: Warn when RUSH_API_KEY_SECRET is unset or too short.
     // An empty or short secret means HMAC-SHA256 provides no real keyed-hash protection.
     match std::env::var("RUSH_API_KEY_SECRET") {

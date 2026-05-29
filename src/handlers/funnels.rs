@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use crate::{AppState, TenantContext};
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_auth, require_write};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FunnelStep {
@@ -80,8 +80,10 @@ fn step_where_clause(step: &FunnelStep, from: &str, to: &str) -> String {
 
 pub async fn list_funnels(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
     let rows = state.config_db.list_funnels(&tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let funnels: Vec<FunnelResponse> = rows.into_iter().filter_map(|(id, name, steps_json, created_at)| {
@@ -135,10 +137,12 @@ pub async fn delete_funnel(
 
 pub async fn run_funnel(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
     Json(req): Json<RunFunnelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
     let row = state.config_db.get_funnel(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "funnel not found".to_string()))?;

@@ -116,10 +116,14 @@ pub async fn usage_summary(
     headers: HeaderMap,
     Query(params): Query<SummaryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let is_global = params.global.unwrap_or(false);
+    if is_global {
+        require_admin(&state, &headers).await?;
+    } else {
+        require_auth(&state, &headers).await?;
+    }
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = escape_string_literal(tenant_id);
-    let is_global = params.global.unwrap_or(false);
 
     let now = chrono::Utc::now();
     let from = sanitize_datetime(&params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()));

@@ -69,6 +69,7 @@ pub struct AlertRule {
     pub condition_threshold: f64,
     pub eval_interval_secs: i64,
     pub notification_channel_ids: String,
+    pub runbook_url: String,
     pub state: String,
     pub last_eval_at: Option<String>,
     pub last_triggered_at: Option<String>,
@@ -88,6 +89,7 @@ pub struct AlertRuleResponse {
     pub condition_threshold: f64,
     pub eval_interval_secs: i64,
     pub notification_channel_ids: serde_json::Value,
+    pub runbook_url: String,
     pub state: String,
     pub last_eval_at: Option<String>,
     pub last_triggered_at: Option<String>,
@@ -108,6 +110,7 @@ impl From<AlertRule> for AlertRuleResponse {
             condition_threshold: r.condition_threshold,
             eval_interval_secs: r.eval_interval_secs,
             notification_channel_ids: serde_json::from_str(&r.notification_channel_ids).unwrap_or(serde_json::json!([])),
+            runbook_url: r.runbook_url,
             state: r.state,
             last_eval_at: r.last_eval_at,
             last_triggered_at: r.last_triggered_at,
@@ -163,6 +166,8 @@ pub struct CreateAlertRequest {
     pub eval_interval_secs: i64,
     #[serde(default = "default_empty_array")]
     pub notification_channel_ids: serde_json::Value,
+    #[serde(default)]
+    pub runbook_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +186,8 @@ pub struct UpdateAlertRequest {
     pub eval_interval_secs: i64,
     #[serde(default = "default_empty_array")]
     pub notification_channel_ids: serde_json::Value,
+    #[serde(default)]
+    pub runbook_url: String,
 }
 
 fn default_true() -> bool {

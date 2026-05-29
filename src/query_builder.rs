@@ -97,9 +97,9 @@ impl QueryClauses {
 pub fn resolve_field(field: &str) -> String {
     if let Some(attr_path) = field.strip_prefix("attributes.") {
         // Escape single quotes in every path segment to prevent SQL injection
-        let flat_key = attr_path.replace('\'', "\\'");
+        let flat_key = escape_string_literal(attr_path);
         let flat = format!("JSONExtractString(attributes, '{flat_key}')");
-        let parts: Vec<String> = attr_path.split('.').map(|p| p.replace('\'', "\\'")).collect();
+        let parts: Vec<String> = attr_path.split('.').map(|p| escape_string_literal(p)).collect();
         if parts.len() == 1 {
             return flat;
         }
@@ -311,7 +311,7 @@ fn parse_search_expr(input: &str) -> Option<SearchExpr> {
 /// For array columns, wraps with arrayExists.
 fn term_match_sql(term: &str, columns: &[(&str, bool)]) -> String {
     let has_wildcard = term.contains('*');
-    let escaped = term.replace('\'', "\\'");
+    let escaped = escape_string_literal(term);
 
     if has_wildcard {
         // Convert wildcard term to ILIKE pattern: escape %, _, then replace * with %
@@ -349,8 +349,8 @@ fn term_match_sql(term: &str, columns: &[(&str, bool)]) -> String {
 /// Generate SQL for a `key=value` attribute lookup.
 /// Supports `*` wildcards in the value (e.g. `container.name=wide*`).
 fn kv_match_sql(key: &str, value: &str, ctx: SearchContext) -> String {
-    let ek = key.replace('\'', "\\'");
-    let ev = value.replace('\'', "\\'");
+    let ek = escape_string_literal(key);
+    let ev = escape_string_literal(value);
     let has_wildcard = value.contains('*');
 
     match ctx {
@@ -440,7 +440,7 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
 /// Other columns: positionCaseInsensitive (short strings, always fast).
 fn log_term_match_sql(term: &str) -> String {
     let has_wildcard = term.contains('*');
-    let escaped = term.replace('\'', "\\'");
+    let escaped = escape_string_literal(term);
 
     let other_cols = ["TraceId", "SpanId", "ServiceName", "SeverityText"];
 
@@ -492,7 +492,7 @@ fn log_term_match_sql(term: &str) -> String {
 pub fn format_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => {
-            let escaped = s.replace('\'', "\\'");
+            let escaped = escape_string_literal(s);
             format!("'{escaped}'")
         }
         serde_json::Value::Number(n) => n.to_string(),
@@ -523,10 +523,10 @@ pub fn format_array_value(value: &serde_json::Value) -> String {
 /// Metric tables use Map columns: `Attributes['key']`, `ResourceAttributes['key']`.
 fn resolve_metric_field(field: &str) -> String {
     if let Some(attr_key) = field.strip_prefix("attributes.") {
-        let safe_key = attr_key.replace('\'', "\\'");
+        let safe_key = escape_string_literal(attr_key);
         format!("Attributes['{safe_key}']")
     } else if let Some(res_key) = field.strip_prefix("resource.") {
-        let safe_key = res_key.replace('\'', "\\'");
+        let safe_key = escape_string_literal(res_key);
         format!("ResourceAttributes['{safe_key}']")
     } else {
         match field {
@@ -574,10 +574,10 @@ pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> Q
 /// Log tables use Map columns: `LogAttributes['key']`, `ResourceAttributes['key']`.
 fn resolve_log_field(field: &str) -> String {
     if let Some(attr_key) = field.strip_prefix("attributes.") {
-        let safe_key = attr_key.replace('\'', "\\'");
+        let safe_key = escape_string_literal(attr_key);
         format!("LogAttributes['{safe_key}']")
     } else if let Some(res_key) = field.strip_prefix("resource.") {
-        let safe_key = res_key.replace('\'', "\\'");
+        let safe_key = escape_string_literal(res_key);
         format!("ResourceAttributes['{safe_key}']")
     } else {
         match field {
