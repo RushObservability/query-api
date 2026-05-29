@@ -91,4 +91,6 @@ pub struct AppState {
     pub config: RushConfig,
     /// Per-IP login attempt counter for rate limiting: (attempts, window_start).
     pub login_limiter: Arc<DashMap<String, (u32, Instant)>>,
+    /// API key resolution cache: key_hash → (tenant_id, cached_at). TTL 60s.
+    pub api_key_cache: Arc<DashMap<String, (String, Instant)>>,
 }
