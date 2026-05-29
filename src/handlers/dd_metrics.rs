@@ -329,16 +329,18 @@ pub async fn ingest_v1(
             tenant_id,
         );
 
+        // Clone template once per series; only time_unix/value (scalars) change per point.
+        let mut row = template.clone();
+        let is_count = series.r#type.to_lowercase() == "count";
         for point in &series.points {
             if point.len() < 2 { continue; }
-            let mut row = template.clone();
             row.time_unix = (point[0] as i64) * 1_000_000_000; // seconds → ns
             row.value = point[1];
 
             if is_sum {
-                sum_rows.push(SumRow::from_gauge(&row, series.r#type.to_lowercase() == "count"));
+                sum_rows.push(SumRow::from_gauge(&row, is_count));
             } else {
-                gauge_rows.push(row);
+                gauge_rows.push(row.clone());
             }
         }
     }
@@ -463,15 +465,17 @@ pub async fn ingest_v2(
             tenant_id,
         );
 
+        // Clone template once per series; only time_unix/value (scalars) change per point.
+        let mut row = template.clone();
+        let is_count = dd_type == "count";
         for point in &series.points {
-            let mut row = template.clone();
             row.time_unix = point.timestamp * 1_000_000_000; // seconds → ns
             row.value = point.value;
 
             if is_sum {
-                sum_rows.push(SumRow::from_gauge(&row, dd_type == "count"));
+                sum_rows.push(SumRow::from_gauge(&row, is_count));
             } else {
-                gauge_rows.push(row);
+                gauge_rows.push(row.clone());
             }
         }
     }

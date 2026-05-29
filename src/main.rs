@@ -363,7 +363,12 @@ async fn main() -> anyhow::Result<()> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                limiter_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+                // Hard cap: if oversized (e.g. IP flood), evict aggressively.
+                if limiter_clone.len() > 100_000 {
+                    limiter_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(5));
+                } else {
+                    limiter_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+                }
             }
         });
     }
@@ -378,10 +383,30 @@ async fn main() -> anyhow::Result<()> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                cache_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+                // Hard cap: more keys than any real deployment should have.
+                if cache_clone.len() > 50_000 {
+                    cache_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(10));
+                } else {
+                    cache_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+                }
             }
         });
     }
+
+    // Spawn background task to proactively evict stale suggest cache entries.
+    // Without this, entries queried once but never again persist forever.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let cache = handlers::suggest::suggest_cache();
+            if cache.len() > 10_000 {
+                cache.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(5));
+            } else {
+                cache.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(30));
+            }
+        }
+    });
 
     let state = AppState {
         ch,

@@ -14,7 +14,7 @@ use crate::models::query::StringValueRow;
 /// 30-second in-memory result cache for suggest queries.
 /// Key: "{tenant_id}\0{field}\0{prefix}\0{limit}"
 /// Value: (results, cached_at)
-fn suggest_cache() -> &'static dashmap::DashMap<String, (Vec<String>, std::time::Instant)> {
+pub fn suggest_cache() -> &'static dashmap::DashMap<String, (Vec<String>, std::time::Instant)> {
     static CACHE: std::sync::OnceLock<dashmap::DashMap<String, (Vec<String>, std::time::Instant)>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(dashmap::DashMap::new)
