@@ -11,7 +11,7 @@ use crate::TenantContext;
 use crate::models::query::{TimeRange, Filter, FilterOp};
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
-use crate::query_builder::{format_value, format_array_value};
+use crate::query_builder::{format_value, format_array_value, QueryClauses, sanitize_datetime};
 
 // ── Field resolver ──
 
@@ -46,13 +46,20 @@ fn resolve_rum_field(field: &str) -> String {
     }
 }
 
-fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) -> String {
+/// Build PREWHERE-optimized clauses for rum_events.
+/// PREWHERE: tenant_id + TimestampTime (both in PRIMARY KEY) — evaluated at granule level.
+/// WHERE: precise nanosecond Timestamp bounds + column filters.
+fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) -> QueryClauses {
     let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let from = sanitize_datetime(from);
+    let to = sanitize_datetime(to);
+    let prewhere = format!(
+        "tenant_id = '{escaped_tenant}' \
+         AND TimestampTime >= toDateTime(parseDateTimeBestEffort('{from}')) \
+         AND TimestampTime <= toDateTime(parseDateTimeBestEffort('{to}'))"
+    );
+
     let mut conditions = vec![
-        format!("tenant_id = '{escaped_tenant}'"),
-        // TimestampTime (DateTime) is in the PRIMARY KEY — these enable index pruning
-        format!("TimestampTime >= toDateTime(parseDateTimeBestEffort('{from}'))"),
-        format!("TimestampTime <= toDateTime(parseDateTimeBestEffort('{to}'))"),
         // Precise nanosecond filtering on the full-resolution column
         format!("Timestamp >= parseDateTimeBestEffort('{from}')"),
         format!("Timestamp <= parseDateTimeBestEffort('{to}')"),
@@ -75,7 +82,7 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) ->
         conditions.push(condition);
     }
 
-    conditions.join(" AND ")
+    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
 }
 
 // ── Request / response types ──
@@ -378,7 +385,7 @@ pub async fn list_apps(
     let escaped_tenant = tenant_id.replace('\'', "\\'");
     let sql = format!(
         "SELECT AppName, count() as cnt FROM rum_events \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
          AND TimestampTime >= now() - INTERVAL 7 DAY \
          GROUP BY AppName ORDER BY cnt DESC"
     );
@@ -400,7 +407,7 @@ pub async fn query_events(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT tenant_id, Timestamp, AppName, AppVersion, Environment, SessionId, UserId, \
@@ -409,8 +416,9 @@ pub async fn query_events(
          EventType, EventName, VitalName, VitalValue, VitalRating, \
          ErrorMessage, ErrorStack, ErrorType, InteractionTarget, InteractionType, \
          DurationMs, TraceId, SpanId, Attributes \
-         FROM rum_events WHERE {where_clause} \
+         FROM rum_events {} \
          ORDER BY Timestamp DESC LIMIT {} OFFSET {}",
+        clauses.to_sql(),
         req.limit.min(1000),
         req.offset,
     );
@@ -444,7 +452,7 @@ pub async fn vitals(
         op: FilterOp::Eq,
         value: serde_json::Value::String("web_vital".to_string()),
     });
-    let where_clause = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -454,9 +462,10 @@ pub async fn vitals(
            countIf(VitalRating = 'needs-improvement') * 100.0 / count() as needs_improvement_pct, \
            countIf(VitalRating = 'poor') * 100.0 / count() as poor_pct \
          FROM rum_events \
-         WHERE {where_clause} \
+         {} \
          GROUP BY VitalName \
-         ORDER BY VitalName"
+         ORDER BY VitalName",
+        clauses.to_sql(),
     );
 
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -477,7 +486,7 @@ pub async fn pages(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -487,10 +496,11 @@ pub async fn pages(
            avgIf(DurationMs, DurationMs > 0) as avg_load_ms, \
            countIf(EventType = 'error') as error_count \
          FROM rum_events \
-         WHERE {where_clause} AND PagePath != '' \
+         {} \
          GROUP BY PagePath \
          ORDER BY views DESC \
          LIMIT {}",
+        clauses.with_where_extra("PagePath != ''").to_sql(),
         req.limit.min(100),
     );
 
@@ -518,7 +528,7 @@ pub async fn errors(
         op: FilterOp::Eq,
         value: serde_json::Value::String("error".to_string()),
     });
-    let where_clause = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -529,10 +539,11 @@ pub async fn errors(
            toString(max(Timestamp)) as last_seen, \
            any(ErrorStack) as sample_stack \
          FROM rum_events \
-         WHERE {where_clause} \
+         {} \
          GROUP BY ErrorMessage, ErrorType \
          ORDER BY count DESC \
          LIMIT {}",
+        clauses.to_sql(),
         req.limit.min(100),
     );
 
@@ -554,7 +565,7 @@ pub async fn sessions(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let where_clause = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
 
     let sql = format!(
         "SELECT \
@@ -566,10 +577,11 @@ pub async fn sessions(
            (max(Timestamp) - min(Timestamp)) / 1e9 as duration_s, \
            toString(min(Timestamp)) as first_seen \
          FROM rum_events \
-         WHERE {where_clause} AND SessionId != '' \
+         {} \
          GROUP BY SessionId \
          ORDER BY first_seen DESC \
          LIMIT {} OFFSET {}",
+        clauses.with_where_extra("SessionId != ''").to_sql(),
         req.limit.min(100),
         req.offset,
     );
@@ -602,7 +614,7 @@ pub async fn session_detail(
          ErrorMessage, ErrorStack, ErrorType, InteractionTarget, InteractionType, \
          DurationMs, TraceId, SpanId, Attributes \
          FROM rum_events \
-         WHERE tenant_id = '{escaped_tenant}' AND SessionId = '{escaped_id}' \
+         PREWHERE tenant_id = '{escaped_tenant}' WHERE SessionId = '{escaped_id}' \
          ORDER BY Timestamp ASC \
          LIMIT 1000"
     );
