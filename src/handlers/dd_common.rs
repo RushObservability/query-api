@@ -23,6 +23,10 @@ pub fn validate_api_key(headers: &HeaderMap) -> Result<(), (StatusCode, String)>
     Ok(())
 }
 
+/// Maximum decompressed body size: 32 MB.  Prevents decompression bombs where a
+/// small compressed payload expands to gigabytes, exhausting server memory.
+const MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Decompress body based on Content-Encoding header (gzip, deflate, zstd, or identity).
 pub fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
     let encoding = headers
@@ -32,24 +36,33 @@ pub fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (Sta
 
     if encoding.contains("gzip") {
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
+        let decoder = flate2::read::GzDecoder::new(body.as_ref());
         let mut out = Vec::new();
-        decoder.read_to_end(&mut out).map_err(|e| {
+        decoder.take(MAX_DECOMPRESSED_BYTES).read_to_end(&mut out).map_err(|e| {
             (StatusCode::BAD_REQUEST, format!("gzip decompression failed: {e}"))
         })?;
+        if out.len() as u64 >= MAX_DECOMPRESSED_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
+        }
         Ok(out)
     } else if encoding.contains("deflate") {
         use std::io::Read;
-        let mut decoder = flate2::read::DeflateDecoder::new(body.as_ref());
+        let decoder = flate2::read::DeflateDecoder::new(body.as_ref());
         let mut out = Vec::new();
-        decoder.read_to_end(&mut out).map_err(|e| {
+        decoder.take(MAX_DECOMPRESSED_BYTES).read_to_end(&mut out).map_err(|e| {
             (StatusCode::BAD_REQUEST, format!("deflate decompression failed: {e}"))
         })?;
+        if out.len() as u64 >= MAX_DECOMPRESSED_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
+        }
         Ok(out)
     } else if encoding.contains("zstd") || encoding.contains("zstandard") {
         let out = zstd::decode_all(body.as_ref()).map_err(|e| {
             (StatusCode::BAD_REQUEST, format!("zstd decompression failed: {e}"))
         })?;
+        if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
+        }
         Ok(out)
     } else {
         Ok(body.to_vec())

@@ -87,7 +87,7 @@ pub async fn get_usage(
         .await
         .map_err(|e| {
             tracing::error!("Usage query failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     // Count total tracked signals

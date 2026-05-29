@@ -10,7 +10,7 @@ pub async fn list_service_links(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let links = state.config_db.list_service_links().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
     Ok(Json(serde_json::json!({ "links": links })))
 }
@@ -24,12 +24,12 @@ pub async fn create_service_link(
     state
         .config_db
         .upsert_service_link(&req.service_name, &req.github_repo, &req.default_branch, &req.root_path).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let link = state
         .config_db
         .get_service_link(&req.service_name).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "upsert failed".to_string()))?;
 
     Ok(Json(link))
@@ -44,7 +44,7 @@ pub async fn delete_service_link(
     let deleted = state
         .config_db
         .delete_service_link(&service_name).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     }

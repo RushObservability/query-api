@@ -163,7 +163,7 @@ async fn write_slo_metrics(
     compliant: bool,
     now_nanos: i64,
 ) {
-    let escaped_name = slo_name.replace('\'', "\\'");
+    let escaped_name = crate::query_builder::escape_string_literal(&slo_name);
     let attrs = format!(
         "{{'slo.id': '{slo_id}', 'slo.name': '{escaped_name}'}}"
     );

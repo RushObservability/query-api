@@ -99,7 +99,7 @@ pub async fn get_stats(
     Json(req): Json<StatsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let (from, to) = if let Some(tr) = &req.time_range {
         (tr.from.clone(), tr.to.clone())
     } else {

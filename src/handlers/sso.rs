@@ -108,7 +108,7 @@ pub async fn sso_login(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -201,7 +201,7 @@ pub async fn sso_callback(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -355,7 +355,7 @@ pub async fn sso_callback(
 
     // 11. Set the rush_session cookie and redirect to /
     let cookie = format!(
-        "rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
+        "__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
     );
 
     let mut headers = HeaderMap::new();
@@ -682,7 +682,7 @@ pub async fn sso_acs(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| {
             (StatusCode::BAD_REQUEST, "no SSO provider configured".to_string())
         })?;
@@ -762,7 +762,7 @@ pub async fn sso_acs(
     let user_id = match state
         .config_db
         .find_user_by_external_id(external_id, auth_provider).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
     {
         Some(uid) => uid,
         None => {
@@ -790,7 +790,7 @@ pub async fn sso_acs(
         (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}"))
     })?;
 
-    let cookie = format!("rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400");
+    let cookie = format!("__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400");
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
@@ -813,7 +813,7 @@ pub async fn sso_metadata(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let base_url = resolve_base_url(&headers);
     let acs_url = format!("{base_url}/auth/sso/acs");

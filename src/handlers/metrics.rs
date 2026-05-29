@@ -230,7 +230,7 @@ async fn prom_series_inner(
     let start_secs = params.start.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(now_secs - 3600.0);
     let end_secs = params.end.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(now_secs);
 
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let mut all_series = Vec::new();
 
     for expr_str in &match_exprs {
@@ -252,7 +252,7 @@ async fn prom_series_inner(
         ];
         if let Some(name) = &vs.name {
             if !name.is_empty() {
-                where_parts.push(format!("MetricName = '{}'", name.replace('\'', "\\'")));
+                where_parts.push(format!("MetricName = '{}'", crate::query_builder::escape_string_literal(&name)));
             }
         }
         // Add matchers (skip __name__ since we handle it via vs.name)
@@ -313,7 +313,7 @@ pub async fn prom_labels(
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     // Return well-known labels plus discovered attribute keys
     let mut labels = vec![
         "__name__".to_string(),
@@ -328,17 +328,17 @@ pub async fn prom_labels(
         let trimmed = m.trim().trim_start_matches('{').trim_end_matches('}');
         // Exact match: __name__="value"
         if let Some(val) = trimmed.strip_prefix("__name__=\"").and_then(|s| s.strip_suffix('"')) {
-            let escaped = val.replace('\'', "\\'");
+            let escaped = crate::query_builder::escape_string_literal(&val);
             return Some(format!("AND MetricName = '{escaped}'"));
         }
         // Regex match: __name__=~"value"
         if let Some(val) = trimmed.strip_prefix("__name__=~\"").and_then(|s| s.strip_suffix('"')) {
-            let like = val.replace(".*", "%").replace('.', "_").replace('\'', "\\'");
+            let like = crate::query_builder::escape_string_literal(&val.replace(".*", "%").replace('.', "_"));
             return Some(format!("AND MetricName LIKE '{like}'"));
         }
         // Fallback: treat as literal metric name
         if !trimmed.is_empty() {
-            let escaped = trimmed.replace('\'', "\\'");
+            let escaped = crate::query_builder::escape_string_literal(&trimmed);
             return Some(format!("AND MetricName = '{escaped}'"));
         }
         None
@@ -387,21 +387,21 @@ pub async fn prom_label_values(
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let mut values = Vec::new();
 
     let metric_filter = params.match_expr.as_ref().and_then(|m| {
         let trimmed = m.trim().trim_start_matches('{').trim_end_matches('}');
         if let Some(val) = trimmed.strip_prefix("__name__=\"").and_then(|s| s.strip_suffix('"')) {
-            let escaped = val.replace('\'', "\\'");
+            let escaped = crate::query_builder::escape_string_literal(&val);
             return Some(format!("AND MetricName = '{escaped}'"));
         }
         if let Some(val) = trimmed.strip_prefix("__name__=~\"").and_then(|s| s.strip_suffix('"')) {
-            let like = val.replace(".*", "%").replace('.', "_").replace('\'', "\\'");
+            let like = crate::query_builder::escape_string_literal(&val.replace(".*", "%").replace('.', "_"));
             return Some(format!("AND MetricName LIKE '{like}'"));
         }
         if !trimmed.is_empty() {
-            let escaped = trimmed.replace('\'', "\\'");
+            let escaped = crate::query_builder::escape_string_literal(&trimmed);
             return Some(format!("AND MetricName = '{escaped}'"));
         }
         None
@@ -425,7 +425,7 @@ pub async fn prom_label_values(
                  ORDER BY value LIMIT 500"
             ),
             _ => {
-                let escaped = label_name.replace('\'', "\\'");
+                let escaped = crate::query_builder::escape_string_literal(&label_name);
                 format!(
                     "SELECT DISTINCT Attributes['{escaped}'] AS value FROM {table} \
                      WHERE tenant_id = '{escaped_tenant}' \

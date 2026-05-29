@@ -49,8 +49,8 @@ impl UsageAccumulator {
                 // Build a batch INSERT for efficiency
                 let mut values = Vec::new();
                 for ((tenant_id, signal), (events, bytes)) in &snapshot {
-                    let escaped_tenant = tenant_id.replace('\'', "\\'");
-                    let escaped_signal = signal.replace('\'', "\\'");
+                    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+                    let escaped_signal = crate::query_builder::escape_string_literal(&signal);
                     values.push(format!(
                         "('{escaped_tenant}', '{escaped_signal}', {events}, {bytes})"
                     ));

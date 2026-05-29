@@ -33,13 +33,13 @@ pub async fn get_tenant_retention(
     state
         .config_db
         .get_tenant(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     let overrides = state
         .config_db
         .get_tenant_retention(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let mut resp = TenantRetentionResponse {
         metrics_days: None,
@@ -71,7 +71,7 @@ pub async fn set_tenant_retention(
     state
         .config_db
         .get_tenant(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     // Validate: days must be positive if provided
@@ -104,7 +104,7 @@ pub async fn set_tenant_retention(
                     .config_db
                     .set_tenant_retention(&id, signal, days).await
                     .map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
+                        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
                     })?;
             }
             None => {
@@ -136,13 +136,13 @@ pub async fn delete_tenant_retention(
     state
         .config_db
         .get_tenant(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     let deleted = state
         .config_db
         .delete_tenant_retention(&id, &signal).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     if !deleted {
         return Err((

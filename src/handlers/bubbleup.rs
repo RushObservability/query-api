@@ -209,7 +209,7 @@ pub async fn bubbleup(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let top_k = req.top_k.unwrap_or(10).min(50);
 
     let config = signal_config(&req.signal)?;
@@ -219,10 +219,10 @@ pub async fn bubbleup(
 
     // Compute the earliest and latest timestamps spanning both windows to
     // minimize the ClickHouse scan range.
-    let sel_from = req.selection.from.replace('\'', "\\'");
-    let sel_to = req.selection.to.replace('\'', "\\'");
-    let base_from = req.baseline.from.replace('\'', "\\'");
-    let base_to = req.baseline.to.replace('\'', "\\'");
+    let sel_from = crate::query_builder::escape_string_literal(&req.selection.from);
+    let sel_to = crate::query_builder::escape_string_literal(&req.selection.to);
+    let base_from = crate::query_builder::escape_string_literal(&req.baseline.from);
+    let base_to = crate::query_builder::escape_string_literal(&req.baseline.to);
 
     let earliest = if sel_from < base_from { &sel_from } else { &base_from };
     let latest = if sel_to > base_to { &sel_to } else { &base_to };

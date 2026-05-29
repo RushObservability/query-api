@@ -84,8 +84,8 @@ async fn flush(ch: &Client, events: Vec<UsageEvent>) {
     // Build a batch INSERT
     let mut values = Vec::new();
     for ((name, sig_type, source), count) in &counts {
-        let escaped_name = name.replace('\'', "\\'");
-        let escaped_source = source.replace('\'', "\\'");
+        let escaped_name = crate::query_builder::escape_string_literal(&name);
+        let escaped_source = crate::query_builder::escape_string_literal(&source);
         values.push(format!(
             "('{escaped_name}', '{sig_type}', '{escaped_source}', now64(3), {count})"
         ));

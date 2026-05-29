@@ -25,7 +25,7 @@ pub async fn get_trace(
         ));
     }
 
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     // Use FINAL to deduplicate (MergeTree may have duplicate span_ids from MV + direct insert)
     let rows = crate::tenant_query(
             &state.ch,
@@ -38,11 +38,8 @@ pub async fn get_trace(
         .fetch_all::<WideEvent>()
         .await
         .map_err(|e| {
-            tracing::error!("ClickHouse query failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("query failed: {e}"),
-            )
+            tracing::error!(error = %e, signal = "traces", handler = "get_trace", "ClickHouse query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     if rows.is_empty() {

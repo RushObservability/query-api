@@ -10,13 +10,18 @@ pub(crate) fn sanitize_datetime(s: &str) -> String {
 }
 
 /// Escape a string value for safe embedding inside a SQL single-quoted literal.
-/// Uses the standard SQL double-quote convention (`'` → `''`) which ClickHouse
-/// supports unconditionally. Callers should still wrap the result in single quotes:
+/// Escapes backslashes first (to prevent them from being interpreted as escape
+/// characters when ClickHouse's allow_backslashes_escaping_in_strings is ON),
+/// then uses SQL-standard quote doubling (`'` → `''`) which ClickHouse supports
+/// unconditionally regardless of that setting.
+///
+/// Callers should still wrap the result in single quotes:
 ///   `format!("col = '{}'", escape_string_literal(value))`
 /// Prefer parameterized queries via `.bind()` where the clickhouse driver supports
 /// it; use this helper only for dynamic values that cannot be bound.
 pub(crate) fn escape_string_literal(s: &str) -> String {
-    s.replace('\'', "''")
+    // Backslash must be escaped first to avoid double-escaping the apostrophe step.
+    s.replace('\\', "\\\\").replace('\'', "''")
 }
 
 /// Return true if `s` is a safe SQL column identifier (letter/underscore start,
@@ -308,42 +313,49 @@ fn parse_search_expr(input: &str) -> Option<SearchExpr> {
 
 /// Generate a ClickHouse SQL fragment that checks if `term` appears in any of the given columns.
 /// Supports `*` wildcards: `slack * posted` → ILIKE '%slack%posted%'.
-/// For array columns, wraps with arrayExists.
-fn term_match_sql(term: &str, columns: &[(&str, bool)]) -> String {
+///
+/// Column tuple: `(name, is_array, use_lower_like)`
+/// - `is_array`: wrap with arrayExists (Vec<String> columns)
+/// - `use_lower_like`: emit `lower(col) LIKE '%lower_term%'` to leverage ngrambf_v1 skip indexes
+///   built on `lower(col)` expressions (e.g. `lower(attributes)`). Ignored for array columns.
+fn term_match_sql(term: &str, columns: &[(&str, bool, bool)]) -> String {
     let has_wildcard = term.contains('*');
     let escaped = escape_string_literal(term);
+    let lower_term = term.to_lowercase();
+    let escaped_lower = escape_string_literal(&lower_term);
 
-    if has_wildcard {
-        // Convert wildcard term to ILIKE pattern: escape %, _, then replace * with %
-        let pattern = escaped
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-            .replace('*', "%");
-        let like_pattern = format!("%{pattern}%");
-        let parts: Vec<String> = columns
-            .iter()
-            .map(|(col, is_array)| {
+    let parts: Vec<String> = columns
+        .iter()
+        .map(|(col, is_array, use_lower_like)| {
+            if has_wildcard {
+                // Build LIKE pattern from the term (escape SQL wildcards, map * → %)
+                let base = if *use_lower_like { &escaped_lower } else { &escaped };
+                let pattern = base
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+                    .replace('*', "%");
+                let like_pattern = format!("%{pattern}%");
                 if *is_array {
                     format!("arrayExists(x -> x ILIKE '{like_pattern}', {col})")
+                } else if *use_lower_like {
+                    // lower(col) LIKE uses ngrambf_v1 index built on lower(col)
+                    format!("lower({col}) LIKE '{like_pattern}'")
                 } else {
                     format!("{col} ILIKE '{like_pattern}'")
                 }
-            })
-            .collect();
-        format!("({})", parts.join(" OR "))
-    } else {
-        let parts: Vec<String> = columns
-            .iter()
-            .map(|(col, is_array)| {
-                if *is_array {
-                    format!("arrayExists(x -> positionCaseInsensitive(x, '{escaped}') > 0, {col})")
-                } else {
-                    format!("positionCaseInsensitive({col}, '{escaped}') > 0")
-                }
-            })
-            .collect();
-        format!("({})", parts.join(" OR "))
-    }
+            } else if *is_array {
+                format!("arrayExists(x -> positionCaseInsensitive(x, '{escaped}') > 0, {col})")
+            } else if *use_lower_like {
+                // lower(col) LIKE '%lower_term%' — hits ngrambf_v1(lower(col)) skip index,
+                // skipping granules that provably cannot contain the term.
+                let like_safe = escaped_lower.replace('%', "\\%").replace('_', "\\_");
+                format!("lower({col}) LIKE '%{like_safe}%'")
+            } else {
+                format!("positionCaseInsensitive({col}, '{escaped}') > 0")
+            }
+        })
+        .collect();
+    format!("({})", parts.join(" OR "))
 }
 
 /// Generate SQL for a `key=value` attribute lookup.
@@ -378,7 +390,7 @@ fn kv_match_sql(key: &str, value: &str, ctx: SearchContext) -> String {
 }
 
 /// Recursively generate SQL for a search expression tree.
-fn search_expr_to_sql(expr: &SearchExpr, columns: &[(&str, bool)], ctx: SearchContext) -> String {
+fn search_expr_to_sql(expr: &SearchExpr, columns: &[(&str, bool, bool)], ctx: SearchContext) -> String {
     match expr {
         SearchExpr::Term(term) => term_match_sql(term, columns),
         SearchExpr::KeyValue(key, value) => kv_match_sql(key, value, ctx),
@@ -396,14 +408,18 @@ fn search_expr_to_sql(expr: &SearchExpr, columns: &[(&str, bool)], ctx: SearchCo
 /// Build a SQL condition for free-text search on span columns (events table).
 pub fn build_span_search_sql(search: &str) -> Option<String> {
     let expr = parse_search_expr(search)?;
-    let columns: Vec<(&str, bool)> = vec![
-        ("trace_id", false),
-        ("span_id", false),
-        ("service_name", false),
-        ("http_path", false),
-        ("attributes", false),
-        ("event_names", true),
-        ("event_attributes", true),
+    // (column, is_array, use_lower_like)
+    // use_lower_like=true means emit `lower(col) LIKE '%term%'` to hit the ngrambf_v1
+    // skip index built on lower(col). The wide_events DDL defines:
+    //   INDEX idx_attributes_ngram lower(attributes) TYPE ngrambf_v1(...)
+    let columns: Vec<(&str, bool, bool)> = vec![
+        ("trace_id",         false, false),
+        ("span_id",          false, false),
+        ("service_name",     false, false),
+        ("http_path",        false, false),
+        ("attributes",       false, true),  // ngrambf_v1 on lower(attributes)
+        ("event_names",      true,  false),
+        ("event_attributes", true,  false),
     ];
     Some(search_expr_to_sql(&expr, &columns, SearchContext::Spans))
 }

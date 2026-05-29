@@ -38,7 +38,7 @@ fn resolve_log_field(field: &str) -> String {
                 format!("LogAttributes['{attr}']")
             } else {
                 // Unqualified key: check both LogAttributes and ResourceAttributes
-                let escaped = field.replace('\'', "\\'");
+                let escaped = crate::query_builder::escape_string_literal(&field);
                 format!(
                     "if(LogAttributes['{escaped}'] != '', LogAttributes['{escaped}'], ResourceAttributes['{escaped}'])"
                 )
@@ -51,7 +51,7 @@ fn resolve_log_field(field: &str) -> String {
 /// tenant_id + time range go into PREWHERE (evaluated at granule level before decompression);
 /// column filters and full-text search go into WHERE.
 fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str>, tenant_id: &str) -> QueryClauses {
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
     let prewhere = format!(
@@ -113,6 +113,12 @@ pub async fn query_logs(
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
 
+    if let Some(ref s) = req.search {
+        if s.len() > 512 {
+            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+        }
+    }
+    let offset = req.offset.min(100_000);
     let limit = req.limit.min(1000);
     let select_cols = "Timestamp, TraceId, SpanId, SeverityText, SeverityNumber, \
          ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
@@ -152,7 +158,7 @@ pub async fn query_logs(
         );
         let narrow_rows = narrow_res.map_err(|e| {
             tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         if (narrow_rows.len() as u64) >= limit {
             let total = narrow_rows.len() as u64;
@@ -160,7 +166,7 @@ pub async fn query_logs(
         } else {
             let rows = full_res.map_err(|e| {
                 tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
             let total = rows.len() as u64;
             (rows, total)
@@ -171,7 +177,7 @@ pub async fn query_logs(
             "SELECT {select_cols} FROM otel_logs {} \
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit} OFFSET {}",
             clauses.to_sql(),
-            req.offset,
+            offset,
         );
         if req.search.is_some() {
             tracing::debug!(signal = "logs", handler = "query_logs", "log search query executing");
@@ -180,7 +186,7 @@ pub async fn query_logs(
             .fetch_all::<LogRecord>().await
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "logs", handler = "query_logs", "search query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
         let total = rows.len() as u64;
         (rows, total)
@@ -205,8 +211,9 @@ pub async fn query_logs(
         state.usage.track_many(signals, "log", "explore");
     }
 
-    // P7: Serialize typed structs directly — no intermediate serde_json::Value
-    Ok(Json(serde_json::json!({ "rows": rows, "total": total })))
+    #[derive(serde::Serialize)]
+    struct Resp { rows: Vec<LogRecord>, total: u64 }
+    Ok(Json(Resp { rows, total }))
 }
 
 /// Count logs bucketed by time interval.
@@ -244,7 +251,7 @@ pub async fn count_logs(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "logs", handler = "count_logs", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     Ok(Json(buckets))

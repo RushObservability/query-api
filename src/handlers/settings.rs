@@ -40,8 +40,18 @@ fn generate_api_key() -> String {
 /// Hash an API key using HMAC-SHA256 keyed with RUSH_API_KEY_SECRET.
 /// Produces a consistent hash for lookups while preventing offline
 /// dictionary attacks against a stolen database.
+///
+/// # Panics in debug builds / warns in release if RUSH_API_KEY_SECRET is absent or weak.
 pub fn hash_api_key(key: &str) -> String {
     let secret = std::env::var("RUSH_API_KEY_SECRET").unwrap_or_default();
+    if secret.len() < 32 {
+        // An empty or short key makes HMAC equivalent to a plain hash, enabling
+        // offline dictionary attacks against a stolen api_keys table.
+        tracing::warn!(
+            "RUSH_API_KEY_SECRET is not set or shorter than 32 bytes; \
+             API key hashing is insecure — set a strong random secret in production"
+        );
+    }
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts any key length");
     mac.update(key.as_bytes());
@@ -54,7 +64,7 @@ pub async fn list_api_keys(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
     let rows = state.config_db.list_api_keys().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
     let keys: Vec<ApiKeyListEntry> = rows
         .into_iter()
@@ -75,7 +85,7 @@ pub async fn create_api_key(
     let prefix = key[..8].to_string();
 
     state.config_db.create_api_key(&id, &req.name, &key_hash, &prefix).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
 
     tracing::info!(
@@ -131,7 +141,7 @@ pub async fn delete_api_key(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
     let deleted = state.config_db.delete_api_key(&id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));

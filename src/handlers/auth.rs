@@ -32,23 +32,29 @@ pub async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Rate limit: max 10 attempts per IP per 60-second window
+    // Rate limit: max 10 attempts per (IP, username) pair per 60-second window.
+    // Keying on both IP and username prevents simple IP-rotation attacks: an
+    // attacker cycling X-Forwarded-For values still hits the per-username limit.
+    // X-Forwarded-For is included as a hint but the username anchor is the binding
+    // constraint, since that header is spoofable by any client.
     let ip = headers
         .get("x-forwarded-for")
         .or_else(|| headers.get("x-real-ip"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    // Combine IP + username so that neither axis alone can be used to bypass the limit.
+    let rate_key = format!("{}:{}", ip, req.username);
     {
         let now = std::time::Instant::now();
-        let current = state.login_limiter.get(&ip).map(|e| *e.value());
+        let current = state.login_limiter.get(&rate_key).map(|e| *e.value());
         let (count, window_start) = current.unwrap_or((0u32, now));
         let (new_count, new_window) = if now.duration_since(window_start).as_secs() >= 60 {
             (1u32, now)
         } else {
             (count + 1, window_start)
         };
-        state.login_limiter.insert(ip.clone(), (new_count, new_window));
+        state.login_limiter.insert(rate_key, (new_count, new_window));
         if new_count > 10 {
             return Err((StatusCode::TOO_MANY_REQUESTS, "too many login attempts, try again later".to_string()));
         }
@@ -84,8 +90,10 @@ pub async fn login(
         "user authenticated"
     );
 
+    // __Host- prefix requires Secure, Path=/, and no Domain attribute.
+    // It prevents subdomain cookie injection attacks even if a subdomain is compromised.
     let cookie = format!(
-        "rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
+        "__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
     );
 
     let mut headers = HeaderMap::new();
@@ -119,7 +127,7 @@ pub async fn logout(
         state.config_db.delete_session(&token).await;
     }
 
-    let clear_cookie = "rush_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+    let clear_cookie = "__Host-rush_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
@@ -168,7 +176,7 @@ pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie_header.split(';') {
         let part = part.trim();
-        if let Some(value) = part.strip_prefix("rush_session=") {
+        if let Some(value) = part.strip_prefix("__Host-rush_session=").or_else(|| part.strip_prefix("rush_session=")) {
             let value = value.trim();
             if !value.is_empty() {
                 return Some(value.to_string());

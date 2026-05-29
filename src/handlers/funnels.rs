@@ -62,7 +62,7 @@ struct TraceCountRow {
 /// PREWHERE: tenant_id + timestamp range (both in primary key) — granule-level filtering.
 /// WHERE: optional service/path/status filters.
 fn step_clauses(step: &FunnelStep, from: &str, to: &str, tenant_id: &str) -> QueryClauses {
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let safe_from = sanitize_datetime(from);
     let safe_to = sanitize_datetime(to);
     let prewhere = format!(

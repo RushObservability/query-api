@@ -349,14 +349,14 @@ pub async fn ingest_v1(
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
             let mut insert = state.ch.insert("otel_metrics_gauge")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &gauge_rows {
                 insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
                 })?;
             }
             insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
             })?;
         }
         Ok::<_, (StatusCode, String)>(())
@@ -364,14 +364,14 @@ pub async fn ingest_v1(
     let sum_fut = async {
         if !sum_rows.is_empty() {
             let mut insert = state.ch.insert("otel_metrics_sum")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &sum_rows {
                 insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
                 })?;
             }
             insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
             })?;
         }
         Ok::<_, (StatusCode, String)>(())
@@ -484,14 +484,14 @@ pub async fn ingest_v2(
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
             let mut insert = state.ch.insert("otel_metrics_gauge")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &gauge_rows {
                 insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
                 })?;
             }
             insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
             })?;
         }
         Ok::<_, (StatusCode, String)>(())
@@ -499,14 +499,14 @@ pub async fn ingest_v2(
     let sum_fut = async {
         if !sum_rows.is_empty() {
             let mut insert = state.ch.insert("otel_metrics_sum")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &sum_rows {
                 insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
                 })?;
             }
             insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
             })?;
         }
         Ok::<_, (StatusCode, String)>(())
@@ -567,7 +567,7 @@ pub async fn check_run(
     let now_s = chrono::Utc::now().timestamp();
 
     let mut insert = state.ch.insert("otel_metrics_gauge")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
     for check in &checks {
         let (svc, attrs) = extract_tags(&check.tags);
@@ -585,12 +585,12 @@ pub async fn check_run(
         row.value = check.status as f64;
 
         insert.write(&row).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
         })?;
     }
 
     insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
     })?;
 
     // Record usage for per-tenant ingest metering
