@@ -84,7 +84,9 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     INDEX idx_http_method http_method TYPE set(16) GRANULARITY 4,
     INDEX idx_status status TYPE set(8) GRANULARITY 4,
     INDEX idx_http_status http_status_code TYPE minmax GRANULARITY 1,
-    INDEX idx_duration duration_ns TYPE minmax GRANULARITY 1
+    INDEX idx_duration duration_ns TYPE minmax GRANULARITY 1,
+    INDEX idx_attributes_ngram lower(attributes) TYPE ngrambf_v1(4, 65536, 3, 0) GRANULARITY 1,
+    INDEX idx_event_attributes_ngram arrayStringConcat(event_attributes, ' ') TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(timestamp)
@@ -582,8 +584,56 @@ pub fn spawn_maintenance(url: String, user: String, password: String, config: Ru
             tracing::error!("background retention TTL application failed: {e}");
         }
         apply_storage_policy(&client, &config).await;
+        apply_skip_indexes(&client).await;
         tracing::info!("background maintenance tasks complete");
     });
+}
+
+/// Add ngrambf_v1 skip indexes on wide_events for fast attribute free-text search.
+/// Idempotent — checks system.data_skipping_indices before issuing ALTER TABLE.
+async fn apply_skip_indexes(client: &Client) {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct IndexRow { count: u64 }
+
+    let indexes: &[(&str, &str)] = &[
+        (
+            "idx_attributes_ngram",
+            "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
+             idx_attributes_ngram lower(attributes) TYPE ngrambf_v1(4, 65536, 3, 0) GRANULARITY 1",
+        ),
+        (
+            "idx_event_attributes_ngram",
+            "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
+             idx_event_attributes_ngram arrayStringConcat(event_attributes, ' ') \
+             TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
+        ),
+    ];
+
+    for (name, ddl) in indexes {
+        // Check if the index already exists
+        let check = format!(
+            "SELECT count() as count FROM system.data_skipping_indices \
+             WHERE database = 'observability' AND table = 'wide_events' AND name = '{name}'"
+        );
+        let exists = client.query(&check).fetch_one::<IndexRow>().await
+            .map(|r| r.count > 0)
+            .unwrap_or(false);
+
+        if !exists {
+            tracing::info!(index = name, "adding skip index to wide_events");
+            if let Err(e) = client.query(ddl).execute().await {
+                tracing::warn!(index = name, error = %e, "failed to add skip index");
+                continue;
+            }
+            // Materialize the index on existing data (non-blocking — ClickHouse runs async)
+            let materialize = format!(
+                "ALTER TABLE observability.wide_events MATERIALIZE INDEX {name}"
+            );
+            if let Err(e) = client.query(&materialize).execute().await {
+                tracing::warn!(index = name, error = %e, "failed to materialize skip index");
+            }
+        }
+    }
 }
 
 /// Check if a table's TTL expression already contains the desired interval,

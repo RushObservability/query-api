@@ -9,8 +9,8 @@ use axum::{
 use crate::AppState;
 use crate::TenantContext;
 use crate::models::log::LogRecord;
-use crate::models::query::{CountBucket, CountQueryRequest, CountRow, Filter, FilterOp, TimeRange};
-use crate::query_builder::{format_value, build_log_search_sql};
+use crate::models::query::{CountBucket, CountQueryRequest, Filter, FilterOp, TimeRange};
+use crate::query_builder::{format_value, build_log_search_sql, sanitize_datetime, QueryClauses};
 
 /// Resolve a log field name to a ClickHouse column expression.
 /// Uses materialized columns for common resource attributes (avoids Map lookups).
@@ -47,13 +47,20 @@ fn resolve_log_field(field: &str) -> String {
     }
 }
 
-fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str>, tenant_id: &str) -> String {
+/// Build PREWHERE-optimized query clauses for otel_logs.
+/// tenant_id + time range go into PREWHERE (evaluated at granule level before decompression);
+/// column filters and full-text search go into WHERE.
+fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str>, tenant_id: &str) -> QueryClauses {
     let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let mut conditions = vec![
-        format!("tenant_id = '{escaped_tenant}'"),
-        format!("Timestamp >= parseDateTimeBestEffort('{from}')"),
-        format!("Timestamp <= parseDateTimeBestEffort('{to}')"),
-    ];
+    let from = sanitize_datetime(from);
+    let to = sanitize_datetime(to);
+    let prewhere = format!(
+        "tenant_id = '{escaped_tenant}' \
+         AND Timestamp >= parseDateTimeBestEffort('{from}') \
+         AND Timestamp <= parseDateTimeBestEffort('{to}')"
+    );
+
+    let mut conditions = Vec::new();
 
     for filter in filters {
         let field = resolve_log_field(&filter.field);
@@ -78,7 +85,7 @@ fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str
         }
     }
 
-    conditions.join(" AND ")
+    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
 }
 
 /// Log query request.
@@ -105,7 +112,6 @@ pub async fn query_logs(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
-    let where_clause = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
     let limit = req.limit.min(1000);
     let select_cols = "Timestamp, TraceId, SpanId, SeverityText, SeverityNumber, \
@@ -115,6 +121,8 @@ pub async fn query_logs(
     // The table's primary key is (ServiceName, TimestampTime, Timestamp), so a
     // wide time range without ServiceName filter requires a full scan.  Querying
     // just the last hour first is nearly instant and usually returns enough rows.
+    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+
     let (rows, total) = if req.search.is_none() && req.offset == 0 {
         // Try last 1 hour first
         let narrow_to = &req.time_range.to;
@@ -124,10 +132,11 @@ pub async fn query_logs(
                 .unwrap_or_else(|_| chrono::Utc::now().into());
             (to_dt - chrono::Duration::hours(1)).to_rfc3339()
         };
-        let narrow_where = build_log_where(&req.filters, &narrow_from, narrow_to, None, tenant_id);
+        let narrow_clauses = build_log_where(&req.filters, &narrow_from, narrow_to, None, tenant_id);
         let narrow_sql = format!(
-            "SELECT {select_cols} FROM otel_logs WHERE {narrow_where} \
-             ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}"
+            "SELECT {select_cols} FROM otel_logs {} \
+             ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+            narrow_clauses.to_sql(),
         );
         let narrow_rows = crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
             .fetch_all::<LogRecord>().await
@@ -143,8 +152,9 @@ pub async fn query_logs(
         } else {
             // Not enough recent logs — fall back to full range
             let full_sql = format!(
-                "SELECT {select_cols} FROM otel_logs WHERE {where_clause} \
-                 ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}"
+                "SELECT {select_cols} FROM otel_logs {} \
+                 ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+                clauses.to_sql(),
             );
             let rows = crate::tenant_query(&state.ch, &full_sql, tenant_id)
                 .fetch_all::<LogRecord>().await
@@ -158,8 +168,9 @@ pub async fn query_logs(
     } else {
         // Search or pagination: use full range
         let sql = format!(
-            "SELECT {select_cols} FROM otel_logs WHERE {where_clause} \
+            "SELECT {select_cols} FROM otel_logs {} \
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit} OFFSET {}",
+            clauses.to_sql(),
             req.offset,
         );
         if req.search.is_some() {
@@ -205,7 +216,7 @@ pub async fn count_logs(
     Json(req): Json<CountQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let where_clause = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
     let interval_fn = match req.interval.as_str() {
         "1s" => "toStartOfSecond(Timestamp)",
@@ -222,9 +233,10 @@ pub async fn count_logs(
         "SELECT toString({interval_fn}) as bucket, count() as count, \
          countIf(SeverityNumber >= 17) as error_count \
          FROM otel_logs \
-         WHERE {where_clause} \
+         {} \
          GROUP BY bucket \
-         ORDER BY bucket ASC"
+         ORDER BY bucket ASC",
+        clauses.to_sql(),
     );
 
     let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)

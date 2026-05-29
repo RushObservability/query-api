@@ -4,6 +4,7 @@ use axum::http::{HeaderValue, header};
 use clickhouse::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -102,8 +103,19 @@ async fn resolve_tenant_from_headers(
             let key = val[7..].trim();
             let key_hash = handlers::settings::hash_api_key(key);
 
+            // Fast path: check in-memory cache (TTL 60s) before hitting ClickHouse
+            if let Some(entry) = state.api_key_cache.get(&key_hash) {
+                let (tid, ts) = entry.value();
+                if ts.elapsed() < std::time::Duration::from_secs(60) {
+                    return tid.clone();
+                }
+            }
+
             match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
-                Ok(Some(tid)) => return tid,
+                Ok(Some(tid)) => {
+                    state.api_key_cache.insert(key_hash, (tid.clone(), std::time::Instant::now()));
+                    return tid;
+                }
                 Ok(None) => {
                     tracing::debug!(method = "api_key", "tenant resolution: key not found, falling through");
                 }
@@ -122,8 +134,19 @@ async fn resolve_tenant_from_headers(
         if !key.is_empty() {
             let key_hash = handlers::settings::hash_api_key(key);
 
+            // Fast path: check in-memory cache (TTL 60s) before hitting ClickHouse
+            if let Some(entry) = state.api_key_cache.get(&key_hash) {
+                let (tid, ts) = entry.value();
+                if ts.elapsed() < std::time::Duration::from_secs(60) {
+                    return tid.clone();
+                }
+            }
+
             match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
-                Ok(Some(tid)) => return tid,
+                Ok(Some(tid)) => {
+                    state.api_key_cache.insert(key_hash, (tid.clone(), std::time::Instant::now()));
+                    return tid;
+                }
                 Ok(None) => {
                     tracing::debug!(method = "dd_api_key", "tenant resolution: DD key not found, falling through");
                 }
@@ -272,7 +295,8 @@ async fn main() -> anyhow::Result<()> {
         .with_database(&clickhouse_db)
         .with_user(&clickhouse_user)
         .with_password(&clickhouse_password)
-        .with_option("max_execution_time", "30");
+        .with_option("max_execution_time", "30")
+        .with_compression(clickhouse::Compression::Lz4);
 
     // Check if ClickHouse supports the rush_tenant_id custom setting for row policy enforcement.
     // If not (no custom_settings_prefixes configured), row policies are NOT created (they would
@@ -339,6 +363,21 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let api_key_cache: std::sync::Arc<dashmap::DashMap<String, (String, std::time::Instant)>> =
+        std::sync::Arc::new(dashmap::DashMap::new());
+
+    // Spawn background task to evict expired API key cache entries (TTL 60s)
+    {
+        let cache_clone = api_key_cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cache_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+            }
+        });
+    }
+
     let state = AppState {
         ch,
         config_db,
@@ -346,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
         usage_accumulator,
         config: wide_config,
         login_limiter,
+        api_key_cache,
     };
 
     let app = Router::new()
@@ -853,6 +893,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         })
+        .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware))
