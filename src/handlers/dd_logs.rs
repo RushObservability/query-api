@@ -135,7 +135,7 @@ async fn ingest_logs_inner(
     let mut insert = state
         .ch
         .insert("otel_logs")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
     let mut count = 0u64;
 
@@ -211,13 +211,13 @@ async fn ingest_logs_inner(
         };
 
         insert.write(&row).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
         })?;
         count += 1;
     }
 
     insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
     })?;
 
     // Record usage for per-tenant ingest metering

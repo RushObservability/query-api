@@ -315,7 +315,7 @@ async fn query_clickhouse(
     align: bool,
     tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let mut where_parts = vec![
         format!("tenant_id = '{escaped_tenant}'"),
         format!("TimeUnix >= toDateTime64({}, 9)", start_secs as i64),
@@ -327,7 +327,7 @@ async fn query_clickhouse(
         if !name.is_empty() {
             where_parts.push(format!(
                 "MetricName = '{}'",
-                name.replace('\'', "\\'")
+                crate::query_builder::escape_string_literal(&name)
             ));
         }
     }

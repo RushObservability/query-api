@@ -24,7 +24,7 @@ pub async fn list_services(
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let rows = crate::tenant_query(
             &state.ch,
             &format!(
@@ -46,7 +46,7 @@ pub async fn list_services(
             tracing::error!(error = %e, handler = "list_services", "query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("query failed: {e}"),
+                "query failed".into(),
             )
         })?;
 
@@ -103,7 +103,7 @@ pub async fn service_graph(
     Query(params): Query<GraphParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let minutes = params.minutes.min(10080); // max 7d
 
     // Node metrics: per-service aggregate.
@@ -164,12 +164,12 @@ pub async fn service_graph(
 
     let nodes = nodes_result.map_err(|e| {
         tracing::error!(error = %e, handler = "service_graph", "nodes query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
     })?;
 
     let edges = edges_result.map_err(|e| {
         tracing::error!(error = %e, handler = "service_graph", "edges query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
     })?;
 
     Ok(Json(ServiceGraph { nodes, edges }))

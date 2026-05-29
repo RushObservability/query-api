@@ -101,7 +101,7 @@ pub async fn list_users(
     let rows = state
         .config_db
         .list_users().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let users: Vec<UserResponse> = rows.into_iter().map(user_response).collect();
 
@@ -139,7 +139,7 @@ pub async fn create_user(
     let id = state
         .config_db
         .create_user(&username, &password, &display_name).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     // New users default to the viewers group
     let _ = state
@@ -149,7 +149,7 @@ pub async fn create_user(
     let row = state
         .config_db
         .get_user(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -179,7 +179,7 @@ pub async fn delete_user(
     let username = state
         .config_db
         .get_username(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
 
     if username == "admin" {
@@ -192,7 +192,7 @@ pub async fn delete_user(
     let deleted = state
         .config_db
         .delete_user(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
@@ -243,7 +243,7 @@ pub async fn change_password(
     let updated = state
         .config_db
         .change_password(&id, &req.password).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
@@ -264,7 +264,7 @@ pub async fn toggle_user(
     let updated = state
         .config_db
         .set_user_enabled(&id, req.enabled).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
@@ -273,7 +273,7 @@ pub async fn toggle_user(
     let row = state
         .config_db
         .get_user(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
 
     Ok(Json(user_response(row)))

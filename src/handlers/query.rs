@@ -23,7 +23,16 @@ pub async fn execute_query(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+
+    // Input validation
+    if let Some(ref s) = req.search {
+        if s.len() > 512 {
+            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+        }
+    }
+    let offset = req.offset.min(100_000);
+
+    let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
@@ -31,7 +40,7 @@ pub async fn execute_query(
         "SELECT * FROM wide_events {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
         clauses.to_sql(),
         req.limit.min(1000),
-        req.offset,
+        offset,
     );
 
     let count_sql = format!("SELECT count() as count FROM wide_events {}", clauses.to_sql());
@@ -44,7 +53,7 @@ pub async fn execute_query(
 
     let rows = rows_result.map_err(|e| {
         tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
     })?;
 
     let total = count_result.map(|r| r.count).unwrap_or(0);
@@ -69,8 +78,9 @@ pub async fn execute_query(
         "query completed"
     );
 
-    // P7: Serialize typed structs directly — no intermediate serde_json::Value
-    Ok(Json(serde_json::json!({ "rows": rows, "total": total })))
+    #[derive(serde::Serialize)]
+    struct Resp { rows: Vec<WideEvent>, total: u64 }
+    Ok(Json(Resp { rows, total }))
 }
 
 /// Count events bucketed by time interval.
@@ -80,7 +90,7 @@ pub async fn count_query(
     Json(req): Json<CountQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
@@ -111,7 +121,7 @@ pub async fn count_query(
             tracing::error!(error = %e, signal = "traces", handler = "count_query", "query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("query failed: {e}"),
+                "query failed".into(),
             )
         })?;
 
@@ -132,7 +142,7 @@ pub async fn group_query(
     }
 
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
@@ -172,7 +182,7 @@ pub async fn group_query(
                 tracing::error!(error = %e, signal = "traces", handler = "group_query", "query failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("query failed: {e}"),
+                    "query failed".into(),
                 )
             })?;
 
@@ -202,7 +212,7 @@ pub async fn timeseries_query(
     Json(req): Json<TimeseriesRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
@@ -240,7 +250,7 @@ pub async fn timeseries_query(
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", "query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
 
         // Only track usage if results returned
@@ -274,7 +284,7 @@ pub async fn timeseries_query(
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", "query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
 
         // Only track usage if results returned

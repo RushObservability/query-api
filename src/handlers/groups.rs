@@ -77,7 +77,7 @@ pub async fn list_groups(
     let rows = state
         .config_db
         .list_groups().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let groups: Vec<GroupResponse> = rows.into_iter().map(group_response).collect();
 
@@ -117,12 +117,12 @@ pub async fn create_group(
     let id = state
         .config_db
         .create_group(&name, &description, &scopes, &permissions).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let row = state
         .config_db
         .get_group(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -153,7 +153,7 @@ pub async fn update_group(
     let current = state
         .config_db
         .get_group(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
     let description = req.description.unwrap_or(current.2);
@@ -169,7 +169,7 @@ pub async fn update_group(
     let updated = state
         .config_db
         .update_group(&id, &description, &scopes, &permissions).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "group not found".to_string()));
@@ -178,7 +178,7 @@ pub async fn update_group(
     let row = state
         .config_db
         .get_group(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
     Ok(Json(group_response(row)))
@@ -195,7 +195,7 @@ pub async fn delete_group(
     match state
         .config_db
         .delete_group(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
     {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "group not found".to_string())),
@@ -221,18 +221,18 @@ pub async fn set_group_tenants(
     state
         .config_db
         .get_group(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
     state
         .config_db
         .set_group_tenants(&id, &req.tenant_ids).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let row = state
         .config_db
         .get_group(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
     Ok(Json(group_response(row)))
@@ -249,7 +249,7 @@ pub async fn get_user_groups(
     let group_ids = state
         .config_db
         .get_user_groups(&user_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     Ok(Json(serde_json::json!({ "group_ids": group_ids })))
 }
@@ -271,12 +271,12 @@ pub async fn set_user_groups(
     state
         .config_db
         .set_user_groups(&user_id, &req.group_ids).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     let group_ids = state
         .config_db
         .get_user_groups(&user_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     Ok(Json(serde_json::json!({ "group_ids": group_ids })))
 }

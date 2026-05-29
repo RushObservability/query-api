@@ -40,7 +40,7 @@ fn resolve_rum_field(field: &str) -> String {
         "interaction_type" | "InteractionType" => "InteractionType".to_string(),
         "trace_id" | "TraceId" => "TraceId".to_string(),
         _ => {
-            let escaped = field.replace('\'', "\\'");
+            let escaped = crate::query_builder::escape_string_literal(&field);
             format!("'{escaped}'")
         }
     }
@@ -50,7 +50,7 @@ fn resolve_rum_field(field: &str) -> String {
 /// PREWHERE: tenant_id + TimestampTime (both in PRIMARY KEY) — evaluated at granule level.
 /// WHERE: precise nanosecond Timestamp bounds + column filters.
 fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) -> QueryClauses {
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
     let prewhere = format!(
@@ -242,51 +242,68 @@ pub async fn ingest(
     let mut insert = state
         .ch
         .insert("rum_events")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
+    // Build template row with all constant meta fields once; only event-specific
+    // fields (scalars + per-event strings) are updated inside the loop.
+    // Avoids 16 String clones × N events for identical meta values.
+    let mut row = RumRecord {
+        tenant_id: tenant_id.clone(),
+        timestamp: 0,
+        app_name: meta.app_name.clone(),
+        app_version: meta.app_version.clone(),
+        environment: meta.environment.clone(),
+        session_id: meta.session_id.clone(),
+        user_id: meta.user_id.clone(),
+        page_url: meta.page_url.clone(),
+        page_path: meta.page_path.clone(),
+        view_name: meta.view_name.clone(),
+        referrer: meta.referrer.clone(),
+        browser_name: meta.browser_name.clone(),
+        browser_version: meta.browser_version.clone(),
+        os_name: meta.os_name.clone(),
+        os_version: meta.os_version.clone(),
+        device_type: meta.device_type.clone(),
+        screen_width: meta.screen_width,
+        screen_height: meta.screen_height,
+        event_type: String::new(),
+        event_name: String::new(),
+        vital_name: String::new(),
+        vital_value: 0.0,
+        vital_rating: String::new(),
+        error_message: String::new(),
+        error_stack: String::new(),
+        error_type: String::new(),
+        interaction_target: String::new(),
+        interaction_type: String::new(),
+        duration_ms: 0.0,
+        trace_id: String::new(),
+        span_id: String::new(),
+        attributes: String::new(),
+    };
     for evt in &payload.events {
-        let ts = evt.timestamp.unwrap_or(now_ns);
-        let record = RumRecord {
-            tenant_id: tenant_id.clone(),
-            timestamp: ts,
-            app_name: meta.app_name.clone(),
-            app_version: meta.app_version.clone(),
-            environment: meta.environment.clone(),
-            session_id: meta.session_id.clone(),
-            user_id: meta.user_id.clone(),
-            page_url: meta.page_url.clone(),
-            page_path: meta.page_path.clone(),
-            view_name: meta.view_name.clone(),
-            referrer: meta.referrer.clone(),
-            browser_name: meta.browser_name.clone(),
-            browser_version: meta.browser_version.clone(),
-            os_name: meta.os_name.clone(),
-            os_version: meta.os_version.clone(),
-            device_type: meta.device_type.clone(),
-            screen_width: meta.screen_width,
-            screen_height: meta.screen_height,
-            event_type: evt.event_type.clone(),
-            event_name: evt.event_name.clone(),
-            vital_name: evt.vital_name.clone(),
-            vital_value: evt.vital_value,
-            vital_rating: evt.vital_rating.clone(),
-            error_message: evt.error_message.clone(),
-            error_stack: evt.error_stack.clone(),
-            error_type: evt.error_type.clone(),
-            interaction_target: evt.interaction_target.clone(),
-            interaction_type: evt.interaction_type.clone(),
-            duration_ms: evt.duration_ms,
-            trace_id: evt.trace_id.clone(),
-            span_id: evt.span_id.clone(),
-            attributes: evt.attributes.clone(),
-        };
-        insert.write(&record).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+        row.timestamp = evt.timestamp.unwrap_or(now_ns);
+        row.event_type = evt.event_type.clone();
+        row.event_name = evt.event_name.clone();
+        row.vital_name = evt.vital_name.clone();
+        row.vital_value = evt.vital_value;
+        row.vital_rating = evt.vital_rating.clone();
+        row.error_message = evt.error_message.clone();
+        row.error_stack = evt.error_stack.clone();
+        row.error_type = evt.error_type.clone();
+        row.interaction_target = evt.interaction_target.clone();
+        row.interaction_type = evt.interaction_type.clone();
+        row.duration_ms = evt.duration_ms;
+        row.trace_id = evt.trace_id.clone();
+        row.span_id = evt.span_id.clone();
+        row.attributes = evt.attributes.clone();
+        insert.write(&row).await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
         })?;
     }
 
     insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
     })?;
 
     // Insert synthetic spans into wide_events for RUM events with trace IDs.
@@ -382,7 +399,7 @@ pub async fn list_apps(
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let sql = format!(
         "SELECT AppName, count() as cnt FROM rum_events \
          PREWHERE tenant_id = '{escaped_tenant}' \
@@ -394,7 +411,7 @@ pub async fn list_apps(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "list_apps", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     Ok(Json(serde_json::json!({ "apps": rows })))
@@ -420,7 +437,7 @@ pub async fn query_events(
          ORDER BY Timestamp DESC LIMIT {} OFFSET {}",
         clauses.to_sql(),
         req.limit.min(1000),
-        req.offset,
+        req.offset.min(100_000),
     );
 
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -428,7 +445,7 @@ pub async fn query_events(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "query_events", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     let json_rows: Vec<serde_json::Value> = rows
@@ -473,7 +490,7 @@ pub async fn vitals(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "vitals", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     Ok(Json(serde_json::json!({ "vitals": rows })))
@@ -509,7 +526,7 @@ pub async fn pages(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "pages", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     Ok(Json(serde_json::json!({ "pages": rows })))
@@ -552,7 +569,7 @@ pub async fn errors(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "errors", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     Ok(Json(serde_json::json!({ "errors": rows })))
@@ -583,7 +600,7 @@ pub async fn sessions(
          LIMIT {} OFFSET {}",
         clauses.with_where_extra("SessionId != ''").to_sql(),
         req.limit.min(100),
-        req.offset,
+        req.offset.min(100_000),
     );
 
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -591,7 +608,7 @@ pub async fn sessions(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "sessions", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     Ok(Json(serde_json::json!({ "sessions": rows })))
@@ -604,8 +621,8 @@ pub async fn session_detail(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let escaped_id = id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_id = crate::query_builder::escape_string_literal(&id);
     let sql = format!(
         "SELECT tenant_id, Timestamp, AppName, AppVersion, Environment, SessionId, UserId, \
          PageUrl, PagePath, ViewName, Referrer, BrowserName, BrowserVersion, \
@@ -624,7 +641,7 @@ pub async fn session_detail(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "session_detail", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     let json_rows: Vec<serde_json::Value> = rows
@@ -664,8 +681,8 @@ pub async fn list_replay_sessions(
     Path(app_name): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let escaped_app = app_name.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_app = crate::query_builder::escape_string_literal(&app_name);
     let sql = format!(
         "SELECT DISTINCT session_id FROM rum_replay_chunks \
          WHERE tenant_id = '{escaped_tenant}' AND app_name = '{escaped_app}'"
@@ -673,7 +690,7 @@ pub async fn list_replay_sessions(
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<ReplaySessionRow>()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into()))?;
     let ids: Vec<String> = rows.into_iter().map(|r| r.session_id).collect();
     Ok(Json(serde_json::json!({ "session_ids": ids })))
 }
@@ -710,12 +727,12 @@ pub async fn ingest_replay(
     let mut insert = state
         .ch
         .insert("rum_replay_chunks")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
     insert.write(&row).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
     })?;
     insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
+        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
     })?;
 
     Ok(StatusCode::OK)
@@ -728,8 +745,8 @@ pub async fn get_replay(
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
-    let escaped_sid = session_id.replace('\'', "\\'");
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_sid = crate::query_builder::escape_string_literal(&session_id);
 
     let sql = format!(
         "SELECT tenant_id, session_id, app_name, chunk_idx, chunk_ts, events_json \
@@ -744,7 +761,7 @@ pub async fn get_replay(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "get_replay", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     // Concatenate all events across chunks in order

@@ -39,7 +39,10 @@ pub async fn suggest_values(
     Query(params): Query<SuggestParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    if params.prefix.len() > 200 {
+        return Err((StatusCode::BAD_REQUEST, "prefix too long (max 200 chars)".into()));
+    }
+    let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     let col_expr = if let Some(attr_path) = field.strip_prefix("attributes.") {
         // OTel attributes use flat dotted keys — try flat key first, nested as fallback.
         // Validate every dot-separated segment to prevent SQL injection via attr_path.
@@ -95,7 +98,7 @@ pub async fn suggest_values(
         "tenant_id = '{escaped_tenant}' AND timestamp >= now() - INTERVAL 24 HOUR"
     );
     let prefix_filter = if !params.prefix.is_empty() {
-        let escaped = params.prefix.replace('\'', "\\'");
+        let escaped = crate::query_builder::escape_string_literal(&params.prefix);
         format!("WHERE val LIKE '{escaped}%'")
     } else {
         String::new()
@@ -115,7 +118,7 @@ pub async fn suggest_values(
         .await
         .map_err(|e| {
             tracing::error!("Suggest query failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     let values: Vec<String> = rows.into_iter().map(|r| r.val).filter(|v| !v.is_empty()).collect();

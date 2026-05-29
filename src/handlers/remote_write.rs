@@ -208,7 +208,7 @@ pub async fn prom_remote_write(
     let mut insert = state
         .ch
         .insert("otel_metrics_gauge")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
     for ts in &write_req.timeseries {
         // Extract __name__ (metric name) and job (service name) from labels
@@ -269,7 +269,7 @@ pub async fn prom_remote_write(
             insert.write(&row).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("insert write: {e}"),
+                    "insert failed".into(),
                 )
             })?;
         }
@@ -278,7 +278,7 @@ pub async fn prom_remote_write(
     insert.end().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("insert end: {e}"),
+            "insert failed".into(),
         )
     })?;
 

@@ -130,7 +130,7 @@ pub async fn list_custom_skills(
     let skills = state
         .config_db
         .list_custom_skills().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     Ok(Json(serde_json::json!({ "skills": skills })))
 }
 
@@ -141,7 +141,7 @@ pub async fn get_custom_skill(
     let skill = state
         .config_db
         .get_custom_skill(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
     Ok(Json(skill))
 }
@@ -165,7 +165,7 @@ pub async fn create_custom_skill(
     let existing = state
         .config_db
         .get_custom_skill_by_name(&req.name).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     if existing.is_some() {
         return Err((
             StatusCode::CONFLICT,
@@ -176,7 +176,7 @@ pub async fn create_custom_skill(
     let created = state
         .config_db
         .create_custom_skill(&req, "").await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
     Ok((StatusCode::CREATED, Json::<CustomSkill>(created)))
 }
@@ -192,7 +192,7 @@ pub async fn update_custom_skill(
     let existing = state
         .config_db
         .get_custom_skill(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
 
     validate_skill_fields(
@@ -207,7 +207,7 @@ pub async fn update_custom_skill(
     let updated = state
         .config_db
         .update_custom_skill(&id, &req).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
 
     Ok(Json(updated))
@@ -222,7 +222,7 @@ pub async fn delete_custom_skill(
     let deleted = state
         .config_db
         .delete_custom_skill(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "custom skill not found".to_string()));
     }

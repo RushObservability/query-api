@@ -153,7 +153,7 @@ pub async fn usage_summary(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, handler = "usage_summary", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     let mut signals = HashMap::new();
@@ -231,7 +231,7 @@ pub async fn usage_breakdown(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, handler = "usage_breakdown", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     // Group by timestamp
@@ -296,7 +296,7 @@ pub async fn usage_tenants(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, handler = "usage_tenants", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     // Pivot: (tenant_id, signal) rows -> nested tenant entries
