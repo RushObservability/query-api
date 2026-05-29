@@ -124,7 +124,10 @@ pub async fn query_logs(
     let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
     let (rows, total) = if req.search.is_none() && req.offset == 0 {
-        // Try last 1 hour first
+        // Fire narrow (last 1h) and full-range queries in parallel.
+        // Use the narrow result when it has enough rows — avoids serialising two
+        // round-trips in the common "browsing recent logs" case while paying at
+        // most one extra full-range scan when data is sparse.
         let narrow_to = &req.time_range.to;
         let narrow_from = {
             let to_dt = chrono::DateTime::parse_from_rfc3339(narrow_to)
@@ -138,30 +141,27 @@ pub async fn query_logs(
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
             narrow_clauses.to_sql(),
         );
-        let narrow_rows = crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
-            .fetch_all::<LogRecord>().await
-            .map_err(|e| {
-                tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
-            })?;
-
+        let full_sql = format!(
+            "SELECT {select_cols} FROM otel_logs {} \
+             ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+            clauses.to_sql(),
+        );
+        let (narrow_res, full_res) = tokio::join!(
+            crate::tenant_query(&state.ch, &narrow_sql, tenant_id).fetch_all::<LogRecord>(),
+            crate::tenant_query(&state.ch, &full_sql, tenant_id).fetch_all::<LogRecord>(),
+        );
+        let narrow_rows = narrow_res.map_err(|e| {
+            tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+        })?;
         if (narrow_rows.len() as u64) >= limit {
-            // Got enough from the last hour — fast path success
             let total = narrow_rows.len() as u64;
             (narrow_rows, total)
         } else {
-            // Not enough recent logs — fall back to full range
-            let full_sql = format!(
-                "SELECT {select_cols} FROM otel_logs {} \
-                 ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
-                clauses.to_sql(),
-            );
-            let rows = crate::tenant_query(&state.ch, &full_sql, tenant_id)
-                .fetch_all::<LogRecord>().await
-                .map_err(|e| {
-                    tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
-                })?;
+            let rows = full_res.map_err(|e| {
+                tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
+            })?;
             let total = rows.len() as u64;
             (rows, total)
         }
