@@ -296,6 +296,11 @@ async fn main() -> anyhow::Result<()> {
         .with_user(&clickhouse_user)
         .with_password(&clickhouse_password)
         .with_option("max_execution_time", "30")
+        // Server-side INSERT buffering: ClickHouse batches writes internally,
+        // reducing part creation rate at high ingest volume.
+        // These options are silently ignored for SELECT queries.
+        .with_option("async_insert", "1")
+        .with_option("wait_for_async_insert", "0")
         .with_compression(clickhouse::Compression::Lz4);
 
     // Check if ClickHouse supports the rush_tenant_id custom setting for row policy enforcement.

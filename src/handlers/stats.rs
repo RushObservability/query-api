@@ -118,77 +118,77 @@ pub async fn get_stats(
     let span_stats_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as total, count() / {range_secs} as rate \
          FROM otel_traces \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND Timestamp >= parseDateTimeBestEffort('{from}') \
            AND Timestamp <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<TotalRateResult>();
 
     let span_today_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM otel_traces \
-         WHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
+         PREWHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
     ), tenant_id).fetch_one::<CountResult>();
 
     let log_stats_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as total, count() / {range_secs} as rate \
          FROM otel_logs \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND Timestamp >= parseDateTimeBestEffort('{from}') \
            AND Timestamp <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<TotalRateResult>();
 
     let log_today_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM otel_logs \
-         WHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
+         PREWHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
     ), tenant_id).fetch_one::<CountResult>();
 
     let mg_total_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM otel_metrics_gauge \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<CountResult>();
 
     let ms_total_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM otel_metrics_sum \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<CountResult>();
 
     let mh_total_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM otel_metrics_histogram \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<CountResult>();
 
     let mg_rate_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() / {range_secs} as rate FROM otel_metrics_gauge \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<RateResult>();
 
     let ms_rate_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() / {range_secs} as rate FROM otel_metrics_sum \
-         WHERE tenant_id = '{escaped_tenant}' \
+         PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<RateResult>();
 
     let mg_today_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM otel_metrics_gauge \
-         WHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
+         PREWHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
     ), tenant_id).fetch_one::<CountResult>();
 
     let ms_today_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM otel_metrics_sum \
-         WHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
+         PREWHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
     ), tenant_id).fetch_one::<CountResult>();
 
     let unique_series_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT uniq(MetricName, Attributes) as count FROM otel_metrics_gauge \
-         WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR"
+         PREWHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR"
     ), tenant_id).fetch_one::<CountResult>();
 
     let storage_fut = state.ch.query(
