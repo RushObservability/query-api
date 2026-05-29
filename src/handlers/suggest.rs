@@ -11,6 +11,15 @@ use crate::AppState;
 use crate::TenantContext;
 use crate::models::query::StringValueRow;
 
+/// 30-second in-memory result cache for suggest queries.
+/// Key: "{tenant_id}\0{field}\0{prefix}\0{limit}"
+/// Value: (results, cached_at)
+fn suggest_cache() -> &'static dashmap::DashMap<String, (Vec<String>, std::time::Instant)> {
+    static CACHE: std::sync::OnceLock<dashmap::DashMap<String, (Vec<String>, std::time::Instant)>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(dashmap::DashMap::new)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SuggestParams {
     #[serde(default)]
@@ -68,24 +77,37 @@ pub async fn suggest_values(
         field.clone()
     };
 
-    // P4: Always constrain to recent data to avoid full table scans
-    let mut where_parts = vec![
-        format!("tenant_id = '{escaped_tenant}'"),
-        "timestamp >= now() - INTERVAL 24 HOUR".to_string(),
-    ];
-    if !params.prefix.is_empty() {
-        let escaped = params.prefix.replace('\'', "\\'");
-        where_parts.push(format!("val LIKE '{escaped}%'"));
+    let limit = params.limit.min(100);
+
+    // Check 30s result cache before hitting ClickHouse
+    let cache_key = format!("{}\0{}\0{}\0{}", tenant_id, field, params.prefix, limit);
+    if let Some(entry) = suggest_cache().get(&cache_key) {
+        let (cached_values, ts) = entry.value();
+        if ts.elapsed() < std::time::Duration::from_secs(30) {
+            return Ok(Json(cached_values.clone()));
+        }
     }
-    let where_clause = format!("WHERE {}", where_parts.join(" AND "));
+
+    // PREWHERE: tenant_id + timestamp (both in primary key of wide_events) →
+    // evaluated at granule level before decompression, avoiding full table scan.
+    // WHERE: the LIKE filter on the computed alias (ClickHouse allows alias refs in WHERE).
+    let prewhere = format!(
+        "tenant_id = '{escaped_tenant}' AND timestamp >= now() - INTERVAL 24 HOUR"
+    );
+    let prefix_filter = if !params.prefix.is_empty() {
+        let escaped = params.prefix.replace('\'', "\\'");
+        format!("WHERE val LIKE '{escaped}%'")
+    } else {
+        String::new()
+    };
 
     let sql = format!(
         "SELECT DISTINCT {col_expr} as val \
          FROM wide_events \
-         {where_clause} \
+         PREWHERE {prewhere} \
+         {prefix_filter} \
          ORDER BY val \
-         LIMIT {}",
-        params.limit.min(100),
+         LIMIT {limit}",
     );
 
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -93,12 +115,10 @@ pub async fn suggest_values(
         .await
         .map_err(|e| {
             tracing::error!("Suggest query failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("query failed: {e}"),
-            )
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("query failed: {e}"))
         })?;
 
     let values: Vec<String> = rows.into_iter().map(|r| r.val).filter(|v| !v.is_empty()).collect();
+    suggest_cache().insert(cache_key, (values.clone(), std::time::Instant::now()));
     Ok(Json(values))
 }

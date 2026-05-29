@@ -7,6 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use crate::{AppState, TenantContext};
 use crate::handlers::users::{require_auth, require_write};
+use crate::query_builder::{QueryClauses, sanitize_datetime};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FunnelStep {
@@ -57,10 +58,19 @@ struct TraceCountRow {
     count: u64,
 }
 
-fn step_where_clause(step: &FunnelStep, from: &str, to: &str) -> String {
-    let mut conditions = vec![
-        format!("timestamp >= '{}' AND timestamp <= '{}'", from.replace('\'', ""), to.replace('\'', "")),
-    ];
+/// Build PREWHERE + WHERE clauses for a funnel step query on wide_events.
+/// PREWHERE: tenant_id + timestamp range (both in primary key) — granule-level filtering.
+/// WHERE: optional service/path/status filters.
+fn step_clauses(step: &FunnelStep, from: &str, to: &str, tenant_id: &str) -> QueryClauses {
+    let escaped_tenant = tenant_id.replace('\'', "\\'");
+    let safe_from = sanitize_datetime(from);
+    let safe_to = sanitize_datetime(to);
+    let prewhere = format!(
+        "tenant_id = '{escaped_tenant}' \
+         AND timestamp >= parseDateTimeBestEffort('{safe_from}') \
+         AND timestamp <= parseDateTimeBestEffort('{safe_to}')"
+    );
+    let mut conditions = Vec::new();
     if let Some(svc) = &step.service_name {
         let safe = svc.replace('\'', "''");
         conditions.push(format!("service_name = '{safe}'"));
@@ -75,7 +85,7 @@ fn step_where_clause(step: &FunnelStep, from: &str, to: &str) -> String {
     if let Some(max) = step.max_status_code {
         conditions.push(format!("http_status_code <= {max}"));
     }
-    format!("WHERE {}", conditions.join(" AND "))
+    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
 }
 
 pub async fn list_funnels(
@@ -150,20 +160,21 @@ pub async fn run_funnel(
     let steps: Vec<FunnelStep> = serde_json::from_str(&row.2)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut step_counts: Vec<u64> = Vec::with_capacity(steps.len());
+    // Build all SQL strings up front, then fire all step queries in parallel.
+    let sqls: Vec<String> = steps.iter().map(|step| {
+        let clauses = step_clauses(step, &req.from, &req.to, &tenant.tenant_id);
+        format!("SELECT count(DISTINCT trace_id) as count FROM wide_events {}", clauses.to_sql())
+    }).collect();
 
-    for step in &steps {
-        let where_clause = step_where_clause(step, &req.from, &req.to);
-        let sql = format!(
-            "SELECT count(DISTINCT trace_id) as count FROM wide_events {where_clause}"
-        );
-        let count = crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
-            .fetch_one::<TraceCountRow>()
-            .await
-            .map(|r| r.count)
-            .unwrap_or(0);
-        step_counts.push(count);
-    }
+    let futures: Vec<_> = sqls.iter().map(|sql| {
+        crate::tenant_query(&state.ch, sql, &tenant.tenant_id).fetch_one::<TraceCountRow>()
+    }).collect();
+
+    let step_counts: Vec<u64> = futures_util::future::join_all(futures)
+        .await
+        .into_iter()
+        .map(|r| r.map(|row| row.count).unwrap_or(0))
+        .collect();
 
     let first = *step_counts.first().unwrap_or(&0) as f64;
     let mut result_steps: Vec<FunnelResultStep> = Vec::new();
