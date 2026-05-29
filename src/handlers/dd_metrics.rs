@@ -343,33 +343,40 @@ pub async fn ingest_v1(
         }
     }
 
-    // Insert gauges
-    if !gauge_rows.is_empty() {
-        let mut insert = state.ch.insert("otel_metrics_gauge")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
-        for row in &gauge_rows {
-            insert.write(row).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+    // Insert gauges and sums in parallel to save one sequential HTTP round-trip.
+    let gauge_fut = async {
+        if !gauge_rows.is_empty() {
+            let mut insert = state.ch.insert("otel_metrics_gauge")
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+            for row in &gauge_rows {
+                insert.write(row).await.map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                })?;
+            }
+            insert.end().await.map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
             })?;
         }
-        insert.end().await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
-        })?;
-    }
-
-    // Insert sums
-    if !sum_rows.is_empty() {
-        let mut insert = state.ch.insert("otel_metrics_sum")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
-        for row in &sum_rows {
-            insert.write(row).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let sum_fut = async {
+        if !sum_rows.is_empty() {
+            let mut insert = state.ch.insert("otel_metrics_sum")
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+            for row in &sum_rows {
+                insert.write(row).await.map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                })?;
+            }
+            insert.end().await.map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
             })?;
         }
-        insert.end().await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
-        })?;
-    }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let (gauge_res, sum_res) = tokio::join!(gauge_fut, sum_fut);
+    gauge_res?;
+    sum_res?;
 
     let total = gauge_rows.len() + sum_rows.len();
 
@@ -469,31 +476,40 @@ pub async fn ingest_v2(
         }
     }
 
-    if !gauge_rows.is_empty() {
-        let mut insert = state.ch.insert("otel_metrics_gauge")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
-        for row in &gauge_rows {
-            insert.write(row).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+    // Insert gauges and sums in parallel to save one sequential HTTP round-trip.
+    let gauge_fut = async {
+        if !gauge_rows.is_empty() {
+            let mut insert = state.ch.insert("otel_metrics_gauge")
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+            for row in &gauge_rows {
+                insert.write(row).await.map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                })?;
+            }
+            insert.end().await.map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
             })?;
         }
-        insert.end().await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
-        })?;
-    }
-
-    if !sum_rows.is_empty() {
-        let mut insert = state.ch.insert("otel_metrics_sum")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
-        for row in &sum_rows {
-            insert.write(row).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let sum_fut = async {
+        if !sum_rows.is_empty() {
+            let mut insert = state.ch.insert("otel_metrics_sum")
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert init: {e}")))?;
+            for row in &sum_rows {
+                insert.write(row).await.map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("insert write: {e}"))
+                })?;
+            }
+            insert.end().await.map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
             })?;
         }
-        insert.end().await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("insert end: {e}"))
-        })?;
-    }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let (gauge_res, sum_res) = tokio::join!(gauge_fut, sum_fut);
+    gauge_res?;
+    sum_res?;
 
     let total = gauge_rows.len() + sum_rows.len();
 
