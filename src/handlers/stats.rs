@@ -36,6 +36,9 @@ pub struct StatsResponse {
     pub logs: SignalStats,
     pub metrics: MetricStats,
     pub storage: Vec<TableStorage>,
+    // True when an object-storage (S3/MinIO) disk is configured, so the UI can
+    // distinguish "tiering off" from "tiering on but nothing moved to cold yet".
+    pub object_store_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<StatsUsage>,
 }
@@ -67,6 +70,14 @@ pub struct TableStorage {
     pub compressed_bytes: u64,
     #[serde(rename = "uncompressed_bytes")]
     pub uncompressed_bytes: u64,
+    // Tiered-storage breakdown: bytes on local disk vs object store (S3/MinIO).
+    // Classified by joining system.parts.disk_name → system.disks.type, so it
+    // works regardless of disk names and reports 0 for object store when tiering
+    // isn't configured.
+    #[serde(rename = "bytes_local")]
+    pub bytes_local: u64,
+    #[serde(rename = "bytes_object_store")]
+    pub bytes_object_store: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Row)]
@@ -193,14 +204,17 @@ pub async fn get_stats(
 
     let storage_fut = state.ch.query(
         "SELECT \
-             table as table_name, \
-             sum(rows) as total_rows, \
-             sum(bytes_on_disk) as bytes_on_disk, \
-             sum(data_compressed_bytes) as compressed_bytes, \
-             sum(data_uncompressed_bytes) as uncompressed_bytes \
-         FROM system.parts \
-         WHERE database = 'observability' AND active \
-         GROUP BY table \
+             p.table as table_name, \
+             sum(p.rows) as total_rows, \
+             sum(p.bytes_on_disk) as bytes_on_disk, \
+             sum(p.data_compressed_bytes) as compressed_bytes, \
+             sum(p.data_uncompressed_bytes) as uncompressed_bytes, \
+             sumIf(p.bytes_on_disk, d.type = 'Local') as bytes_local, \
+             sumIf(p.bytes_on_disk, d.type != 'Local') as bytes_object_store \
+         FROM system.parts AS p \
+         LEFT JOIN system.disks AS d ON p.disk_name = d.name \
+         WHERE p.database = 'observability' AND p.active \
+         GROUP BY table_name \
          ORDER BY bytes_on_disk DESC"
     ).fetch_all::<TableStorage>();
 
@@ -261,6 +275,12 @@ pub async fn get_stats(
         }
     }
 
+    // Is any object-storage (S3/MinIO) disk configured? Distinguishes "tiering
+    // off" from "on but nothing moved to cold yet" (when object-store bytes = 0).
+    let object_store_enabled = state.ch.query(
+        "SELECT count() AS count FROM system.disks WHERE type != 'Local'"
+    ).fetch_one::<CountResult>().await.map(|r| r.count > 0).unwrap_or(false);
+
     let stats_usage = if usage_rows.is_empty() {
         None
     } else {
@@ -290,6 +310,7 @@ pub async fn get_stats(
             unique_series,
         },
         storage,
+        object_store_enabled,
         usage: stats_usage,
     }))
 }

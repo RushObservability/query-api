@@ -69,6 +69,28 @@ async fn collect_and_write(ch: &Client) -> anyhow::Result<()> {
         "SELECT sum(rows) as count FROM system.parts WHERE database = 'observability' AND active"
     ).await;
 
+    // ── Tiered storage breakdown: data bytes on local disk vs object store ──
+    // Classified by joining each part's disk to system.disks.type, matching the
+    // on-demand /stats endpoint. Object store = any non-Local disk (S3/MinIO).
+    let storage_local_bytes = query_bytes(ch,
+        "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
+         LEFT JOIN system.disks d ON p.disk_name = d.name \
+         WHERE p.database = 'observability' AND p.active AND d.type = 'Local'"
+    ).await;
+    let storage_object_store_bytes = query_bytes(ch,
+        "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
+         LEFT JOIN system.disks d ON p.disk_name = d.name \
+         WHERE p.database = 'observability' AND p.active AND d.type != 'Local'"
+    ).await;
+
+    // ── Local disk capacity (headroom) from system.disks ──
+    let disk_local_free_bytes = query_bytes(ch,
+        "SELECT sum(free_space) as total FROM system.disks WHERE type = 'Local'"
+    ).await;
+    let disk_local_total_bytes = query_bytes(ch,
+        "SELECT sum(total_space) as total FROM system.disks WHERE type = 'Local'"
+    ).await;
+
     // ── Write all metrics ──
     let metrics: Vec<(&str, f64)> = vec![
         ("rush_stats_span_events_total", span_total as f64),
@@ -78,6 +100,12 @@ async fn collect_and_write(ch: &Client) -> anyhow::Result<()> {
         ("rush_stats_unique_series", unique_series as f64),
         ("rush_stats_storage_bytes", storage_bytes as f64),
         ("rush_stats_storage_rows", storage_rows as f64),
+        // Tiered storage: where the data physically lives.
+        ("rush_stats_storage_local_bytes", storage_local_bytes as f64),
+        ("rush_stats_storage_object_store_bytes", storage_object_store_bytes as f64),
+        // Local disk capacity, for headroom / move-pressure monitoring.
+        ("rush_stats_disk_local_free_bytes", disk_local_free_bytes as f64),
+        ("rush_stats_disk_local_total_bytes", disk_local_total_bytes as f64),
     ];
 
     let values: Vec<String> = metrics.iter().map(|(name, val)| {
