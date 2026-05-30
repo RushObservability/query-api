@@ -311,51 +311,73 @@ fn parse_search_expr(input: &str) -> Option<SearchExpr> {
     }
 }
 
-/// Generate a ClickHouse SQL fragment that checks if `term` appears in any of the given columns.
-/// Supports `*` wildcards: `slack * posted` → ILIKE '%slack%posted%'.
-///
-/// Column tuple: `(name, is_array, use_lower_like)`
-/// - `is_array`: wrap with arrayExists (Vec<String> columns)
-/// - `use_lower_like`: emit `lower(col) LIKE '%lower_term%'` to leverage ngrambf_v1 skip indexes
-///   built on `lower(col)` expressions (e.g. `lower(attributes)`). Ignored for array columns.
-fn term_match_sql(term: &str, columns: &[(&str, bool, bool)]) -> String {
-    let has_wildcard = term.contains('*');
-    let escaped = escape_string_literal(term);
-    let lower_term = term.to_lowercase();
-    let escaped_lower = escape_string_literal(&lower_term);
+/// If `term` is an exact trace_id (32 hex) or span_id (16 hex), return an indexed
+/// equality predicate. `trace_id = …` / `span_id = …` use the `bloom_filter(0.001)`
+/// skip indexes (idx_trace_id / idx_span_id), letting ClickHouse drop nearly every
+/// granule in the lookback window. Returns None for anything that isn't an exact ID.
+fn id_lookup_sql(term: &str) -> Option<String> {
+    let t = term.trim();
+    if t.is_empty() || t.contains('*') || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match t.len() {
+        32 => Some(format!("trace_id = '{}'", escape_string_literal(t))),
+        16 => Some(format!("span_id = '{}'", escape_string_literal(t))),
+        _ => None,
+    }
+}
 
-    let parts: Vec<String> = columns
-        .iter()
-        .map(|(col, is_array, use_lower_like)| {
-            if has_wildcard {
-                // Build LIKE pattern from the term (escape SQL wildcards, map * → %)
-                let base = if *use_lower_like { &escaped_lower } else { &escaped };
-                let pattern = base
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-                    .replace('*', "%");
-                let like_pattern = format!("%{pattern}%");
-                if *is_array {
-                    format!("arrayExists(x -> x ILIKE '{like_pattern}', {col})")
-                } else if *use_lower_like {
-                    // lower(col) LIKE uses ngrambf_v1 index built on lower(col)
-                    format!("lower({col}) LIKE '{like_pattern}'")
-                } else {
-                    format!("{col} ILIKE '{like_pattern}'")
-                }
-            } else if *is_array {
-                format!("arrayExists(x -> positionCaseInsensitive(x, '{escaped}') > 0, {col})")
-            } else if *use_lower_like {
-                // lower(col) LIKE '%lower_term%' — hits ngrambf_v1(lower(col)) skip index,
-                // skipping granules that provably cannot contain the term.
-                let like_safe = escaped_lower.replace('%', "\\%").replace('_', "\\_");
-                format!("lower({col}) LIKE '%{like_safe}%'")
-            } else {
-                format!("positionCaseInsensitive({col}, '{escaped}') > 0")
-            }
-        })
-        .collect();
-    format!("({})", parts.join(" OR "))
+/// The single combined free-text search expression, indexed by the native `text`
+/// (inverted) index `idx_search_text` with the `ngrams(4)` tokenizer. It MUST match the
+/// index DDL in migrations.rs character-for-character, or the planner can't use the
+/// index and falls back to a full scan.
+///
+/// Why a single concatenated expression instead of `lower(attributes) LIKE … OR
+/// lower(arrayStringConcat(event_attributes,' ')) LIKE …`:
+/// ClickHouse can only prune granules across an `OR` when every branch resolves to the
+/// SAME index. An OR of two *different* indexes prunes nothing (validated: 90/90
+/// granules read). Folding both columns into one indexed expression makes the search a
+/// single index probe that prunes (validated via EXPLAIN: ~17/135 granules for a needle)
+/// and keeps event-attribute content searchable.
+///
+/// The `text(ngrams(4))` index keeps substring `LIKE '%term%'` semantics (ClickHouse
+/// decomposes the pattern into 4-grams and intersects their posting lists) while
+/// avoiding the bloom-filter saturation of the old ngrambf_v1 (~97k distinct 4-grams
+/// per granule vs a 65536-bit filter).
+pub(crate) const SEARCH_BLOB_EXPR: &str =
+    "lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' ')))";
+
+/// Generate a ClickHouse predicate for a single free-text span search term.
+///
+/// Index strategy — this is what makes a 7-day needle/haystack search prune granules
+/// instead of full-scanning:
+/// - Exact 32-hex / 16-hex terms route to `trace_id = …` / `span_id = …`, which use
+///   the bloom_filter skip indexes (Idea 1: separate ID lookup from free text).
+/// - Every other term searches the single `SEARCH_BLOB_EXPR`, backed by the
+///   `idx_search_blob` ngrambf_v1 index, so the planner can drop granules.
+///
+/// Trade-off: free text no longer substring-matches service_name / span_name /
+/// event_names. http/url fields are already inside `attributes` (serialized
+/// SpanAttributes), so they remain searchable. service_name/span_name should be
+/// queried via structured filters, which use their own bloom indexes.
+fn term_match_sql(term: &str) -> String {
+    // Idea 1: exact-ID fast path.
+    if let Some(id_pred) = id_lookup_sql(term) {
+        return id_pred;
+    }
+
+    // Free text → single index-backed LIKE pattern.
+    let escaped_lower = escape_string_literal(&term.to_lowercase());
+    // `*` wildcards map to `%`; literal `%`/`_` are escaped. Always wrapped in `%…%`
+    // for substring semantics. ngrambf_v1 still prunes using the literal n-grams
+    // between wildcards.
+    let inner = escaped_lower
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        .replace('*', "%");
+    let pattern = format!("%{inner}%");
+
+    format!("{SEARCH_BLOB_EXPR} LIKE '{pattern}'")
 }
 
 /// Generate SQL for a `key=value` attribute lookup.
@@ -389,46 +411,34 @@ fn kv_match_sql(key: &str, value: &str, ctx: SearchContext) -> String {
     }
 }
 
-/// Recursively generate SQL for a search expression tree.
-fn search_expr_to_sql(expr: &SearchExpr, columns: &[(&str, bool, bool)], ctx: SearchContext) -> String {
+/// Recursively generate SQL for a span search expression tree.
+fn search_expr_to_sql(expr: &SearchExpr, ctx: SearchContext) -> String {
     match expr {
-        SearchExpr::Term(term) => term_match_sql(term, columns),
+        SearchExpr::Term(term) => term_match_sql(term),
         SearchExpr::KeyValue(key, value) => kv_match_sql(key, value, ctx),
         SearchExpr::And(exprs) => {
-            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, columns, ctx)).collect();
+            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, ctx)).collect();
             format!("({})", parts.join(" AND "))
         }
         SearchExpr::Or(exprs) => {
-            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, columns, ctx)).collect();
+            let parts: Vec<String> = exprs.iter().map(|e| search_expr_to_sql(e, ctx)).collect();
             format!("({})", parts.join(" OR "))
         }
     }
 }
 
-/// Build a SQL condition for free-text search on span columns (events table).
+/// Build a SQL condition for free-text search on span columns (wide_events).
+/// Free-text terms are restricted to ngrambf_v1-indexed expressions (see
+/// `term_match_sql`) so a multi-day lookback can prune granules via skip indexes.
 pub fn build_span_search_sql(search: &str) -> Option<String> {
     let expr = parse_search_expr(search)?;
-    // (column, is_array, use_lower_like)
-    // use_lower_like=true means emit `lower(col) LIKE '%term%'` to hit the ngrambf_v1
-    // skip index built on lower(col). The wide_events DDL defines:
-    //   INDEX idx_attributes_ngram lower(attributes) TYPE ngrambf_v1(...)
-    let columns: Vec<(&str, bool, bool)> = vec![
-        ("trace_id",         false, false),
-        ("span_id",          false, false),
-        ("service_name",     false, false),
-        ("http_path",        false, false),
-        ("attributes",       false, true),  // ngrambf_v1 on lower(attributes)
-        ("event_names",      true,  false),
-        ("event_attributes", true,  false),
-    ];
-    Some(search_expr_to_sql(&expr, &columns, SearchContext::Spans))
+    Some(search_expr_to_sql(&expr, SearchContext::Spans))
 }
 
 /// Build a SQL condition for free-text search on log columns (otel_logs table).
-/// Body uses hasToken(lower(Body), ...) to leverage the tokenbf_v1 skip index,
-/// falling back to lower(Body) LIKE ... for wildcard/substring searches (ngrambf_v1).
-/// Other scalar columns use positionCaseInsensitive (short/LowCardinality, always fast).
-/// Map columns are skipped — users search them via `key=value` syntax (direct map lookup).
+/// Free text searches `lower(Body)` via `LIKE`, backed by the native `text` index
+/// `idx_body_text` (ngrams(4)). Exact trace/span IDs route to indexed equality.
+/// Map columns are searched via `key=value` syntax (direct map lookup).
 pub fn build_log_search_sql(search: &str) -> Option<String> {
     let expr = parse_search_expr(search)?;
     Some(log_search_expr_to_sql(&expr))
@@ -450,59 +460,37 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
     }
 }
 
-/// Generate SQL for a single search term on log columns.
-/// Body: hasToken(lower(Body), 'token') for each alphanumeric sub-token (uses tokenbf_v1).
-/// Body wildcard: lower(Body) LIKE '%pattern%' (uses ngrambf_v1).
-/// Other columns: positionCaseInsensitive (short strings, always fast).
+/// Generate a ClickHouse predicate for a single free-text log search term.
+///
+/// Mirrors the span search strategy so a multi-day haystack scan prunes granules:
+/// - Exact 32-hex / 16-hex terms route to `TraceId = …` / `SpanId = …`, using the
+///   `idx_trace_id` bloom filter (Idea 1: separate ID lookup from free text).
+/// - Every other term searches the single `lower(Body)` expression, backed by the
+///   native `text` index `idx_body_text` (ngrams(4)) via `LIKE`. Previously this OR'd
+///   in `positionCaseInsensitive(TraceId/SpanId/ServiceName/SeverityText, …)`, which are
+///   non-indexed — and a granule can only be skipped when EVERY OR branch is provably
+///   false, so those branches silently defeated the Body index and forced a full scan.
+///
+/// Trade-off: free text no longer substring-matches ServiceName / SeverityText; those
+/// are queried via structured filters (which use their own bloom/set indexes).
 fn log_term_match_sql(term: &str) -> String {
-    let has_wildcard = term.contains('*');
-    let escaped = escape_string_literal(term);
-
-    let other_cols = ["TraceId", "SpanId", "ServiceName", "SeverityText"];
-
-    if has_wildcard {
-        let pattern = escaped
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-            .replace('*', "%");
-        let like_pattern = format!("%{pattern}%");
-        let lower_pattern = like_pattern.to_lowercase();
-
-        let mut parts: Vec<String> = other_cols
-            .iter()
-            .map(|col| format!("{col} ILIKE '{like_pattern}'"))
-            .collect();
-        // lower(Body) LIKE leverages ngrambf_v1 index
-        parts.push(format!("lower(Body) LIKE '{lower_pattern}'"));
-        format!("({})", parts.join(" OR "))
-    } else {
-        let mut parts: Vec<String> = other_cols
-            .iter()
-            .map(|col| format!("positionCaseInsensitive({col}, '{escaped}') > 0"))
-            .collect();
-
-        // Extract alphanumeric tokens for hasToken (matches tokenbf_v1 tokenisation)
-        let lower_term = escaped.to_lowercase();
-        let tokens: Vec<&str> = lower_term
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .collect();
-
-        if tokens.is_empty() {
-            // No alphanumeric content — fall back to LIKE
-            parts.push(format!("lower(Body) LIKE '%{lower_term}%'"));
-        } else if tokens.len() == 1 {
-            parts.push(format!("hasToken(lower(Body), '{}')", tokens[0]));
-        } else {
-            // Multi-token term (e.g. UUID with hyphens): hasToken matches whole tokens
-            // only, so "f7d156a" won't match "2f7d156a". Use LIKE for the full term
-            // so substring matches within tokens are found correctly.
-            let lower_like = lower_term.replace('%', "\\%").replace('_', "\\_");
-            parts.push(format!("lower(Body) LIKE '%{lower_like}%'"));
+    // Idea 1: exact-ID fast path (TraceId is 32 hex, SpanId is 16 hex).
+    let t = term.trim();
+    if !t.is_empty() && !t.contains('*') && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        match t.len() {
+            32 => return format!("TraceId = '{}'", escape_string_literal(t)),
+            16 => return format!("SpanId = '{}'", escape_string_literal(t)),
+            _ => {}
         }
-
-        format!("({})", parts.join(" OR "))
     }
+
+    // Free text → single index-backed LIKE on lower(Body) (matches idx_body_text).
+    let escaped_lower = escape_string_literal(&term.to_lowercase());
+    let inner = escaped_lower
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        .replace('*', "%");
+    format!("lower(Body) LIKE '%{inner}%'")
 }
 
 pub fn format_value(value: &serde_json::Value) -> String {
@@ -634,4 +622,84 @@ pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> Quer
     }
 
     QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    // Idea 1: an exact 32-hex term is routed to an indexed trace_id equality lookup.
+    #[test]
+    fn full_trace_id_routes_to_indexed_equality() {
+        let sql = build_span_search_sql("a1b2c3d4e5f6071829304a5b6c7d8e9f").unwrap();
+        assert_eq!(sql, "trace_id = 'a1b2c3d4e5f6071829304a5b6c7d8e9f'");
+        assert!(!sql.contains("positionCaseInsensitive"));
+    }
+
+    // Idea 1: an exact 16-hex term is routed to an indexed span_id equality lookup.
+    #[test]
+    fn full_span_id_routes_to_indexed_equality() {
+        let sql = build_span_search_sql("a1b2c3d4e5f60718").unwrap();
+        assert_eq!(sql, "span_id = 'a1b2c3d4e5f60718'");
+    }
+
+    // Free text uses the single combined SEARCH_BLOB_EXPR (one skip index), and never
+    // the non-indexed columns or an OR of two indexes that would defeat granule skipping.
+    #[test]
+    fn free_text_uses_single_combined_index_expr() {
+        let sql = build_span_search_sql("timeout").unwrap();
+        assert_eq!(sql, format!("{SEARCH_BLOB_EXPR} LIKE '%timeout%'"));
+        // No index-hostile predicates that would force a full scan.
+        assert!(!sql.contains("positionCaseInsensitive"));
+        assert!(!sql.contains("arrayExists"));
+        assert!(!sql.contains("service_name"));
+        assert!(!sql.contains("http_path"));
+        // Not an OR of two different indexes (which cannot prune in ClickHouse).
+        assert!(!sql.contains(" OR "));
+    }
+
+    // Wildcards still produce a LIKE pattern ngrambf can prune on, with no full-scan ops.
+    #[test]
+    fn wildcard_term_stays_index_friendly() {
+        let sql = build_span_search_sql("slack*posted").unwrap();
+        assert_eq!(sql, format!("{SEARCH_BLOB_EXPR} LIKE '%slack%posted%'"));
+        assert!(!sql.contains("positionCaseInsensitive"));
+    }
+
+    // A non-hex / wrong-length token is treated as free text, not an ID lookup.
+    #[test]
+    fn non_id_token_is_free_text() {
+        // 32 chars but contains a non-hex char 'z' → not an ID.
+        let sql = build_span_search_sql("z1b2c3d4e5f6071829304a5b6c7d8e9f").unwrap();
+        assert!(sql.contains("LIKE '%z1b2c3d4e5f6071829304a5b6c7d8e9f%'"));
+        assert!(!sql.starts_with("trace_id ="));
+    }
+
+    // AND with a key=value term keeps the indexed branch (AND can still prune).
+    #[test]
+    fn and_with_kv_preserves_indexed_branch() {
+        let sql = build_span_search_sql("error db.system=postgresql").unwrap();
+        assert!(sql.contains(&format!("{SEARCH_BLOB_EXPR} LIKE '%error%'")));
+        assert!(sql.contains("JSONExtractString(attributes, 'db.system') = 'postgresql'"));
+    }
+
+    // Log free text uses the single indexed lower(Body) LIKE, never the non-indexed
+    // positionCaseInsensitive columns that previously defeated the Body text index.
+    #[test]
+    fn log_free_text_uses_only_body_index() {
+        let sql = build_log_search_sql("timeout").unwrap();
+        assert_eq!(sql, "lower(Body) LIKE '%timeout%'");
+        assert!(!sql.contains("positionCaseInsensitive"));
+        assert!(!sql.contains("ServiceName"));
+        assert!(!sql.contains("hasToken"));
+    }
+
+    // Log search routes exact trace/span IDs to indexed equality.
+    #[test]
+    fn log_full_trace_id_routes_to_equality() {
+        let sql = build_log_search_sql("a1b2c3d4e5f6071829304a5b6c7d8e9f").unwrap();
+        assert_eq!(sql, "TraceId = 'a1b2c3d4e5f6071829304a5b6c7d8e9f'");
+        let sql = build_log_search_sql("a1b2c3d4e5f60718").unwrap();
+        assert_eq!(sql, "SpanId = 'a1b2c3d4e5f60718'");
+    }
 }
