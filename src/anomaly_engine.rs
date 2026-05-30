@@ -91,6 +91,19 @@ fn build_smtp_transport(cfg: &SmtpConfig) -> Option<AsyncSmtpTransport<Tokio1Exe
     Some(builder.build())
 }
 
+/// Spawn the anomaly engine as a background task on the API server (mirrors
+/// `spawn_alert_engine` / `spawn_slo_engine`). Without this, anomaly rules are
+/// never evaluated unless the standalone `anomaly_engine` binary is run, so no
+/// anomaly events are ever persisted.
+pub fn spawn_anomaly_engine(
+    config_db: Arc<ConfigDb>,
+    ch: Client,
+    smtp_config: SmtpConfig,
+    prom_base_url: String,
+) {
+    tokio::spawn(run_anomaly_engine(config_db, ch, smtp_config, prom_base_url));
+}
+
 /// Run the anomaly engine loop forever. Call this directly from the standalone binary.
 pub async fn run_anomaly_engine(
     config_db: Arc<ConfigDb>,

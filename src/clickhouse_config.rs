@@ -261,6 +261,38 @@ impl ConfigDb {
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
 
+            // ── Investigation sessions (owned by sre-agent; mutable → ReplacingMergeTree) ──
+            "CREATE TABLE IF NOT EXISTS config_investigation_sessions (
+                id                String,
+                tenant_id         String DEFAULT 'default',
+                title             String DEFAULT '',
+                status            String DEFAULT 'active',
+                template_id       String DEFAULT '',
+                created_by        String DEFAULT '',
+                created_at        String DEFAULT toString(now()),
+                updated_at        String DEFAULT toString(now()),
+                working_memory    String DEFAULT '{}',
+                prompt_tokens     Int64 DEFAULT 0,
+                completion_tokens Int64 DEFAULT 0,
+                llm_model         String DEFAULT '',
+                version           UInt64,
+                is_deleted        UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (id)",
+
+            // ── Investigation turns (owned by sre-agent; append-only) ──
+            "CREATE TABLE IF NOT EXISTS config_investigation_turns (
+                id          String,
+                session_id  String,
+                turn_index  Int64,
+                role        String,
+                content     String,
+                tool_calls  String DEFAULT '[]',
+                report_kind String DEFAULT '',
+                created_at  String DEFAULT toString(now())
+            ) ENGINE = MergeTree()
+            ORDER BY (session_id, turn_index)",
+
             // ── Service links ─────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_service_links (
                 service_name   String,
