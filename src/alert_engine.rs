@@ -61,8 +61,9 @@ pub fn spawn_alert_engine(config_db: Arc<ConfigDb>, ch: Client, smtp_config: Smt
 }
 
 /// Build a rich Slack payload with colored attachment, metadata fields, and action buttons.
-/// Follows the Grafana/Datadog pattern: legacy attachment title/text/fields for the card,
-/// plus a Block Kit `actions` block inside the attachment for clickable buttons.
+/// Follows the Grafana/Datadog pattern: a legacy attachment (title/text/fields/actions) for
+/// the colored card. The attachment `actions` are legacy link buttons whose `text` is a
+/// plain string (NOT Block Kit objects — those render as "1" inside a legacy attachment).
 fn build_slack_payload(
     alert_name: &str,
     alert_state: &str,
@@ -123,24 +124,27 @@ fn build_slack_payload(
         "monitors" => "/monitors",
         _          => "/",
     };
+    // NOTE: these go into the legacy attachment `actions` array (below), which expects
+    // `text` to be a plain STRING. (Block Kit buttons use an object for `text`; putting a
+    // Block Kit button into a legacy attachment makes Slack render the label as "1".)
     let mut buttons: Vec<serde_json::Value> = Vec::new();
     if !alert_id.is_empty() && !base_url.is_empty() {
         buttons.push(serde_json::json!({
             "type": "button",
-            "text": { "type": "plain_text", "text": "View Alert", "emoji": true },
+            "text": "View Alert",
             "url": format!("{base_url}/alerts/{alert_id}"),
             "style": "primary",
         }));
         buttons.push(serde_json::json!({
             "type": "button",
-            "text": { "type": "plain_text", "text": "View Query", "emoji": true },
+            "text": "View Query",
             "url": format!("{base_url}{view_query_path}"),
         }));
     }
     if !runbook_url.is_empty() {
         buttons.push(serde_json::json!({
             "type": "button",
-            "text": { "type": "plain_text", "text": "📖 Runbook", "emoji": true },
+            "text": "📖 Runbook",
             "url": runbook_url,
         }));
     }
@@ -605,4 +609,34 @@ async fn eval_alerts(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod slack_payload_tests {
+    use super::*;
+
+    // Regression: legacy attachment `actions` require `text` to be a plain string.
+    // A Block Kit object there makes Slack render the button label as "1".
+    #[test]
+    fn action_buttons_have_string_text() {
+        // SAFETY: tests are single-threaded here; set base URL so buttons are emitted.
+        unsafe { std::env::set_var("RUSH_BASE_URL", "https://rush.example.com"); }
+        let payload = build_slack_payload(
+            "Payments Service Activity", "FIRING", 578.0, 10.0,
+            "apm", ">", "Alerts when payments generates > 10 spans", "alert-123",
+            "https://runbook.example.com/payments",
+        );
+        let actions = payload["attachments"][0]["actions"].as_array().expect("actions array");
+        assert!(!actions.is_empty(), "expected action buttons");
+        for btn in actions {
+            let text = &btn["text"];
+            assert!(text.is_string(), "button text must be a string, got: {text}");
+            assert!(!text.as_str().unwrap().is_empty(), "button text must be non-empty");
+            assert!(btn["url"].is_string(), "link button must have a url");
+        }
+        // Spot-check the expected labels are present.
+        let labels: Vec<&str> = actions.iter().map(|b| b["text"].as_str().unwrap()).collect();
+        assert!(labels.contains(&"View Alert"));
+        assert!(labels.contains(&"View Query"));
+    }
 }
