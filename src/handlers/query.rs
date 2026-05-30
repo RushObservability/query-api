@@ -43,7 +43,16 @@ pub async fn execute_query(
         offset,
     );
 
-    let count_sql = format!("SELECT count() as count FROM wide_events {}", clauses.to_sql());
+    // Capped count: an exact count() re-scans the entire lookback window with the same
+    // predicate as the data fetch (doubling the work) just to render "N results". Wrap
+    // in a subquery with LIMIT so ClickHouse stops reading once the cap is reached.
+    // The UI can render this as "10000+". For needle searches (few matches) the cost
+    // is dominated by skip-index pruning anyway; for common terms it short-circuits.
+    const COUNT_CAP: u64 = 10_000;
+    let count_sql = format!(
+        "SELECT count() as count FROM (SELECT 1 FROM wide_events {} LIMIT {COUNT_CAP})",
+        clauses.to_sql(),
+    );
 
     // P0: Run data fetch and count in parallel
     let (rows_result, count_result) = tokio::join!(

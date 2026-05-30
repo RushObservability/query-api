@@ -84,9 +84,9 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     INDEX idx_http_method http_method TYPE set(16) GRANULARITY 4,
     INDEX idx_status status TYPE set(8) GRANULARITY 4,
     INDEX idx_http_status http_status_code TYPE minmax GRANULARITY 1,
-    INDEX idx_duration duration_ns TYPE minmax GRANULARITY 1,
-    INDEX idx_attributes_ngram lower(attributes) TYPE ngrambf_v1(4, 65536, 3, 0) GRANULARITY 1,
-    INDEX idx_event_attributes_ngram arrayStringConcat(event_attributes, ' ') TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1
+    INDEX idx_duration duration_ns TYPE minmax GRANULARITY 1
+    -- Free-text search index (text on 26.2+, ngrambf fallback below) is added
+    -- version-aware by apply_skip_indexes(), not inline, so CREATE TABLE works on any version.
 )
 ENGINE = MergeTree()
 PARTITION BY toDate(timestamp)
@@ -394,8 +394,6 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     `mat_action` LowCardinality(String) MATERIALIZED LogAttributes['audit.action'],
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_service_name ServiceName TYPE bloom_filter(0.01) GRANULARITY 4,
-    INDEX idx_body lower(Body) TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
-    INDEX idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1,
     INDEX idx_severity SeverityText TYPE set(8) GRANULARITY 4,
     INDEX idx_source_ip mat_source_ip TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_user_id mat_user_id TYPE bloom_filter(0.01) GRANULARITY 1,
@@ -589,48 +587,120 @@ pub fn spawn_maintenance(url: String, user: String, password: String, config: Ru
     });
 }
 
-/// Add ngrambf_v1 skip indexes on wide_events for fast attribute free-text search.
-/// Idempotent — checks system.data_skipping_indices before issuing ALTER TABLE.
+/// Maintain the free-text search skip indexes on wide_events and otel_logs. Idempotent
+/// and version-aware.
+///
+/// On ClickHouse 26.2+ the search index is a native `text` (inverted) index: exact
+/// token→row postings that don't saturate as the vocabulary grows (the wide_events
+/// search blob has ~97k distinct 4-grams per granule, which over-saturated the old
+/// 65536-bit ngrambf filter). Below 26.2, `text` indexes don't exist, so we fall back
+/// to an `ngrambf_v1` index on the same expression. The `ngrams(4)` tokenizer (and the
+/// 4-gram bloom filter) both preserve substring `LIKE '%term%'` pruning.
+///
+/// CRITICAL: this is **create-before-drop**. We create/verify the desired index FIRST,
+/// and only drop superseded indexes once the desired one exists. A drop-then-create
+/// order would, on a version where the create fails, leave the table with NO search
+/// index — turning every free-text query into a full scan.
 async fn apply_skip_indexes(client: &Client) {
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct IndexRow { count: u64 }
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct VerRow { v: String }
 
-    let indexes: &[(&str, &str)] = &[
-        (
-            "idx_attributes_ngram",
-            "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
-             idx_attributes_ngram lower(attributes) TYPE ngrambf_v1(4, 65536, 3, 0) GRANULARITY 1",
-        ),
-        (
-            "idx_event_attributes_ngram",
-            "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
-             idx_event_attributes_ngram arrayStringConcat(event_attributes, ' ') \
-             TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
-        ),
+    async fn index_exists(client: &Client, table: &str, name: &str) -> bool {
+        let sql = format!(
+            "SELECT count() as count FROM system.data_skipping_indices \
+             WHERE database = 'observability' AND table = '{table}' AND name = '{name}'"
+        );
+        client.query(&sql).fetch_one::<IndexRow>().await.map(|r| r.count > 0).unwrap_or(false)
+    }
+
+    // Native `text` indexes are GA in 26.2+. Be conservative on parse failure.
+    let text_supported = match client.query("SELECT version() AS v").fetch_one::<VerRow>().await {
+        Ok(r) => {
+            let mut parts = r.v.split('.');
+            let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            major > 26 || (major == 26 && minor >= 2)
+        }
+        Err(_) => false,
+    };
+    tracing::info!(text_supported, "selecting search index strategy");
+
+    // Per table: the desired index for each strategy, and what to drop on each path.
+    // (table, text_name, text_ddl, ngram_name, ngram_ddl, drop_on_text, drop_on_ngram)
+    struct Plan {
+        table: &'static str,
+        text_name: &'static str,
+        text_ddl: &'static str,
+        ngram_name: &'static str,
+        ngram_ddl: &'static str,
+        drop_on_text: &'static [&'static str],
+        drop_on_ngram: &'static [&'static str],
+    }
+    let plans = [
+        Plan {
+            table: "wide_events",
+            text_name: "idx_search_text",
+            text_ddl: "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
+                idx_search_text lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' '))) \
+                TYPE text(tokenizer = ngrams(4)) GRANULARITY 1",
+            ngram_name: "idx_search_blob",
+            ngram_ddl: "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
+                idx_search_blob lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' '))) \
+                TYPE ngrambf_v1(4, 65536, 3, 0) GRANULARITY 1",
+            // On text path, drop the ngram blob + the original per-column ngram indexes.
+            drop_on_text: &["idx_search_blob", "idx_attributes_ngram", "idx_event_attributes_ngram"],
+            // On ngram path, keep idx_search_blob (desired); drop only the superseded
+            // per-column ngram indexes and any stale text index.
+            drop_on_ngram: &["idx_attributes_ngram", "idx_event_attributes_ngram", "idx_search_text"],
+        },
+        Plan {
+            table: "otel_logs",
+            text_name: "idx_body_text",
+            text_ddl: "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS \
+                idx_body_text lower(Body) TYPE text(tokenizer = ngrams(4)) GRANULARITY 1",
+            ngram_name: "idx_body_ngram",
+            ngram_ddl: "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS \
+                idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
+            // On text path, the text index supersedes both tokenbf + ngrambf on Body.
+            drop_on_text: &["idx_body", "idx_body_ngram"],
+            // On ngram path, keep the existing bloom indexes (idx_body tokenbf is a useful
+            // word index; idx_body_ngram is the desired substring index). Drop only a stale text index.
+            drop_on_ngram: &["idx_body_text"],
+        },
     ];
 
-    for (name, ddl) in indexes {
-        // Check if the index already exists
-        let check = format!(
-            "SELECT count() as count FROM system.data_skipping_indices \
-             WHERE database = 'observability' AND table = 'wide_events' AND name = '{name}'"
-        );
-        let exists = client.query(&check).fetch_one::<IndexRow>().await
-            .map(|r| r.count > 0)
-            .unwrap_or(false);
+    for p in &plans {
+        let (want_name, want_ddl, drops): (&str, &str, &[&str]) = if text_supported {
+            (p.text_name, p.text_ddl, p.drop_on_text)
+        } else {
+            (p.ngram_name, p.ngram_ddl, p.drop_on_ngram)
+        };
 
-        if !exists {
-            tracing::info!(index = name, "adding skip index to wide_events");
-            if let Err(e) = client.query(ddl).execute().await {
-                tracing::warn!(index = name, error = %e, "failed to add skip index");
-                continue;
+        // 1. Ensure the desired index exists (create + materialize) BEFORE dropping anything.
+        if !index_exists(client, p.table, want_name).await {
+            tracing::info!(table = p.table, index = want_name, "creating search index");
+            if let Err(e) = client.query(want_ddl).execute().await {
+                tracing::warn!(table = p.table, index = want_name, error = %e,
+                    "failed to create search index — leaving existing indexes intact");
+                continue; // do NOT drop anything if we couldn't create the replacement
             }
-            // Materialize the index on existing data (non-blocking — ClickHouse runs async)
-            let materialize = format!(
-                "ALTER TABLE observability.wide_events MATERIALIZE INDEX {name}"
-            );
+            let materialize = format!("ALTER TABLE observability.{} MATERIALIZE INDEX {}", p.table, want_name);
             if let Err(e) = client.query(&materialize).execute().await {
-                tracing::warn!(index = name, error = %e, "failed to materialize skip index");
+                tracing::warn!(table = p.table, index = want_name, error = %e, "failed to materialize search index");
+            }
+        }
+
+        // 2. Desired index is present — now it's safe to drop superseded ones.
+        for name in drops {
+            if *name == want_name { continue; }
+            if index_exists(client, p.table, name).await {
+                tracing::info!(table = p.table, index = name, "dropping superseded search index");
+                let drop_ddl = format!("ALTER TABLE observability.{} DROP INDEX IF EXISTS {}", p.table, name);
+                if let Err(e) = client.query(&drop_ddl).execute().await {
+                    tracing::warn!(table = p.table, index = name, error = %e, "failed to drop superseded index");
+                }
             }
         }
     }

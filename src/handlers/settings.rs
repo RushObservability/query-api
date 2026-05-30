@@ -46,11 +46,16 @@ pub fn hash_api_key(key: &str) -> String {
     let secret = std::env::var("RUSH_API_KEY_SECRET").unwrap_or_default();
     if secret.len() < 32 {
         // An empty or short key makes HMAC equivalent to a plain hash, enabling
-        // offline dictionary attacks against a stolen api_keys table.
-        tracing::warn!(
-            "RUSH_API_KEY_SECRET is not set or shorter than 32 bytes; \
-             API key hashing is insecure — set a strong random secret in production"
-        );
+        // offline dictionary attacks against a stolen api_keys table. Warn ONCE —
+        // this runs on every API-key hash (every ingest request), so a per-call
+        // warning would flood the logs.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "RUSH_API_KEY_SECRET is not set or shorter than 32 bytes; \
+                 API key hashing is insecure — set a strong random secret in production"
+            );
+        });
     }
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts any key length");
