@@ -650,14 +650,14 @@ async fn query_metric(
 
         let sql = format!(
             "SELECT ({group_expr}) AS group_key, {agg} AS value \
-             FROM otel_metrics_gauge WHERE {where_clause} \
+             FROM metrics_gauge WHERE {where_clause} \
              GROUP BY group_key"
         );
         let rows = ch.query(&sql).fetch_all::<GroupedRow>().await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!(
-            "SELECT {agg} AS value FROM otel_metrics_gauge WHERE {where_clause}"
+            "SELECT {agg} AS value FROM metrics_gauge WHERE {where_clause}"
         );
         let row = ch.query(&sql).fetch_one::<ValueRow>().await?;
         Ok(vec![("".to_string(), row.value)])
@@ -775,14 +775,14 @@ async fn query_log(
 
         let sql = format!(
             "SELECT ({group_expr}) AS group_key, count() AS value \
-             FROM otel_logs WHERE {where_clause} \
+             FROM logs WHERE {where_clause} \
              GROUP BY group_key"
         );
         let rows = ch.query(&sql).fetch_all::<GroupedRow>().await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!(
-            "SELECT count() AS value FROM otel_logs WHERE {where_clause}"
+            "SELECT count() AS value FROM logs WHERE {where_clause}"
         );
         let row = ch.query(&sql).fetch_one::<ValueRow>().await?;
         Ok(vec![("".to_string(), row.value)])
@@ -871,14 +871,14 @@ async fn query_apm(
 
         let sql = format!(
             "SELECT ({group_expr}) AS group_key, {agg} AS value \
-             FROM wide_events WHERE {where_clause} \
+             FROM spans WHERE {where_clause} \
              GROUP BY group_key"
         );
         let rows = ch.query(&sql).fetch_all::<GroupedRow>().await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!(
-            "SELECT {agg} AS value FROM wide_events WHERE {where_clause}"
+            "SELECT {agg} AS value FROM spans WHERE {where_clause}"
         );
         let row = ch.query(&sql).fetch_one::<ValueRow>().await?;
         Ok(vec![("".to_string(), row.value)])
@@ -1014,7 +1014,7 @@ async fn build_preview_timeseries(
                     escape_ch(&f.value),
                 ));
             }
-            ("otel_metrics_gauge".to_string(), agg.to_string(), conds.join(" AND "))
+            ("metrics_gauge".to_string(), agg.to_string(), conds.join(" AND "))
         }
         "log" => {
             let cfg: LogQueryConfig = match serde_json::from_str(&monitor.query_config) {
@@ -1036,7 +1036,7 @@ async fn build_preview_timeseries(
             for f in &cfg.filters {
                 conds.push(format!("{} = '{}'", escape_ch(&f.field), escape_ch(&f.value)));
             }
-            ("otel_logs".to_string(), "count()".to_string(), conds.join(" AND "))
+            ("logs".to_string(), "count()".to_string(), conds.join(" AND "))
         }
         "apm" => {
             let cfg: ApmQueryConfig = match serde_json::from_str(&monitor.query_config) {
@@ -1063,14 +1063,14 @@ async fn build_preview_timeseries(
                 "p99_latency" | "p99" => "quantile(0.99)(duration_ns) / 1000000".to_string(),
                 _ => "count()".to_string(),
             };
-            ("wide_events".to_string(), agg, conds.join(" AND "))
+            ("spans".to_string(), agg, conds.join(" AND "))
         }
         _ => return vec![],
     };
 
     let time_col = match table.as_str() {
-        "otel_metrics_gauge" => "TimeUnix",
-        "otel_logs" => "Timestamp",
+        "metrics_gauge" => "TimeUnix",
+        "logs" => "Timestamp",
         _ => "timestamp",
     };
 

@@ -224,7 +224,7 @@ fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
     }
 
     // Safety net: if the query had no WHERE clause, append one so tenant isolation
-    // is always enforced even for bare "SELECT * FROM otel_logs" queries.
+    // is always enforced even for bare "SELECT * FROM logs" queries.
     if injections == 0 {
         result.push_str(&format!(" WHERE {tenant_condition}"));
     }
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_inject_tenant_filter_simple() {
-        let sql = "SELECT count() FROM otel_logs WHERE Timestamp > '2024-01-01'";
+        let sql = "SELECT count() FROM logs WHERE Timestamp > '2024-01-01'";
         let result = inject_tenant_filter(sql, "security");
         assert!(result.contains("tenant_id = 'security' AND"));
         assert!(result.contains("Timestamp > '2024-01-01'"));
@@ -387,8 +387,8 @@ mod tests {
 
     #[test]
     fn test_inject_tenant_filter_multiple_where() {
-        let sql = "WITH sub AS (SELECT * FROM otel_logs WHERE Timestamp > '2024-01-01') \
-                   SELECT * FROM otel_traces WHERE Timestamp > '2024-01-01'";
+        let sql = "WITH sub AS (SELECT * FROM logs WHERE Timestamp > '2024-01-01') \
+                   SELECT * FROM spans_raw WHERE Timestamp > '2024-01-01'";
         let result = inject_tenant_filter(sql, "eng");
         // Both WHERE clauses should have tenant_id injected
         let count = result.matches("tenant_id = 'eng'").count();
@@ -397,14 +397,14 @@ mod tests {
 
     #[test]
     fn test_inject_tenant_filter_escapes_quotes() {
-        let sql = "SELECT * FROM otel_logs WHERE Body LIKE '%test%'";
+        let sql = "SELECT * FROM logs WHERE Body LIKE '%test%'";
         let result = inject_tenant_filter(sql, "tenant'evil");
         assert!(result.contains("tenant_id = 'tenant''evil'"));
     }
 
     #[test]
     fn test_build_scoped_query_replaces_placeholders() {
-        let sql = "SELECT count() FROM otel_logs WHERE Timestamp BETWEEN @window_start AND @window_end";
+        let sql = "SELECT count() FROM logs WHERE Timestamp BETWEEN @window_start AND @window_end";
         let result = build_scoped_query(sql, "default", "2024-01-01 00:00:00", "2024-01-01 00:05:00");
         assert!(result.contains("'2024-01-01 00:00:00'"));
         assert!(result.contains("'2024-01-01 00:05:00'"));
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn test_inject_tenant_filter_ignores_where_in_string_literal() {
         // "where" inside a quoted string should NOT get a tenant filter injected
-        let sql = "SELECT count() FROM otel_logs WHERE Body LIKE 'show where errors occurred'";
+        let sql = "SELECT count() FROM logs WHERE Body LIKE 'show where errors occurred'";
         let result = inject_tenant_filter(sql, "sec");
         // Should inject exactly once (the real WHERE), not twice
         assert_eq!(result.matches("tenant_id = 'sec'").count(), 1, "got: {result}");
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn test_inject_tenant_filter_no_where_clause() {
         // Queries without WHERE must still get a tenant filter appended
-        let sql = "SELECT count() FROM otel_logs";
+        let sql = "SELECT count() FROM logs";
         let result = inject_tenant_filter(sql, "acme");
         assert!(result.contains("WHERE tenant_id = 'acme'"), "missing tenant filter: {result}");
     }

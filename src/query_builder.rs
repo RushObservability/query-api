@@ -118,7 +118,7 @@ pub fn resolve_field(field: &str) -> String {
         format!("if({flat} != '', {flat}, {nested})")
     } else {
         match field {
-            // `level` is a logs concept; in wide_events the equivalent is `status`
+            // `level` is a logs concept; in spans the equivalent is `status`
             // (values: "Ok", "Error", "Unset"). Lower-case both sides so that
             // `level=error`, `level=Error`, etc. all match correctly.
             "level" => "lower(status)".to_string(),
@@ -427,7 +427,7 @@ fn search_expr_to_sql(expr: &SearchExpr, ctx: SearchContext) -> String {
     }
 }
 
-/// Build a SQL condition for free-text search on span columns (wide_events).
+/// Build a SQL condition for free-text search on span columns (spans).
 /// Free-text terms are restricted to ngrambf_v1-indexed expressions (see
 /// `term_match_sql`) so a multi-day lookback can prune granules via skip indexes.
 pub fn build_span_search_sql(search: &str) -> Option<String> {
@@ -435,7 +435,7 @@ pub fn build_span_search_sql(search: &str) -> Option<String> {
     Some(search_expr_to_sql(&expr, SearchContext::Spans))
 }
 
-/// Build a SQL condition for free-text search on log columns (otel_logs table).
+/// Build a SQL condition for free-text search on log columns (logs table).
 /// Free text searches `lower(Body)` via `LIKE`, backed by the native `text` index
 /// `idx_body_text` (ngrams(4)). Exact trace/span IDs route to indexed equality.
 /// Map columns are searched via `key=value` syntax (direct map lookup).
@@ -541,7 +541,7 @@ fn resolve_metric_field(field: &str) -> String {
     }
 }
 
-/// Build query clauses for metric tables (otel_metrics_gauge, _sum, etc.).
+/// Build query clauses for metric tables (metrics_gauge, _sum, etc.).
 /// Time column is `TimeUnix`. Time range goes into PREWHERE; filters go into WHERE.
 pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
     let from = sanitize_datetime(from);
@@ -574,7 +574,7 @@ pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> Q
 
 // ── Logs query builder ──
 
-/// Map a filter field name to the ClickHouse column expression for the otel_logs table.
+/// Map a filter field name to the ClickHouse column expression for the logs table.
 /// Log tables use Map columns: `LogAttributes['key']`, `ResourceAttributes['key']`.
 fn resolve_log_field(field: &str) -> String {
     if let Some(attr_key) = field.strip_prefix("attributes.") {
@@ -593,7 +593,7 @@ fn resolve_log_field(field: &str) -> String {
     }
 }
 
-/// Build query clauses for the otel_logs table. Time column is `Timestamp`.
+/// Build query clauses for the logs table. Time column is `Timestamp`.
 /// Time range goes into PREWHERE; filters go into WHERE.
 pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
     let from = sanitize_datetime(from);

@@ -119,7 +119,7 @@ struct DdSpan {
 
 // ═══ ClickHouse rows ═══
 
-/// Row for otel_traces table.
+/// Row for spans_raw table.
 #[derive(Debug, Clone, Serialize, Row)]
 struct TraceInsertRow {
     tenant_id: String,
@@ -187,8 +187,8 @@ fn dd_type_to_span_kind(span_type: &str) -> &'static str {
     }
 }
 
-/// Convert a DdSpan into an otel_traces insert row.
-/// The materialized view `otel_to_wide` handles populating wide_events automatically.
+/// Convert a DdSpan into an spans_raw insert row.
+/// The materialized view `spans_mv` handles populating spans automatically.
 fn convert_span(
     span: &DdSpan,
     env: &str,
@@ -290,7 +290,7 @@ pub async fn ingest_v04(
         return Ok(Json(serde_json::json!({"rate_by_service": {}})));
     }
 
-    let mut trace_insert = state.ch.insert("otel_traces")
+    let mut trace_insert = state.ch.insert("spans_raw")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert init: {e}")))?;
 
     for trace in &traces {
@@ -429,7 +429,7 @@ pub async fn ingest_agent(
             return Ok(Json(serde_json::json!({"rate_by_service": {}})));
         }
 
-        let mut trace_insert = state.ch.insert("otel_traces")
+        let mut trace_insert = state.ch.insert("spans_raw")
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert init: {e}")))?;
 
         for span in &all_spans {
@@ -469,7 +469,7 @@ pub async fn ingest_agent(
                 return Ok(Json(serde_json::json!({"rate_by_service": {}})));
             }
 
-            let mut trace_insert = state.ch.insert("otel_traces")
+            let mut trace_insert = state.ch.insert("spans_raw")
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert init: {e}")))?;
 
             for trace in &traces {

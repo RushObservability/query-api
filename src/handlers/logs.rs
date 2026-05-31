@@ -47,7 +47,7 @@ fn resolve_log_field(field: &str) -> String {
     }
 }
 
-/// Build PREWHERE-optimized query clauses for otel_logs.
+/// Build PREWHERE-optimized query clauses for logs.
 /// tenant_id + time range go into PREWHERE (evaluated at granule level before decompression);
 /// column filters and full-text search go into WHERE.
 fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str>, tenant_id: &str) -> QueryClauses {
@@ -104,7 +104,7 @@ pub struct LogQueryRequest {
 
 fn default_limit() -> u64 { 100 }
 
-/// Query logs from otel_logs.
+/// Query logs from logs.
 pub async fn query_logs(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -143,12 +143,12 @@ pub async fn query_logs(
         };
         let narrow_clauses = build_log_where(&req.filters, &narrow_from, narrow_to, None, tenant_id);
         let narrow_sql = format!(
-            "SELECT {select_cols} FROM otel_logs {} \
+            "SELECT {select_cols} FROM logs {} \
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
             narrow_clauses.to_sql(),
         );
         let full_sql = format!(
-            "SELECT {select_cols} FROM otel_logs {} \
+            "SELECT {select_cols} FROM logs {} \
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
             clauses.to_sql(),
         );
@@ -174,7 +174,7 @@ pub async fn query_logs(
     } else {
         // Search or pagination: use full range
         let sql = format!(
-            "SELECT {select_cols} FROM otel_logs {} \
+            "SELECT {select_cols} FROM logs {} \
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit} OFFSET {}",
             clauses.to_sql(),
             offset,
@@ -256,7 +256,7 @@ pub async fn export_logs(
          ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
     let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
     let sql = format!(
-        "SELECT {select_cols} FROM otel_logs {} \
+        "SELECT {select_cols} FROM logs {} \
          ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
         clauses.to_sql(),
     );
@@ -328,7 +328,7 @@ pub async fn count_logs(
     let sql = format!(
         "SELECT toString({interval_fn}) as bucket, count() as count, \
          countIf(SeverityNumber >= 17) as error_count \
-         FROM otel_logs \
+         FROM logs \
          {} \
          GROUP BY bucket \
          ORDER BY bucket ASC",

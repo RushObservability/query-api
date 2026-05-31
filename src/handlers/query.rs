@@ -15,7 +15,7 @@ use crate::models::query::{
 use crate::models::trace::WideEvent;
 use crate::query_builder::{resolve_field, build_where_clause_with_search};
 
-/// Execute a structured query against wide_events.
+/// Execute a structured query against spans.
 pub async fn execute_query(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -37,7 +37,7 @@ pub async fn execute_query(
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     let sql = format!(
-        "SELECT * FROM wide_events {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
+        "SELECT * FROM spans {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
         clauses.to_sql(),
         req.limit.min(1000),
         offset,
@@ -50,7 +50,7 @@ pub async fn execute_query(
     // is dominated by skip-index pruning anyway; for common terms it short-circuits.
     const COUNT_CAP: u64 = 10_000;
     let count_sql = format!(
-        "SELECT count() as count FROM (SELECT 1 FROM wide_events {} LIMIT {COUNT_CAP})",
+        "SELECT count() as count FROM (SELECT 1 FROM spans {} LIMIT {COUNT_CAP})",
         clauses.to_sql(),
     );
 
@@ -132,7 +132,7 @@ pub async fn export_query(
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
     let sql = format!(
-        "SELECT * FROM wide_events {} ORDER BY timestamp DESC LIMIT {limit}",
+        "SELECT * FROM spans {} ORDER BY timestamp DESC LIMIT {limit}",
         clauses.to_sql(),
     );
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -213,7 +213,7 @@ pub async fn count_query(
     let sql = format!(
         "SELECT toString({interval_fn}) as bucket, count() as count, \
          countIf(http_status_code >= 500 OR status = 'ERROR') as error_count \
-         FROM wide_events {} \
+         FROM spans {} \
          GROUP BY bucket \
          ORDER BY bucket ASC",
         clauses.to_sql(),
@@ -265,7 +265,7 @@ pub async fn group_query(
 
     let sql = format!(
         "SELECT {group_select}, count() as count \
-         FROM wide_events {} \
+         FROM spans {} \
          GROUP BY {group_by} \
          ORDER BY count DESC \
          LIMIT {}",
@@ -344,7 +344,7 @@ pub async fn timeseries_query(
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
                 quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
-             FROM wide_events {} \
+             FROM spans {} \
              GROUP BY bucket, group_key \
              ORDER BY bucket ASC, count DESC",
             clauses.to_sql(),
@@ -378,7 +378,7 @@ pub async fn timeseries_query(
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
                 quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
-             FROM wide_events {} \
+             FROM spans {} \
              GROUP BY bucket \
              ORDER BY bucket ASC",
             clauses.to_sql(),

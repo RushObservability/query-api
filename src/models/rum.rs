@@ -1,7 +1,7 @@
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
-/// A single RUM event from the rum_events table.
+/// A single RUM event from the rum table.
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct RumRecord {
     pub tenant_id: String,

@@ -10,7 +10,7 @@ const MIGRATIONS: &[&str] = &[
     "CREATE DATABASE IF NOT EXISTS observability",
 
     // ── OTel traces (v2: multi-tenant with materialized HTTP columns) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_traces
+    r"CREATE TABLE IF NOT EXISTS observability.spans_raw
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
@@ -55,7 +55,7 @@ ORDER BY (tenant_id, ServiceName, SpanName, toDateTime(Timestamp))
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── Wide events (v2: multi-tenant flattened query-friendly schema) ──
-    r"CREATE TABLE IF NOT EXISTS observability.wide_events
+    r"CREATE TABLE IF NOT EXISTS observability.spans
 (
     `tenant_id` LowCardinality(String),
     `timestamp` DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
@@ -95,8 +95,8 @@ TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── MV: OTel traces → wide events (v2: passes tenant_id through) ──
-    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.otel_to_wide
-TO observability.wide_events
+    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.spans_mv
+TO observability.spans
 AS SELECT
     tenant_id,
     Timestamp AS timestamp,
@@ -126,10 +126,10 @@ AS SELECT
     arrayMap(x -> toJSONString(x), `Events.Attributes`) AS event_attributes,
     `Links.TraceId` AS link_trace_ids,
     `Links.SpanId` AS link_span_ids
-FROM observability.otel_traces",
+FROM observability.spans_raw",
 
     // ── MV: trace index for fast trace-id lookups (v2: tenant-scoped) ──
-    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.trace_index
+    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.spans_by_trace
 ENGINE = MergeTree()
 PARTITION BY toDate(timestamp)
 ORDER BY (tenant_id, trace_id, timestamp)
@@ -137,21 +137,21 @@ AS SELECT
     tenant_id, trace_id, span_id, parent_span_id, service_name,
     http_method, http_path, http_status_code,
     duration_ns, status, timestamp
-FROM observability.wide_events",
+FROM observability.spans",
 
     // ── MV: service catalog (v2: tenant-scoped) ──
-    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.service_catalog
+    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.services
 ENGINE = ReplacingMergeTree(last_seen)
 ORDER BY (tenant_id, service_name, http_path, http_method)
 AS SELECT
     tenant_id, service_name, http_path, http_method,
     max(timestamp) AS last_seen,
     count() AS request_count
-FROM observability.wide_events
+FROM observability.spans
 GROUP BY tenant_id, service_name, http_path, http_method",
 
     // ── Gauge metrics (v2: multi-tenant) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_gauge
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_gauge
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
@@ -190,7 +190,7 @@ TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── Sum metrics (v2: multi-tenant) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_sum
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_sum
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
@@ -231,7 +231,7 @@ TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── Histogram metrics (v2: multi-tenant) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_histogram
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_histogram
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
@@ -277,7 +277,7 @@ TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── Exponential Histogram metrics (v2: multi-tenant) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_exponential_histogram
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_exp_histogram
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
@@ -327,7 +327,7 @@ TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── Summary metrics (v2: multi-tenant) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_metrics_summary
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_summary
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
@@ -363,7 +363,7 @@ TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── OTel Logs (v2: multi-tenant with SIEM materialized columns) ──
-    r"CREATE TABLE IF NOT EXISTS observability.otel_logs
+    r"CREATE TABLE IF NOT EXISTS observability.logs
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
@@ -425,7 +425,7 @@ TTL toDateTime(last_queried_at) + INTERVAL 90 DAY DELETE
 SETTINGS index_granularity = 8192",
 
     // ── RUM (Real User Monitoring) events (v2: multi-tenant) ──
-    r"CREATE TABLE IF NOT EXISTS observability.rum_events
+    r"CREATE TABLE IF NOT EXISTS observability.rum
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
@@ -475,7 +475,7 @@ TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
     // ── Session replay chunks (rrweb DOM snapshot + mutation events) ──
-    r"CREATE TABLE IF NOT EXISTS observability.rum_replay_chunks
+    r"CREATE TABLE IF NOT EXISTS observability.rum_replay
 (
     `tenant_id` LowCardinality(String) DEFAULT 'default',
     `session_id` String CODEC(ZSTD(1)),
@@ -514,16 +514,16 @@ SETTINGS index_granularity = 8192",
 /// Call `apply_row_policies()` after `probe_row_policy_support()` confirms
 /// the custom setting is accepted.
 const ROW_POLICY_TABLES: &[&str] = &[
-    "otel_traces",
-    "otel_logs",
-    "wide_events",
-    "otel_metrics_gauge",
-    "otel_metrics_sum",
-    "otel_metrics_histogram",
-    "otel_metrics_exponential_histogram",
-    "otel_metrics_summary",
-    "rum_events",
-    "rum_replay_chunks",
+    "spans_raw",
+    "logs",
+    "spans",
+    "metrics_gauge",
+    "metrics_sum",
+    "metrics_histogram",
+    "metrics_exp_histogram",
+    "metrics_summary",
+    "rum",
+    "rum_replay",
 ];
 
 /// Create row policies on all tenant-scoped tables. Only safe to call when
@@ -587,11 +587,11 @@ pub fn spawn_maintenance(url: String, user: String, password: String, config: Ru
     });
 }
 
-/// Maintain the free-text search skip indexes on wide_events and otel_logs. Idempotent
+/// Maintain the free-text search skip indexes on spans and logs. Idempotent
 /// and version-aware.
 ///
 /// On ClickHouse 26.2+ the search index is a native `text` (inverted) index: exact
-/// token→row postings that don't saturate as the vocabulary grows (the wide_events
+/// token→row postings that don't saturate as the vocabulary grows (the spans
 /// search blob has ~97k distinct 4-grams per granule, which over-saturated the old
 /// 65536-bit ngrambf filter). Below 26.2, `text` indexes don't exist, so we fall back
 /// to an `ngrambf_v1` index on the same expression. The `ngrams(4)` tokenizer (and the
@@ -640,13 +640,13 @@ async fn apply_skip_indexes(client: &Client) {
     }
     let plans = [
         Plan {
-            table: "wide_events",
+            table: "spans",
             text_name: "idx_search_text",
-            text_ddl: "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
+            text_ddl: "ALTER TABLE observability.spans ADD INDEX IF NOT EXISTS \
                 idx_search_text lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' '))) \
                 TYPE text(tokenizer = ngrams(4)) GRANULARITY 1",
             ngram_name: "idx_search_blob",
-            ngram_ddl: "ALTER TABLE observability.wide_events ADD INDEX IF NOT EXISTS \
+            ngram_ddl: "ALTER TABLE observability.spans ADD INDEX IF NOT EXISTS \
                 idx_search_blob lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' '))) \
                 TYPE ngrambf_v1(4, 65536, 3, 0) GRANULARITY 1",
             // On text path, drop the ngram blob + the original per-column ngram indexes.
@@ -656,12 +656,12 @@ async fn apply_skip_indexes(client: &Client) {
             drop_on_ngram: &["idx_attributes_ngram", "idx_event_attributes_ngram", "idx_search_text"],
         },
         Plan {
-            table: "otel_logs",
+            table: "logs",
             text_name: "idx_body_text",
-            text_ddl: "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS \
+            text_ddl: "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
                 idx_body_text lower(Body) TYPE text(tokenizer = ngrams(4)) GRANULARITY 1",
             ngram_name: "idx_body_ngram",
-            ngram_ddl: "ALTER TABLE observability.otel_logs ADD INDEX IF NOT EXISTS \
+            ngram_ddl: "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
                 idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
             // On text path, the text index supersedes both tokenbf + ngrambf on Body.
             drop_on_text: &["idx_body", "idx_body_ngram"],
@@ -742,11 +742,11 @@ async fn apply_retention_ttl(client: &Client, config: &RushConfig) -> anyhow::Re
 
     // Metrics tables
     let metric_tables = [
-        "otel_metrics_gauge",
-        "otel_metrics_sum",
-        "otel_metrics_histogram",
-        "otel_metrics_exponential_histogram",
-        "otel_metrics_summary",
+        "metrics_gauge",
+        "metrics_sum",
+        "metrics_histogram",
+        "metrics_exp_histogram",
+        "metrics_summary",
     ];
     for table in metric_tables {
         if ttl_matches(client, table, metrics_days).await {
@@ -763,8 +763,8 @@ async fn apply_retention_ttl(client: &Client, config: &RushConfig) -> anyhow::Re
 
     // Trace tables
     let trace_ttl_specs: &[(&str, &str)] = &[
-        ("otel_traces", "toDateTime(Timestamp)"),
-        ("wide_events", "toDateTime(timestamp)"),
+        ("spans_raw", "toDateTime(Timestamp)"),
+        ("spans", "toDateTime(timestamp)"),
     ];
     for (table, ts_expr) in trace_ttl_specs {
         if ttl_matches(client, table, traces_days).await {
@@ -780,15 +780,15 @@ async fn apply_retention_ttl(client: &Client, config: &RushConfig) -> anyhow::Re
     }
 
     // Log table
-    if !ttl_matches(client, "otel_logs", logs_days).await {
+    if !ttl_matches(client, "logs", logs_days).await {
         let sql = format!(
-            "ALTER TABLE observability.otel_logs MODIFY TTL toDateTime(Timestamp) + INTERVAL {logs_days} DAY DELETE"
+            "ALTER TABLE observability.logs MODIFY TTL toDateTime(Timestamp) + INTERVAL {logs_days} DAY DELETE"
         );
         if let Err(e) = client.query(&sql).execute().await {
-            tracing::warn!("failed to set TTL on otel_logs: {e}");
+            tracing::warn!("failed to set TTL on logs: {e}");
         }
     } else {
-        tracing::debug!("TTL on otel_logs already {logs_days}d, skipping");
+        tracing::debug!("TTL on logs already {logs_days}d, skipping");
     }
 
     Ok(())
@@ -815,16 +815,16 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
     // (table, timestamp_expr, move_after_days)
     let specs: &[(&str, &str, u32)] = &[
         // Metrics
-        ("otel_metrics_gauge", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("otel_metrics_sum", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("otel_metrics_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("otel_metrics_exponential_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("otel_metrics_summary", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("metrics_gauge", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("metrics_sum", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("metrics_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("metrics_exp_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        ("metrics_summary", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
         // Traces / spans
-        ("otel_traces", "toDateTime(Timestamp)", tiering.traces_move_after_days),
-        ("wide_events", "toDateTime(timestamp)", tiering.traces_move_after_days),
+        ("spans_raw", "toDateTime(Timestamp)", tiering.traces_move_after_days),
+        ("spans", "toDateTime(timestamp)", tiering.traces_move_after_days),
         // Logs
-        ("otel_logs", "toDateTime(Timestamp)", tiering.logs_move_after_days),
+        ("logs", "toDateTime(Timestamp)", tiering.logs_move_after_days),
     ];
 
     for (table, ts_expr, move_days) in specs {
@@ -846,9 +846,9 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
         // We use MODIFY TTL which replaces any existing TTL expression, so we must
         // include the existing DELETE TTL alongside the new MOVE TTL.
         let delete_days = match *table {
-            t if t.starts_with("otel_metrics") => config.effective_metrics_ttl_days(),
-            "otel_traces" | "wide_events" => config.effective_traces_ttl_days(),
-            "otel_logs" => config.effective_logs_ttl_days(),
+            t if t.starts_with("metrics_") => config.effective_metrics_ttl_days(),
+            "spans_raw" | "spans" => config.effective_traces_ttl_days(),
+            "logs" => config.effective_logs_ttl_days(),
             _ => 30,
         };
         let sql = format!(

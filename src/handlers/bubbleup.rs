@@ -104,7 +104,7 @@ fn friendly_dimension_name(col: &str) -> &str {
 fn signal_config(signal: &str) -> Result<SignalConfig, (StatusCode, String)> {
     match signal {
         "spans" => Ok(SignalConfig {
-            table: "wide_events",
+            table: "spans",
             timestamp_col: "timestamp",
             dimensions: vec![
                 "service_name",
@@ -117,7 +117,7 @@ fn signal_config(signal: &str) -> Result<SignalConfig, (StatusCode, String)> {
             ],
         }),
         "logs" => Ok(SignalConfig {
-            table: "otel_logs",
+            table: "logs",
             timestamp_col: "Timestamp",
             dimensions: vec![
                 "ServiceName",

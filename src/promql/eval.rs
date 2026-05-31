@@ -348,14 +348,14 @@ async fn query_clickhouse(
     let gauge_sql = format!(
         "SELECT MetricName, ServiceName, Attributes, \
          toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
-         FROM otel_metrics_gauge \
+         FROM metrics_gauge \
          WHERE {where_clause} \
          ORDER BY TimeUnix"
     );
     let sum_sql = format!(
         "SELECT MetricName, ServiceName, Attributes, \
          toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
-         FROM otel_metrics_sum \
+         FROM metrics_sum \
          WHERE {where_clause} \
          ORDER BY TimeUnix"
     );

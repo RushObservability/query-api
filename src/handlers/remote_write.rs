@@ -71,7 +71,7 @@ pub enum MetricType {
     StateSet = 7,
 }
 
-// ═══ ClickHouse row for otel_metrics_gauge ═══
+// ═══ ClickHouse row for metrics_gauge ═══
 
 #[derive(Debug, Clone, Serialize, Row)]
 struct GaugeRow {
@@ -125,7 +125,7 @@ struct GaugeRow {
 /// POST /prom/api/v1/write — Prometheus remote write receiver.
 ///
 /// Accepts snappy-compressed protobuf `prometheus.WriteRequest` and inserts
-/// samples into `otel_metrics_gauge` in ClickHouse.
+/// samples into `metrics_gauge` in ClickHouse.
 pub async fn prom_remote_write(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -204,10 +204,10 @@ pub async fn prom_remote_write(
         "remote write payload decoded"
     );
 
-    // Insert into otel_metrics_gauge
+    // Insert into metrics_gauge
     let mut insert = state
         .ch
-        .insert("otel_metrics_gauge")
+        .insert("metrics_gauge")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
     for ts in &write_req.timeseries {

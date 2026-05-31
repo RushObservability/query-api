@@ -34,7 +34,7 @@ pub async fn list_services(
                     http_method,
                     toString(last_seen) as last_seen,
                     request_count
-                FROM service_catalog
+                FROM services
                 WHERE tenant_id = '{escaped_tenant}'
                 ORDER BY service_name, http_path",
             ),
@@ -118,7 +118,7 @@ pub async fn service_graph(
             quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
             quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
             quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
-         FROM wide_events \
+         FROM spans \
          PREWHERE tenant_id = '{escaped_tenant}' \
             AND timestamp >= now() - INTERVAL {minutes} MINUTE \
          GROUP BY service_name \
@@ -140,13 +140,13 @@ pub async fn service_graph(
                 trace_id, span_id, service_name AS child_svc, parent_span_id, \
                 (http_status_code >= 500 OR status = 'ERROR') AS child_err, \
                 duration_ns AS child_dur \
-            FROM wide_events \
+            FROM spans \
             PREWHERE tenant_id = '{escaped_tenant}' \
                 AND timestamp >= now() - INTERVAL {minutes} MINUTE \
          ) child \
          INNER JOIN ( \
             SELECT trace_id, span_id, service_name AS parent_svc \
-            FROM wide_events \
+            FROM spans \
             PREWHERE tenant_id = '{escaped_tenant}' \
                 AND timestamp >= now() - INTERVAL {minutes} MINUTE \
          ) parent \

@@ -58,7 +58,7 @@ pub async fn analyze_anomaly_event(
                     "SELECT service_name, \
                             toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) as bucket, \
                             count() as count \
-                     FROM wide_events \
+                     FROM spans \
                      WHERE tenant_id = '{escaped_tenant}' \
                        AND timestamp >= '{}' AND timestamp <= '{}' \
                        AND http_status_code = {} \
@@ -89,7 +89,7 @@ pub async fn analyze_anomaly_event(
                                     SeverityText as severity_text, \
                                     Body as body, \
                                     TraceId as trace_id \
-                             FROM otel_logs \
+                             FROM logs \
                              WHERE tenant_id = '{escaped_tenant}' \
                                AND Timestamp >= parseDateTimeBestEffort('{}') \
                                AND Timestamp <= parseDateTimeBestEffort('{}') \
@@ -444,7 +444,7 @@ pub async fn get_event_correlations(
         "SELECT service_name, \
                 toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) as bucket, \
                 count() as count \
-         FROM wide_events \
+         FROM spans \
          WHERE tenant_id = '{escaped_tenant}' \
            AND timestamp >= '{}' AND timestamp <= '{}' \
            AND http_status_code = {} \
@@ -494,7 +494,7 @@ pub async fn get_event_correlations(
                     SeverityText as severity_text, \
                     Body as body, \
                     TraceId as trace_id \
-             FROM otel_logs \
+             FROM logs \
              WHERE tenant_id = '{escaped_tenant}' \
                AND Timestamp >= parseDateTimeBestEffort('{}') \
                AND Timestamp <= parseDateTimeBestEffort('{}') \

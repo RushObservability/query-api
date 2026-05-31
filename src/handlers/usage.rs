@@ -107,14 +107,14 @@ pub async fn get_usage(
         .map(|r| r.count)
         .unwrap_or(0);
 
-    // Find unused metrics (exist in otel_metrics but not in signal_usage)
+    // Find unused metrics (exist in metrics_ but not in signal_usage)
     let unused_sql = format!(
         "SELECT metric_name \
          FROM ( \
-             SELECT DISTINCT MetricName as metric_name FROM otel_metrics_gauge \
+             SELECT DISTINCT MetricName as metric_name FROM metrics_gauge \
              WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 DAY \
              UNION DISTINCT \
-             SELECT DISTINCT MetricName as metric_name FROM otel_metrics_sum \
+             SELECT DISTINCT MetricName as metric_name FROM metrics_sum \
              WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 DAY \
          ) AS all_metrics \
          LEFT JOIN ( \
@@ -138,14 +138,14 @@ pub async fn get_usage(
              SELECT MetricName as metric_name, \
                     uniq(ServiceName, Attributes) as series_count, \
                     max(length(mapKeys(Attributes))) as label_count \
-             FROM otel_metrics_gauge \
+             FROM metrics_gauge \
              WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              GROUP BY metric_name \
              UNION ALL \
              SELECT MetricName as metric_name, \
                     uniq(ServiceName, Attributes) as series_count, \
                     max(length(mapKeys(Attributes))) as label_count \
-             FROM otel_metrics_sum \
+             FROM metrics_sum \
              WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              GROUP BY metric_name \
          ) \
@@ -199,20 +199,20 @@ pub async fn get_label_breakdown(
     let sql = format!(
         "SELECT label_key, uniq(label_value) as unique_values FROM ( \
              SELECT 'service_name' as label_key, ServiceName as label_value \
-             FROM otel_metrics_gauge \
+             FROM metrics_gauge \
              WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT 'service_name' as label_key, ServiceName as label_value \
-             FROM otel_metrics_sum \
+             FROM metrics_sum \
              WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT k as label_key, v as label_value \
-             FROM otel_metrics_gauge \
+             FROM metrics_gauge \
              ARRAY JOIN mapKeys(Attributes) AS k, mapValues(Attributes) AS v \
              WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT k as label_key, v as label_value \
-             FROM otel_metrics_sum \
+             FROM metrics_sum \
              ARRAY JOIN mapKeys(Attributes) AS k, mapValues(Attributes) AS v \
              WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
          ) \
@@ -229,11 +229,11 @@ pub async fn get_label_breakdown(
     let total_sql = format!(
         "SELECT 'total' as label_key, sum(sc) as unique_values FROM ( \
              SELECT uniq(ServiceName, Attributes) as sc \
-             FROM otel_metrics_gauge \
+             FROM metrics_gauge \
              WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
              UNION ALL \
              SELECT uniq(ServiceName, Attributes) as sc \
-             FROM otel_metrics_sum \
+             FROM metrics_sum \
              WHERE tenant_id = '{escaped_tenant}' AND MetricName = '{escaped}' AND TimeUnix >= now() - INTERVAL 1 HOUR \
          )"
     );
