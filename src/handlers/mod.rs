@@ -11,6 +11,7 @@ pub mod dd_metrics;
 pub mod dd_traces;
 pub mod deploys;
 pub mod detection;
+pub mod export;
 pub mod groups;
 pub mod health;
 pub mod funnels;
