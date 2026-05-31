@@ -446,11 +446,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/count", post(handlers::query::count_query))
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
+        // Export current query + results (CSV/JSON), capped by export_max_rows
+        .route("/api/v1/query/export", post(handlers::query::export_query))
         // BubbleUp comparison analysis
         .route("/api/v1/bubbleup", post(handlers::bubbleup::bubbleup))
         // Log endpoints
         .route("/api/v1/logs", post(handlers::logs::query_logs))
         .route("/api/v1/logs/count", post(handlers::logs::count_logs))
+        .route("/api/v1/logs/export", post(handlers::logs::export_logs))
         // Service catalog
         .route("/api/v1/services", get(handlers::services::list_services))
         .route("/api/v1/services/graph", get(handlers::services::service_graph))
@@ -702,6 +705,8 @@ async fn main() -> anyhow::Result<()> {
         )
         // Feature flags (public — no auth)
         .route("/api/v1/features", get(handlers::settings::get_features))
+        // Export row cap (admin-only setter; value also exposed via /features)
+        .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
         // API Keys (settings)
         .route(
             "/api/v1/api-keys",

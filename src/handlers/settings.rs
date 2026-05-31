@@ -133,10 +133,35 @@ pub async fn get_features(
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let export_max_rows = crate::handlers::export::read_export_max_rows(&state).await;
+
     Json(serde_json::json!({
         "argocd": argocd_enabled,
         "sre_agent": sre_agent_enabled,
+        "export_max_rows": export_max_rows,
     }))
+}
+
+/// PUT /api/v1/settings/export-max-rows — admin only.
+/// Sets the maximum number of rows a user may export from Explore.
+pub async fn set_export_max_rows(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
+    crate::handlers::users::require_admin(&state, &headers).await?;
+
+    let value = body.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
+        (axum::http::StatusCode::BAD_REQUEST, "missing or invalid 'value' (expected a positive integer)".to_string())
+    })?;
+    let value = value.clamp(1, crate::handlers::export::EXPORT_MAX_ROWS_CEILING);
+
+    state.config_db.set_setting("export_max_rows", &value.to_string()).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to set export_max_rows");
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+    })?;
+
+    Ok(Json(serde_json::json!({ "export_max_rows": value })))
 }
 
 pub async fn delete_api_key(

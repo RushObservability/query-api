@@ -216,6 +216,95 @@ pub async fn query_logs(
     Ok(Json(Resp { rows, total }))
 }
 
+/// Log export request — same shape as a log query plus output format and an
+/// optional human-readable query string for the export's metadata header.
+#[derive(Debug, serde::Deserialize)]
+pub struct LogExportRequest {
+    pub time_range: TimeRange,
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    #[serde(default)]
+    pub limit: u64,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub format: crate::handlers::export::ExportFormat,
+    #[serde(default)]
+    pub query_text: Option<String>,
+}
+
+/// Export logs matching the current query as a CSV or JSON file.
+/// Limit is clamped to the admin-configured `export_max_rows` (not the 1000 cap).
+pub async fn export_logs(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(req): Json<LogExportRequest>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use crate::handlers::export;
+    let tenant_id = &tenant.tenant_id;
+
+    if let Some(ref s) = req.search {
+        if s.len() > 512 {
+            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+        }
+    }
+
+    let cap = export::read_export_max_rows(&state).await;
+    let limit = export::effective_limit(req.limit, cap);
+
+    let select_cols = "Timestamp, TraceId, SpanId, SeverityText, SeverityNumber, \
+         ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
+    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+    let sql = format!(
+        "SELECT {select_cols} FROM otel_logs {} \
+         ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+        clauses.to_sql(),
+    );
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<LogRecord>().await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "logs", handler = "export_logs", "export query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
+        })?;
+
+    let unix = chrono::Utc::now().timestamp();
+    match req.format {
+        export::ExportFormat::Csv => {
+            let mut out = export::csv_query_preamble(
+                "logs", &req.time_range.from, &req.time_range.to,
+                req.search.as_deref(), req.query_text.as_deref(),
+            );
+            out.push_str("Timestamp,Severity,ServiceName,Body,TraceId\n");
+            for r in &rows {
+                out.push_str(&format!(
+                    "{},{},{},{},{}\n",
+                    export::csv_field(&export::ts_rfc3339(r.timestamp)),
+                    export::csv_field(&r.severity_text),
+                    export::csv_field(&r.service_name),
+                    export::csv_field(&r.body),
+                    export::csv_field(&r.trace_id),
+                ));
+            }
+            Ok(export::file_response(out, "text/csv; charset=utf-8", &format!("rush-logs-{unix}.csv")))
+        }
+        export::ExportFormat::Json => {
+            let body = serde_json::json!({
+                "query": {
+                    "signal": "logs",
+                    "time_range": { "from": req.time_range.from, "to": req.time_range.to },
+                    "search": req.search,
+                    "query_text": req.query_text,
+                },
+                "exported_at": chrono::Utc::now().to_rfc3339(),
+                "count": rows.len(),
+                "rows": rows,
+            });
+            let s = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
+            Ok(export::file_response(s, "application/json; charset=utf-8", &format!("rush-logs-{unix}.json")))
+        }
+    }
+}
+
 /// Count logs bucketed by time interval.
 pub async fn count_logs(
     State(state): State<AppState>,
