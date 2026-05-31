@@ -8,6 +8,8 @@ use axum::{
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::models::ingest::RumReplayChunk;
 use crate::models::query::{TimeRange, Filter, FilterOp};
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
@@ -239,71 +241,47 @@ pub async fn ingest(
     let meta = &payload.meta;
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-    let mut insert = state
-        .ch
-        .insert("rum")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
+    // Build all rum rows and write via the durable writer.
+    let rum_rows: Vec<RumRecord> = payload.events.iter().map(|evt| {
+        RumRecord {
+            tenant_id: tenant_id.clone(),
+            timestamp: evt.timestamp.unwrap_or(now_ns),
+            app_name: meta.app_name.clone(),
+            app_version: meta.app_version.clone(),
+            environment: meta.environment.clone(),
+            session_id: meta.session_id.clone(),
+            user_id: meta.user_id.clone(),
+            page_url: meta.page_url.clone(),
+            page_path: meta.page_path.clone(),
+            view_name: meta.view_name.clone(),
+            referrer: meta.referrer.clone(),
+            browser_name: meta.browser_name.clone(),
+            browser_version: meta.browser_version.clone(),
+            os_name: meta.os_name.clone(),
+            os_version: meta.os_version.clone(),
+            device_type: meta.device_type.clone(),
+            screen_width: meta.screen_width,
+            screen_height: meta.screen_height,
+            event_type: evt.event_type.clone(),
+            event_name: evt.event_name.clone(),
+            vital_name: evt.vital_name.clone(),
+            vital_value: evt.vital_value,
+            vital_rating: evt.vital_rating.clone(),
+            error_message: evt.error_message.clone(),
+            error_stack: evt.error_stack.clone(),
+            error_type: evt.error_type.clone(),
+            interaction_target: evt.interaction_target.clone(),
+            interaction_type: evt.interaction_type.clone(),
+            duration_ms: evt.duration_ms,
+            trace_id: evt.trace_id.clone(),
+            span_id: evt.span_id.clone(),
+            attributes: evt.attributes.clone(),
+        }
+    }).collect();
 
-    // Build template row with all constant meta fields once; only event-specific
-    // fields (scalars + per-event strings) are updated inside the loop.
-    // Avoids 16 String clones × N events for identical meta values.
-    let mut row = RumRecord {
-        tenant_id: tenant_id.clone(),
-        timestamp: 0,
-        app_name: meta.app_name.clone(),
-        app_version: meta.app_version.clone(),
-        environment: meta.environment.clone(),
-        session_id: meta.session_id.clone(),
-        user_id: meta.user_id.clone(),
-        page_url: meta.page_url.clone(),
-        page_path: meta.page_path.clone(),
-        view_name: meta.view_name.clone(),
-        referrer: meta.referrer.clone(),
-        browser_name: meta.browser_name.clone(),
-        browser_version: meta.browser_version.clone(),
-        os_name: meta.os_name.clone(),
-        os_version: meta.os_version.clone(),
-        device_type: meta.device_type.clone(),
-        screen_width: meta.screen_width,
-        screen_height: meta.screen_height,
-        event_type: String::new(),
-        event_name: String::new(),
-        vital_name: String::new(),
-        vital_value: 0.0,
-        vital_rating: String::new(),
-        error_message: String::new(),
-        error_stack: String::new(),
-        error_type: String::new(),
-        interaction_target: String::new(),
-        interaction_type: String::new(),
-        duration_ms: 0.0,
-        trace_id: String::new(),
-        span_id: String::new(),
-        attributes: String::new(),
-    };
-    for evt in &payload.events {
-        row.timestamp = evt.timestamp.unwrap_or(now_ns);
-        row.event_type = evt.event_type.clone();
-        row.event_name = evt.event_name.clone();
-        row.vital_name = evt.vital_name.clone();
-        row.vital_value = evt.vital_value;
-        row.vital_rating = evt.vital_rating.clone();
-        row.error_message = evt.error_message.clone();
-        row.error_stack = evt.error_stack.clone();
-        row.error_type = evt.error_type.clone();
-        row.interaction_target = evt.interaction_target.clone();
-        row.interaction_type = evt.interaction_type.clone();
-        row.duration_ms = evt.duration_ms;
-        row.trace_id = evt.trace_id.clone();
-        row.span_id = evt.span_id.clone();
-        row.attributes = evt.attributes.clone();
-        insert.write(&row).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-        })?;
-    }
-
-    insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
+    state.writer.write(SpoolBatch::Rum(rum_rows)).await.map_err(|e| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 
     // Insert synthetic spans into spans for RUM events with trace IDs.
@@ -321,58 +299,48 @@ pub async fn ingest(
             synthetic_spans = trace_events.len(),
             "creating synthetic spans in spans"
         );
-        match state.ch.insert("spans") {
-            Ok(mut span_insert) => {
-                for evt in &trace_events {
-                    let ts = evt.timestamp.unwrap_or(now_ns);
-                    let duration_ns = (evt.duration_ms * 1_000_000.0) as u64;
-                    let attrs = serde_json::json!({
-                        "rum.session_id": meta.session_id,
-                        "rum.event_type": evt.event_type,
-                        "browser.name": meta.browser_name,
-                        "browser.version": meta.browser_version,
-                        "os.name": meta.os_name,
-                        "os.version": meta.os_version,
-                        "device.type": meta.device_type,
-                        "screen.width": meta.screen_width,
-                        "screen.height": meta.screen_height,
-                        "referrer": meta.referrer,
-                    });
+        let span_rows: Vec<WideEvent> = trace_events.iter().map(|evt| {
+            let ts = evt.timestamp.unwrap_or(now_ns);
+            let duration_ns = (evt.duration_ms * 1_000_000.0) as u64;
+            let attrs = serde_json::json!({
+                "rum.session_id": meta.session_id,
+                "rum.event_type": evt.event_type,
+                "browser.name": meta.browser_name,
+                "browser.version": meta.browser_version,
+                "os.name": meta.os_name,
+                "os.version": meta.os_version,
+                "device.type": meta.device_type,
+                "screen.width": meta.screen_width,
+                "screen.height": meta.screen_height,
+                "referrer": meta.referrer,
+            });
+            WideEvent {
+                tenant_id: tenant_id.clone(),
+                timestamp: ts,
+                trace_id: evt.trace_id.clone(),
+                span_id: evt.span_id.clone(),
+                parent_span_id: String::new(),
+                service_name: meta.app_name.clone(),
+                span_name: format!("pageview {}", meta.page_path),
+                kind: "CLIENT".to_string(),
+                status: "OK".to_string(),
+                duration_ns,
+                http_method: "GET".to_string(),
+                http_path: meta.page_path.clone(),
+                http_status_code: 200,
+                attributes: attrs.to_string(),
+                event_names: vec![],
+                event_timestamps: vec![],
+                event_attributes: vec![],
+                link_trace_ids: vec![],
+                link_span_ids: vec![],
+            }
+        }).collect();
 
-                    let span = WideEvent {
-                        tenant_id: tenant_id.clone(),
-                        timestamp: ts,
-                        trace_id: evt.trace_id.clone(),
-                        span_id: evt.span_id.clone(),
-                        parent_span_id: String::new(),
-                        service_name: meta.app_name.clone(),
-                        span_name: format!("pageview {}", meta.page_path),
-                        kind: "CLIENT".to_string(),
-                        status: "OK".to_string(),
-                        duration_ns,
-                        http_method: "GET".to_string(),
-                        http_path: meta.page_path.clone(),
-                        http_status_code: 200,
-                        attributes: attrs.to_string(),
-                        event_names: vec![],
-                        event_timestamps: vec![],
-                        event_attributes: vec![],
-                        link_trace_ids: vec![],
-                        link_span_ids: vec![],
-                    };
-                    if let Err(e) = span_insert.write(&span).await {
-                        tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span write failed");
-                    }
-                }
-                if let Err(e) = span_insert.end().await {
-                    tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span insert end failed");
-                } else {
-                    tracing::debug!(signal = "rum", synthetic_spans = trace_events.len(), "synthetic spans committed");
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span insert init failed");
-            }
+        if let Err(e) = state.writer.write(SpoolBatch::Spans(span_rows)).await {
+            tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span write failed");
+        } else {
+            tracing::debug!(signal = "rum", synthetic_spans = trace_events.len(), "synthetic spans committed");
         }
     }
 
@@ -663,16 +631,7 @@ pub struct ReplayIngestPayload {
     pub events: serde_json::Value,
 }
 
-#[derive(Debug, clickhouse::Row, serde::Serialize, serde::Deserialize)]
-struct ReplayChunkRow {
-    pub tenant_id: String,
-    pub session_id: String,
-    pub app_name: String,
-    pub chunk_idx: u32,
-    /// Millisecond unix timestamp of when this chunk was received
-    pub chunk_ts: i64,
-    pub events_json: String,
-}
+// ReplayChunkRow is now crate::models::ingest::RumReplayChunk (imported above)
 
 /// GET /api/v1/rum/replay/available/{app_name} — session IDs that have replay data
 pub async fn list_replay_sessions(
@@ -715,7 +674,7 @@ pub async fn ingest_replay(
 
     let chunk_ts = chrono::Utc::now().timestamp_millis();
 
-    let row = ReplayChunkRow {
+    let row = RumReplayChunk {
         tenant_id: tenant.tenant_id.clone(),
         session_id: payload.session_id.clone(),
         app_name: payload.app_name.clone(),
@@ -724,15 +683,9 @@ pub async fn ingest_replay(
         events_json,
     };
 
-    let mut insert = state
-        .ch
-        .insert("rum_replay")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
-    insert.write(&row).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-    })?;
-    insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
+    state.writer.write(SpoolBatch::RumReplay(vec![row])).await.map_err(|e| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 
     Ok(StatusCode::OK)
@@ -757,7 +710,7 @@ pub async fn get_replay(
     );
 
     let chunks = crate::tenant_query(&state.ch, &sql, tenant_id)
-        .fetch_all::<ReplayChunkRow>()
+        .fetch_all::<RumReplayChunk>()
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "get_replay", "query failed");

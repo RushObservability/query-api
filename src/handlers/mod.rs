@@ -9,6 +9,7 @@ pub mod dd_common;
 pub mod dd_logs;
 pub mod dd_metrics;
 pub mod dd_traces;
+pub mod otlp;
 pub mod deploys;
 pub mod detection;
 pub mod export;

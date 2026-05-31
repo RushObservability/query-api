@@ -1,5 +1,6 @@
 pub mod alert_engine;
 pub mod anomaly_engine;
+pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
 pub mod handlers;
@@ -12,6 +13,7 @@ pub mod retention_enforcer;
 pub mod saml;
 pub mod siem_engine;
 pub mod slo_engine;
+pub mod spool;
 pub mod stats_engine;
 pub mod usage_accumulator;
 pub mod usage_tracker;
@@ -23,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
+use ch_writer::ChWriter;
 use config::RushConfig;
 use clickhouse_config::ConfigDb;
 use usage_accumulator::UsageAccumulator;
@@ -85,6 +88,8 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
 #[derive(Clone)]
 pub struct AppState {
     pub ch: Client,
+    /// Durable write path: inserts go through ChWriter which spools to disk on CH failure.
+    pub writer: ChWriter,
     pub config_db: Arc<ConfigDb>,
     pub usage: UsageTracker,
     pub usage_accumulator: UsageAccumulator,
