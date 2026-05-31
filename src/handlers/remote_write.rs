@@ -4,12 +4,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Extension,
 };
-use clickhouse::Row;
 use prost::Message;
-use serde::Serialize;
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::models::ingest::GaugeRow;
 
 // ═══ Prometheus remote write protobuf types ═══
 // Defined manually to avoid requiring protoc at build time.
@@ -69,55 +69,6 @@ pub enum MetricType {
     GaugeHistogram = 5,
     Info = 6,
     StateSet = 7,
-}
-
-// ═══ ClickHouse row for metrics_gauge ═══
-
-#[derive(Debug, Clone, Serialize, Row)]
-struct GaugeRow {
-    tenant_id: String,
-    #[serde(rename = "ResourceAttributes")]
-    resource_attributes: Vec<(String, String)>,
-    #[serde(rename = "ResourceSchemaUrl")]
-    resource_schema_url: String,
-    #[serde(rename = "ScopeName")]
-    scope_name: String,
-    #[serde(rename = "ScopeVersion")]
-    scope_version: String,
-    #[serde(rename = "ScopeAttributes")]
-    scope_attributes: Vec<(String, String)>,
-    #[serde(rename = "ScopeDroppedAttrCount")]
-    scope_dropped_attr_count: u32,
-    #[serde(rename = "ScopeSchemaUrl")]
-    scope_schema_url: String,
-    #[serde(rename = "ServiceName")]
-    service_name: String,
-    #[serde(rename = "MetricName")]
-    metric_name: String,
-    #[serde(rename = "MetricDescription")]
-    metric_description: String,
-    #[serde(rename = "MetricUnit")]
-    metric_unit: String,
-    #[serde(rename = "Attributes")]
-    attributes: Vec<(String, String)>,
-    #[serde(rename = "StartTimeUnix")]
-    start_time_unix: i64,
-    #[serde(rename = "TimeUnix")]
-    time_unix: i64,
-    #[serde(rename = "Value")]
-    value: f64,
-    #[serde(rename = "Flags")]
-    flags: u32,
-    #[serde(rename = "Exemplars.FilteredAttributes")]
-    exemplars_filtered_attributes: Vec<Vec<(String, String)>>,
-    #[serde(rename = "Exemplars.TimeUnix")]
-    exemplars_time_unix: Vec<i64>,
-    #[serde(rename = "Exemplars.Value")]
-    exemplars_value: Vec<f64>,
-    #[serde(rename = "Exemplars.SpanId")]
-    exemplars_span_id: Vec<String>,
-    #[serde(rename = "Exemplars.TraceId")]
-    exemplars_trace_id: Vec<String>,
 }
 
 // ═══ Handler ═══
@@ -204,11 +155,8 @@ pub async fn prom_remote_write(
         "remote write payload decoded"
     );
 
-    // Insert into metrics_gauge
-    let mut insert = state
-        .ch
-        .insert("metrics_gauge")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
+    // Build all gauge rows for metrics_gauge
+    let mut rows: Vec<GaugeRow> = Vec::new();
 
     for ts in &write_req.timeseries {
         // Extract __name__ (metric name) and job (service name) from labels
@@ -265,21 +213,13 @@ pub async fn prom_remote_write(
             let mut row = template.clone();
             row.time_unix = sample.timestamp * 1_000_000;
             row.value = sample.value;
-
-            insert.write(&row).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "insert failed".into(),
-                )
-            })?;
+            rows.push(row);
         }
     }
 
-    insert.end().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "insert failed".into(),
-        )
+    state.writer.write(SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 
     // Record usage for per-tenant ingest metering (use decompressed size for bytes)

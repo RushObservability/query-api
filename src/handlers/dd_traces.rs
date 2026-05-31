@@ -6,13 +6,14 @@ use axum::{
     Json,
     Extension,
 };
-use clickhouse::Row;
 use prost::Message;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::models::ingest::TraceInsertRow;
 use super::dd_common::{validate_api_key, decompress_body};
 
 // ═══ DD Agent protobuf types (AgentPayload) ═══
@@ -115,58 +116,6 @@ struct DdSpan {
     metrics: std::collections::HashMap<String, f64>,
     #[serde(rename = "type", default)]
     span_type: String,
-}
-
-// ═══ ClickHouse rows ═══
-
-/// Row for spans_raw table.
-#[derive(Debug, Clone, Serialize, Row)]
-struct TraceInsertRow {
-    tenant_id: String,
-    #[serde(rename = "Timestamp")]
-    timestamp: i64,
-    #[serde(rename = "TraceId")]
-    trace_id: String,
-    #[serde(rename = "SpanId")]
-    span_id: String,
-    #[serde(rename = "ParentSpanId")]
-    parent_span_id: String,
-    #[serde(rename = "TraceState")]
-    trace_state: String,
-    #[serde(rename = "SpanName")]
-    span_name: String,
-    #[serde(rename = "SpanKind")]
-    span_kind: String,
-    #[serde(rename = "ServiceName")]
-    service_name: String,
-    #[serde(rename = "ResourceAttributes")]
-    resource_attributes: Vec<(String, String)>,
-    #[serde(rename = "ScopeName")]
-    scope_name: String,
-    #[serde(rename = "ScopeVersion")]
-    scope_version: String,
-    #[serde(rename = "SpanAttributes")]
-    span_attributes: Vec<(String, String)>,
-    #[serde(rename = "Duration")]
-    duration: u64, // nanoseconds
-    #[serde(rename = "StatusCode")]
-    status_code: String,
-    #[serde(rename = "StatusMessage")]
-    status_message: String,
-    #[serde(rename = "Events.Timestamp")]
-    events_timestamp: Vec<i64>,
-    #[serde(rename = "Events.Name")]
-    events_name: Vec<String>,
-    #[serde(rename = "Events.Attributes")]
-    events_attributes: Vec<Vec<(String, String)>>,
-    #[serde(rename = "Links.TraceId")]
-    links_trace_id: Vec<String>,
-    #[serde(rename = "Links.SpanId")]
-    links_span_id: Vec<String>,
-    #[serde(rename = "Links.TraceState")]
-    links_trace_state: Vec<String>,
-    #[serde(rename = "Links.Attributes")]
-    links_attributes: Vec<Vec<(String, String)>>,
 }
 
 
@@ -290,23 +239,17 @@ pub async fn ingest_v04(
         return Ok(Json(serde_json::json!({"rate_by_service": {}})));
     }
 
-    let mut trace_insert = state.ch.insert("spans_raw")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert init: {e}")))?;
-
-    for trace in &traces {
-        for span in trace {
+    let rows: Vec<TraceInsertRow> = traces.iter().flat_map(|trace| {
+        trace.iter().map(|span| {
             let env = span.meta.get("env").cloned().unwrap_or_default();
             let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
+            convert_span(span, &env, &hostname, tenant_id)
+        })
+    }).collect();
 
-            let trace_row = convert_span(span, &env, &hostname, tenant_id);
-            trace_insert.write(&trace_row).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("trace write: {e}"))
-            })?;
-        }
-    }
-
-    trace_insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert end: {e}"))
+    state.writer.write(SpoolBatch::SpansRaw(rows)).await.map_err(|e| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 
     // Record usage for per-tenant ingest metering
@@ -429,20 +372,15 @@ pub async fn ingest_agent(
             return Ok(Json(serde_json::json!({"rate_by_service": {}})));
         }
 
-        let mut trace_insert = state.ch.insert("spans_raw")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert init: {e}")))?;
-
-        for span in &all_spans {
+        let rows: Vec<TraceInsertRow> = all_spans.iter().map(|span| {
             let span_env = span.meta.get("env").cloned().unwrap_or_default();
             let span_host = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-            let trace_row = convert_span(span, &span_env, &span_host, tenant_id);
-            trace_insert.write(&trace_row).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("trace write: {e}"))
-            })?;
-        }
+            convert_span(span, &span_env, &span_host, tenant_id)
+        }).collect();
 
-        trace_insert.end().await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert end: {e}"))
+        state.writer.write(SpoolBatch::SpansRaw(rows)).await.map_err(|e| match e {
+            WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
         })?;
 
         // Record usage for per-tenant ingest metering (protobuf path)
@@ -469,22 +407,17 @@ pub async fn ingest_agent(
                 return Ok(Json(serde_json::json!({"rate_by_service": {}})));
             }
 
-            let mut trace_insert = state.ch.insert("spans_raw")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert init: {e}")))?;
-
-            for trace in &traces {
-                for span in trace {
+            let rows: Vec<TraceInsertRow> = traces.iter().flat_map(|trace| {
+                trace.iter().map(|span| {
                     let env = span.meta.get("env").cloned().unwrap_or_default();
                     let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-                    let trace_row = convert_span(span, &env, &hostname, tenant_id);
-                    trace_insert.write(&trace_row).await.map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("trace write: {e}"))
-                    })?;
-                }
-            }
+                    convert_span(span, &env, &hostname, tenant_id)
+                })
+            }).collect();
 
-            trace_insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("trace insert end: {e}"))
+            state.writer.write(SpoolBatch::SpansRaw(rows)).await.map_err(|e| match e {
+                WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+                WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
             })?;
 
             // Record usage for per-tenant ingest metering (msgpack fallback path)

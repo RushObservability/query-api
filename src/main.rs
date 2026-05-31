@@ -22,6 +22,8 @@ use rush_api::slo_engine;
 use rush_api::stats_engine;
 use rush_api::usage_accumulator::UsageAccumulator;
 use rush_api::usage_tracker;
+use rush_api::ch_writer::ChWriter;
+use rush_api::spool::Spool;
 use rush_api::AppState;
 use rush_api::TenantContext;
 
@@ -366,6 +368,21 @@ async fn main() -> anyhow::Result<()> {
     config_db.ensure_default_detection_rules().await?;
     siem_engine::spawn(ch.clone(), config_db.clone());
 
+    // ── Durable write path: spool + writer ──
+    let spool_dir = std::env::var("RUSH_SPOOL_DIR")
+        .unwrap_or_else(|_| "./data/spool".to_string());
+    let spool_max_bytes: u64 = std::env::var("RUSH_SPOOL_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_147_483_648); // 2 GiB default
+
+    let spool = std::sync::Arc::new(
+        Spool::open(&spool_dir, spool_max_bytes)
+            .expect("failed to open spool directory"),
+    );
+    let writer = ChWriter::new(ch.clone(), spool);
+    writer.clone().spawn_replayer();
+
     // Spawn usage tracker (fire-and-forget signal usage tracking)
     let usage = usage_tracker::spawn(ch.clone());
 
@@ -430,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         ch,
+        writer,
         config_db,
         usage,
         usage_accumulator,
@@ -833,6 +851,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/datadog/api/v0.2/traces", any(handlers::dd_traces::ingest_agent))
         .route("/datadog/v0.3/traces", any(handlers::dd_traces::ingest_v03))
         .route("/datadog/v0.4/traces", any(handlers::dd_traces::ingest_v04))
+        // ═══ OTLP/HTTP Ingest (OTel Collector) ═══
+        .route("/v1/traces",  post(handlers::otlp::ingest_otlp_traces))
+        .route("/v1/logs",    post(handlers::otlp::ingest_otlp_logs))
+        .route("/v1/metrics", post(handlers::otlp::ingest_otlp_metrics))
+        // Vector JSON logs
+        .route("/api/v1/ingest/logs", post(handlers::otlp::ingest_vector_logs))
         // Trace stats from agent trace writer
         .route("/datadog/api/v0.6/stats", any(handlers::dd_common::stub_ok))
         .route("/datadog/api/v0.2/stats", any(handlers::dd_common::stub_ok))

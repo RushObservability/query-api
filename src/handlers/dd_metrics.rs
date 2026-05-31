@@ -6,11 +6,12 @@ use axum::{
     Json,
     Extension,
 };
-use clickhouse::Row;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::models::ingest::{GaugeRow, SumRow};
 use super::dd_common::{validate_api_key, decompress_body};
 
 // ═══ V1 Series payload ═══
@@ -97,137 +98,6 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-// ═══ ClickHouse gauge row ═══
-
-#[derive(Debug, Clone, Serialize, Row)]
-struct GaugeRow {
-    tenant_id: String,
-    #[serde(rename = "ResourceAttributes")]
-    resource_attributes: Vec<(String, String)>,
-    #[serde(rename = "ResourceSchemaUrl")]
-    resource_schema_url: String,
-    #[serde(rename = "ScopeName")]
-    scope_name: String,
-    #[serde(rename = "ScopeVersion")]
-    scope_version: String,
-    #[serde(rename = "ScopeAttributes")]
-    scope_attributes: Vec<(String, String)>,
-    #[serde(rename = "ScopeDroppedAttrCount")]
-    scope_dropped_attr_count: u32,
-    #[serde(rename = "ScopeSchemaUrl")]
-    scope_schema_url: String,
-    #[serde(rename = "ServiceName")]
-    service_name: String,
-    #[serde(rename = "MetricName")]
-    metric_name: String,
-    #[serde(rename = "MetricDescription")]
-    metric_description: String,
-    #[serde(rename = "MetricUnit")]
-    metric_unit: String,
-    #[serde(rename = "Attributes")]
-    attributes: Vec<(String, String)>,
-    #[serde(rename = "StartTimeUnix")]
-    start_time_unix: i64,
-    #[serde(rename = "TimeUnix")]
-    time_unix: i64,
-    #[serde(rename = "Value")]
-    value: f64,
-    #[serde(rename = "Flags")]
-    flags: u32,
-    #[serde(rename = "Exemplars.FilteredAttributes")]
-    exemplars_filtered_attributes: Vec<Vec<(String, String)>>,
-    #[serde(rename = "Exemplars.TimeUnix")]
-    exemplars_time_unix: Vec<i64>,
-    #[serde(rename = "Exemplars.Value")]
-    exemplars_value: Vec<f64>,
-    #[serde(rename = "Exemplars.SpanId")]
-    exemplars_span_id: Vec<String>,
-    #[serde(rename = "Exemplars.TraceId")]
-    exemplars_trace_id: Vec<String>,
-}
-
-/// ClickHouse row for metrics_sum (has AggregationTemporality + IsMonotonic).
-#[derive(Debug, Clone, Serialize, Row)]
-struct SumRow {
-    tenant_id: String,
-    #[serde(rename = "ResourceAttributes")]
-    resource_attributes: Vec<(String, String)>,
-    #[serde(rename = "ResourceSchemaUrl")]
-    resource_schema_url: String,
-    #[serde(rename = "ScopeName")]
-    scope_name: String,
-    #[serde(rename = "ScopeVersion")]
-    scope_version: String,
-    #[serde(rename = "ScopeAttributes")]
-    scope_attributes: Vec<(String, String)>,
-    #[serde(rename = "ScopeDroppedAttrCount")]
-    scope_dropped_attr_count: u32,
-    #[serde(rename = "ScopeSchemaUrl")]
-    scope_schema_url: String,
-    #[serde(rename = "ServiceName")]
-    service_name: String,
-    #[serde(rename = "MetricName")]
-    metric_name: String,
-    #[serde(rename = "MetricDescription")]
-    metric_description: String,
-    #[serde(rename = "MetricUnit")]
-    metric_unit: String,
-    #[serde(rename = "Attributes")]
-    attributes: Vec<(String, String)>,
-    #[serde(rename = "StartTimeUnix")]
-    start_time_unix: i64,
-    #[serde(rename = "TimeUnix")]
-    time_unix: i64,
-    #[serde(rename = "Value")]
-    value: f64,
-    #[serde(rename = "Flags")]
-    flags: u32,
-    #[serde(rename = "Exemplars.FilteredAttributes")]
-    exemplars_filtered_attributes: Vec<Vec<(String, String)>>,
-    #[serde(rename = "Exemplars.TimeUnix")]
-    exemplars_time_unix: Vec<i64>,
-    #[serde(rename = "Exemplars.Value")]
-    exemplars_value: Vec<f64>,
-    #[serde(rename = "Exemplars.SpanId")]
-    exemplars_span_id: Vec<String>,
-    #[serde(rename = "Exemplars.TraceId")]
-    exemplars_trace_id: Vec<String>,
-    #[serde(rename = "AggregationTemporality")]
-    aggregation_temporality: i32,
-    #[serde(rename = "IsMonotonic")]
-    is_monotonic: bool,
-}
-
-impl SumRow {
-    fn from_gauge(g: &GaugeRow, monotonic: bool) -> Self {
-        SumRow {
-            tenant_id: g.tenant_id.clone(),
-            resource_attributes: g.resource_attributes.clone(),
-            resource_schema_url: g.resource_schema_url.clone(),
-            scope_name: g.scope_name.clone(),
-            scope_version: g.scope_version.clone(),
-            scope_attributes: g.scope_attributes.clone(),
-            scope_dropped_attr_count: g.scope_dropped_attr_count,
-            scope_schema_url: g.scope_schema_url.clone(),
-            service_name: g.service_name.clone(),
-            metric_name: g.metric_name.clone(),
-            metric_description: g.metric_description.clone(),
-            metric_unit: g.metric_unit.clone(),
-            attributes: g.attributes.clone(),
-            start_time_unix: g.start_time_unix,
-            time_unix: g.time_unix,
-            value: g.value,
-            flags: g.flags,
-            exemplars_filtered_attributes: g.exemplars_filtered_attributes.clone(),
-            exemplars_time_unix: g.exemplars_time_unix.clone(),
-            exemplars_value: g.exemplars_value.clone(),
-            exemplars_span_id: g.exemplars_span_id.clone(),
-            exemplars_trace_id: g.exemplars_trace_id.clone(),
-            aggregation_temporality: 2, // CUMULATIVE
-            is_monotonic: monotonic,
-        }
-    }
-}
 
 /// Parse DD tags list into (service_name, attributes).
 fn extract_tags(tags: &[String]) -> (String, Vec<(String, String)>) {
@@ -345,42 +215,30 @@ pub async fn ingest_v1(
         }
     }
 
-    // Insert gauges and sums in parallel to save one sequential HTTP round-trip.
+    let total = gauge_rows.len() + sum_rows.len();
+    let gauge_len = gauge_rows.len();
+    let sum_len = sum_rows.len();
+
+    // Write gauges and sums in parallel through the durable writer.
+    let map_err = |e: WriteError| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+    };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            let mut insert = state.ch.insert("metrics_gauge")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
-            for row in &gauge_rows {
-                insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-                })?;
-            }
-            insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-            })?;
+            state.writer.write(SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            let mut insert = state.ch.insert("metrics_sum")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
-            for row in &sum_rows {
-                insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-                })?;
-            }
-            insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-            })?;
+            state.writer.write(SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let (gauge_res, sum_res) = tokio::join!(gauge_fut, sum_fut);
     gauge_res?;
     sum_res?;
-
-    let total = gauge_rows.len() + sum_rows.len();
 
     // Record usage for per-tenant ingest metering
     state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
@@ -390,8 +248,8 @@ pub async fn ingest_v1(
         tenant_id = %tenant_id,
         series_count = payload.series.len(),
         datapoints = total,
-        gauge_count = gauge_rows.len(),
-        sum_count = sum_rows.len(),
+        gauge_count = gauge_len,
+        sum_count = sum_len,
         source = "datadog",
         endpoint = "v1",
         "ingested metrics"
@@ -480,42 +338,27 @@ pub async fn ingest_v2(
         }
     }
 
-    // Insert gauges and sums in parallel to save one sequential HTTP round-trip.
+    let total = gauge_rows.len() + sum_rows.len();
+
+    let map_err = |e: WriteError| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+    };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            let mut insert = state.ch.insert("metrics_gauge")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
-            for row in &gauge_rows {
-                insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-                })?;
-            }
-            insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-            })?;
+            state.writer.write(SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            let mut insert = state.ch.insert("metrics_sum")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
-            for row in &sum_rows {
-                insert.write(row).await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-                })?;
-            }
-            insert.end().await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-            })?;
+            state.writer.write(SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let (gauge_res, sum_res) = tokio::join!(gauge_fut, sum_fut);
     gauge_res?;
     sum_res?;
-
-    let total = gauge_rows.len() + sum_rows.len();
 
     // Record usage for per-tenant ingest metering
     state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
@@ -566,13 +409,9 @@ pub async fn check_run(
 
     let now_s = chrono::Utc::now().timestamp();
 
-    let mut insert = state.ch.insert("metrics_gauge")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
-
-    for check in &checks {
+    let rows: Vec<GaugeRow> = checks.iter().map(|check| {
         let (svc, attrs) = extract_tags(&check.tags);
         let ts = check.timestamp.unwrap_or(now_s) * 1_000_000_000;
-
         let mut row = build_template(
             svc,
             format!("dd.check.{}", check.check),
@@ -583,14 +422,12 @@ pub async fn check_run(
         );
         row.time_unix = ts;
         row.value = check.status as f64;
+        row
+    }).collect();
 
-        insert.write(&row).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-        })?;
-    }
-
-    insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
+    state.writer.write(SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 
     // Record usage for per-tenant ingest metering

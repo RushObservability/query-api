@@ -6,11 +6,12 @@ use axum::{
     Json,
     Extension,
 };
-use clickhouse::Row;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::models::ingest::LogInsertRow;
 use super::dd_common::{validate_api_key, decompress_body, parse_dd_tags, dd_status_to_severity};
 
 /// A single Datadog log entry from the JSON payload.
@@ -33,48 +34,6 @@ struct DdLogEntry {
     timestamp: Option<i64>,
 }
 
-/// ClickHouse row matching the logs schema.
-#[derive(Debug, Clone, Serialize, Row)]
-/// Column order MUST match the logs table exactly (positional encoding).
-/// Table: tenant_id, Timestamp, TimestampDate, TimestampTime, TraceId, SpanId,
-///        TraceFlags, SeverityText, SeverityNumber, Body, ServiceName, ...
-struct LogInsertRow {
-    tenant_id: String,
-    #[serde(rename = "Timestamp")]
-    timestamp: i64, // DateTime64(9) — nanoseconds
-    // TimestampDate and TimestampTime are DEFAULT columns — ClickHouse computes them.
-    // They must NOT appear in the insert struct.
-    #[serde(rename = "TraceId")]
-    trace_id: String,
-    #[serde(rename = "SpanId")]
-    span_id: String,
-    #[serde(rename = "TraceFlags")]
-    trace_flags: u32, // v2 schema: UInt32 (was UInt8)
-    #[serde(rename = "SeverityText")]
-    severity_text: String,
-    #[serde(rename = "SeverityNumber")]
-    severity_number: u8,
-    #[serde(rename = "Body")]
-    body: String,
-    #[serde(rename = "ServiceName")]
-    service_name: String,
-    #[serde(rename = "ResourceSchemaUrl")]
-    resource_schema_url: String,
-    #[serde(rename = "ResourceAttributes")]
-    resource_attributes: Vec<(String, String)>,
-    #[serde(rename = "ScopeSchemaUrl")]
-    scope_schema_url: String,
-    #[serde(rename = "ScopeName")]
-    scope_name: String,
-    #[serde(rename = "ScopeVersion")]
-    scope_version: String,
-    #[serde(rename = "ScopeAttributes")]
-    scope_attributes: Vec<(String, String)>,
-    #[serde(rename = "LogAttributes")]
-    log_attributes: Vec<(String, String)>,
-    #[serde(rename = "EventName")]
-    event_name: String,
-}
 
 /// POST /datadog/v1/input — Datadog log intake endpoint.
 ///
@@ -132,12 +91,7 @@ async fn ingest_logs_inner(
 
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-    let mut insert = state
-        .ch
-        .insert("logs")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
-
-    let mut count = 0u64;
+    let mut rows: Vec<LogInsertRow> = Vec::with_capacity(entries.len());
 
     for entry in &entries {
         // Determine severity: prefer parsing from the log body (more accurate)
@@ -190,7 +144,7 @@ async fn ingest_logs_inner(
             }
         }
 
-        let row = LogInsertRow {
+        rows.push(LogInsertRow {
             tenant_id: tenant_id.clone(),
             timestamp: ts_ns,
             trace_id: String::new(),
@@ -208,16 +162,13 @@ async fn ingest_logs_inner(
             scope_attributes: Vec::new(),
             log_attributes: log_attrs,
             event_name: String::new(),
-        };
-
-        insert.write(&row).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
-        })?;
-        count += 1;
+        });
     }
 
-    insert.end().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
+    let count = rows.len() as u64;
+    state.writer.write(SpoolBatch::Logs(rows)).await.map_err(|e| match e {
+        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 
     // Record usage for per-tenant ingest metering
