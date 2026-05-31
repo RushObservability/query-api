@@ -33,9 +33,9 @@ struct DdLogEntry {
     timestamp: Option<i64>,
 }
 
-/// ClickHouse row matching the otel_logs schema.
+/// ClickHouse row matching the logs schema.
 #[derive(Debug, Clone, Serialize, Row)]
-/// Column order MUST match the otel_logs table exactly (positional encoding).
+/// Column order MUST match the logs table exactly (positional encoding).
 /// Table: tenant_id, Timestamp, TimestampDate, TimestampTime, TraceId, SpanId,
 ///        TraceFlags, SeverityText, SeverityNumber, Body, ServiceName, ...
 struct LogInsertRow {
@@ -79,7 +79,7 @@ struct LogInsertRow {
 /// POST /datadog/v1/input — Datadog log intake endpoint.
 ///
 /// Accepts a JSON array of log entries, optionally gzip-compressed.
-/// Maps DD log fields to the otel_logs ClickHouse schema.
+/// Maps DD log fields to the logs ClickHouse schema.
 pub async fn ingest_logs(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -134,7 +134,7 @@ async fn ingest_logs_inner(
 
     let mut insert = state
         .ch
-        .insert("otel_logs")
+        .insert("logs")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
     let mut count = 0u64;

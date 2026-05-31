@@ -3311,7 +3311,7 @@ impl ConfigDb {
                 "Failed login brute force",
                 "Detects IPs with 10+ failed login attempts within the detection window.",
                 "SELECT mat_source_ip, count() AS attempt_count \
-                 FROM otel_logs \
+                 FROM logs \
                  WHERE Timestamp BETWEEN @window_start AND @window_end \
                    AND mat_action = 'login_failed' \
                  GROUP BY mat_source_ip \
@@ -3325,7 +3325,7 @@ impl ConfigDb {
                    countIf(StatusCode = 'ERROR') AS errors, \
                    count() AS total, \
                    errors / total AS error_rate \
-                 FROM otel_traces \
+                 FROM spans_raw \
                  WHERE Timestamp BETWEEN @window_start AND @window_end \
                  GROUP BY ServiceName \
                  HAVING error_rate > 0.05 AND total > 100",
@@ -3337,7 +3337,7 @@ impl ConfigDb {
                 "SELECT ServiceName, SpanName, \
                    quantile(0.99)(Duration) / 1000000 AS p99_ms, \
                    count() AS total \
-                 FROM otel_traces \
+                 FROM spans_raw \
                  WHERE Timestamp BETWEEN @window_start AND @window_end \
                    AND SpanKind = 'SPAN_KIND_SERVER' \
                  GROUP BY ServiceName, SpanName \
@@ -3350,7 +3350,7 @@ impl ConfigDb {
                 "SELECT ServiceName, \
                    Attributes['host.name'] AS host, \
                    avg(Value) AS avg_cpu \
-                 FROM otel_metrics_gauge \
+                 FROM metrics_gauge \
                  WHERE TimeUnix BETWEEN @window_start AND @window_end \
                    AND MetricName = 'system.cpu.utilization' \
                  GROUP BY ServiceName, host \
@@ -3363,14 +3363,14 @@ impl ConfigDb {
                 "WITH \
                    current AS ( \
                      SELECT ServiceName, sum(Value) AS current_rate \
-                     FROM otel_metrics_sum \
+                     FROM metrics_sum \
                      WHERE TimeUnix BETWEEN @window_start AND @window_end \
                        AND MetricName = 'http.server.request.count' \
                      GROUP BY ServiceName \
                    ), \
                    previous AS ( \
                      SELECT ServiceName, sum(Value) AS prev_rate \
-                     FROM otel_metrics_sum \
+                     FROM metrics_sum \
                      WHERE TimeUnix BETWEEN @window_start - INTERVAL 1 HOUR AND @window_start \
                        AND MetricName = 'http.server.request.count' \
                      GROUP BY ServiceName \
@@ -3387,13 +3387,13 @@ impl ConfigDb {
                 "Detects services with both elevated error rates and high p99 latency.",
                 "WITH \
                    error_services AS ( \
-                     SELECT ServiceName FROM otel_traces \
+                     SELECT ServiceName FROM spans_raw \
                      WHERE Timestamp BETWEEN @window_start AND @window_end \
                      GROUP BY ServiceName \
                      HAVING countIf(StatusCode = 'ERROR') / count() > 0.05 \
                    ), \
                    slow_services AS ( \
-                     SELECT ServiceName FROM otel_traces \
+                     SELECT ServiceName FROM spans_raw \
                      WHERE Timestamp BETWEEN @window_start AND @window_end \
                        AND SpanKind = 'SPAN_KIND_SERVER' \
                      GROUP BY ServiceName \
@@ -3408,7 +3408,7 @@ impl ConfigDb {
                 "High severity log volume",
                 "Fires when ERROR/FATAL log volume exceeds 100 entries in the window.",
                 "SELECT ServiceName, SeverityText, count() AS log_count \
-                 FROM otel_logs \
+                 FROM logs \
                  WHERE Timestamp BETWEEN @window_start AND @window_end \
                    AND SeverityText IN ('ERROR', 'FATAL') \
                  GROUP BY ServiceName, SeverityText \
@@ -3423,7 +3423,7 @@ impl ConfigDb {
                 "WITH \
                    error_logs AS ( \
                      SELECT ServiceName, count() AS log_errors \
-                     FROM otel_logs \
+                     FROM logs \
                      WHERE Timestamp BETWEEN @window_start AND @window_end \
                        AND SeverityText IN ('ERROR', 'FATAL') \
                      GROUP BY ServiceName \
@@ -3431,7 +3431,7 @@ impl ConfigDb {
                    ), \
                    trace_errors AS ( \
                      SELECT ServiceName, count() AS span_errors \
-                     FROM otel_traces \
+                     FROM spans_raw \
                      WHERE Timestamp BETWEEN @window_start AND @window_end \
                        AND StatusCode = 'ERROR' \
                      GROUP BY ServiceName \
@@ -3444,13 +3444,13 @@ impl ConfigDb {
             ),
             (
                 "Latency spike + memory pressure",
-                "Correlates high p99 latency from wide_events with elevated memory usage \
+                "Correlates high p99 latency from spans with elevated memory usage \
                  from metrics on the same service. Indicates resource exhaustion as the \
                  likely root cause of slow responses.",
                 "WITH \
                    slow_services AS ( \
                      SELECT ServiceName \
-                     FROM wide_events \
+                     FROM spans \
                      WHERE timestamp BETWEEN @window_start AND @window_end \
                        AND http_status_code > 0 \
                      GROUP BY ServiceName \
@@ -3458,14 +3458,14 @@ impl ConfigDb {
                    ), \
                    mem_pressure AS ( \
                      SELECT ResourceAttributes['service.name'] AS ServiceName \
-                     FROM otel_metrics_gauge \
+                     FROM metrics_gauge \
                      WHERE TimeUnix BETWEEN @window_start AND @window_end \
                        AND MetricName IN ('process.runtime.jvm.memory.usage', \
                                           'container.memory.usage', \
                                           'process.memory.usage') \
                      GROUP BY ServiceName \
                      HAVING max(Value) > 0.85 * any( \
-                       SELECT Value FROM otel_metrics_gauge \
+                       SELECT Value FROM metrics_gauge \
                        WHERE MetricName LIKE '%memory.limit%' AND TimeUnix >= @window_start \
                        LIMIT 1 \
                      ) \
@@ -3478,12 +3478,12 @@ impl ConfigDb {
             (
                 "Post-deploy error rate increase",
                 "Detects deploy events followed by a significant error rate increase within \
-                 30 minutes. Joins trace deploy spans with wide_events to identify \
+                 30 minutes. Joins trace deploy spans with spans to identify \
                  deployments that caused regressions (>5% error rate with 20+ requests).",
                 "WITH \
                    recent_deploys AS ( \
                      SELECT ServiceName, max(Timestamp) AS deploy_time \
-                     FROM otel_traces \
+                     FROM spans_raw \
                      WHERE Timestamp BETWEEN @window_start AND @window_end \
                        AND SpanName LIKE '%deploy%' \
                      GROUP BY ServiceName \
@@ -3492,7 +3492,7 @@ impl ConfigDb {
                      SELECT w.service_name AS ServiceName, \
                        countIf(w.http_status_code >= 500) AS errors, \
                        count() AS total \
-                     FROM wide_events w \
+                     FROM spans w \
                      INNER JOIN recent_deploys rd ON w.service_name = rd.ServiceName \
                      WHERE w.timestamp >= rd.deploy_time \
                        AND w.timestamp <= rd.deploy_time + INTERVAL 30 MINUTE \
@@ -3510,7 +3510,7 @@ impl ConfigDb {
                 "WITH \
                    recent_errors AS ( \
                      SELECT ServiceName, Body, count() AS cnt \
-                     FROM otel_logs \
+                     FROM logs \
                      WHERE Timestamp BETWEEN @window_start AND @window_end \
                        AND SeverityText IN ('ERROR', 'FATAL') \
                      GROUP BY ServiceName, Body \
@@ -3518,7 +3518,7 @@ impl ConfigDb {
                    ), \
                    historical_errors AS ( \
                      SELECT DISTINCT ServiceName, Body \
-                     FROM otel_logs \
+                     FROM logs \
                      WHERE Timestamp BETWEEN @window_start - INTERVAL 7 DAY AND @window_start \
                        AND SeverityText IN ('ERROR', 'FATAL') \
                    ) \
@@ -3539,7 +3539,7 @@ impl ConfigDb {
                      SELECT service_name, \
                        countIf(status = 'ERROR' OR http_status_code >= 500) AS errors, \
                        count() AS total \
-                     FROM wide_events \
+                     FROM spans \
                      WHERE timestamp BETWEEN @window_start AND @window_end \
                      GROUP BY service_name \
                      HAVING total > 10 AND errors / total > 0.1 \

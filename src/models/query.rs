@@ -1,7 +1,7 @@
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
-/// A structured query request against wide_events.
+/// A structured query request against spans.
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
     pub time_range: TimeRange,

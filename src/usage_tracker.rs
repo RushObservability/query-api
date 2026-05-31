@@ -117,7 +117,7 @@ pub fn extract_metrics_from_query(query: &str) -> Vec<String> {
     }
 }
 
-/// Extract signal names from span/wide_events query filters.
+/// Extract signal names from span/spans query filters.
 pub fn extract_span_signals(filters: &[(String, String)]) -> Vec<String> {
     let mut names = Vec::new();
     for (field, value) in filters {
@@ -129,7 +129,7 @@ pub fn extract_span_signals(filters: &[(String, String)]) -> Vec<String> {
         }
     }
     if names.is_empty() {
-        names.push("wide_events_query".to_string());
+        names.push("spans_query".to_string());
     }
     names
 }

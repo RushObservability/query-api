@@ -510,7 +510,7 @@ pub async fn autocomplete(
     let suggestions: Vec<String> = match params.ac_type.as_str() {
         "metric" => {
             // Search across gauge, sum, and histogram tables
-            let tables = ["otel_metrics_gauge", "otel_metrics_sum", "otel_metrics_histogram"];
+            let tables = ["metrics_gauge", "metrics_sum", "metrics_histogram"];
             let mut all: Vec<String> = Vec::new();
             for table in &tables {
                 let sql = format!(
@@ -536,7 +536,7 @@ pub async fn autocomplete(
         }
         "label_key" => {
             let metric = escape_ch(&params.metric);
-            let tables = ["otel_metrics_gauge", "otel_metrics_sum", "otel_metrics_histogram"];
+            let tables = ["metrics_gauge", "metrics_sum", "metrics_histogram"];
             let mut all: Vec<String> = Vec::new();
             for table in &tables {
                 let sql = format!(
@@ -565,7 +565,7 @@ pub async fn autocomplete(
         "label_value" => {
             let metric = escape_ch(&params.metric);
             let key = escape_ch(&params.key);
-            let tables = ["otel_metrics_gauge", "otel_metrics_sum", "otel_metrics_histogram"];
+            let tables = ["metrics_gauge", "metrics_sum", "metrics_histogram"];
             let mut all: Vec<String> = Vec::new();
             for table in &tables {
                 let sql = format!(
@@ -593,7 +593,7 @@ pub async fn autocomplete(
         }
         "service" => {
             let sql = format!(
-                "SELECT DISTINCT service_name AS value FROM wide_events \
+                "SELECT DISTINCT service_name AS value FROM spans \
                  WHERE tenant_id = '{tenant_id}' AND service_name LIKE '{prefix}%' \
                  LIMIT 20"
             );
@@ -608,7 +608,7 @@ pub async fn autocomplete(
         "endpoint" => {
             let service = escape_ch(&params.service);
             let sql = format!(
-                "SELECT DISTINCT http_path AS value FROM wide_events \
+                "SELECT DISTINCT http_path AS value FROM spans \
                  WHERE tenant_id = '{tenant_id}' AND service_name = '{service}' \
                  AND http_path LIKE '{prefix}%' \
                  LIMIT 20"
@@ -623,7 +623,7 @@ pub async fn autocomplete(
         }
         "log_service" => {
             let sql = format!(
-                "SELECT DISTINCT ServiceName AS value FROM otel_logs \
+                "SELECT DISTINCT ServiceName AS value FROM logs \
                  WHERE tenant_id = '{tenant_id}' AND ServiceName LIKE '{prefix}%' \
                  LIMIT 20"
             );

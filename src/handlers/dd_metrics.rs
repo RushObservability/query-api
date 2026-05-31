@@ -146,7 +146,7 @@ struct GaugeRow {
     exemplars_trace_id: Vec<String>,
 }
 
-/// ClickHouse row for otel_metrics_sum (has AggregationTemporality + IsMonotonic).
+/// ClickHouse row for metrics_sum (has AggregationTemporality + IsMonotonic).
 #[derive(Debug, Clone, Serialize, Row)]
 struct SumRow {
     tenant_id: String,
@@ -247,12 +247,12 @@ fn extract_tags(tags: &[String]) -> (String, Vec<(String, String)>) {
 }
 
 /// Determine which table to insert into based on DD metric type.
-/// Returns "otel_metrics_gauge" or "otel_metrics_sum".
+/// Returns "metrics_gauge" or "metrics_sum".
 fn table_for_type(dd_type: &str) -> &'static str {
     match dd_type.to_lowercase().as_str() {
-        "count" | "1" => "otel_metrics_sum",
-        "rate" | "2" => "otel_metrics_sum",
-        _ => "otel_metrics_gauge", // gauge (3), unspecified (0), default
+        "count" | "1" => "metrics_sum",
+        "rate" | "2" => "metrics_sum",
+        _ => "metrics_gauge", // gauge (3), unspecified (0), default
     }
 }
 
@@ -319,7 +319,7 @@ pub async fn ingest_v1(
 
     for series in &payload.series {
         let (svc, attrs) = extract_tags(&series.tags);
-        let is_sum = table_for_type(&series.r#type) == "otel_metrics_sum";
+        let is_sum = table_for_type(&series.r#type) == "metrics_sum";
         let template = build_template(
             svc,
             series.metric.clone(),
@@ -348,7 +348,7 @@ pub async fn ingest_v1(
     // Insert gauges and sums in parallel to save one sequential HTTP round-trip.
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            let mut insert = state.ch.insert("otel_metrics_gauge")
+            let mut insert = state.ch.insert("metrics_gauge")
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &gauge_rows {
                 insert.write(row).await.map_err(|e| {
@@ -363,7 +363,7 @@ pub async fn ingest_v1(
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            let mut insert = state.ch.insert("otel_metrics_sum")
+            let mut insert = state.ch.insert("metrics_sum")
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &sum_rows {
                 insert.write(row).await.map_err(|e| {
@@ -454,7 +454,7 @@ pub async fn ingest_v2(
             Some(serde_json::Value::String(s)) => s.as_str(),
             _ => "gauge",
         };
-        let is_sum = table_for_type(dd_type) == "otel_metrics_sum";
+        let is_sum = table_for_type(dd_type) == "metrics_sum";
 
         let template = build_template(
             svc,
@@ -483,7 +483,7 @@ pub async fn ingest_v2(
     // Insert gauges and sums in parallel to save one sequential HTTP round-trip.
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            let mut insert = state.ch.insert("otel_metrics_gauge")
+            let mut insert = state.ch.insert("metrics_gauge")
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &gauge_rows {
                 insert.write(row).await.map_err(|e| {
@@ -498,7 +498,7 @@ pub async fn ingest_v2(
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            let mut insert = state.ch.insert("otel_metrics_sum")
+            let mut insert = state.ch.insert("metrics_sum")
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
             for row in &sum_rows {
                 insert.write(row).await.map_err(|e| {
@@ -566,7 +566,7 @@ pub async fn check_run(
 
     let now_s = chrono::Utc::now().timestamp();
 
-    let mut insert = state.ch.insert("otel_metrics_gauge")
+    let mut insert = state.ch.insert("metrics_gauge")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
     for check in &checks {

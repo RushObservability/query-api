@@ -10,7 +10,7 @@ fn vec_pairs_as_map<S: Serializer>(v: &Vec<(String, String)>, s: S) -> Result<S:
     map.end()
 }
 
-/// A single log record from the otel_logs table.
+/// A single log record from the logs table.
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct LogRecord {
     #[serde(rename = "Timestamp")]

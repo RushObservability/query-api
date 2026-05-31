@@ -292,7 +292,7 @@ async fn fetch_apm_data(
          quantile(0.50)(duration_ns) as p50, \
          quantile(0.95)(duration_ns) as p95, \
          quantile(0.99)(duration_ns) as p99 \
-         FROM wide_events \
+         FROM spans \
          WHERE service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp <= parseDateTimeBestEffort('{}') \
          GROUP BY bucket ORDER BY bucket",
         rule.service_name.replace('\'', "''"),
@@ -413,7 +413,7 @@ async fn insert_anomaly_log(
     );
 
     let sql = format!(
-        "INSERT INTO otel_logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES \
+        "INSERT INTO logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES \
          ({ts_nanos}, '{severity_text}', {severity_number}, 'wide-anomaly-engine', '{body}', \
          {{'anomaly.rule_id': '{rule_id}', 'anomaly.rule_name': '{rule_name}', 'anomaly.state': '{state}', \
          'anomaly.metric': '{metric}', 'anomaly.value': '{value:.2}', 'anomaly.expected': '{expected:.2}', \

@@ -46,7 +46,7 @@ fn resolve_rum_field(field: &str) -> String {
     }
 }
 
-/// Build PREWHERE-optimized clauses for rum_events.
+/// Build PREWHERE-optimized clauses for rum.
 /// PREWHERE: tenant_id + TimestampTime (both in PRIMARY KEY) — evaluated at granule level.
 /// WHERE: precise nanosecond Timestamp bounds + column filters.
 fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) -> QueryClauses {
@@ -241,7 +241,7 @@ pub async fn ingest(
 
     let mut insert = state
         .ch
-        .insert("rum_events")
+        .insert("rum")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
 
     // Build template row with all constant meta fields once; only event-specific
@@ -306,7 +306,7 @@ pub async fn ingest(
         (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
     })?;
 
-    // Insert synthetic spans into wide_events for RUM events with trace IDs.
+    // Insert synthetic spans into spans for RUM events with trace IDs.
     // This allows clicking "View trace" on pageview events in the RUM dashboard.
     let trace_events: Vec<&RumIngestEvent> = payload
         .events
@@ -319,9 +319,9 @@ pub async fn ingest(
             signal = "rum",
             tenant_id = %tenant_id,
             synthetic_spans = trace_events.len(),
-            "creating synthetic spans in wide_events"
+            "creating synthetic spans in spans"
         );
-        match state.ch.insert("wide_events") {
+        match state.ch.insert("spans") {
             Ok(mut span_insert) => {
                 for evt in &trace_events {
                     let ts = evt.timestamp.unwrap_or(now_ns);
@@ -401,7 +401,7 @@ pub async fn list_apps(
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let sql = format!(
-        "SELECT AppName, count() as cnt FROM rum_events \
+        "SELECT AppName, count() as cnt FROM rum \
          PREWHERE tenant_id = '{escaped_tenant}' \
          AND TimestampTime >= now() - INTERVAL 7 DAY \
          GROUP BY AppName ORDER BY cnt DESC"
@@ -433,7 +433,7 @@ pub async fn query_events(
          EventType, EventName, VitalName, VitalValue, VitalRating, \
          ErrorMessage, ErrorStack, ErrorType, InteractionTarget, InteractionType, \
          DurationMs, TraceId, SpanId, Attributes \
-         FROM rum_events {} \
+         FROM rum {} \
          ORDER BY Timestamp DESC LIMIT {} OFFSET {}",
         clauses.to_sql(),
         req.limit.min(1000),
@@ -478,7 +478,7 @@ pub async fn vitals(
            countIf(VitalRating = 'good') * 100.0 / count() as good_pct, \
            countIf(VitalRating = 'needs-improvement') * 100.0 / count() as needs_improvement_pct, \
            countIf(VitalRating = 'poor') * 100.0 / count() as poor_pct \
-         FROM rum_events \
+         FROM rum \
          {} \
          GROUP BY VitalName \
          ORDER BY VitalName",
@@ -512,7 +512,7 @@ pub async fn pages(
            uniqExact(SessionId) as unique_sessions, \
            avgIf(DurationMs, DurationMs > 0) as avg_load_ms, \
            countIf(EventType = 'error') as error_count \
-         FROM rum_events \
+         FROM rum \
          {} \
          GROUP BY PagePath \
          ORDER BY views DESC \
@@ -555,7 +555,7 @@ pub async fn errors(
            uniqExact(SessionId) as affected_sessions, \
            toString(max(Timestamp)) as last_seen, \
            any(ErrorStack) as sample_stack \
-         FROM rum_events \
+         FROM rum \
          {} \
          GROUP BY ErrorMessage, ErrorType \
          ORDER BY count DESC \
@@ -593,7 +593,7 @@ pub async fn sessions(
            countIf(EventType = 'error') as error_count, \
            (max(Timestamp) - min(Timestamp)) / 1e9 as duration_s, \
            toString(min(Timestamp)) as first_seen \
-         FROM rum_events \
+         FROM rum \
          {} \
          GROUP BY SessionId \
          ORDER BY first_seen DESC \
@@ -630,7 +630,7 @@ pub async fn session_detail(
          EventType, EventName, VitalName, VitalValue, VitalRating, \
          ErrorMessage, ErrorStack, ErrorType, InteractionTarget, InteractionType, \
          DurationMs, TraceId, SpanId, Attributes \
-         FROM rum_events \
+         FROM rum \
          PREWHERE tenant_id = '{escaped_tenant}' WHERE SessionId = '{escaped_id}' \
          ORDER BY Timestamp ASC \
          LIMIT 1000"
@@ -684,7 +684,7 @@ pub async fn list_replay_sessions(
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let escaped_app = crate::query_builder::escape_string_literal(&app_name);
     let sql = format!(
-        "SELECT DISTINCT session_id FROM rum_replay_chunks \
+        "SELECT DISTINCT session_id FROM rum_replay \
          WHERE tenant_id = '{escaped_tenant}' AND app_name = '{escaped_app}'"
     );
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
@@ -726,7 +726,7 @@ pub async fn ingest_replay(
 
     let mut insert = state
         .ch
-        .insert("rum_replay_chunks")
+        .insert("rum_replay")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into()))?;
     insert.write(&row).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, "insert failed".into())
@@ -750,7 +750,7 @@ pub async fn get_replay(
 
     let sql = format!(
         "SELECT tenant_id, session_id, app_name, chunk_idx, chunk_ts, events_json \
-         FROM rum_replay_chunks \
+         FROM rum_replay \
          WHERE tenant_id = '{escaped_tenant}' AND session_id = '{escaped_sid}' \
          ORDER BY chunk_idx ASC \
          LIMIT 500"

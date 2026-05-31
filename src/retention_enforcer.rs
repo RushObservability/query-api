@@ -55,11 +55,11 @@ async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<(
             continue;
         }
         let metric_tables = [
-            "otel_metrics_gauge",
-            "otel_metrics_sum",
-            "otel_metrics_histogram",
-            "otel_metrics_exponential_histogram",
-            "otel_metrics_summary",
+            "metrics_gauge",
+            "metrics_sum",
+            "metrics_histogram",
+            "metrics_exp_histogram",
+            "metrics_summary",
         ];
         for table in metric_tables {
             let sql = format!(
@@ -76,19 +76,19 @@ async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<(
         if rule.retain_days >= table_traces_ttl {
             continue;
         }
-        // otel_traces
+        // spans_raw
         if let Some(clause) = build_trace_where_otel(rule) {
             let sql = format!(
-                "ALTER TABLE observability.otel_traces DELETE WHERE \
+                "ALTER TABLE observability.spans_raw DELETE WHERE \
                  toDateTime(Timestamp) < now() - INTERVAL {} DAY AND {clause}",
                 rule.retain_days
             );
             execute_or_log(ch, &sql, dry_run).await;
         }
-        // wide_events
+        // spans
         if let Some(clause) = build_trace_where_wide(rule) {
             let sql = format!(
-                "ALTER TABLE observability.wide_events DELETE WHERE \
+                "ALTER TABLE observability.spans DELETE WHERE \
                  toDateTime(timestamp) < now() - INTERVAL {} DAY AND {clause}",
                 rule.retain_days
             );
@@ -144,7 +144,7 @@ fn build_trace_where_wide(rule: &TraceRetentionRule) -> Option<String> {
         parts.push(format!("service_name = '{svc}'"));
     }
     if let Some(ref attr) = rule.attribute {
-        // wide_events has `environment` as a first-class column for the common case
+        // spans has `environment` as a first-class column for the common case
         if attr.key == "deployment.environment" {
             parts.push(format!("environment = '{}'", attr.value));
         } else {
@@ -240,11 +240,11 @@ async fn enforce_tenant_retention(
         match signal.as_str() {
             "metrics" => {
                 let metric_tables = [
-                    "otel_metrics_gauge",
-                    "otel_metrics_sum",
-                    "otel_metrics_histogram",
-                    "otel_metrics_exponential_histogram",
-                    "otel_metrics_summary",
+                    "metrics_gauge",
+                    "metrics_sum",
+                    "metrics_histogram",
+                    "metrics_exp_histogram",
+                    "metrics_summary",
                 ];
                 for table in metric_tables {
                     let sql = format!(
@@ -256,17 +256,17 @@ async fn enforce_tenant_retention(
                 }
             }
             "traces" => {
-                // otel_traces
+                // spans_raw
                 let sql = format!(
-                    "ALTER TABLE observability.otel_traces DELETE \
+                    "ALTER TABLE observability.spans_raw DELETE \
                      WHERE tenant_id = '{safe_tenant_id}' \
                      AND toDate(Timestamp) < today() - {retain_days}"
                 );
                 execute_or_log(ch, &sql, dry_run).await;
 
-                // wide_events
+                // spans
                 let sql = format!(
-                    "ALTER TABLE observability.wide_events DELETE \
+                    "ALTER TABLE observability.spans DELETE \
                      WHERE tenant_id = '{safe_tenant_id}' \
                      AND toDate(timestamp) < today() - {retain_days}"
                 );
@@ -274,7 +274,7 @@ async fn enforce_tenant_retention(
             }
             "logs" => {
                 let sql = format!(
-                    "ALTER TABLE observability.otel_logs DELETE \
+                    "ALTER TABLE observability.logs DELETE \
                      WHERE tenant_id = '{safe_tenant_id}' \
                      AND toDate(Timestamp) < today() - {retain_days}"
                 );

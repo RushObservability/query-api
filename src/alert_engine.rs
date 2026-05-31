@@ -485,21 +485,21 @@ async fn eval_alerts(
                 let s = mc.to_sql();
                 format!(
                     "SELECT count() as count FROM (\
-                     SELECT TimeUnix FROM observability.otel_metrics_gauge {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_sum {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_histogram {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_exponential_histogram {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.otel_metrics_summary {s})"
+                     SELECT TimeUnix FROM observability.metrics_gauge {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.metrics_sum {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.metrics_histogram {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.metrics_exp_histogram {s} \
+                     UNION ALL SELECT TimeUnix FROM observability.metrics_summary {s})"
                 )
             }
             "logs" => {
                 let lc = build_logs_where_clause(&query_config.filters, &from, &now_str);
-                format!("SELECT count() as count FROM observability.otel_logs {}", lc.to_sql())
+                format!("SELECT count() as count FROM observability.logs {}", lc.to_sql())
             }
             _ => {
-                // "apm" (default) — query wide_events
+                // "apm" (default) — query spans
                 let wc = build_where_clause(&query_config.filters, &from, &now_str);
-                format!("SELECT count() as count FROM wide_events {}", wc.to_sql())
+                format!("SELECT count() as count FROM spans {}", wc.to_sql())
             }
         };
 

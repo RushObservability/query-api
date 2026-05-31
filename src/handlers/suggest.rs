@@ -91,7 +91,7 @@ pub async fn suggest_values(
         }
     }
 
-    // PREWHERE: tenant_id + timestamp (both in primary key of wide_events) →
+    // PREWHERE: tenant_id + timestamp (both in primary key of spans) →
     // evaluated at granule level before decompression, avoiding full table scan.
     // WHERE: the LIKE filter on the computed alias (ClickHouse allows alias refs in WHERE).
     let prewhere = format!(
@@ -106,7 +106,7 @@ pub async fn suggest_values(
 
     let sql = format!(
         "SELECT DISTINCT {col_expr} as val \
-         FROM wide_events \
+         FROM spans \
          PREWHERE {prewhere} \
          {prefix_filter} \
          ORDER BY val \

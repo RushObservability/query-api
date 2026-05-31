@@ -32,32 +32,32 @@ async fn collect_and_write(ch: &Client) -> anyhow::Result<()> {
 
     // ── Span stats ──
     let span_total = query_count(ch, &format!(
-        "SELECT count() as count FROM otel_traces WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
+        "SELECT count() as count FROM spans_raw WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
     )).await;
 
     let span_bytes = query_bytes(ch,
-        "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'otel_traces' AND active"
+        "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans_raw' AND active"
     ).await;
 
     // ── Log stats ──
     let log_total = query_count(ch, &format!(
-        "SELECT count() as count FROM otel_logs WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
+        "SELECT count() as count FROM logs WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
     )).await;
 
     // ── Metric stats ──
     let metric_gauge = query_count(ch, &format!(
-        "SELECT count() as count FROM otel_metrics_gauge WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
+        "SELECT count() as count FROM metrics_gauge WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
     )).await;
     let metric_sum = query_count(ch, &format!(
-        "SELECT count() as count FROM otel_metrics_sum WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
+        "SELECT count() as count FROM metrics_sum WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
     )).await;
     let metric_hist = query_count(ch, &format!(
-        "SELECT count() as count FROM otel_metrics_histogram WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
+        "SELECT count() as count FROM metrics_histogram WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
     )).await;
     let metric_total = metric_gauge + metric_sum + metric_hist;
 
     let unique_series = query_count(ch,
-        "SELECT uniq(MetricName, Attributes) as count FROM otel_metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR"
+        "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR"
     ).await;
 
     // ── Storage ──
@@ -116,7 +116,7 @@ async fn collect_and_write(ch: &Client) -> anyhow::Result<()> {
     }).collect();
 
     let sql = format!(
-        "INSERT INTO otel_metrics_gauge \
+        "INSERT INTO metrics_gauge \
          (ResourceAttributes, ResourceSchemaUrl, ScopeName, ScopeVersion, ScopeAttributes, \
           ScopeDroppedAttrCount, ScopeSchemaUrl, ServiceName, MetricName, MetricDescription, \
           MetricUnit, Attributes, StartTimeUnix, TimeUnix, Value, Flags, \

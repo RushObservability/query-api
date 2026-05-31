@@ -30,7 +30,7 @@ pub async fn get_trace(
     let rows = crate::tenant_query(
             &state.ch,
             &format!(
-                "SELECT * FROM wide_events PREWHERE tenant_id = '{escaped_tenant}' WHERE trace_id = ? ORDER BY timestamp ASC"
+                "SELECT * FROM spans PREWHERE tenant_id = '{escaped_tenant}' WHERE trace_id = ? ORDER BY timestamp ASC"
             ),
             tenant_id,
         )

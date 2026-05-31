@@ -2,7 +2,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 /// A single wide event span as stored in ClickHouse (v2 schema).
-/// Column order must match the `wide_events` table exactly for `SELECT *`.
+/// Column order must match the `spans` table exactly for `SELECT *`.
 /// timestamp/event_timestamps are i64 nanoseconds since epoch (DateTime64(9)).
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct WideEvent {
@@ -27,7 +27,7 @@ pub struct WideEvent {
     pub link_span_ids: Vec<String>,
 }
 
-/// A lightweight span row from the trace_index materialized view.
+/// A lightweight span row from the spans_by_trace materialized view.
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct TraceIndexRow {
     pub tenant_id: String,

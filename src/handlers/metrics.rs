@@ -265,7 +265,7 @@ async fn prom_series_inner(
         let where_clause = where_parts.join(" AND ");
 
         // Query both gauge and sum tables
-        for table in &["otel_metrics_gauge", "otel_metrics_sum"] {
+        for table in &["metrics_gauge", "metrics_sum"] {
             let sql = format!(
                 "SELECT DISTINCT MetricName, ServiceName, Attributes \
                  FROM {table} \
@@ -345,7 +345,7 @@ pub async fn prom_labels(
     });
 
     // Discover attribute keys from gauge and sum tables
-    for table in &["otel_metrics_gauge", "otel_metrics_sum"] {
+    for table in &["metrics_gauge", "metrics_sum"] {
         let sql = format!(
             "SELECT DISTINCT arrayJoin(mapKeys(Attributes)) AS name \
              FROM {table} \
@@ -408,7 +408,7 @@ pub async fn prom_label_values(
     });
     let filter = metric_filter.as_deref().unwrap_or("");
 
-    for table in &["otel_metrics_gauge", "otel_metrics_sum"] {
+    for table in &["metrics_gauge", "metrics_sum"] {
         let sql = match label_name.as_str() {
             "__name__" => format!(
                 "SELECT DISTINCT MetricName AS value FROM {table} \

@@ -58,7 +58,7 @@ struct TraceCountRow {
     count: u64,
 }
 
-/// Build PREWHERE + WHERE clauses for a funnel step query on wide_events.
+/// Build PREWHERE + WHERE clauses for a funnel step query on spans.
 /// PREWHERE: tenant_id + timestamp range (both in primary key) — granule-level filtering.
 /// WHERE: optional service/path/status filters.
 fn step_clauses(step: &FunnelStep, from: &str, to: &str, tenant_id: &str) -> QueryClauses {
@@ -163,7 +163,7 @@ pub async fn run_funnel(
     // Build all SQL strings up front, then fire all step queries in parallel.
     let sqls: Vec<String> = steps.iter().map(|step| {
         let clauses = step_clauses(step, &req.from, &req.to, &tenant.tenant_id);
-        format!("SELECT count(DISTINCT trace_id) as count FROM wide_events {}", clauses.to_sql())
+        format!("SELECT count(DISTINCT trace_id) as count FROM spans {}", clauses.to_sql())
     }).collect();
 
     let futures: Vec<_> = sqls.iter().map(|sql| {

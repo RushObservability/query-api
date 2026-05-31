@@ -2,7 +2,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Raw sample from ClickHouse otel_metrics_gauge or otel_metrics_sum
+/// Raw sample from ClickHouse metrics_gauge or metrics_sum
 #[derive(Debug, Clone, Row, Deserialize)]
 pub struct MetricSample {
     #[serde(rename = "MetricName")]
