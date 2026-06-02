@@ -318,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?
     );
     config_db.ensure_default_tenant().await?;
+    config_db.ensure_global_retention().await?;
     config_db.ensure_default_admin().await?;
     config_db.ensure_default_groups().await?;
     config_db.ensure_default_templates().await?;
@@ -382,6 +383,25 @@ async fn main() -> anyhow::Result<()> {
     );
     let writer = ChWriter::new(ch.clone(), spool);
     writer.clone().spawn_replayer();
+
+    // Metric firewall: load compiled rules now, then refresh periodically so
+    // changes (incl. from other replicas) propagate to the ingest hot path.
+    if let Ok(fw) = config_db.compiled_metric_firewall().await {
+        if let Ok(mut g) = writer.firewall.write() { *g = Arc::new(fw); }
+    }
+    {
+        let fw_handle = writer.firewall.clone();
+        let cdb = config_db.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if let Ok(fw) = cdb.compiled_metric_firewall().await {
+                    if let Ok(mut g) = fw_handle.write() { *g = Arc::new(fw); }
+                }
+            }
+        });
+    }
 
     // Spawn usage tracker (fire-and-forget signal usage tracking)
     let usage = usage_tracker::spawn(ch.clone());
@@ -763,6 +783,23 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/tenants/{id}/auth",
             put(handlers::tenants::set_auth_required),
+        )
+        // Global retention caps (default + per-signal maximums)
+        .route(
+            "/api/v1/retention/global",
+            get(handlers::retention::get_global_retention)
+                .put(handlers::retention::set_global_retention),
+        )
+        // Metric firewall (ingest-time block / drop-label rules)
+        .route(
+            "/api/v1/metric-firewall",
+            get(handlers::metric_firewall::list)
+                .post(handlers::metric_firewall::create),
+        )
+        .route(
+            "/api/v1/metric-firewall/{id}",
+            put(handlers::metric_firewall::update)
+                .delete(handlers::metric_firewall::delete),
         )
         // Tenant retention overrides
         .route(

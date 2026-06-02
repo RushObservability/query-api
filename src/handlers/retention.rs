@@ -6,7 +6,84 @@ use axum::{
 };
 
 use crate::AppState;
+use crate::clickhouse_config::GlobalRetention;
 use crate::handlers::users::require_admin;
+
+#[derive(serde::Serialize)]
+pub struct GlobalRetentionResponse {
+    pub default_days: i32,
+    /// Per-signal caps (0 = inherit default_days).
+    pub logs_days: i32,
+    pub metrics_days: i32,
+    pub apm_days: i32,
+    /// Resolved caps actually applied (per-signal value if set, else default).
+    pub effective_logs: i32,
+    pub effective_metrics: i32,
+    pub effective_apm: i32,
+}
+
+impl From<GlobalRetention> for GlobalRetentionResponse {
+    fn from(g: GlobalRetention) -> Self {
+        GlobalRetentionResponse {
+            default_days: g.default_days,
+            logs_days: g.logs_days,
+            metrics_days: g.metrics_days,
+            apm_days: g.apm_days,
+            effective_logs: g.effective_logs(),
+            effective_metrics: g.effective_metrics(),
+            effective_apm: g.effective_apm(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetGlobalRetentionRequest {
+    pub default_days: i32,
+    /// 0 (or null) = inherit default_days.
+    #[serde(default)]
+    pub logs_days: i32,
+    #[serde(default)]
+    pub metrics_days: i32,
+    #[serde(default)]
+    pub apm_days: i32,
+}
+
+/// GET /api/v1/retention/global
+pub async fn get_global_retention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let g = state
+        .config_db
+        .get_global_retention().await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?
+        // Sane default if the store hasn't been seeded yet.
+        .unwrap_or(GlobalRetention { default_days: 365, logs_days: 0, metrics_days: 0, apm_days: 0 });
+    Ok(Json(GlobalRetentionResponse::from(g)))
+}
+
+/// PUT /api/v1/retention/global
+pub async fn set_global_retention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetGlobalRetentionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    if req.default_days < 1 {
+        return Err((StatusCode::BAD_REQUEST, "default_days must be >= 1".to_string()));
+    }
+    for (label, v) in [("logs_days", req.logs_days), ("metrics_days", req.metrics_days), ("apm_days", req.apm_days)] {
+        if v < 0 {
+            return Err((StatusCode::BAD_REQUEST, format!("{label} must be >= 0 (0 = inherit default)")));
+        }
+    }
+    state
+        .config_db
+        .set_global_retention(req.default_days, req.logs_days, req.metrics_days, req.apm_days).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
+    get_global_retention(State(state), headers).await
+}
 
 #[derive(serde::Deserialize)]
 pub struct SetRetentionRequest {
@@ -85,6 +162,28 @@ pub async fn set_tenant_retention(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!("{label} must be >= 1"),
+                ));
+            }
+        }
+    }
+
+    // Clamp against the global caps — a tenant cannot exceed the global maximum
+    // for a signal (the table TTL would already have dropped the data anyway).
+    let global = state
+        .config_db
+        .get_global_retention().await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?
+        .unwrap_or(GlobalRetention { default_days: 365, logs_days: 0, metrics_days: 0, apm_days: 0 });
+    for (label, val, max) in [
+        ("metrics_days", req.metrics_days, global.effective_metrics()),
+        ("traces_days", req.traces_days, global.effective_apm()),
+        ("logs_days", req.logs_days, global.effective_logs()),
+    ] {
+        if let Some(d) = val {
+            if d > max {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{label} ({d}d) exceeds the global maximum of {max}d"),
                 ));
             }
         }

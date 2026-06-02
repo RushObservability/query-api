@@ -78,6 +78,58 @@ pub struct ConfigDb {
     pub client: Client,
 }
 
+/// A metric firewall rule (storage + API shape). `enabled`/`*_regex` are 0/1.
+/// `action` is "block" or "drop_label".
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize, serde::Serialize)]
+pub struct MetricFirewallRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: u8,
+    pub action: String,
+    pub metric_pattern: String,
+    pub metric_regex: u8,
+    pub match_label_key: String,
+    pub match_label_value: String,
+    pub match_label_value_regex: u8,
+    pub drop_label_pattern: String,
+    pub drop_label_regex: u8,
+    pub created_at: String,
+}
+
+/// Global retention caps. Per-signal values of 0 mean "inherit `default_days`".
+/// These are the maximum retention per signal (logs / metrics / apm), used as
+/// the table-level TTL and as the ceiling for tenant overrides. `apm` covers
+/// traces (spans) and RUM.
+#[derive(Debug, Clone, Copy, clickhouse::Row, serde::Deserialize, serde::Serialize)]
+pub struct GlobalRetention {
+    pub default_days: i32,
+    pub logs_days: i32,
+    pub metrics_days: i32,
+    pub apm_days: i32,
+}
+
+impl GlobalRetention {
+    /// Effective days for a signal, clamped to a safe floor of 1 so a stray 0
+    /// can never become an `INTERVAL 0 DAY` (delete-everything) TTL.
+    fn eff(value: i32, default_days: i32) -> i32 {
+        let v = if value > 0 { value } else { default_days };
+        v.max(1)
+    }
+    pub fn effective_logs(&self) -> i32 { Self::eff(self.logs_days, self.default_days) }
+    pub fn effective_metrics(&self) -> i32 { Self::eff(self.metrics_days, self.default_days) }
+    pub fn effective_apm(&self) -> i32 { Self::eff(self.apm_days, self.default_days) }
+
+    /// Effective cap for a tenant-retention signal name ("logs"/"metrics"/"traces").
+    pub fn effective_for_signal(&self, signal: &str) -> Option<i32> {
+        match signal {
+            "logs" => Some(self.effective_logs()),
+            "metrics" => Some(self.effective_metrics()),
+            "traces" => Some(self.effective_apm()),
+            _ => None,
+        }
+    }
+}
+
 impl ConfigDb {
     pub async fn open(url: &str, user: &str, password: &str) -> anyhow::Result<Self> {
         let client = Client::default()
@@ -613,6 +665,21 @@ impl ConfigDb {
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (tenant_id, signal)",
 
+            // ── Global retention (singleton, id='global') ─────────────────────────
+            // default_days applies to any signal whose per-signal value is 0 (inherit).
+            // These are the MAXIMUM retention per signal — tenant overrides are clamped
+            // to them, and they double as the table-level TTL. apm covers traces + RUM.
+            "CREATE TABLE IF NOT EXISTS config_global_retention (
+                id           String,
+                default_days Int32 DEFAULT 365,
+                logs_days    Int32 DEFAULT 0,
+                metrics_days Int32 DEFAULT 0,
+                apm_days     Int32 DEFAULT 0,
+                version      UInt64,
+                is_deleted   UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (id)",
+
             // ── Maintenance windows ───────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_maintenance_windows (
                 id         String,
@@ -623,6 +690,25 @@ impl ConfigDb {
                 created_at String DEFAULT toString(now()),
                 version    UInt64,
                 is_deleted UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (id)",
+
+            // ── Metric firewall (ingest-time block / drop-label rules) ────────────
+            "CREATE TABLE IF NOT EXISTS config_metric_firewall (
+                id                      String,
+                name                    String,
+                enabled                 UInt8 DEFAULT 1,
+                action                  String DEFAULT 'block',
+                metric_pattern          String DEFAULT '',
+                metric_regex            UInt8 DEFAULT 0,
+                match_label_key         String DEFAULT '',
+                match_label_value       String DEFAULT '',
+                match_label_value_regex UInt8 DEFAULT 0,
+                drop_label_pattern      String DEFAULT '',
+                drop_label_regex        UInt8 DEFAULT 0,
+                created_at              String DEFAULT toString(now()),
+                version                 UInt64,
+                is_deleted              UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
 
@@ -666,8 +752,13 @@ impl ConfigDb {
         if existing.is_none() {
             let ver = Self::next_version();
             let now = Self::now_str();
+            // The "default" tenant is the unconditional catch-all that
+            // tenant_middleware falls back to for unauthenticated, header-less
+            // requests, so a lock on it can't be enforced — seed it unlocked
+            // (auth_required=0) to match that reality. User-created tenants
+            // still default to locked (see create_tenant).
             self.client
-                .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 1, 1, ?, ?, 0)")
+                .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 1, 0, ?, ?, 0)")
                 .bind("default")
                 .bind("default")
                 .bind(&now)
@@ -886,6 +977,104 @@ impl ConfigDb {
             .fetch_all::<Row>()
             .await?;
         Ok(rows.into_iter().map(|r| (r.tenant_id, r.signal, r.retain_days)).collect())
+    }
+
+    // ── Global retention operations ────────────────────────────────────────────
+
+    /// Seed the singleton global-retention row if absent: 365d default, all
+    /// signals inheriting it (per-signal value 0 = inherit default).
+    pub async fn ensure_global_retention(&self) -> anyhow::Result<()> {
+        if self.get_global_retention().await?.is_none() {
+            self.set_global_retention(365, 0, 0, 0).await?;
+        }
+        Ok(())
+    }
+
+    /// Raw stored global retention (per-signal 0 = inherit `default_days`).
+    /// Returns None if unset.
+    pub async fn get_global_retention(&self) -> anyhow::Result<Option<GlobalRetention>> {
+        let result = self.client
+            .query("SELECT default_days, logs_days, metrics_days, apm_days FROM config_global_retention FINAL WHERE id = 'global' AND is_deleted = 0 LIMIT 1")
+            .fetch_one::<GlobalRetention>()
+            .await;
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn set_global_retention(&self, default_days: i32, logs_days: i32, metrics_days: i32, apm_days: i32) -> anyhow::Result<()> {
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_global_retention (id, default_days, logs_days, metrics_days, apm_days, version, is_deleted) VALUES ('global', ?, ?, ?, ?, ?, 0)")
+            .bind(default_days)
+            .bind(logs_days)
+            .bind(metrics_days)
+            .bind(apm_days)
+            .bind(ver)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    // ── Metric firewall operations ─────────────────────────────────────────────
+
+    pub async fn list_metric_firewall(&self) -> anyhow::Result<Vec<MetricFirewallRule>> {
+        let rows = self.client
+            .query("SELECT id, name, enabled, action, metric_pattern, metric_regex, match_label_key, match_label_value, match_label_value_regex, drop_label_pattern, drop_label_regex, created_at FROM config_metric_firewall FINAL WHERE is_deleted = 0 ORDER BY created_at")
+            .fetch_all::<MetricFirewallRule>()
+            .await?;
+        Ok(rows)
+    }
+
+    /// Insert/replace a rule (ReplacingMergeTree keyed by id + version).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_metric_firewall(&self, r: &MetricFirewallRule) -> anyhow::Result<()> {
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_metric_firewall (id, name, enabled, action, metric_pattern, metric_regex, match_label_key, match_label_value, match_label_value_regex, drop_label_pattern, drop_label_regex, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&r.id).bind(&r.name).bind(r.enabled).bind(&r.action)
+            .bind(&r.metric_pattern).bind(r.metric_regex)
+            .bind(&r.match_label_key).bind(&r.match_label_value).bind(r.match_label_value_regex)
+            .bind(&r.drop_label_pattern).bind(r.drop_label_regex)
+            .bind(&r.created_at).bind(ver)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_metric_firewall(&self, id: &str) -> anyhow::Result<bool> {
+        let existing = self.list_metric_firewall().await?;
+        let Some(r) = existing.into_iter().find(|r| r.id == id) else { return Ok(false) };
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_metric_firewall (id, name, enabled, action, metric_pattern, metric_regex, match_label_key, match_label_value, match_label_value_regex, drop_label_pattern, drop_label_regex, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(&r.id).bind(&r.name).bind(r.enabled).bind(&r.action)
+            .bind(&r.metric_pattern).bind(r.metric_regex)
+            .bind(&r.match_label_key).bind(&r.match_label_value).bind(r.match_label_value_regex)
+            .bind(&r.drop_label_pattern).bind(r.drop_label_regex)
+            .bind(&r.created_at).bind(ver)
+            .execute()
+            .await?;
+        Ok(true)
+    }
+
+    /// Load + compile the firewall rules for the ingest hot path.
+    pub async fn compiled_metric_firewall(&self) -> anyhow::Result<crate::metric_firewall::MetricFirewall> {
+        let rows = self.list_metric_firewall().await?;
+        let raw: Vec<crate::metric_firewall::RawRule> = rows.iter().map(|r| crate::metric_firewall::RawRule {
+            enabled: r.enabled != 0,
+            action: r.action.clone(),
+            metric_pattern: r.metric_pattern.clone(),
+            metric_regex: r.metric_regex != 0,
+            match_label_key: r.match_label_key.clone(),
+            match_label_value: r.match_label_value.clone(),
+            match_label_value_regex: r.match_label_value_regex != 0,
+            drop_label_pattern: r.drop_label_pattern.clone(),
+            drop_label_regex: r.drop_label_regex != 0,
+        }).collect();
+        Ok(crate::metric_firewall::MetricFirewall::compile(&raw))
     }
 
     // ── User & session operations ──────────────────────────────────────────────

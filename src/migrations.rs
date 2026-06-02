@@ -732,63 +732,60 @@ async fn ttl_matches(client: &Client, table: &str, days: u32) -> bool {
 /// Skips tables whose TTL already matches the desired interval to avoid
 /// blocking on redundant ALTER TABLE mutations at every boot.
 async fn apply_retention_ttl(client: &Client, config: &RushConfig) -> anyhow::Result<()> {
-    let metrics_days = config.effective_metrics_ttl_days();
-    let traces_days = config.effective_traces_ttl_days();
-    let logs_days = config.effective_logs_ttl_days();
+    apply_retention_ttls(
+        client,
+        config.effective_logs_ttl_days(),
+        config.effective_metrics_ttl_days(),
+        config.effective_traces_ttl_days(),
+    )
+    .await
+}
+
+/// Apply table-level retention TTLs from explicit per-signal day counts. Used at
+/// boot from rush.toml and periodically by the retention enforcer from the
+/// UI-editable global-retention store. `apm` covers traces (spans) and RUM.
+///
+/// Safety: each value is floored to 1 day so a stray 0 can never produce an
+/// `INTERVAL 0 DAY` (delete-everything-now) TTL.
+pub async fn apply_retention_ttls(
+    client: &Client,
+    logs_days: u32,
+    metrics_days: u32,
+    apm_days: u32,
+) -> anyhow::Result<()> {
+    let logs_days = logs_days.max(1);
+    let metrics_days = metrics_days.max(1);
+    let apm_days = apm_days.max(1);
 
     tracing::info!(
-        "applying retention TTLs: metrics={metrics_days}d, traces={traces_days}d, logs={logs_days}d"
+        "applying retention TTLs: metrics={metrics_days}d, apm={apm_days}d (incl. RUM), logs={logs_days}d"
     );
 
-    // Metrics tables
-    let metric_tables = [
-        "metrics_gauge",
-        "metrics_sum",
-        "metrics_histogram",
-        "metrics_exp_histogram",
-        "metrics_summary",
+    // (table, timestamp expression, days)
+    let specs: &[(&str, &str, u32)] = &[
+        ("metrics_gauge", "toDateTime(TimeUnix)", metrics_days),
+        ("metrics_sum", "toDateTime(TimeUnix)", metrics_days),
+        ("metrics_histogram", "toDateTime(TimeUnix)", metrics_days),
+        ("metrics_exp_histogram", "toDateTime(TimeUnix)", metrics_days),
+        ("metrics_summary", "toDateTime(TimeUnix)", metrics_days),
+        ("spans_raw", "toDateTime(Timestamp)", apm_days),
+        ("spans", "toDateTime(timestamp)", apm_days),
+        ("rum", "toDateTime(Timestamp)", apm_days),
+        ("rum_replay", "toDateTime(chunk_ts)", apm_days),
+        ("logs", "toDateTime(Timestamp)", logs_days),
     ];
-    for table in metric_tables {
-        if ttl_matches(client, table, metrics_days).await {
-            tracing::debug!("TTL on {table} already {metrics_days}d, skipping");
+
+    for (table, ts_expr, days) in specs {
+        if ttl_matches(client, table, *days).await {
+            tracing::debug!("TTL on {table} already {days}d, skipping");
             continue;
         }
         let sql = format!(
-            "ALTER TABLE observability.{table} MODIFY TTL toDateTime(TimeUnix) + INTERVAL {metrics_days} DAY DELETE"
+            "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {days} DAY DELETE"
         );
         if let Err(e) = client.query(&sql).execute().await {
             tracing::warn!("failed to set TTL on {table}: {e}");
         }
-    }
-
-    // Trace tables
-    let trace_ttl_specs: &[(&str, &str)] = &[
-        ("spans_raw", "toDateTime(Timestamp)"),
-        ("spans", "toDateTime(timestamp)"),
-    ];
-    for (table, ts_expr) in trace_ttl_specs {
-        if ttl_matches(client, table, traces_days).await {
-            tracing::debug!("TTL on {table} already {traces_days}d, skipping");
-            continue;
-        }
-        let sql = format!(
-            "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {traces_days} DAY DELETE"
-        );
-        if let Err(e) = client.query(&sql).execute().await {
-            tracing::warn!("failed to set TTL on {table}: {e}");
-        }
-    }
-
-    // Log table
-    if !ttl_matches(client, "logs", logs_days).await {
-        let sql = format!(
-            "ALTER TABLE observability.logs MODIFY TTL toDateTime(Timestamp) + INTERVAL {logs_days} DAY DELETE"
-        );
-        if let Err(e) = client.query(&sql).execute().await {
-            tracing::warn!("failed to set TTL on logs: {e}");
-        }
-    } else {
-        tracing::debug!("TTL on logs already {logs_days}d, skipping");
     }
 
     Ok(())

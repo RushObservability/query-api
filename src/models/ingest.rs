@@ -405,6 +405,24 @@ pub struct SummaryRow {
     pub flags: u32,
 }
 
+// ═══ Metric firewall integration ═══
+// All metric row types expose metric_name + attributes for the ingest-time
+// metric firewall (see crate::metric_firewall).
+macro_rules! impl_metric_row {
+    ($t:ty) => {
+        impl crate::metric_firewall::MetricRow for $t {
+            fn fw_metric_name(&self) -> &str { &self.metric_name }
+            fn fw_attributes(&self) -> &[(String, String)] { &self.attributes }
+            fn fw_attributes_mut(&mut self) -> &mut Vec<(String, String)> { &mut self.attributes }
+        }
+    };
+}
+impl_metric_row!(GaugeRow);
+impl_metric_row!(SumRow);
+impl_metric_row!(HistogramRow);
+impl_metric_row!(ExpHistogramRow);
+impl_metric_row!(SummaryRow);
+
 // ═══ rum_replay ═══
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
