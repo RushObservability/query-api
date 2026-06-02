@@ -99,11 +99,43 @@ impl SpoolBatch {
 pub struct ChWriter {
     ch: Client,
     pub spool: Arc<Spool>,
+    /// Hot-swappable compiled metric firewall (applied to metric batches before
+    /// insert/spool). Refreshed by a background task and on config change.
+    pub firewall: Arc<std::sync::RwLock<Arc<crate::metric_firewall::MetricFirewall>>>,
 }
 
 impl ChWriter {
     pub fn new(ch: Client, spool: Arc<Spool>) -> Self {
-        ChWriter { ch, spool }
+        ChWriter {
+            ch,
+            spool,
+            firewall: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::metric_firewall::MetricFirewall::default(),
+            ))),
+        }
+    }
+
+    /// Apply the metric firewall to a metric batch in place (drops blocked
+    /// datapoints, strips dropped labels). No-op for non-metric batches.
+    fn apply_firewall(&self, batch: &mut SpoolBatch) {
+        let fw = match self.firewall.read() {
+            Ok(g) => g.clone(), // cheap Arc clone; guard released immediately
+            Err(_) => return,
+        };
+        if fw.is_empty() {
+            return;
+        }
+        let dropped = match batch {
+            SpoolBatch::Gauge(rows) => fw.apply(rows),
+            SpoolBatch::Sum(rows) => fw.apply(rows),
+            SpoolBatch::Histogram(rows) => fw.apply(rows),
+            SpoolBatch::ExpHistogram(rows) => fw.apply(rows),
+            SpoolBatch::Summary(rows) => fw.apply(rows),
+            _ => 0,
+        };
+        if dropped > 0 {
+            tracing::debug!(dropped = dropped, table = batch.table(), "metric firewall blocked datapoints");
+        }
     }
 
     /// Write a batch to ClickHouse.
@@ -111,7 +143,13 @@ impl ChWriter {
     /// - On success: returns `Ok(())`.
     /// - On CH failure: serialises the batch and spools it; returns `Ok(())`.
     /// - On spool full: returns `Err(WriteError::Backpressure)`.
-    pub async fn write(&self, batch: SpoolBatch) -> Result<(), WriteError> {
+    pub async fn write(&self, mut batch: SpoolBatch) -> Result<(), WriteError> {
+        // Metric firewall runs before insert/spool so spooled data is already
+        // filtered (replay re-inserts as-is). Dropping everything → nothing to do.
+        self.apply_firewall(&mut batch);
+        if batch.len() == 0 {
+            return Ok(());
+        }
         let row_count = batch.len();
         let table = batch.table();
 

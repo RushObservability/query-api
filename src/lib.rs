@@ -4,6 +4,7 @@ pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
 pub mod handlers;
+pub mod metric_firewall;
 pub mod migrations;
 pub mod models;
 pub mod monitor_engine;

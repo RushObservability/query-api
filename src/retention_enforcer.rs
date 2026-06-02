@@ -29,6 +29,13 @@ pub fn spawn_retention_enforcer(ch: Client, config: RushConfig, config_db: Arc<C
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
+            // Apply table-level TTLs from the UI-editable global-retention store
+            // (the source of truth; rush.toml only seeds it and was applied at boot).
+            if !dry_run {
+                if let Err(e) = apply_global_retention_ttls(&ch, &config_db).await {
+                    tracing::error!(error = %e, engine = "retention", "applying global retention TTLs failed");
+                }
+            }
             if let Err(e) = enforce_retention(&ch, &config).await {
                 tracing::error!(error = %e, engine = "retention", "global retention enforcement failed");
             }
@@ -182,6 +189,22 @@ async fn execute_or_log(ch: &Client, sql: &str, dry_run: bool) {
 ///
 /// Tenants wanting LONGER retention than global are not supported (the global
 /// TTL will have already removed the data).
+/// Read the global-retention store and apply the effective per-signal caps as
+/// table-level TTLs. This makes the UI-editable caps the source of truth.
+async fn apply_global_retention_ttls(ch: &Client, config_db: &ConfigDb) -> anyhow::Result<()> {
+    let g = match config_db.get_global_retention().await? {
+        Some(g) => g,
+        None => return Ok(()), // not seeded yet; boot-time rush.toml TTLs stand
+    };
+    crate::migrations::apply_retention_ttls(
+        ch,
+        g.effective_logs() as u32,
+        g.effective_metrics() as u32,
+        g.effective_apm() as u32,
+    )
+    .await
+}
+
 async fn enforce_tenant_retention(
     ch: &Client,
     config: &RushConfig,
@@ -200,9 +223,12 @@ async fn enforce_tenant_retention(
         "processing tenant retention overrides"
     );
 
-    let global_metrics = config.effective_metrics_ttl_days() as i32;
-    let global_traces = config.effective_traces_ttl_days() as i32;
-    let global_logs = config.effective_logs_ttl_days() as i32;
+    // Caps come from the global-retention store (falling back to rush.toml only
+    // if the store hasn't been seeded yet).
+    let store = config_db.get_global_retention().await?;
+    let global_metrics = store.map(|g| g.effective_metrics()).unwrap_or(config.effective_metrics_ttl_days() as i32);
+    let global_traces = store.map(|g| g.effective_apm()).unwrap_or(config.effective_traces_ttl_days() as i32);
+    let global_logs = store.map(|g| g.effective_logs()).unwrap_or(config.effective_logs_ttl_days() as i32);
 
     for (tenant_id, signal, retain_days) in &overrides {
         let global_days = match signal.as_str() {
@@ -269,6 +295,20 @@ async fn enforce_tenant_retention(
                     "ALTER TABLE observability.spans DELETE \
                      WHERE tenant_id = '{safe_tenant_id}' \
                      AND toDate(timestamp) < today() - {retain_days}"
+                );
+                execute_or_log(ch, &sql, dry_run).await;
+
+                // RUM is governed by the apm cap too (per product decision).
+                let sql = format!(
+                    "ALTER TABLE observability.rum DELETE \
+                     WHERE tenant_id = '{safe_tenant_id}' \
+                     AND toDate(Timestamp) < today() - {retain_days}"
+                );
+                execute_or_log(ch, &sql, dry_run).await;
+                let sql = format!(
+                    "ALTER TABLE observability.rum_replay DELETE \
+                     WHERE tenant_id = '{safe_tenant_id}' \
+                     AND toDate(chunk_ts) < today() - {retain_days}"
                 );
                 execute_or_log(ch, &sql, dry_run).await;
             }
