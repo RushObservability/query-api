@@ -8,6 +8,7 @@ pub mod metric_firewall;
 pub mod migrations;
 pub mod models;
 pub mod monitor_engine;
+pub mod object_store_spool;
 pub mod promql;
 pub mod query_builder;
 pub mod retention_enforcer;

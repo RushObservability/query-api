@@ -1,4 +1,6 @@
 use clickhouse::Client;
+use std::sync::Arc;
+use crate::spool::IngestBuffer;
 
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct CountRow {
@@ -10,19 +12,19 @@ struct BytesRow {
     total: u64,
 }
 
-pub fn spawn_stats_engine(ch: Client) {
+pub fn spawn_stats_engine(ch: Client, buffer: Arc<IngestBuffer>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            if let Err(e) = collect_and_write(&ch).await {
+            if let Err(e) = collect_and_write(&ch, &buffer).await {
                 tracing::error!("stats engine error: {e}");
             }
         }
     });
 }
 
-async fn collect_and_write(ch: &Client) -> anyhow::Result<()> {
+async fn collect_and_write(ch: &Client, buffer: &IngestBuffer) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     let now_nanos = now.timestamp_nanos_opt().unwrap_or(0);
     let one_hour_ago = (now - chrono::Duration::hours(1))
@@ -91,8 +93,16 @@ async fn collect_and_write(ch: &Client) -> anyhow::Result<()> {
         "SELECT sum(total_space) as total FROM system.disks WHERE type = 'Local'"
     ).await;
 
+    // ── Ingest buffer (durable spool) depth + drain progress ──
+    let buf_oldest = buffer.oldest_age_secs().await.unwrap_or(0);
+
     // ── Write all metrics ──
     let metrics: Vec<(&str, f64)> = vec![
+        ("rush_stats_ingest_buffer_pending_bytes", buffer.total_bytes() as f64),
+        ("rush_stats_ingest_buffer_pending_count", buffer.segment_count() as f64),
+        ("rush_stats_ingest_buffer_oldest_age_secs", buf_oldest as f64),
+        // Cumulative counter — drain rate = rate(rush_stats_ingest_buffer_committed_total).
+        ("rush_stats_ingest_buffer_committed_total", buffer.committed_total() as f64),
         ("rush_stats_span_events_total", span_total as f64),
         ("rush_stats_span_events_bytes", span_bytes as f64),
         ("rush_stats_logs_total", log_total as f64),

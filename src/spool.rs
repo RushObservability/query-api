@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SEGMENT_MAX_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB per segment
@@ -38,6 +39,8 @@ struct SpoolInner {
 
 pub struct Spool {
     inner: Mutex<SpoolInner>,
+    /// Monotonic count of segments successfully drained (for drain-rate metric).
+    committed: AtomicU64,
 }
 
 impl Spool {
@@ -76,7 +79,31 @@ impl Spool {
                 seq: max_seq,
                 current: None,
             }),
+            committed: AtomicU64::new(0),
         })
+    }
+
+    pub fn committed_total(&self) -> u64 {
+        self.committed.load(Ordering::Relaxed)
+    }
+
+    /// Age (seconds) of the oldest pending segment, parsed from its `seg-<ms>-`
+    /// filename. `None` when empty.
+    pub fn oldest_age_secs(&self) -> Option<u64> {
+        let g = self.inner.lock().unwrap();
+        let mut oldest_ms: Option<u64> = None;
+        for entry in fs::read_dir(&g.dir).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".spool") { continue; }
+            // seg-<ms:020>-<seq>.spool
+            if let Some(ms) = name.strip_prefix("seg-").and_then(|r| r.split('-').next()).and_then(|s| s.parse::<u64>().ok()) {
+                oldest_ms = Some(oldest_ms.map_or(ms, |o| o.min(ms)));
+            }
+        }
+        let ms = oldest_ms?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        Some(now.saturating_sub(ms) / 1000)
     }
 
     /// Append a record to the spool.  Returns `Err(SpoolFull)` when
@@ -220,10 +247,15 @@ impl Spool {
         let _ = fs::remove_file(path);
         let mut g = self.inner.lock().unwrap();
         g.total_bytes = g.total_bytes.saturating_sub(size);
+        self.committed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn total_bytes(&self) -> u64 {
         self.inner.lock().unwrap().total_bytes
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.inner.lock().unwrap().max_bytes
     }
 
     pub fn segment_count(&self) -> usize {
@@ -247,6 +279,138 @@ fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> std::io::Result<Option<
         Ok(_) => Ok(Some(())),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+// ─── Backend seam ────────────────────────────────────────────────────────────
+//
+// `IngestBuffer` is the backend the durable write path (`ChWriter`) writes
+// through. `Disk` is the default and needs no object store — it wraps the
+// segmented `Spool` above and preserves today's behavior exactly. An
+// `ObjectStore` variant (MinIO/S3 + manifest) is added later (see
+// docs/PRD-object-store-ingest-buffer.md); the replayer stays backend-agnostic
+// by going through `next_batch()` / `commit()`.
+
+/// A unit of spooled work for the replayer: the records to insert plus an opaque
+/// handle used to `commit` (remove/ack) them once successfully written to CH.
+pub struct DrainBatch {
+    pub records: Vec<(String, Vec<u8>)>,
+    handle: BatchHandle,
+}
+
+enum BatchHandle {
+    Disk(PathBuf),
+    ObjectStore(object_store::path::Path),
+}
+
+pub enum IngestBuffer {
+    Disk(Spool),
+    ObjectStore(crate::object_store_spool::ObjectStoreSpool),
+}
+
+impl IngestBuffer {
+    /// Append a framed record (failure-path hot call). 429 when over the cap.
+    pub async fn append(&self, table: &str, payload: &[u8]) -> Result<(), SpoolFull> {
+        match self {
+            IngestBuffer::Disk(s) => s.append(table, payload),
+            IngestBuffer::ObjectStore(s) => s.append(table, payload).await,
+        }
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        match self {
+            IngestBuffer::Disk(s) => s.total_bytes(),
+            IngestBuffer::ObjectStore(s) => s.total_bytes(),
+        }
+    }
+
+    pub fn segment_count(&self) -> usize {
+        match self {
+            IngestBuffer::Disk(s) => s.segment_count(),
+            IngestBuffer::ObjectStore(s) => s.segment_count(),
+        }
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            IngestBuffer::Disk(_) => "disk",
+            IngestBuffer::ObjectStore(_) => "object_store",
+        }
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        match self {
+            IngestBuffer::Disk(s) => s.max_bytes(),
+            IngestBuffer::ObjectStore(s) => s.max_bytes(),
+        }
+    }
+
+    /// Monotonic count of batches drained+committed (for the drain-rate metric).
+    pub fn committed_total(&self) -> u64 {
+        match self {
+            IngestBuffer::Disk(s) => s.committed_total(),
+            IngestBuffer::ObjectStore(s) => s.committed_total(),
+        }
+    }
+
+    /// Age (seconds) of the oldest pending batch — the replay lag. `None`/0 when empty.
+    pub async fn oldest_age_secs(&self) -> Option<u64> {
+        match self {
+            IngestBuffer::Disk(s) => s.oldest_age_secs(),
+            IngestBuffer::ObjectStore(s) => s.oldest_age_secs().await,
+        }
+    }
+
+    /// The next unit of work to replay, or `None` when empty. For the disk
+    /// backend this seals the open segment when no closed segment is available
+    /// (so a partial trailing batch still drains), and discards an unreadable
+    /// segment before trying the next.
+    pub async fn next_batch(&self) -> Option<DrainBatch> {
+        match self {
+            IngestBuffer::Disk(s) => {
+                // Loop (not recursion) to skip unreadable segments.
+                loop {
+                    let path = match s.take_oldest_segment() {
+                        Some(p) => p,
+                        None => {
+                            if s.total_bytes() > 0 {
+                                s.seal_current();
+                                match s.take_oldest_segment() {
+                                    Some(p) => p,
+                                    None => return None,
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                    };
+                    match Spool::read_segment(&path) {
+                        Ok(records) => return Some(DrainBatch { records, handle: BatchHandle::Disk(path) }),
+                        Err(e) => {
+                            tracing::error!(error = %e, segment = %path.display(), "ingest buffer: failed to read segment — discarding");
+                            s.remove_segment(&path);
+                            continue;
+                        }
+                    }
+                }
+            }
+            IngestBuffer::ObjectStore(s) => {
+                s.next_batch().await.map(|(key, records)| DrainBatch {
+                    records,
+                    handle: BatchHandle::ObjectStore(key),
+                })
+            }
+        }
+    }
+
+    /// Commit (remove/ack) a batch that was successfully drained to ClickHouse.
+    pub async fn commit(&self, batch: DrainBatch) {
+        match (self, batch.handle) {
+            (IngestBuffer::Disk(s), BatchHandle::Disk(path)) => s.remove_segment(&path),
+            (IngestBuffer::ObjectStore(s), BatchHandle::ObjectStore(key)) => s.commit(&key).await,
+            // Mismatched handle/backend can't happen (handles are minted by the same backend).
+            _ => tracing::error!("ingest buffer: commit handle/backend mismatch"),
+        }
     }
 }
 
