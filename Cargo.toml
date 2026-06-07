@@ -50,6 +50,8 @@ rmp-serde = "1"
 zstd = "0.13"
 tokio-stream = "0.1"
 futures-util = "0.3"
+object_store = { version = "=0.12.1", features = ["aws"] }
+bytes = "1"
 kube = { version = "0.98", features = ["client", "runtime", "derive"] }
 k8s-openapi = { version = "0.24", features = ["v1_32"] }
 base64 = "0.22"

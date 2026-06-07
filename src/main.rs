@@ -23,7 +23,7 @@ use rush_api::stats_engine;
 use rush_api::usage_accumulator::UsageAccumulator;
 use rush_api::usage_tracker;
 use rush_api::ch_writer::ChWriter;
-use rush_api::spool::Spool;
+use rush_api::spool::{IngestBuffer, Spool};
 use rush_api::AppState;
 use rush_api::TenantContext;
 
@@ -236,6 +236,28 @@ async fn resolve_tenant_from_headers(
 
 use axum::extract::State;
 
+/// Build the object-store ingest buffer from `RUSH_BUFFER_S3_*` env (reuses the
+/// standard S3/MinIO settings). Returns an error if required vars are missing so
+/// the caller can fall back to disk.
+async fn build_object_store_buffer(max_bytes: u64) -> anyhow::Result<IngestBuffer> {
+    let endpoint = std::env::var("RUSH_BUFFER_S3_ENDPOINT").unwrap_or_default();
+    let bucket = std::env::var("RUSH_BUFFER_S3_BUCKET")
+        .map_err(|_| anyhow::anyhow!("RUSH_BUFFER_S3_BUCKET is required for object_store backend"))?;
+    let prefix = std::env::var("RUSH_BUFFER_S3_PREFIX").unwrap_or_else(|_| "ingest/".to_string());
+    let region = std::env::var("RUSH_BUFFER_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let access = std::env::var("RUSH_BUFFER_S3_ACCESS_KEY")
+        .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+        .unwrap_or_default();
+    let secret = std::env::var("RUSH_BUFFER_S3_SECRET_KEY")
+        .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+        .unwrap_or_default();
+    let s = rush_api::object_store_spool::ObjectStoreSpool::open_s3(
+        &endpoint, &bucket, &prefix, &region, &access, &secret, max_bytes,
+    )
+    .await?;
+    Ok(IngestBuffer::ObjectStore(s))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -337,7 +359,19 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "wide@localhost".to_string()),
     };
 
-    // Spawn background engines
+    // Ingest-buffer drain controls (Phase 3):
+    //  RUSH_DRAIN_WORKER_ONLY=true → run only the buffer drain (no HTTP, no engines).
+    //  RUSH_RUN_REPLAYER=false     → don't drain in this process (API replicas opt out
+    //                                so the drain is single-writer in HA / object-store).
+    let drain_only = std::env::var("RUSH_DRAIN_WORKER_ONLY")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+    let run_replayer = std::env::var("RUSH_RUN_REPLAYER")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true);
+
+    // Spawn background engines (skipped in drain-worker-only mode)
+    if !drain_only {
     alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config.clone());
     slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
 
@@ -360,7 +394,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("in-process anomaly engine disabled (RUSH_RUN_ANOMALY_ENGINE=false); expecting a dedicated anomaly-engine deployment");
     }
     retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone(), config_db.clone());
-    stats_engine::spawn_stats_engine(ch.clone());
+    // stats_engine is spawned after the ingest buffer is built (it emits buffer metrics).
 
     // Spawn the Datadog-style monitor engine (v2 alerting)
     monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config);
@@ -368,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
     // Seed built-in SIEM detection rules and spawn the SIEM detection engine
     config_db.ensure_default_detection_rules().await?;
     siem_engine::spawn(ch.clone(), config_db.clone());
+    } // end `if !drain_only` (background engines)
 
     // ── Durable write path: spool + writer ──
     let spool_dir = std::env::var("RUSH_SPOOL_DIR")
@@ -377,12 +412,44 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2_147_483_648); // 2 GiB default
 
-    let spool = std::sync::Arc::new(
-        Spool::open(&spool_dir, spool_max_bytes)
-            .expect("failed to open spool directory"),
-    );
-    let writer = ChWriter::new(ch.clone(), spool);
-    writer.clone().spawn_replayer();
+    // Backend selection. Disk is the default and needs no object store. The
+    // object-store backend is opt-in via RUSH_BUFFER_BACKEND=object_store; if its
+    // config is missing/invalid we log and fall back to disk so ingestion always works.
+    let backend = std::env::var("RUSH_BUFFER_BACKEND").unwrap_or_else(|_| "disk".to_string());
+    let buffer = if backend == "object_store" {
+        match build_object_store_buffer(spool_max_bytes).await {
+            Ok(b) => {
+                tracing::info!("ingest buffer backend: object_store");
+                std::sync::Arc::new(b)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "object_store buffer backend failed to init — falling back to disk");
+                let spool = Spool::open(&spool_dir, spool_max_bytes).expect("failed to open spool directory");
+                std::sync::Arc::new(IngestBuffer::Disk(spool))
+            }
+        }
+    } else {
+        let spool = Spool::open(&spool_dir, spool_max_bytes).expect("failed to open spool directory");
+        std::sync::Arc::new(IngestBuffer::Disk(spool))
+    };
+    let writer = ChWriter::new(ch.clone(), buffer);
+    if drain_only || run_replayer {
+        writer.clone().spawn_replayer();
+    }
+    // Stats engine (emits ingest-buffer depth/age/drain metrics). API process only.
+    if !drain_only {
+        stats_engine::spawn_stats_engine(ch.clone(), writer.buffer.clone());
+    }
+
+    // Drain-worker-only: this process exists solely to drain the ingest buffer
+    // into ClickHouse. Don't serve HTTP, run engines, or load the firewall.
+    if drain_only {
+        tracing::info!(
+            backend = %backend,
+            "RUSH_DRAIN_WORKER_ONLY — draining ingest buffer to ClickHouse; not serving HTTP"
+        );
+        std::future::pending::<()>().await;
+    }
 
     // Metric firewall: load compiled rules now, then refresh periodically so
     // changes (incl. from other replicas) propagate to the ingest hot path.
@@ -790,6 +857,8 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::retention::get_global_retention)
                 .put(handlers::retention::set_global_retention),
         )
+        // Ingest buffer status (durable spool depth + backend)
+        .route("/api/v1/ingest/buffer", get(handlers::ingest_buffer::buffer_status))
         // Metric firewall (ingest-time block / drop-label rules)
         .route(
             "/api/v1/metric-firewall",

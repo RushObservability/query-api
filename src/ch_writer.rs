@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::ingest::{ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, RumReplayChunk, SumRow, SummaryRow, TraceInsertRow};
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
-use crate::spool::{Spool, SpoolFull};
+use crate::spool::{IngestBuffer, SpoolFull};
 
 // ─── Public error type ───────────────────────────────────────────────────────
 
@@ -94,21 +94,23 @@ impl SpoolBatch {
 
 // ─── ChWriter ────────────────────────────────────────────────────────────────
 
-/// Cloneable ClickHouse writer with integrated spool.
+/// Cloneable ClickHouse writer with an integrated durable buffer (spool).
 #[derive(Clone)]
 pub struct ChWriter {
     ch: Client,
-    pub spool: Arc<Spool>,
+    /// Durable failure-path buffer. Backend-agnostic: `Disk` (default, no object
+    /// store) or, later, `ObjectStore`. See `crate::spool::IngestBuffer`.
+    pub buffer: Arc<IngestBuffer>,
     /// Hot-swappable compiled metric firewall (applied to metric batches before
     /// insert/spool). Refreshed by a background task and on config change.
     pub firewall: Arc<std::sync::RwLock<Arc<crate::metric_firewall::MetricFirewall>>>,
 }
 
 impl ChWriter {
-    pub fn new(ch: Client, spool: Arc<Spool>) -> Self {
+    pub fn new(ch: Client, buffer: Arc<IngestBuffer>) -> Self {
         ChWriter {
             ch,
-            spool,
+            buffer,
             firewall: Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::metric_firewall::MetricFirewall::default(),
             ))),
@@ -167,7 +169,7 @@ impl ChWriter {
                 let payload = serde_json::to_vec(&batch)
                     .map_err(|e| WriteError::Fatal(format!("serde_json serialise: {e}")))?;
 
-                match self.spool.append(table, &payload) {
+                match self.buffer.append(table, &payload).await {
                     Ok(()) => Ok(()),
                     Err(SpoolFull) => Err(WriteError::Backpressure),
                 }
@@ -175,14 +177,14 @@ impl ChWriter {
         }
     }
 
-    /// Total bytes currently occupying the spool.
+    /// Total bytes currently occupying the buffer.
     pub fn spool_bytes(&self) -> u64 {
-        self.spool.total_bytes()
+        self.buffer.total_bytes()
     }
 
-    /// Number of segment files in the spool.
+    /// Number of pending segments/objects in the buffer.
     pub fn spool_segments(&self) -> usize {
-        self.spool.segment_count()
+        self.buffer.segment_count()
     }
 
     /// Spawn a background tokio task that replays spooled segments to CH.
@@ -196,45 +198,13 @@ impl ChWriter {
                 tokio::time::sleep(POLL_INTERVAL).await;
 
                 loop {
-                    let path = match self.spool.take_oldest_segment() {
-                        Some(p) => p,
-                        None => {
-                            // No closed segment, but the open segment may still
-                            // hold a partial batch. Seal it so it can be drained
-                            // (e.g. after CH recovers with no further traffic),
-                            // then retry once. If nothing got sealed, we're done.
-                            if self.spool.total_bytes() > 0 {
-                                self.spool.seal_current();
-                                match self.spool.take_oldest_segment() {
-                                    Some(p) => p,
-                                    None => break, // spool truly empty
-                                }
-                            } else {
-                                break; // spool empty
-                            }
-                        }
-                    };
-
-                    tracing::debug!(
-                        segment = %path.display(),
-                        "replayer: reading segment"
-                    );
-
-                    let records = match Spool::read_segment(&path) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                segment = %path.display(),
-                                "replayer: failed to read segment — discarding"
-                            );
-                            self.spool.remove_segment(&path);
-                            continue;
-                        }
+                    let drain = match self.buffer.next_batch().await {
+                        Some(d) => d,
+                        None => break, // buffer empty
                     };
 
                     let mut all_ok = true;
-                    for (table, payload) in &records {
+                    for (table, payload) in &drain.records {
                         let batch: SpoolBatch = match serde_json::from_slice(payload) {
                             Ok(b) => b,
                             Err(e) => {
@@ -259,15 +229,13 @@ impl ChWriter {
                     }
 
                     if all_ok {
-                        self.spool.remove_segment(&path);
-                        tracing::info!(
-                            segment = %path.display(),
-                            records = records.len(),
-                            "replayer: segment replayed and removed"
-                        );
+                        let n = drain.records.len();
+                        self.buffer.commit(drain).await;
+                        tracing::info!(records = n, "replayer: batch replayed and committed");
                         backoff = Duration::from_secs(5); // reset on success
                     } else {
                         // CH is still down — back off and stop this replay pass.
+                        // (drain not committed → retried next pass.)
                         tracing::warn!(
                             backoff_secs = backoff.as_secs(),
                             "replayer: CH unavailable, backing off"
