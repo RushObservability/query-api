@@ -52,8 +52,13 @@ fn map_write_err(e: WriteError) -> (StatusCode, String) {
     }
 }
 
+/// Max inflated OTLP body (decompression-bomb guard). Real OTLP batches are well
+/// under this; the OTel Collector's otlphttp exporter caps payloads far lower.
+const MAX_OTLP_BODY: usize = 64 * 1024 * 1024; // 64 MiB
+
 /// Decode an incoming request body as protobuf, returning 415 for JSON and
-/// 400 for other decode failures.
+/// 400 for other decode failures. Honors `Content-Encoding: gzip` (the OTel
+/// Collector's otlphttp exporter compresses by default), bounded by MAX_OTLP_BODY.
 fn decode_proto<T: Message + Default>(
     headers: &HeaderMap,
     body: &[u8],
@@ -69,7 +74,35 @@ fn decode_proto<T: Message + Default>(
             "OTLP JSON is not supported; use application/x-protobuf".to_string(),
         ));
     }
-    T::decode(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("protobuf decode failed: {e}")))
+
+    let encoding = headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let decoded: std::borrow::Cow<[u8]> = if encoding.contains("gzip") {
+        use std::io::Read;
+        // Read at most MAX_OTLP_BODY+1 so an over-large inflation is detected and
+        // rejected rather than exhausting memory.
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(body)
+            .take(MAX_OTLP_BODY as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("gzip decompress failed: {e}")))?;
+        if out.len() > MAX_OTLP_BODY {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("decompressed OTLP body exceeds {} byte limit", MAX_OTLP_BODY),
+            ));
+        }
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+
+    T::decode(decoded.as_ref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("protobuf decode failed: {e}")))
 }
 
 /// Convert an OTLP AnyValue to a String for storage as a span/log attribute value.
