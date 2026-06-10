@@ -52,15 +52,25 @@ async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<(
     let dry_run = config.retention.enforcer.dry_run;
 
     // ── Metric rules ──
-    for rule in &config.retention.metrics {
-        // Only enforce rules that are shorter than the table TTL
-        if rule.retain_days >= table_metrics_ttl {
-            continue;
-        }
-        let where_clause = build_metric_where(rule);
-        if where_clause.is_empty() {
-            continue;
-        }
+    // OR all rules' predicates together so each metric table gets ONE mutation
+    // per tick instead of one per rule (mutations are heavyweight in ClickHouse
+    // and queue serially).
+    let metric_preds: Vec<String> = config.retention.metrics.iter()
+        .filter(|rule| rule.retain_days < table_metrics_ttl)
+        .filter_map(|rule| {
+            let where_clause = build_metric_where(rule);
+            if where_clause.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "(toDateTime(TimeUnix) < now() - INTERVAL {} DAY AND {where_clause})",
+                    rule.retain_days
+                ))
+            }
+        })
+        .collect();
+    if !metric_preds.is_empty() {
+        let combined = metric_preds.join(" OR ");
         let metric_tables = [
             "metrics_gauge",
             "metrics_sum",
@@ -69,38 +79,38 @@ async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<(
             "metrics_summary",
         ];
         for table in metric_tables {
-            let sql = format!(
-                "ALTER TABLE observability.{table} DELETE WHERE \
-                 toDateTime(TimeUnix) < now() - INTERVAL {} DAY AND {where_clause}",
-                rule.retain_days
-            );
+            let sql = format!("ALTER TABLE observability.{table} DELETE WHERE {combined}");
             execute_or_log(ch, &sql, dry_run).await;
         }
     }
 
-    // ── Trace rules ──
-    for rule in &config.retention.traces {
-        if rule.retain_days >= table_traces_ttl {
-            continue;
-        }
-        // spans_raw
-        if let Some(clause) = build_trace_where_otel(rule) {
-            let sql = format!(
-                "ALTER TABLE observability.spans_raw DELETE WHERE \
-                 toDateTime(Timestamp) < now() - INTERVAL {} DAY AND {clause}",
-                rule.retain_days
-            );
-            execute_or_log(ch, &sql, dry_run).await;
-        }
-        // spans
-        if let Some(clause) = build_trace_where_wide(rule) {
-            let sql = format!(
-                "ALTER TABLE observability.spans DELETE WHERE \
-                 toDateTime(timestamp) < now() - INTERVAL {} DAY AND {clause}",
-                rule.retain_days
-            );
-            execute_or_log(ch, &sql, dry_run).await;
-        }
+    // ── Trace rules ── (same combining, per span table)
+    let otel_preds: Vec<String> = config.retention.traces.iter()
+        .filter(|rule| rule.retain_days < table_traces_ttl)
+        .filter_map(|rule| build_trace_where_otel(rule).map(|clause| format!(
+            "(toDateTime(Timestamp) < now() - INTERVAL {} DAY AND {clause})", rule.retain_days
+        )))
+        .collect();
+    if !otel_preds.is_empty() {
+        let sql = format!(
+            "ALTER TABLE observability.spans_raw DELETE WHERE {}",
+            otel_preds.join(" OR ")
+        );
+        execute_or_log(ch, &sql, dry_run).await;
+    }
+
+    let wide_preds: Vec<String> = config.retention.traces.iter()
+        .filter(|rule| rule.retain_days < table_traces_ttl)
+        .filter_map(|rule| build_trace_where_wide(rule).map(|clause| format!(
+            "(toDateTime(timestamp) < now() - INTERVAL {} DAY AND {clause})", rule.retain_days
+        )))
+        .collect();
+    if !wide_preds.is_empty() {
+        let sql = format!(
+            "ALTER TABLE observability.spans DELETE WHERE {}",
+            wide_preds.join(" OR ")
+        );
+        execute_or_log(ch, &sql, dry_run).await;
     }
 
     Ok(())

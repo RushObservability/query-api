@@ -10,7 +10,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,10 @@ struct SpoolInner {
     seq: u64,
     /// Currently open segment file + its current size.
     current: Option<(File, u64, PathBuf)>,
+    /// All segment paths (open + sealed), kept sorted. Zero-padded `seg-<ms>-<seq>`
+    /// names sort chronologically, so `first()` is the oldest. Maintained on
+    /// open/rotate/remove so stats and the replayer never have to read_dir.
+    segments: std::collections::BTreeSet<PathBuf>,
 }
 
 pub struct Spool {
@@ -52,8 +56,10 @@ impl Spool {
 
         let mut total_bytes: u64 = 0;
         let mut max_seq: u64 = 0;
+        let mut segments = std::collections::BTreeSet::new();
 
-        // Scan existing segments to restore byte count and find max sequence.
+        // Scan existing segments once at startup to restore byte count, max
+        // sequence, and the in-memory segment index.
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -61,6 +67,7 @@ impl Spool {
             if name_str.ends_with(".spool") {
                 let size = entry.metadata()?.len();
                 total_bytes += size;
+                segments.insert(entry.path());
 
                 // Parse seq from seg-<ms>-<seq>.spool
                 if let Some(seq) = parse_seq(&name_str) {
@@ -78,6 +85,7 @@ impl Spool {
                 total_bytes,
                 seq: max_seq,
                 current: None,
+                segments,
             }),
             committed: AtomicU64::new(0),
         })
@@ -88,20 +96,15 @@ impl Spool {
     }
 
     /// Age (seconds) of the oldest pending segment, parsed from its `seg-<ms>-`
-    /// filename. `None` when empty.
+    /// filename. `None` when empty. Served from the in-memory index — no I/O.
     pub fn oldest_age_secs(&self) -> Option<u64> {
         let g = self.inner.lock().unwrap();
-        let mut oldest_ms: Option<u64> = None;
-        for entry in fs::read_dir(&g.dir).ok()?.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.ends_with(".spool") { continue; }
-            // seg-<ms:020>-<seq>.spool
-            if let Some(ms) = name.strip_prefix("seg-").and_then(|r| r.split('-').next()).and_then(|s| s.parse::<u64>().ok()) {
-                oldest_ms = Some(oldest_ms.map_or(ms, |o| o.min(ms)));
-            }
-        }
-        let ms = oldest_ms?;
+        let oldest = g.segments.first()?;
+        let name = oldest.file_name()?.to_string_lossy().into_owned();
+        let ms = name
+            .strip_prefix("seg-")
+            .and_then(|r| r.split('-').next())
+            .and_then(|s| s.parse::<u64>().ok())?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         Some(now.saturating_sub(ms) / 1000)
     }
@@ -137,6 +140,7 @@ impl Spool {
                 .append(true)
                 .open(&path)
                 .map_err(|_| SpoolFull)?;
+            g.segments.insert(path.clone());
             g.current = Some((file, 0, path));
         }
 
@@ -156,32 +160,15 @@ impl Spool {
     }
 
     /// Take the path of the oldest closed (completed) segment, for replay.
-    /// Does NOT include the currently open segment.
+    /// Does NOT include the currently open segment. Served from the in-memory
+    /// index — no directory scan.
     pub fn take_oldest_segment(&self) -> Option<PathBuf> {
         let g = self.inner.lock().unwrap();
         let current_path = g.current.as_ref().map(|(_, _, p)| p.clone());
-
-        let mut segments: Vec<PathBuf> = {
-            fs::read_dir(&g.dir)
-                .ok()?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension().and_then(|e| e.to_str()) == Some("spool")
-                })
-                .collect()
-        };
-        segments.sort();
-
-        for seg in segments {
-            if let Some(ref cur) = current_path {
-                if &seg == cur {
-                    continue; // skip the open segment
-                }
-            }
-            return Some(seg);
-        }
-        None
+        g.segments
+            .iter()
+            .find(|seg| current_path.as_ref() != Some(seg))
+            .cloned()
     }
 
     /// Read all framed records from a segment file.
@@ -241,12 +228,13 @@ impl Spool {
         }
     }
 
-    /// Remove a segment file and update total_bytes.
+    /// Remove a segment file and update total_bytes + the in-memory index.
     pub fn remove_segment(&self, path: &Path) {
         let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let _ = fs::remove_file(path);
         let mut g = self.inner.lock().unwrap();
         g.total_bytes = g.total_bytes.saturating_sub(size);
+        g.segments.remove(path);
         self.committed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -258,17 +246,9 @@ impl Spool {
         self.inner.lock().unwrap().max_bytes
     }
 
+    /// Number of segments (open + sealed). In-memory index — no I/O.
     pub fn segment_count(&self) -> usize {
-        let g = self.inner.lock().unwrap();
-        fs::read_dir(&g.dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().extension().and_then(|x| x.to_str()) == Some("spool")
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
+        self.inner.lock().unwrap().segments.len()
     }
 }
 
@@ -310,10 +290,22 @@ pub enum IngestBuffer {
 
 impl IngestBuffer {
     /// Append a framed record (failure-path hot call). 429 when over the cap.
-    pub async fn append(&self, table: &str, payload: &[u8]) -> Result<(), SpoolFull> {
-        match self {
-            IngestBuffer::Disk(s) => s.append(table, payload),
-            IngestBuffer::ObjectStore(s) => s.append(table, payload).await,
+    /// Disk appends are blocking file writes serialized by the spool mutex, so
+    /// they run on the blocking pool — otherwise, exactly when ClickHouse is
+    /// down, every ingest request would do blocking I/O on a tokio worker.
+    pub async fn append(self: &Arc<Self>, table: &str, payload: Vec<u8>) -> Result<(), SpoolFull> {
+        match &**self {
+            IngestBuffer::Disk(_) => {
+                let me = Arc::clone(self);
+                let table = table.to_string();
+                tokio::task::spawn_blocking(move || match &*me {
+                    IngestBuffer::Disk(s) => s.append(&table, &payload),
+                    IngestBuffer::ObjectStore(_) => unreachable!(),
+                })
+                .await
+                .map_err(|_| SpoolFull)?
+            }
+            IngestBuffer::ObjectStore(s) => s.append(table, &payload).await,
         }
     }
 
@@ -364,35 +356,43 @@ impl IngestBuffer {
     /// The next unit of work to replay, or `None` when empty. For the disk
     /// backend this seals the open segment when no closed segment is available
     /// (so a partial trailing batch still drains), and discards an unreadable
-    /// segment before trying the next.
-    pub async fn next_batch(&self) -> Option<DrainBatch> {
-        match self {
-            IngestBuffer::Disk(s) => {
-                // Loop (not recursion) to skip unreadable segments.
-                loop {
-                    let path = match s.take_oldest_segment() {
-                        Some(p) => p,
-                        None => {
-                            if s.total_bytes() > 0 {
-                                s.seal_current();
-                                match s.take_oldest_segment() {
-                                    Some(p) => p,
-                                    None => return None,
+    /// segment before trying the next. Disk reads (up to a 32 MiB segment) and
+    /// the seal fsync run on the blocking pool.
+    pub async fn next_batch(self: &Arc<Self>) -> Option<DrainBatch> {
+        match &**self {
+            IngestBuffer::Disk(_) => {
+                let me = Arc::clone(self);
+                tokio::task::spawn_blocking(move || {
+                    let IngestBuffer::Disk(s) = &*me else { unreachable!() };
+                    // Loop (not recursion) to skip unreadable segments.
+                    loop {
+                        let path = match s.take_oldest_segment() {
+                            Some(p) => p,
+                            None => {
+                                if s.total_bytes() > 0 {
+                                    s.seal_current();
+                                    match s.take_oldest_segment() {
+                                        Some(p) => p,
+                                        None => return None,
+                                    }
+                                } else {
+                                    return None;
                                 }
-                            } else {
-                                return None;
+                            }
+                        };
+                        match Spool::read_segment(&path) {
+                            Ok(records) => return Some(DrainBatch { records, handle: BatchHandle::Disk(path) }),
+                            Err(e) => {
+                                tracing::error!(error = %e, segment = %path.display(), "ingest buffer: failed to read segment — discarding");
+                                s.remove_segment(&path);
+                                continue;
                             }
                         }
-                    };
-                    match Spool::read_segment(&path) {
-                        Ok(records) => return Some(DrainBatch { records, handle: BatchHandle::Disk(path) }),
-                        Err(e) => {
-                            tracing::error!(error = %e, segment = %path.display(), "ingest buffer: failed to read segment — discarding");
-                            s.remove_segment(&path);
-                            continue;
-                        }
                     }
-                }
+                })
+                .await
+                .ok()
+                .flatten()
             }
             IngestBuffer::ObjectStore(s) => {
                 s.next_batch().await.map(|(key, records)| DrainBatch {

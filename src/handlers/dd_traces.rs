@@ -227,7 +227,7 @@ pub async fn ingest_v04(
     // but we still accept it if present
     let _ = validate_api_key(&headers);
 
-    let raw = decompress_body(&headers, body)?;
+    let raw = decompress_body(&headers, body).await?;
 
     // Decode msgpack: Vec<Vec<DdSpan>> (array of traces, each trace is array of spans)
     let traces: Vec<Vec<DdSpan>> = rmp_serde::from_slice(&raw).map_err(|e| {
@@ -255,7 +255,7 @@ pub async fn ingest_v04(
     // Record usage for per-tenant ingest metering
     state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "traces",
         tenant_id = %tenant_id,
         spans_count = span_count,
@@ -292,7 +292,7 @@ pub async fn ingest_agent(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let _ = validate_api_key(&headers);
-    let raw = decompress_body(&headers, body)?;
+    let raw = decompress_body(&headers, body).await?;
 
     // Log content-type for debugging
     let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none");
@@ -312,22 +312,26 @@ pub async fn ingest_agent(
         Ok(payload) => {
         let env = payload.env.clone();
         let hostname = payload.host_name.clone();
-        let tp_count = payload.tracer_payloads.len();
-        let chunk_count: usize = payload.tracer_payloads.iter()
-            .map(|tp| tp.chunks.len() + tp.traces.len()).sum();
-        let total_spans: usize = payload.tracer_payloads.iter()
-            .flat_map(|tp| tp.chunks.iter().chain(tp.traces.iter()))
-            .map(|c| c.spans.len())
-            .sum();
-        tracing::debug!(
-            endpoint = "v0.2",
-            host = %hostname,
-            env = %env,
-            tracer_payloads = tp_count,
-            chunks = chunk_count,
-            spans = total_spans,
-            "protobuf payload decoded"
-        );
+        // The chunk/span sums exist only for this debug line — don't pay for
+        // them per request unless debug logging is actually enabled.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let tp_count = payload.tracer_payloads.len();
+            let chunk_count: usize = payload.tracer_payloads.iter()
+                .map(|tp| tp.chunks.len() + tp.traces.len()).sum();
+            let total_spans: usize = payload.tracer_payloads.iter()
+                .flat_map(|tp| tp.chunks.iter().chain(tp.traces.iter()))
+                .map(|c| c.spans.len())
+                .sum();
+            tracing::debug!(
+                endpoint = "v0.2",
+                host = %hostname,
+                env = %env,
+                tracer_payloads = tp_count,
+                chunks = chunk_count,
+                spans = total_spans,
+                "protobuf payload decoded"
+            );
+        }
         let mut span_count = 0usize;
         // Collect all spans from the protobuf payload
         let mut all_spans: Vec<DdSpan> = Vec::new();
@@ -386,7 +390,7 @@ pub async fn ingest_agent(
         // Record usage for per-tenant ingest metering (protobuf path)
         state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
 
-        tracing::info!(
+        tracing::debug!(
             signal = "traces",
             tenant_id = %tenant_id,
             spans_count = span_count,
@@ -423,7 +427,7 @@ pub async fn ingest_agent(
             // Record usage for per-tenant ingest metering (msgpack fallback path)
             state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
 
-            tracing::info!(
+            tracing::debug!(
                 signal = "traces",
                 tenant_id = %tenant_id,
                 spans_count = span_count,

@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("rush_api=debug,tower_http=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("rush_api=info,tower_http=info"));
 
     let log_format = std::env::var("RUSH_LOG_FORMAT").unwrap_or_else(|_| "pretty".to_string());
     match log_format.as_str() {
@@ -324,6 +324,14 @@ async fn main() -> anyhow::Result<()> {
         // Server-side INSERT buffering: ClickHouse batches writes internally,
         // reducing part creation rate at high ingest volume.
         // These options are silently ignored for SELECT queries.
+        //
+        // DURABILITY TRADEOFF (deliberate): wait_for_async_insert=0 means an
+        // insert is acked once buffered, BEFORE the server-side flush — a
+        // flush-time error (e.g. disk full) silently drops those rows and the
+        // disk spool never sees them, because the insert "succeeded". We accept
+        // that window for ingest throughput; the spool covers the common case
+        // (CH down/unreachable → insert errors → rows spooled). Set this to "1"
+        // if at-least-once mattering more than latency.
         .with_option("async_insert", "1")
         .with_option("wait_for_async_insert", "0")
         .with_compression(clickhouse::Compression::Lz4);
@@ -812,6 +820,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/features", get(handlers::settings::get_features))
         // Export row cap (admin-only setter; value also exposed via /features)
         .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
+        .route(
+            "/api/v1/settings/sre-agent",
+            get(handlers::settings::get_sre_agent_settings).put(handlers::settings::set_sre_agent_settings),
+        )
         // API Keys (settings)
         .route(
             "/api/v1/api-keys",

@@ -90,6 +90,19 @@ pub async fn create_tenant(
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
 
+    // Tenant names must be unique: telemetry rows and the X-Rush-Tenant header
+    // are keyed by NAME, so duplicate names would silently merge/split data.
+    // Case-insensitive to avoid "Test" vs "test" confusion. ClickHouse has no
+    // transactions, so a concurrent create could still race past this check —
+    // acceptable for an admin-only config endpoint.
+    let existing = state
+        .config_db
+        .list_tenants().await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
+    if existing.iter().any(|(_, n, ..)| n.eq_ignore_ascii_case(&name)) {
+        return Err((StatusCode::CONFLICT, format!("a tenant named \"{name}\" already exists")));
+    }
+
     let id = Uuid::new_v4().to_string();
 
     state

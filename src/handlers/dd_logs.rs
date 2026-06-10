@@ -71,7 +71,7 @@ async fn ingest_logs_inner(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_api_key(&headers)?;
 
-    let raw = decompress_body(&headers, body)?;
+    let raw = decompress_body(&headers, body).await?;
 
     // The DD agent sends either a JSON array or a single object
     let entries: Vec<DdLogEntry> = if raw.first() == Some(&b'[') {
@@ -174,7 +174,7 @@ async fn ingest_logs_inner(
     // Record usage for per-tenant ingest metering
     state.usage_accumulator.record(&tenant_id, "logs", count, raw.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "logs",
         tenant_id = %tenant_id,
         count = count,

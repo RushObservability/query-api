@@ -3,6 +3,19 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use dashmap::DashMap;
+use std::time::{Duration, Instant};
+
+/// (user_id, username, display_name, tenant_id, role) — the require_auth tuple.
+type SessionUser = (String, String, String, String, String);
+/// (id, name, enabled, auth_required) for a tenant; None = tenant not found.
+type TenantFlags = Option<(String, String, bool, bool)>;
+
+/// TTL for the config-plane read caches below. Mutations through this process
+/// clear the caches immediately; mutations from another replica are visible
+/// after at most this long. Keep it short — these exist to absorb the
+/// per-request auth fan-out, not to be a long-lived cache.
+const CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -76,10 +89,19 @@ pub struct MonitorRow {
 
 pub struct ConfigDb {
     pub client: Client,
+    /// Session token → cached auth tuple. Purged on logout and any user/group
+    /// mutation; otherwise expires after CONFIG_CACHE_TTL. This is the hottest
+    /// lookup in the service (every UI request).
+    session_cache: DashMap<String, (SessionUser, Instant)>,
+    /// Tenant name-or-id → flags. Negative results are cached too so unknown
+    /// tenants on the ingest path don't hammer ClickHouse.
+    tenant_cache: DashMap<String, (TenantFlags, Instant)>,
+    /// user_id → (scopes, permissions, tenant_ids).
+    perms_cache: DashMap<String, ((Vec<String>, Vec<String>, Vec<String>), Instant)>,
 }
 
 /// A metric firewall rule (storage + API shape). `enabled`/`*_regex` are 0/1.
-/// `action` is "block" or "drop_label".
+/// `action` is "allow", "block" or "drop_label".
 #[derive(Debug, Clone, clickhouse::Row, serde::Deserialize, serde::Serialize)]
 pub struct MetricFirewallRule {
     pub id: String,
@@ -136,9 +158,27 @@ impl ConfigDb {
             .with_url(url)
             .with_user(user)
             .with_password(password);
-        let db = Self { client };
+        let db = Self {
+            client,
+            session_cache: DashMap::new(),
+            tenant_cache: DashMap::new(),
+            perms_cache: DashMap::new(),
+        };
         db.run_migrations().await?;
         Ok(db)
+    }
+
+    /// Drop all config-plane caches. Called by every tenant/user/group mutation:
+    /// coarse but cheap (the caches rebuild on next request), and it guarantees
+    /// permission changes made through this process take effect immediately.
+    fn invalidate_config_caches(&self) {
+        self.session_cache.clear();
+        self.tenant_cache.clear();
+        self.perms_cache.clear();
+    }
+
+    fn cache_fresh(at: Instant) -> bool {
+        at.elapsed() < CONFIG_CACHE_TTL
     }
 
     async fn run_migrations(&self) -> anyhow::Result<()> {
@@ -795,6 +835,7 @@ impl ConfigDb {
     }
 
     pub async fn create_tenant(&self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.invalidate_config_caches();
         let ver = Self::next_version();
         let now = Self::now_str();
         self.client
@@ -823,22 +864,42 @@ impl ConfigDb {
         }
     }
 
-    pub async fn get_tenant_id_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
+    /// Cached tenant flag lookup by name OR id. One query feeds
+    /// `is_tenant_enabled`, `is_tenant_auth_required` and `get_tenant_id_by_name`,
+    /// which the tenant middleware may call several times per request.
+    /// Negative results (unknown tenant) are cached too.
+    async fn tenant_flags(&self, name_or_id: &str) -> TenantFlags {
+        if let Some(entry) = self.tenant_cache.get(name_or_id) {
+            let (flags, at) = entry.value();
+            if Self::cache_fresh(*at) {
+                return flags.clone();
+            }
+        }
         #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row { id: String }
+        struct Row { id: String, name: String, enabled: u8, auth_required: u8 }
         let result = self.client
-            .query("SELECT id FROM config_tenants FINAL WHERE name = ? AND enabled = 1 AND is_deleted = 0 LIMIT 1")
-            .bind(name)
+            .query("SELECT id, name, enabled, auth_required FROM config_tenants FINAL WHERE (id = ? OR name = ?) AND is_deleted = 0 LIMIT 1")
+            .bind(name_or_id)
+            .bind(name_or_id)
             .fetch_one::<Row>()
             .await;
-        match result {
-            Ok(r) => Ok(Some(r.id)),
-            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let flags: TenantFlags = match result {
+            Ok(r) => Some((r.id, r.name, r.enabled != 0, r.auth_required != 0)),
+            Err(_) => None,
+        };
+        self.tenant_cache.insert(name_or_id.to_string(), (flags.clone(), Instant::now()));
+        flags
+    }
+
+    pub async fn get_tenant_id_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
+        // Preserves prior semantics: only enabled tenants resolve by name.
+        Ok(self.tenant_flags(name).await
+            .filter(|(_, n, enabled, _)| *enabled && n == name)
+            .map(|(id, ..)| id))
     }
 
     pub async fn set_tenant_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<bool> {
+        self.invalidate_config_caches();
         let existing = self.get_tenant(id).await?;
         let (_, name, _, auth_required, created_at) = match existing {
             Some(t) => t,
@@ -859,36 +920,19 @@ impl ConfigDb {
     }
 
     pub async fn is_tenant_enabled(&self, name_or_id: &str) -> bool {
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row { enabled: u8 }
-        let result = self.client
-            .query("SELECT enabled FROM config_tenants FINAL WHERE (id = ? OR name = ?) AND is_deleted = 0 LIMIT 1")
-            .bind(name_or_id)
-            .bind(name_or_id)
-            .fetch_one::<Row>()
-            .await;
-        match result {
-            Ok(r) => r.enabled != 0,
-            Err(_) => false,
-        }
+        self.tenant_flags(name_or_id).await
+            .map(|(_, _, enabled, _)| enabled)
+            .unwrap_or(false)
     }
 
     pub async fn is_tenant_auth_required(&self, name_or_id: &str) -> bool {
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row { auth_required: u8 }
-        let result = self.client
-            .query("SELECT auth_required FROM config_tenants FINAL WHERE (id = ? OR name = ?) AND is_deleted = 0 LIMIT 1")
-            .bind(name_or_id)
-            .bind(name_or_id)
-            .fetch_one::<Row>()
-            .await;
-        match result {
-            Ok(r) => r.auth_required != 0,
-            Err(_) => false,
-        }
+        self.tenant_flags(name_or_id).await
+            .map(|(_, _, _, auth_required)| auth_required)
+            .unwrap_or(false)
     }
 
     pub async fn set_tenant_auth_required(&self, id: &str, auth_required: bool) -> anyhow::Result<bool> {
+        self.invalidate_config_caches();
         let existing = self.get_tenant(id).await?;
         let (_, name, enabled, _, created_at) = match existing {
             Some(t) => t,
@@ -909,6 +953,7 @@ impl ConfigDb {
     }
 
     pub async fn delete_tenant(&self, id: &str) -> anyhow::Result<bool> {
+        self.invalidate_config_caches();
         let existing = self.get_tenant(id).await?;
         let (_, name, enabled, auth_required, created_at) = match existing {
             Some(t) => t,
@@ -1192,6 +1237,14 @@ impl ConfigDb {
     }
 
     pub async fn get_session_user(&self, token: &str) -> Option<(String, String, String, String, String)> {
+        // Hot path: every session-authenticated request lands here (middleware
+        // plus most handlers). Serve from cache when fresh.
+        if let Some(entry) = self.session_cache.get(token) {
+            let (user, at) = entry.value();
+            if Self::cache_fresh(*at) {
+                return Some(user.clone());
+            }
+        }
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row { id: String, username: String, display_name: String, tenant_id: String, expires_at: String, user_id: String }
         let now = Self::now_str();
@@ -1203,14 +1256,19 @@ impl ConfigDb {
             .await;
         let row = result.ok()?;
         let role = self.derive_user_role(&row.id).await.unwrap_or_else(|_| "viewer".to_string());
-        Some((row.id, row.username, row.display_name, row.tenant_id, role))
+        let user: SessionUser = (row.id, row.username, row.display_name, row.tenant_id, role);
+        self.session_cache.insert(token.to_string(), (user.clone(), Instant::now()));
+        Some(user)
     }
 
     pub async fn delete_session(&self, token: &str) {
-        // Sessions use MergeTree with TTL; we delete by inserting a tombstone via ALTER DELETE
-        // For simplicity we use the lightweight mutation approach
+        // Purge the auth cache first so logout takes effect immediately even if
+        // the storage delete lags.
+        self.session_cache.remove(token);
+        // Lightweight DELETE instead of a heavyweight ALTER ... DELETE mutation:
+        // marks rows via a mask column instead of rewriting parts.
         let _ = self.client
-            .query("ALTER TABLE config_sessions DELETE WHERE token = ?")
+            .query("DELETE FROM config_sessions WHERE token = ?")
             .bind(token)
             .execute()
             .await;
@@ -1227,6 +1285,7 @@ impl ConfigDb {
     }
 
     pub async fn create_user(&self, username: &str, password: &str, display_name: &str) -> anyhow::Result<String> {
+        self.invalidate_config_caches();
         let id = uuid::Uuid::new_v4().to_string();
         let password_hash = hash_password(password)?;
         let now = Self::now_str();
@@ -1245,6 +1304,7 @@ impl ConfigDb {
     }
 
     pub async fn delete_user(&self, id: &str) -> anyhow::Result<bool> {
+        self.invalidate_config_caches();
         let existing = self.get_user(id).await?;
         if existing.is_none() { return Ok(false); }
         // Remove sessions
@@ -1317,6 +1377,7 @@ impl ConfigDb {
     }
 
     pub async fn set_user_enabled(&self, user_id: &str, enabled: bool) -> anyhow::Result<bool> {
+        self.invalidate_config_caches();
         let existing = self.get_user(user_id).await?;
         let (_, username, display_name, tenant_id, _, created_at) = match existing {
             Some(u) => u,
@@ -1482,6 +1543,7 @@ impl ConfigDb {
     }
 
     pub async fn create_group(&self, name: &str, description: &str, scopes: &str, permissions: &str) -> anyhow::Result<String> {
+        self.invalidate_config_caches();
         let id = uuid::Uuid::new_v4().to_string();
         let now = Self::now_str();
         let ver = Self::next_version();
@@ -1500,6 +1562,7 @@ impl ConfigDb {
     }
 
     pub async fn update_group(&self, id: &str, description: &str, scopes: &str, permissions: &str) -> anyhow::Result<bool> {
+        self.invalidate_config_caches();
         let existing = self.get_group(id).await?;
         let (_, name, _, _, _, system, created_at, _) = match existing {
             Some(g) => g,
@@ -1522,6 +1585,7 @@ impl ConfigDb {
     }
 
     pub async fn delete_group(&self, id: &str) -> anyhow::Result<Result<bool, String>> {
+        self.invalidate_config_caches();
         let existing = self.get_group(id).await?;
         let (_, name, description, scopes, permissions, system, created_at, _) = match existing {
             Some(g) => g,
@@ -1544,6 +1608,7 @@ impl ConfigDb {
     }
 
     pub async fn set_group_tenants(&self, group_id: &str, tenant_ids: &[String]) -> anyhow::Result<()> {
+        self.invalidate_config_caches();
         // Soft-delete existing bindings
         let existing_tids = self.get_group_tenant_ids(group_id).await?;
         for tid in &existing_tids {
@@ -1582,6 +1647,7 @@ impl ConfigDb {
     }
 
     pub async fn set_user_groups(&self, user_id: &str, group_ids: &[String]) -> anyhow::Result<()> {
+        self.invalidate_config_caches();
         let existing = self.get_user_groups(user_id).await?;
         for gid in &existing {
             let ver = Self::next_version();
@@ -1607,26 +1673,38 @@ impl ConfigDb {
     }
 
     pub async fn resolve_user_permissions(&self, user_id: &str) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
-        let group_ids = self.get_user_groups(user_id).await?;
+        if let Some(entry) = self.perms_cache.get(user_id) {
+            let (perms, at) = entry.value();
+            if Self::cache_fresh(*at) {
+                return Ok(perms.clone());
+            }
+        }
+
         let mut all_scopes = std::collections::HashSet::new();
         let mut all_permissions = std::collections::HashSet::new();
         let mut all_tenant_ids = std::collections::HashSet::new();
 
-        for gid in &group_ids {
-            #[derive(clickhouse::Row, serde::Deserialize)]
-            struct GRow { scopes: String, permissions: String }
-            if let Ok(g) = self.client
-                .query("SELECT scopes, permissions FROM config_groups FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
-                .bind(gid)
-                .fetch_one::<GRow>()
-                .await
-            {
-                if let Ok(s) = serde_json::from_str::<Vec<String>>(&g.scopes) { all_scopes.extend(s); }
-                if let Ok(p) = serde_json::from_str::<Vec<String>>(&g.permissions) { all_permissions.extend(p); }
-            }
-            let tids = self.get_group_tenant_ids(gid).await?;
-            all_tenant_ids.extend(tids);
+        // Two fixed queries regardless of group count (previously 1 + 2·N).
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct GRow { scopes: String, permissions: String }
+        let groups = self.client
+            .query("SELECT g.scopes, g.permissions FROM config_user_groups ug FINAL JOIN config_groups g FINAL ON ug.group_id = g.id WHERE ug.user_id = ? AND ug.is_deleted = 0 AND g.is_deleted = 0")
+            .bind(user_id)
+            .fetch_all::<GRow>()
+            .await?;
+        for g in &groups {
+            if let Ok(s) = serde_json::from_str::<Vec<String>>(&g.scopes) { all_scopes.extend(s); }
+            if let Ok(p) = serde_json::from_str::<Vec<String>>(&g.permissions) { all_permissions.extend(p); }
         }
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct TRow { tenant_id: String }
+        let tids = self.client
+            .query("SELECT gt.tenant_id FROM config_user_groups ug FINAL JOIN config_group_tenants gt FINAL ON ug.group_id = gt.group_id WHERE ug.user_id = ? AND ug.is_deleted = 0 AND gt.is_deleted = 0")
+            .bind(user_id)
+            .fetch_all::<TRow>()
+            .await?;
+        all_tenant_ids.extend(tids.into_iter().map(|r| r.tenant_id));
 
         if all_scopes.contains("all") {
             all_scopes = std::collections::HashSet::from(["all".to_string()]);
@@ -1636,11 +1714,13 @@ impl ConfigDb {
             all_permissions.insert("write".to_string());
         }
 
-        Ok((
-            all_scopes.into_iter().collect(),
-            all_permissions.into_iter().collect(),
-            all_tenant_ids.into_iter().collect(),
-        ))
+        let result = (
+            all_scopes.into_iter().collect::<Vec<_>>(),
+            all_permissions.into_iter().collect::<Vec<_>>(),
+            all_tenant_ids.into_iter().collect::<Vec<_>>(),
+        );
+        self.perms_cache.insert(user_id.to_string(), (result.clone(), Instant::now()));
+        Ok(result)
     }
 
     // ── SSO provider operations ────────────────────────────────────────────────

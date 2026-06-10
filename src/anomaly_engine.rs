@@ -145,7 +145,22 @@ async fn eval_anomaly_rules(
         tracing::debug!(engine = "anomaly", rules_due = due_rules.len(), "tick -- evaluating rules");
     }
 
-    for rule in due_rules {
+    // Prefetch every due rule's data concurrently — the fetches are independent
+    // reads, so the tick pays for the slowest fetch instead of the sum of all.
+    let fetched = futures_util::future::join_all(due_rules.iter().map(|rule| async move {
+        match rule.source.as_str() {
+            "apm" => Some(fetch_apm_data(ch, rule, &now).await),
+            "prometheus" => Some(fetch_prom_data(http_client, prom_base_url, rule, &now).await),
+            _ => None,
+        }
+    }))
+    .await;
+
+    // Per-series eval logs are accumulated here and written as ONE batch insert
+    // at the end of the tick (previously one INSERT per series per rule).
+    let mut eval_log_values: Vec<String> = Vec::new();
+
+    for (rule, prefetched) in due_rules.into_iter().zip(fetched) {
         tracing::debug!(
             engine = "anomaly",
             rule_name = %rule.name,
@@ -154,10 +169,9 @@ async fn eval_anomaly_rules(
             "evaluating rule"
         );
 
-        let all_series = match rule.source.as_str() {
-            "apm" => fetch_apm_data(ch, &rule, &now).await,
-            "prometheus" => fetch_prom_data(http_client, prom_base_url, &rule, &now).await,
-            _ => {
+        let all_series = match prefetched {
+            Some(r) => r,
+            None => {
                 tracing::warn!(engine = "anomaly", rule_id = %rule.id, source = %rule.source, "unknown data source");
                 continue;
             }
@@ -210,10 +224,8 @@ async fn eval_anomaly_rules(
                 "series evaluated"
             );
 
-            // Write a log per series evaluation to ClickHouse
-            if let Err(e) = insert_anomaly_log(ch, &now, &rule, series_state, metric_label, latest_val, result.mean, result.deviation).await {
-                tracing::warn!(error = %e, engine = "anomaly", rule_name = %rule.name, "failed to write eval log");
-            }
+            // Collect the eval log row; flushed in one batch insert per tick.
+            eval_log_values.push(anomaly_log_tuple(&now, &rule, series_state, metric_label, latest_val, result.mean, result.deviation));
 
             if result.anomalous {
                 any_anomalous = true;
@@ -269,6 +281,17 @@ async fn eval_anomaly_rules(
             );
         } else {
             config_db.update_anomaly_state(&rule.id, new_state, &now_str, None).await?;
+        }
+    }
+
+    // Flush all per-series eval logs in one INSERT (previously one per series).
+    if !eval_log_values.is_empty() {
+        let sql = format!(
+            "INSERT INTO logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES {}",
+            eval_log_values.join(", ")
+        );
+        if let Err(e) = ch.query(&sql).execute().await {
+            tracing::warn!(error = %e, engine = "anomaly", rows = eval_log_values.len(), "failed to write eval log batch");
         }
     }
 
@@ -393,8 +416,9 @@ async fn fetch_prom_data(
     Ok(results)
 }
 
-async fn insert_anomaly_log(
-    ch: &Client,
+/// Build one VALUES tuple for a per-series eval log row. Rows are accumulated
+/// across the whole tick and flushed in a single batch INSERT.
+fn anomaly_log_tuple(
     now: &chrono::DateTime<chrono::Utc>,
     rule: &AnomalyRule,
     state: &str,
@@ -402,7 +426,7 @@ async fn insert_anomaly_log(
     value: f64,
     expected: f64,
     deviation: f64,
-) -> anyhow::Result<()> {
+) -> String {
     let ts_nanos = now.timestamp_nanos_opt().unwrap_or(now.timestamp() * 1_000_000_000);
     let severity_text = if state == "anomalous" { "WARN" } else { "INFO" };
     let severity_number: u8 = if state == "anomalous" { 13 } else { 9 }; // WARN=13, INFO=9
@@ -412,9 +436,8 @@ async fn insert_anomaly_log(
         rule.name, state, metric, value, expected, deviation,
     );
 
-    let sql = format!(
-        "INSERT INTO logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES \
-         ({ts_nanos}, '{severity_text}', {severity_number}, 'wide-anomaly-engine', '{body}', \
+    format!(
+        "({ts_nanos}, '{severity_text}', {severity_number}, 'wide-anomaly-engine', '{body}', \
          {{'anomaly.rule_id': '{rule_id}', 'anomaly.rule_name': '{rule_name}', 'anomaly.state': '{state}', \
          'anomaly.metric': '{metric}', 'anomaly.value': '{value:.2}', 'anomaly.expected': '{expected:.2}', \
          'anomaly.deviation': '{deviation:.1}'}})",
@@ -425,14 +448,11 @@ async fn insert_anomaly_log(
         rule_id = rule.id,
         rule_name = crate::query_builder::escape_string_literal(&rule.name),
         state = state,
-        metric = crate::query_builder::escape_string_literal(&metric),
+        metric = crate::query_builder::escape_string_literal(metric),
         value = value,
         expected = expected,
         deviation = deviation,
-    );
-
-    ch.query(&sql).execute().await?;
-    Ok(())
+    )
 }
 
 async fn send_notifications(
