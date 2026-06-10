@@ -164,6 +164,73 @@ pub async fn set_export_max_rows(
     Ok(Json(serde_json::json!({ "export_max_rows": value })))
 }
 
+/// Defaults + clamps for the SRE agent's per-investigation cost budget. Must
+/// stay in sync with sre-agent's LoopBudget (which re-clamps defensively).
+const SRE_AGENT_DEFAULT_MAX_TOOL_STEPS: u64 = 40;
+const SRE_AGENT_DEFAULT_MAX_LLM_CALLS: u64 = 55;
+
+/// GET /api/v1/settings/sre-agent — admin only.
+/// Current investigation budget (defaults when unset).
+pub async fn get_sre_agent_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let read = |key: &'static str, default: u64| {
+        let db = state.config_db.clone();
+        async move {
+            db.get_setting(key).await.ok().flatten()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
+        }
+    };
+    let max_tool_steps = read("sre_agent_max_tool_steps", SRE_AGENT_DEFAULT_MAX_TOOL_STEPS).await;
+    let max_llm_calls = read("sre_agent_max_llm_calls", SRE_AGENT_DEFAULT_MAX_LLM_CALLS).await;
+    Ok(Json(serde_json::json!({
+        "max_tool_steps": max_tool_steps,
+        "max_llm_calls": max_llm_calls,
+        "defaults": {
+            "max_tool_steps": SRE_AGENT_DEFAULT_MAX_TOOL_STEPS,
+            "max_llm_calls": SRE_AGENT_DEFAULT_MAX_LLM_CALLS,
+        },
+    })))
+}
+
+/// PUT /api/v1/settings/sre-agent — admin only.
+/// Sets the SRE agent's per-investigation budget: max tool-executing rounds
+/// and max total LLM calls (cost control). Values are clamped server-side;
+/// the agent clamps again on read.
+pub async fn set_sre_agent_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+
+    let steps = body.get("max_tool_steps").and_then(|v| v.as_u64()).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "missing or invalid 'max_tool_steps' (expected a positive integer)".to_string())
+    })?;
+    let calls = body.get("max_llm_calls").and_then(|v| v.as_u64()).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "missing or invalid 'max_llm_calls' (expected a positive integer)".to_string())
+    })?;
+
+    let steps = steps.clamp(4, 200);
+    // LLM calls must exceed tool steps (retries/critique/summary need slack).
+    let calls = calls.clamp(steps + 2, 300);
+
+    for (key, value) in [
+        ("sre_agent_max_tool_steps", steps),
+        ("sre_agent_max_llm_calls", calls),
+    ] {
+        state.config_db.set_setting(key, &value.to_string()).await.map_err(|e| {
+            tracing::error!(error = %e, key, "failed to save sre-agent setting");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+        })?;
+    }
+
+    Ok(Json(serde_json::json!({ "max_tool_steps": steps, "max_llm_calls": calls })))
+}
+
 pub async fn delete_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -169,7 +169,7 @@ impl ChWriter {
                 let payload = serde_json::to_vec(&batch)
                     .map_err(|e| WriteError::Fatal(format!("serde_json serialise: {e}")))?;
 
-                match self.buffer.append(table, &payload).await {
+                match self.buffer.append(table, payload).await {
                     Ok(()) => Ok(()),
                     Err(SpoolFull) => Err(WriteError::Backpressure),
                 }

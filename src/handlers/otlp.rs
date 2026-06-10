@@ -56,12 +56,16 @@ fn map_write_err(e: WriteError) -> (StatusCode, String) {
 /// under this; the OTel Collector's otlphttp exporter caps payloads far lower.
 const MAX_OTLP_BODY: usize = 64 * 1024 * 1024; // 64 MiB
 
+/// Bodies larger than this (or any compressed body) are decompressed/decoded on
+/// the blocking pool so multi-hundred-ms CPU work never stalls a tokio worker.
+const OFFLOAD_THRESHOLD: usize = 256 * 1024;
+
 /// Decode an incoming request body as protobuf, returning 415 for JSON and
 /// 400 for other decode failures. Honors `Content-Encoding: gzip` (the OTel
 /// Collector's otlphttp exporter compresses by default), bounded by MAX_OTLP_BODY.
-fn decode_proto<T: Message + Default>(
+async fn decode_proto<T: Message + Default + Send + 'static>(
     headers: &HeaderMap,
-    body: &[u8],
+    body: Bytes,
 ) -> Result<T, (StatusCode, String)> {
     let ct = headers
         .get("content-type")
@@ -75,16 +79,29 @@ fn decode_proto<T: Message + Default>(
         ));
     }
 
-    let encoding = headers
+    let gzip = headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+        .contains("gzip");
 
-    let decoded: std::borrow::Cow<[u8]> = if encoding.contains("gzip") {
+    if gzip || body.len() > OFFLOAD_THRESHOLD {
+        // Decompression + protobuf decode are synchronous CPU work; run them on
+        // the blocking pool. `Bytes` is cheap to move across threads.
+        tokio::task::spawn_blocking(move || decode_proto_sync::<T>(gzip, &body))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode task failed: {e}")))?
+    } else {
+        decode_proto_sync::<T>(gzip, &body)
+    }
+}
+
+fn decode_proto_sync<T: Message + Default>(gzip: bool, body: &[u8]) -> Result<T, (StatusCode, String)> {
+    let decoded: std::borrow::Cow<[u8]> = if gzip {
         use std::io::Read;
         // Read at most MAX_OTLP_BODY+1 so an over-large inflation is detected and
-        // rejected rather than exhausting memory.
+        // rejected rather than exhausting memory (decompression-bomb guard).
         let mut out = Vec::new();
         flate2::read::GzDecoder::new(body)
             .take(MAX_OTLP_BODY as u64 + 1)
@@ -234,7 +251,7 @@ pub async fn ingest_otlp_traces(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
 
-    let req: ExportTraceServiceRequest = decode_proto(&headers, &body)?;
+    let req: ExportTraceServiceRequest = decode_proto(&headers, body.clone()).await?;
 
     let mut rows: Vec<TraceInsertRow> = Vec::new();
 
@@ -364,7 +381,7 @@ pub async fn ingest_otlp_traces(
         .usage_accumulator
         .record(tenant_id, "traces", count as u64, body.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "traces",
         tenant_id = %tenant_id,
         spans_count = count,
@@ -385,7 +402,7 @@ pub async fn ingest_otlp_logs(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
 
-    let req: ExportLogsServiceRequest = decode_proto(&headers, &body)?;
+    let req: ExportLogsServiceRequest = decode_proto(&headers, body.clone()).await?;
 
     let mut rows: Vec<LogInsertRow> = Vec::new();
 
@@ -470,7 +487,7 @@ pub async fn ingest_otlp_logs(
         .usage_accumulator
         .record(tenant_id, "logs", count as u64, body.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "logs",
         tenant_id = %tenant_id,
         count = count,
@@ -491,7 +508,7 @@ pub async fn ingest_otlp_metrics(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
 
-    let req: ExportMetricsServiceRequest = decode_proto(&headers, &body)?;
+    let req: ExportMetricsServiceRequest = decode_proto(&headers, body.clone()).await?;
 
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
@@ -781,7 +798,7 @@ pub async fn ingest_otlp_metrics(
         .usage_accumulator
         .record(tenant_id, "metrics", total as u64, body.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "metrics",
         tenant_id = %tenant_id,
         total = total,
@@ -835,11 +852,12 @@ pub struct VectorLogEntry {
     pub span_id: String,
     #[serde(default)]
     pub trace_flags: u32,
-    /// Flat JSON object.  Missing keys → empty map.
+    /// Flat JSON object.  Missing keys → empty map. Deserialized straight into
+    /// a map (not a generic Value) so attrs are parsed exactly once.
     #[serde(default)]
-    pub resource_attributes: serde_json::Value,
+    pub resource_attributes: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
-    pub log_attributes: serde_json::Value,
+    pub log_attributes: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub scope_name: String,
     #[serde(default)]
@@ -847,21 +865,17 @@ pub struct VectorLogEntry {
 }
 
 /// Flatten a JSON object into Vec<(String,String)>.
-/// Non-objects and non-string leaf values are stringified.
-fn json_obj_to_attrs(v: &serde_json::Value) -> Vec<(String, String)> {
-    match v {
-        serde_json::Value::Object(map) => map
-            .iter()
-            .map(|(k, v)| {
-                let s = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                (k.clone(), s)
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+/// Non-string leaf values are stringified.
+fn json_obj_to_attrs(map: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    map.iter()
+        .map(|(k, v)| {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), s)
+        })
+        .collect()
 }
 
 pub async fn ingest_vector_logs(

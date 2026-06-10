@@ -28,12 +28,25 @@ pub fn validate_api_key(headers: &HeaderMap) -> Result<(), (StatusCode, String)>
 const MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Decompress body based on Content-Encoding header (gzip, deflate, zstd, or identity).
-pub fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
+/// Compressed bodies are inflated on the blocking pool — decompression is
+/// synchronous CPU work that would otherwise stall a tokio worker for the
+/// duration (tens to hundreds of ms on large agent payloads).
+pub async fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
     let encoding = headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
+    if encoding.contains("gzip") || encoding.contains("deflate") || encoding.contains("zstd") || encoding.contains("zstandard") {
+        tokio::task::spawn_blocking(move || decompress_body_sync(&encoding, body))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decompress task failed: {e}")))?
+    } else {
+        Ok(body.to_vec())
+    }
+}
 
+fn decompress_body_sync(encoding: &str, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
     if encoding.contains("gzip") {
         use std::io::Read;
         let decoder = flate2::read::GzDecoder::new(body.as_ref());
@@ -56,7 +69,8 @@ pub fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (Sta
             return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
         }
         Ok(out)
-    } else if encoding.contains("zstd") || encoding.contains("zstandard") {
+    } else {
+        // zstd / zstandard (only reachable for these encodings via the async wrapper)
         let out = zstd::decode_all(body.as_ref()).map_err(|e| {
             (StatusCode::BAD_REQUEST, format!("zstd decompression failed: {e}"))
         })?;
@@ -64,8 +78,6 @@ pub fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (Sta
             return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
         }
         Ok(out)
-    } else {
-        Ok(body.to_vec())
     }
 }
 

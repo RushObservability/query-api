@@ -32,69 +32,81 @@ async fn collect_and_write(ch: &Client, buffer: &IngestBuffer) -> anyhow::Result
         .to_string();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    // ── Span stats ──
-    let span_total = query_count(ch, &format!(
+    // All of these queries are independent — run them concurrently so the tick's
+    // wall time is the slowest query, not the sum of all of them (~14 round trips).
+    let q_spans = format!(
         "SELECT count() as count FROM spans_raw WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
-    )).await;
-
-    let span_bytes = query_bytes(ch,
-        "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans_raw' AND active"
-    ).await;
-
-    // ── Log stats ──
-    let log_total = query_count(ch, &format!(
+    );
+    let q_logs = format!(
         "SELECT count() as count FROM logs WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
-    )).await;
-
-    // ── Metric stats ──
-    let metric_gauge = query_count(ch, &format!(
+    );
+    let q_gauge = format!(
         "SELECT count() as count FROM metrics_gauge WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
-    )).await;
-    let metric_sum = query_count(ch, &format!(
+    );
+    let q_sum = format!(
         "SELECT count() as count FROM metrics_sum WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
-    )).await;
-    let metric_hist = query_count(ch, &format!(
+    );
+    let q_hist = format!(
         "SELECT count() as count FROM metrics_histogram WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
-    )).await;
+    );
+    let (
+        span_total,
+        span_bytes,
+        log_total,
+        metric_gauge,
+        metric_sum,
+        metric_hist,
+        unique_series,
+        storage_bytes,
+        storage_rows,
+        storage_local_bytes,
+        storage_object_store_bytes,
+        disk_local_free_bytes,
+        disk_local_total_bytes,
+        buf_oldest,
+    ) = tokio::join!(
+        query_count(ch, &q_spans),
+        query_bytes(ch,
+            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans_raw' AND active"
+        ),
+        query_count(ch, &q_logs),
+        query_count(ch, &q_gauge),
+        query_count(ch, &q_sum),
+        query_count(ch, &q_hist),
+        query_count(ch,
+            "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR"
+        ),
+        query_bytes(ch,
+            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND active"
+        ),
+        query_count(ch,
+            "SELECT sum(rows) as count FROM system.parts WHERE database = 'observability' AND active"
+        ),
+        // Tiered storage breakdown: data bytes on local disk vs object store.
+        // Classified by joining each part's disk to system.disks.type, matching
+        // the on-demand /stats endpoint. Object store = any non-Local disk.
+        query_bytes(ch,
+            "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
+             LEFT JOIN system.disks d ON p.disk_name = d.name \
+             WHERE p.database = 'observability' AND p.active AND d.type = 'Local'"
+        ),
+        query_bytes(ch,
+            "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
+             LEFT JOIN system.disks d ON p.disk_name = d.name \
+             WHERE p.database = 'observability' AND p.active AND d.type != 'Local'"
+        ),
+        // Local disk capacity (headroom) from system.disks.
+        query_bytes(ch,
+            "SELECT sum(free_space) as total FROM system.disks WHERE type = 'Local'"
+        ),
+        query_bytes(ch,
+            "SELECT sum(total_space) as total FROM system.disks WHERE type = 'Local'"
+        ),
+        // Ingest buffer (durable spool) replay lag.
+        buffer.oldest_age_secs(),
+    );
     let metric_total = metric_gauge + metric_sum + metric_hist;
-
-    let unique_series = query_count(ch,
-        "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR"
-    ).await;
-
-    // ── Storage ──
-    let storage_bytes: u64 = ch.query(
-        "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND active"
-    ).fetch_one::<BytesRow>().await.map(|r| r.total).unwrap_or(0);
-
-    let storage_rows = query_count(ch,
-        "SELECT sum(rows) as count FROM system.parts WHERE database = 'observability' AND active"
-    ).await;
-
-    // ── Tiered storage breakdown: data bytes on local disk vs object store ──
-    // Classified by joining each part's disk to system.disks.type, matching the
-    // on-demand /stats endpoint. Object store = any non-Local disk (S3/MinIO).
-    let storage_local_bytes = query_bytes(ch,
-        "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
-         LEFT JOIN system.disks d ON p.disk_name = d.name \
-         WHERE p.database = 'observability' AND p.active AND d.type = 'Local'"
-    ).await;
-    let storage_object_store_bytes = query_bytes(ch,
-        "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
-         LEFT JOIN system.disks d ON p.disk_name = d.name \
-         WHERE p.database = 'observability' AND p.active AND d.type != 'Local'"
-    ).await;
-
-    // ── Local disk capacity (headroom) from system.disks ──
-    let disk_local_free_bytes = query_bytes(ch,
-        "SELECT sum(free_space) as total FROM system.disks WHERE type = 'Local'"
-    ).await;
-    let disk_local_total_bytes = query_bytes(ch,
-        "SELECT sum(total_space) as total FROM system.disks WHERE type = 'Local'"
-    ).await;
-
-    // ── Ingest buffer (durable spool) depth + drain progress ──
-    let buf_oldest = buffer.oldest_age_secs().await.unwrap_or(0);
+    let buf_oldest = buf_oldest.unwrap_or(0);
 
     // ── Write all metrics ──
     let metrics: Vec<(&str, f64)> = vec![

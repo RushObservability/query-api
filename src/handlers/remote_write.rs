@@ -106,27 +106,34 @@ pub async fn prom_remote_write(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("snappy"));
 
-    // Decompress snappy — Prometheus remote write always uses snappy framing
-    // Try snappy decompression; if it fails and content-encoding isn't snappy,
-    // treat as raw protobuf (for flexibility with custom senders).
-    let decompressed = match snap::raw::Decoder::new().decompress_vec(&body) {
-        Ok(data) => data,
-        Err(_) if !is_snappy => body.to_vec(),
-        Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("snappy decompression failed: {e}"),
-            ));
-        }
-    };
-
-    // Decode protobuf
-    let write_req = WriteRequest::decode(decompressed.as_slice()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("protobuf decode failed: {e}"),
-        )
-    })?;
+    // Decompress snappy — Prometheus remote write always uses snappy framing.
+    // Decompression + protobuf decode are synchronous CPU work; run them on the
+    // blocking pool so large remote_write batches don't stall a tokio worker.
+    // If decompression fails and content-encoding isn't snappy, treat as raw
+    // protobuf (for flexibility with custom senders).
+    let (write_req, decompressed_len) = tokio::task::spawn_blocking(move || {
+        let decompressed = match snap::raw::Decoder::new().decompress_vec(&body) {
+            Ok(data) => data,
+            Err(_) if !is_snappy => body.to_vec(),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("snappy decompression failed: {e}"),
+                ));
+            }
+        };
+        let len = decompressed.len();
+        WriteRequest::decode(decompressed.as_slice())
+            .map(|req| (req, len))
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("protobuf decode failed: {e}"),
+                )
+            })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode task failed: {e}")))??;
 
     if write_req.timeseries.is_empty() {
         return Ok(StatusCode::NO_CONTENT);
@@ -223,7 +230,7 @@ pub async fn prom_remote_write(
     })?;
 
     // Record usage for per-tenant ingest metering (use decompressed size for bytes)
-    state.usage_accumulator.record(tenant_id, "metrics", sample_count as u64, decompressed.len() as u64);
+    state.usage_accumulator.record(tenant_id, "metrics", sample_count as u64, decompressed_len as u64);
 
     tracing::info!(
         signal = "metrics",

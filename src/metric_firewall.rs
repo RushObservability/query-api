@@ -3,10 +3,15 @@
 //! Rules are evaluated against every metric datapoint as it flows through
 //! `ChWriter` (covering OTLP, Datadog, and Prometheus ingest uniformly). Each
 //! rule either:
+//!   - **allows** the datapoint — a matching series is exempt from all block
+//!     rules (enables allowlist mode: one catch-all block rule + allow rules),
 //!   - **blocks** the datapoint (drops the whole series), matched by metric name
 //!     (literal/regex) and/or a label key+value (literal/regex), or
 //!   - **drops labels** from the series whose key matches a literal/regex,
 //!     optionally scoped to a metric/label match.
+//!
+//! Precedence is fixed: allow → block. Drop-label rules always apply, even to
+//! allowed series — allow exempts from blocking, not from label stripping.
 //!
 //! Compiled rules live behind `Arc<RwLock<Arc<MetricFirewall>>>` in `ChWriter`
 //! and are hot-swapped by a background refresher / on config change, so the
@@ -57,8 +62,18 @@ impl Matcher {
 }
 
 #[derive(Clone)]
+enum CompiledAction {
+    /// Exempt matching series from all block rules.
+    Allow,
+    /// Drop matching series entirely.
+    Block,
+    /// Strip label KEYS matching the inner matcher from matching series.
+    DropLabel(Matcher),
+}
+
+#[derive(Clone)]
 struct CompiledRule {
-    block: bool,
+    action: CompiledAction,
     /// Metric-name match (Any = any metric).
     metric: Matcher,
     /// Optional label condition: series must carry `label_key` whose value
@@ -66,9 +81,6 @@ struct CompiledRule {
     /// label condition.
     label_key: Option<String>,
     label_value: Matcher,
-    /// For drop-label rules: which label KEYS to strip (Any = strip all labels
-    /// on a matching series — guarded against below). None for block rules.
-    drop_label: Option<Matcher>,
 }
 
 impl CompiledRule {
@@ -88,16 +100,51 @@ impl CompiledRule {
     }
 }
 
-/// A compiled, ready-to-evaluate set of firewall rules.
+/// A set of rules for one action, with a literal-metric-name fast path: rules
+/// whose metric matcher is an exact string are bucketed by name so a row only
+/// pays a HashMap probe for them; regex/any-metric rules stay in a scan list.
+#[derive(Clone, Default)]
+struct RuleSet {
+    by_literal: std::collections::HashMap<String, Vec<CompiledRule>>,
+    scan: Vec<CompiledRule>,
+}
+
+impl RuleSet {
+    fn is_empty(&self) -> bool {
+        self.by_literal.is_empty() && self.scan.is_empty()
+    }
+
+    fn push(&mut self, rule: CompiledRule) {
+        if let Matcher::Literal(name) = &rule.metric {
+            self.by_literal.entry(name.clone()).or_default().push(rule);
+        } else {
+            self.scan.push(rule);
+        }
+    }
+
+    fn matches(&self, name: &str, attrs: &[(String, String)]) -> bool {
+        if let Some(rules) = self.by_literal.get(name) {
+            if rules.iter().any(|r| r.predicate_matches(name, attrs)) {
+                return true;
+            }
+        }
+        self.scan.iter().any(|r| r.predicate_matches(name, attrs))
+    }
+}
+
+/// A compiled, ready-to-evaluate set of firewall rules, pre-partitioned by
+/// action so `apply` never scans rules of the wrong kind.
 #[derive(Clone, Default)]
 pub struct MetricFirewall {
-    rules: Vec<CompiledRule>,
+    allow: RuleSet,
+    block: RuleSet,
+    drop: Vec<CompiledRule>,
 }
 
 /// Raw rule fields as stored in `config_metric_firewall` (also the API shape).
 pub struct RawRule {
     pub enabled: bool,
-    pub action: String, // "block" | "drop_label"
+    pub action: String, // "allow" | "block" | "drop_label"
     pub metric_pattern: String,
     pub metric_regex: bool,
     pub match_label_key: String,
@@ -111,57 +158,80 @@ impl MetricFirewall {
     /// Compile raw rules; invalid-regex rules are skipped (logged) rather than
     /// failing the whole set.
     pub fn compile(raw: &[RawRule]) -> Self {
-        let mut rules = Vec::new();
+        let mut fw = MetricFirewall::default();
         for r in raw {
             if !r.enabled {
                 continue;
             }
-            let block = r.action != "drop_label";
             let Some(metric) = Matcher::build(&r.metric_pattern, r.metric_regex) else { continue };
             let label_key = if r.match_label_key.is_empty() { None } else { Some(r.match_label_key.clone()) };
             let Some(label_value) = Matcher::build(&r.match_label_value, r.match_label_value_regex) else { continue };
 
-            let drop_label = if block {
-                None
-            } else {
-                // A drop-label rule needs a non-empty drop pattern, otherwise it
-                // would strip every label — refuse that (require an explicit key).
-                if r.drop_label_pattern.is_empty() {
-                    tracing::warn!("metric firewall: drop_label rule has empty label pattern, skipping");
-                    continue;
+            let action = match r.action.as_str() {
+                "allow" => {
+                    // An allow rule with no criteria would exempt everything and
+                    // silently neuter every block rule — refuse it (the API also
+                    // rejects this; guard here for rows written by other paths).
+                    if matches!(metric, Matcher::Any) && label_key.is_none() {
+                        tracing::warn!("metric firewall: allow rule has no match criteria, skipping");
+                        continue;
+                    }
+                    CompiledAction::Allow
                 }
-                match Matcher::build(&r.drop_label_pattern, r.drop_label_regex) {
-                    Some(m) => Some(m),
-                    None => continue,
+                "drop_label" => {
+                    // A drop-label rule needs a non-empty drop pattern, otherwise it
+                    // would strip every label — refuse that (require an explicit key).
+                    if r.drop_label_pattern.is_empty() {
+                        tracing::warn!("metric firewall: drop_label rule has empty label pattern, skipping");
+                        continue;
+                    }
+                    match Matcher::build(&r.drop_label_pattern, r.drop_label_regex) {
+                        Some(m) => CompiledAction::DropLabel(m),
+                        None => continue,
+                    }
                 }
+                // Unknown action strings have always compiled as block; keep that.
+                _ => CompiledAction::Block,
             };
 
-            rules.push(CompiledRule { block, metric, label_key, label_value, drop_label });
+            let rule = CompiledRule { action, metric, label_key, label_value };
+            match &rule.action {
+                CompiledAction::Allow => fw.allow.push(rule),
+                CompiledAction::Block => fw.block.push(rule),
+                CompiledAction::DropLabel(_) => fw.drop.push(rule),
+            }
         }
-        MetricFirewall { rules }
+        fw
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.allow.is_empty() && self.block.is_empty() && self.drop.is_empty()
     }
 
     /// Apply all rules to a batch of metric rows in place. Returns the number of
-    /// datapoints dropped (for logging/metrics).
+    /// datapoints dropped (for logging/metrics). Rules are pre-partitioned by
+    /// action, and literal-name rules are probed via HashMap, so each row scans
+    /// only regex/any-metric rules of the relevant action.
     pub fn apply<T: MetricRow>(&self, rows: &mut Vec<T>) -> usize {
-        if self.rules.is_empty() {
+        if self.is_empty() {
             return 0;
         }
         let before = rows.len();
         rows.retain_mut(|row| {
-            for rule in &self.rules {
-                if !rule.predicate_matches(row.fw_metric_name(), row.fw_attributes()) {
-                    continue;
-                }
-                if rule.block {
+            // Allow rules take precedence over block rules: a series matching any
+            // allow rule cannot be blocked (labels may still be stripped below).
+            if !self.block.is_empty() {
+                let allowed = !self.allow.is_empty()
+                    && self.allow.matches(row.fw_metric_name(), row.fw_attributes());
+                if !allowed && self.block.matches(row.fw_metric_name(), row.fw_attributes()) {
                     return false; // drop the whole datapoint
                 }
-                if let Some(dl) = &rule.drop_label {
-                    row.fw_attributes_mut().retain(|(k, _)| !dl.matches(k));
+            }
+            for rule in &self.drop {
+                if rule.predicate_matches(row.fw_metric_name(), row.fw_attributes()) {
+                    if let CompiledAction::DropLabel(dl) = &rule.action {
+                        row.fw_attributes_mut().retain(|(k, _)| !dl.matches(k));
+                    }
                 }
             }
             true
@@ -243,5 +313,61 @@ mod tests {
         let mut rows = vec![row("m", &[("a", "b")])];
         assert_eq!(fw.apply(&mut rows), 0);
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn allowlist_mode_catch_all_block_plus_allow() {
+        // "Block all, then allow": a match-everything block rule with allow
+        // exemptions. Rule order must not matter (allow has fixed precedence).
+        let fw = MetricFirewall::compile(&[
+            raw("block", "", false, "", "", false, "", false), // catch-all block
+            raw("allow", "^http_.*", true, "", "", false, "", false),
+            raw("allow", "", false, "team", "core", false, "", false),
+        ]);
+        let mut rows = vec![
+            row("http_requests_total", &[]),          // allowed by metric
+            row("node_cpu_seconds", &[("team", "core")]), // allowed by label
+            row("node_cpu_seconds", &[("team", "web")]),  // blocked
+            row("go_goroutines", &[]),                    // blocked
+        ];
+        assert_eq!(fw.apply(&mut rows), 2);
+        let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["http_requests_total", "node_cpu_seconds"]);
+        assert_eq!(rows[1].attrs[0].1, "core");
+    }
+
+    #[test]
+    fn allow_exempts_blocking_but_not_label_stripping() {
+        let fw = MetricFirewall::compile(&[
+            raw("allow", "^http_.*", true, "", "", false, "", false),
+            raw("block", "^http_.*", true, "", "", false, "", false),
+            raw("drop_label", "", false, "", "", false, "^tmp_.*", true),
+        ]);
+        let mut rows = vec![row("http_requests_total", &[("method", "GET"), ("tmp_debug", "1")])];
+        assert_eq!(fw.apply(&mut rows), 0); // allow beats block
+        assert_eq!(rows.len(), 1);
+        // ...but drop_label still applied to the allowed series.
+        assert_eq!(rows[0].attrs, vec![("method".to_string(), "GET".to_string())]);
+    }
+
+    #[test]
+    fn allow_without_block_changes_nothing() {
+        let fw = MetricFirewall::compile(&[raw("allow", "^http_.*", true, "", "", false, "", false)]);
+        let mut rows = vec![row("http_requests_total", &[]), row("node_cpu", &[])];
+        assert_eq!(fw.apply(&mut rows), 0);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn match_all_allow_rule_is_refused_at_compile() {
+        // An allow rule with no criteria would neuter every block rule — the
+        // compiler must skip it so blocks still apply.
+        let fw = MetricFirewall::compile(&[
+            raw("allow", "", false, "", "", false, "", false), // skipped
+            raw("block", "^node_.*", true, "", "", false, "", false),
+        ]);
+        let mut rows = vec![row("node_cpu", &[]), row("http_x", &[])];
+        assert_eq!(fw.apply(&mut rows), 1);
+        assert_eq!(rows[0].name, "http_x");
     }
 }

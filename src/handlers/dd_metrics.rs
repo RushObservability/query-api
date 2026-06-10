@@ -173,7 +173,7 @@ pub async fn ingest_v1(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     validate_api_key(&headers)?;
-    let raw = decompress_body(&headers, body)?;
+    let raw = decompress_body(&headers, body).await?;
 
     let payload: V1SeriesPayload = serde_json::from_slice(&raw).map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}"))
@@ -243,7 +243,7 @@ pub async fn ingest_v1(
     // Record usage for per-tenant ingest metering
     state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "metrics",
         tenant_id = %tenant_id,
         series_count = payload.series.len(),
@@ -269,7 +269,7 @@ pub async fn ingest_v2(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     validate_api_key(&headers)?;
-    let raw = decompress_body(&headers, body)?;
+    let raw = decompress_body(&headers, body).await?;
 
     // DD agent v7 sends protobuf by default for v2/series.
     // Try JSON first; if it fails, accept gracefully (protobuf support TODO).
@@ -363,7 +363,7 @@ pub async fn ingest_v2(
     // Record usage for per-tenant ingest metering
     state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "metrics",
         tenant_id = %tenant_id,
         series_count = payload.series.len(),
@@ -386,7 +386,7 @@ pub async fn check_run(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     validate_api_key(&headers)?;
-    let raw = decompress_body(&headers, body)?;
+    let raw = decompress_body(&headers, body).await?;
 
     // Agent may send null or non-array — handle gracefully
     let checks: Vec<ServiceCheck> = match serde_json::from_slice(&raw) {
@@ -433,7 +433,7 @@ pub async fn check_run(
     // Record usage for per-tenant ingest metering
     state.usage_accumulator.record(tenant_id, "metrics", checks.len() as u64, raw.len() as u64);
 
-    tracing::info!(
+    tracing::debug!(
         signal = "metrics",
         tenant_id = %tenant_id,
         count = checks.len(),
