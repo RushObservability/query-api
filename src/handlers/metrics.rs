@@ -5,13 +5,38 @@ use axum::{
     response::IntoResponse,
     Extension,
 };
+use dashmap::DashMap;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use crate::AppState;
 use crate::TenantContext;
 use crate::models::metrics::*;
 use crate::promql;
+
+/// Short-TTL cache for Prometheus metadata endpoints (/labels, /label/{name}/values).
+/// Grafana variable refresh hammers these with the same expressions; each miss costs
+/// two 1h table scans. Keys embed the tenant_id so entries never cross tenants.
+static PROM_META_CACHE: LazyLock<DashMap<String, (Vec<String>, Instant)>> =
+    LazyLock::new(DashMap::new);
+const PROM_META_TTL: Duration = Duration::from_secs(60);
+const PROM_META_CACHE_MAX: usize = 10_000;
+
+fn prom_meta_cache_get(key: &str) -> Option<Vec<String>> {
+    PROM_META_CACHE
+        .get(key)
+        .filter(|e| e.1.elapsed() < PROM_META_TTL)
+        .map(|e| e.0.clone())
+}
+
+fn prom_meta_cache_put(key: String, values: Vec<String>) {
+    if PROM_META_CACHE.len() > PROM_META_CACHE_MAX {
+        PROM_META_CACHE.clear(); // defensive cap against unbounded distinct exprs
+    }
+    PROM_META_CACHE.insert(key, (values, Instant::now()));
+}
 
 // ═══ Prometheus-compatible API endpoints ═══
 
@@ -264,28 +289,30 @@ async fn prom_series_inner(
 
         let where_clause = where_parts.join(" AND ");
 
-        // Query both gauge and sum tables
-        for table in &["metrics_gauge", "metrics_sum"] {
-            let sql = format!(
+        // Query gauge and sum tables concurrently — one of them is almost always
+        // empty for a given metric, so serializing the two round-trips just added
+        // latency.
+        let make_sql = |table: &str| {
+            format!(
                 "SELECT DISTINCT MetricName, ServiceName, Attributes \
                  FROM {table} \
                  WHERE {where_clause} \
                  LIMIT 1000"
+            )
+        };
+        let (gauge_sql, sum_sql) = (make_sql("metrics_gauge"), make_sql("metrics_sum"));
+        let (gauge_rows, sum_rows) = tokio::join!(
+            crate::tenant_query(&state.ch, &gauge_sql, tenant_id).fetch_all::<SeriesRow>(),
+            crate::tenant_query(&state.ch, &sum_sql, tenant_id).fetch_all::<SeriesRow>(),
+        );
+
+        for row in gauge_rows.unwrap_or_default().into_iter().chain(sum_rows.unwrap_or_default()) {
+            let labels = promql::build_label_set(
+                &row.metric_name,
+                &row.service_name,
+                &row.attributes,
             );
-
-            let rows: Vec<SeriesRow> = crate::tenant_query(&state.ch, &sql, tenant_id)
-                .fetch_all()
-                .await
-                .unwrap_or_default();
-
-            for row in rows {
-                let labels = promql::build_label_set(
-                    &row.metric_name,
-                    &row.service_name,
-                    &row.attributes,
-                );
-                all_series.push(labels);
-            }
+            all_series.push(labels);
         }
     }
 
@@ -314,6 +341,13 @@ pub async fn prom_labels(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+
+    // 60s TTL cache keyed by (tenant, match expression).
+    let cache_key = format!("labels|{tenant_id}|{}", params.match_expr.as_deref().unwrap_or(""));
+    if let Some(cached) = prom_meta_cache_get(&cache_key) {
+        return Ok(Json(PromResponse { status: "success", data: cached }));
+    }
+
     // Return well-known labels plus discovered attribute keys
     let mut labels = vec![
         "__name__".to_string(),
@@ -344,9 +378,9 @@ pub async fn prom_labels(
         None
     });
 
-    // Discover attribute keys from gauge and sum tables
-    for table in &["metrics_gauge", "metrics_sum"] {
-        let sql = format!(
+    // Discover attribute keys from gauge and sum tables, concurrently.
+    let make_sql = |table: &str| {
+        format!(
             "SELECT DISTINCT arrayJoin(mapKeys(Attributes)) AS name \
              FROM {table} \
              WHERE tenant_id = '{escaped_tenant}' \
@@ -355,22 +389,24 @@ pub async fn prom_labels(
              ORDER BY name \
              LIMIT 200",
             filter = metric_filter.as_deref().unwrap_or("")
-        );
+        )
+    };
+    let (gauge_sql, sum_sql) = (make_sql("metrics_gauge"), make_sql("metrics_sum"));
+    let (gauge_rows, sum_rows) = tokio::join!(
+        crate::tenant_query(&state.ch, &gauge_sql, tenant_id).fetch_all::<LabelNameRow>(),
+        crate::tenant_query(&state.ch, &sum_sql, tenant_id).fetch_all::<LabelNameRow>(),
+    );
 
-        let rows: Vec<LabelNameRow> = crate::tenant_query(&state.ch, &sql, tenant_id)
-            .fetch_all()
-            .await
-            .unwrap_or_default();
-
-        for row in rows {
-            if !row.name.is_empty() && !labels.contains(&row.name) {
-                labels.push(row.name);
-            }
+    for row in gauge_rows.unwrap_or_default().into_iter().chain(sum_rows.unwrap_or_default()) {
+        if !row.name.is_empty() && !labels.contains(&row.name) {
+            labels.push(row.name);
         }
     }
 
     labels.sort();
     labels.dedup();
+
+    prom_meta_cache_put(cache_key, labels.clone());
 
     Ok(Json(PromResponse {
         status: "success",
@@ -388,6 +424,16 @@ pub async fn prom_label_values(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+
+    // 60s TTL cache keyed by (tenant, label, match expression).
+    let cache_key = format!(
+        "values|{tenant_id}|{label_name}|{}",
+        params.match_expr.as_deref().unwrap_or("")
+    );
+    if let Some(cached) = prom_meta_cache_get(&cache_key) {
+        return Ok(Json(PromResponse { status: "success", data: cached }));
+    }
+
     let mut values = Vec::new();
 
     let metric_filter = params.match_expr.as_ref().and_then(|m| {
@@ -408,49 +454,51 @@ pub async fn prom_label_values(
     });
     let filter = metric_filter.as_deref().unwrap_or("");
 
-    for table in &["metrics_gauge", "metrics_sum"] {
-        let sql = match label_name.as_str() {
-            "__name__" => format!(
-                "SELECT DISTINCT MetricName AS value FROM {table} \
+    let make_sql = |table: &str| match label_name.as_str() {
+        "__name__" => format!(
+            "SELECT DISTINCT MetricName AS value FROM {table} \
+             WHERE tenant_id = '{escaped_tenant}' \
+             AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             {filter} \
+             ORDER BY value LIMIT 500"
+        ),
+        "service_name" | "job" => format!(
+            "SELECT DISTINCT ServiceName AS value FROM {table} \
+             WHERE tenant_id = '{escaped_tenant}' \
+             AND TimeUnix >= now() - INTERVAL 1 HOUR \
+             {filter} \
+             ORDER BY value LIMIT 500"
+        ),
+        _ => {
+            let escaped = crate::query_builder::escape_string_literal(&label_name);
+            format!(
+                "SELECT DISTINCT Attributes['{escaped}'] AS value FROM {table} \
                  WHERE tenant_id = '{escaped_tenant}' \
                  AND TimeUnix >= now() - INTERVAL 1 HOUR \
+                   AND value != '' \
                  {filter} \
                  ORDER BY value LIMIT 500"
-            ),
-            "service_name" | "job" => format!(
-                "SELECT DISTINCT ServiceName AS value FROM {table} \
-                 WHERE tenant_id = '{escaped_tenant}' \
-                 AND TimeUnix >= now() - INTERVAL 1 HOUR \
-                 {filter} \
-                 ORDER BY value LIMIT 500"
-            ),
-            _ => {
-                let escaped = crate::query_builder::escape_string_literal(&label_name);
-                format!(
-                    "SELECT DISTINCT Attributes['{escaped}'] AS value FROM {table} \
-                     WHERE tenant_id = '{escaped_tenant}' \
-                     AND TimeUnix >= now() - INTERVAL 1 HOUR \
-                       AND value != '' \
-                     {filter} \
-                     ORDER BY value LIMIT 500"
-                )
-            }
-        };
+            )
+        }
+    };
 
-        let rows: Vec<LabelValueRow> = crate::tenant_query(&state.ch, &sql, tenant_id)
-            .fetch_all()
-            .await
-            .unwrap_or_default();
+    // Query gauge and sum tables concurrently.
+    let (gauge_sql, sum_sql) = (make_sql("metrics_gauge"), make_sql("metrics_sum"));
+    let (gauge_rows, sum_rows) = tokio::join!(
+        crate::tenant_query(&state.ch, &gauge_sql, tenant_id).fetch_all::<LabelValueRow>(),
+        crate::tenant_query(&state.ch, &sum_sql, tenant_id).fetch_all::<LabelValueRow>(),
+    );
 
-        for row in rows {
-            if !row.value.is_empty() && !values.contains(&row.value) {
-                values.push(row.value);
-            }
+    for row in gauge_rows.unwrap_or_default().into_iter().chain(sum_rows.unwrap_or_default()) {
+        if !row.value.is_empty() && !values.contains(&row.value) {
+            values.push(row.value);
         }
     }
 
     values.sort();
     values.dedup();
+
+    prom_meta_cache_put(cache_key, values.clone());
 
     Ok(Json(PromResponse {
         status: "success",

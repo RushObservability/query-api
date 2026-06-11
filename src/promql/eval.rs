@@ -1,12 +1,32 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::future::Future;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use clickhouse::Client;
+use dashmap::DashMap;
 use promql_parser::parser::{self, Expr};
 
 use super::types::TimeSeries;
 use super::{aggregate, binary, compute, scalar, sql, translate, types};
 use crate::models::metrics::MetricSample;
+
+/// Which metrics table(s) a metric name lives in. A metric is either a gauge or a
+/// sum in practice, so half the per-selector scans always return 0 rows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MetricTable {
+    Gauge,
+    Sum,
+    Both,
+}
+
+/// (tenant_id, metric_name) → which table(s) returned rows last time. Tenant-scoped:
+/// different tenants may ship the same metric name with different types. 5-minute TTL
+/// so a metric that starts emitting to the other table is picked up quickly.
+static METRIC_TABLE_CACHE: LazyLock<DashMap<(String, String), (MetricTable, Instant)>> =
+    LazyLock::new(DashMap::new);
+const METRIC_TABLE_TTL: Duration = Duration::from_secs(300);
+const METRIC_TABLE_CACHE_MAX: usize = 10_000;
 
 // ═══════════════════════════════════════════════════════════════════
 // Public API
@@ -345,40 +365,88 @@ async fn query_clickhouse(
 
     let where_clause = where_parts.join(" AND ");
 
-    let gauge_sql = format!(
-        "SELECT MetricName, ServiceName, Attributes, \
-         toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
-         FROM metrics_gauge \
-         WHERE {where_clause} \
-         ORDER BY TimeUnix"
-    );
-    let sum_sql = format!(
-        "SELECT MetricName, ServiceName, Attributes, \
-         toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
-         FROM metrics_sum \
-         WHERE {where_clause} \
-         ORDER BY TimeUnix"
-    );
+    // NOTE on SQL-side bucketing: we deliberately still pull raw samples here rather
+    // than pushing step-bucketing into SQL (GROUP BY toStartOfInterval + argMax/avg),
+    // because rate()/increase() counter-reset detection requires adjacent raw samples;
+    // pre-bucketing would silently change their semantics. Revisit by splitting the
+    // align=true (instant vector) path, which CAN be bucketed server-side safely.
+    //
+    // ORDER BY series key first, then time: rows arrive grouped per series so the
+    // label set is built once per series (key-change detection) instead of once per
+    // sample row, and per-series samples arrive already time-sorted.
+    let make_sql = |table: &str| {
+        format!(
+            "SELECT MetricName, ServiceName, Attributes, \
+             toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
+             FROM {table} \
+             WHERE {where_clause} \
+             ORDER BY MetricName, ServiceName, Attributes, TimeUnix"
+        )
+    };
 
-    let (gauge_res, sum_res) = tokio::join!(
-        crate::tenant_query(ch, &gauge_sql, tenant_id).fetch_all::<MetricSample>(),
-        crate::tenant_query(ch, &sum_sql, tenant_id).fetch_all::<MetricSample>(),
-    );
+    // Table-routing cache (tenant, metric) → gauge/sum/both: skip the table that
+    // never has this metric. Only usable when the selector names a metric.
+    let cache_key: Option<(String, String)> = vs
+        .name
+        .as_ref()
+        .filter(|n| !n.is_empty())
+        .map(|n| (tenant_id.to_string(), n.clone()));
+    let cached_choice = cache_key.as_ref().and_then(|k| {
+        METRIC_TABLE_CACHE
+            .get(k)
+            .filter(|e| e.1.elapsed() < METRIC_TABLE_TTL)
+            .map(|e| e.0)
+    });
 
-    let gauge_rows = gauge_res.unwrap_or_default();
-    let sum_rows = sum_res.unwrap_or_default();
+    let (gauge_rows, sum_rows) = match cached_choice {
+        Some(MetricTable::Gauge) => {
+            let rows = crate::tenant_query(ch, &make_sql("metrics_gauge"), tenant_id)
+                .fetch_all::<MetricSample>()
+                .await
+                .unwrap_or_default();
+            (rows, Vec::new())
+        }
+        Some(MetricTable::Sum) => {
+            let rows = crate::tenant_query(ch, &make_sql("metrics_sum"), tenant_id)
+                .fetch_all::<MetricSample>()
+                .await
+                .unwrap_or_default();
+            (Vec::new(), rows)
+        }
+        _ => {
+            // Cache miss (or 'both'): query both tables in parallel.
+            let (gauge_res, sum_res) = tokio::join!(
+                crate::tenant_query(ch, &make_sql("metrics_gauge"), tenant_id)
+                    .fetch_all::<MetricSample>(),
+                crate::tenant_query(ch, &make_sql("metrics_sum"), tenant_id)
+                    .fetch_all::<MetricSample>(),
+            );
+            let gauge_rows = gauge_res.unwrap_or_default();
+            let sum_rows = sum_res.unwrap_or_default();
 
-    let all_samples: Vec<(BTreeMap<String, String>, f64, f64)> = gauge_rows
-        .iter()
-        .chain(sum_rows.iter())
-        .map(|s| {
-            let labels = types::build_label_set(&s.metric_name, &s.service_name, &s.attributes);
-            let ts_secs = s.ts_ms as f64 / 1000.0;
-            (labels, ts_secs, s.value)
-        })
-        .collect();
+            // Record which table(s) actually had data (only on a true miss, and only
+            // when at least one table returned rows — an empty result tells us nothing).
+            if cached_choice.is_none() {
+                if let Some(key) = cache_key {
+                    let observed = match (!gauge_rows.is_empty(), !sum_rows.is_empty()) {
+                        (true, false) => Some(MetricTable::Gauge),
+                        (false, true) => Some(MetricTable::Sum),
+                        (true, true) => Some(MetricTable::Both),
+                        (false, false) => None,
+                    };
+                    if let Some(observed) = observed {
+                        if METRIC_TABLE_CACHE.len() > METRIC_TABLE_CACHE_MAX {
+                            METRIC_TABLE_CACHE.clear(); // defensive cap
+                        }
+                        METRIC_TABLE_CACHE.insert(key, (observed, Instant::now()));
+                    }
+                }
+            }
+            (gauge_rows, sum_rows)
+        }
+    };
 
-    let series = types::group_into_series(all_samples);
+    let series = rows_to_series(&gauge_rows, &sum_rows);
 
     if align {
         // Step-align for VectorSelector (instant vectors)
@@ -388,6 +456,58 @@ async fn query_clickhouse(
         // Return all raw samples for MatrixSelector (range vectors)
         Ok(series)
     }
+}
+
+/// Convert raw sample rows into TimeSeries. Rows must arrive ordered by
+/// (MetricName, ServiceName, Attributes, TimeUnix) — the SQL guarantees this — so a
+/// label BTreeMap is allocated once per distinct series (key-change detection) instead
+/// of once per sample row, as group_into_series used to require.
+///
+/// Output matches the old `group_into_series` exactly: series sorted by label set,
+/// samples time-sorted, and series with identical label sets (e.g. the same labels
+/// appearing in both tables, or raw keys that collapse to the same label set after
+/// empty-value attributes are dropped) merged together.
+fn rows_to_series(gauge_rows: &[MetricSample], sum_rows: &[MetricSample]) -> Vec<TimeSeries> {
+    let mut series: Vec<TimeSeries> = Vec::new();
+
+    for rows in [gauge_rows, sum_rows] {
+        let mut prev_key: Option<(&str, &str, &[(String, String)])> = None;
+        for s in rows {
+            let key = (
+                s.metric_name.as_str(),
+                s.service_name.as_str(),
+                s.attributes.as_slice(),
+            );
+            if prev_key != Some(key) {
+                series.push(TimeSeries {
+                    labels: types::build_label_set(&s.metric_name, &s.service_name, &s.attributes),
+                    samples: Vec::new(),
+                });
+                prev_key = Some(key);
+            }
+            series
+                .last_mut()
+                .expect("series pushed above")
+                .samples
+                .push((s.ts_ms as f64 / 1000.0, s.value));
+        }
+    }
+
+    // Merge duplicate label sets (rare) and restore the label-sorted output order the
+    // previous BTreeMap-based grouping produced.
+    series.sort_by(|a, b| a.labels.cmp(&b.labels));
+    let mut merged: Vec<TimeSeries> = Vec::with_capacity(series.len());
+    for ts in series {
+        match merged.last_mut() {
+            Some(last) if last.labels == ts.labels => {
+                last.samples.extend(ts.samples);
+                last.samples
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            _ => merged.push(ts),
+        }
+    }
+    merged
 }
 
 /// Snap raw series to step timestamps, picking the latest sample within tolerance.
@@ -403,19 +523,25 @@ fn step_align_series(
         lookback.max(5.0)
     };
 
+    // Two-pointer merge: samples are time-sorted and steps ascending, so a single
+    // forward pass replaces the old O(steps × samples) per-step reverse scan. For
+    // each step we want the latest sample with ts in [t - half_step, t + half_step].
     series
         .into_iter()
         .map(|ts| {
-            let samples: Vec<(f64, f64)> = step_timestamps
-                .iter()
-                .filter_map(|&t| {
-                    ts.samples
-                        .iter()
-                        .rev()
-                        .find(|(st, _)| *st <= t + half_step && *st >= t - half_step)
-                        .map(|(_, v)| (t, *v))
-                })
-                .collect();
+            let mut samples: Vec<(f64, f64)> = Vec::with_capacity(step_timestamps.len());
+            let mut i = 0usize; // first sample index not yet known to be <= t + half_step
+            for &t in step_timestamps {
+                while i < ts.samples.len() && ts.samples[i].0 <= t + half_step {
+                    i += 1;
+                }
+                if i > 0 {
+                    let (st, v) = ts.samples[i - 1];
+                    if st >= t - half_step {
+                        samples.push((t, v));
+                    }
+                }
+            }
             TimeSeries {
                 labels: ts.labels,
                 samples,
@@ -540,5 +666,182 @@ fn collect_metrics(expr: &Expr, names: &mut Vec<String>) {
         Expr::Unary(u) => collect_metrics(&u.expr, names),
         Expr::Paren(p) => collect_metrics(&p.expr, names),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference implementation of step alignment — the exact pre-optimization
+    /// per-step reverse scan — used to pin the two-pointer rewrite's behavior.
+    fn step_align_reference(
+        series: Vec<TimeSeries>,
+        step_timestamps: &[f64],
+        lookback: f64,
+    ) -> Vec<TimeSeries> {
+        let half_step = if step_timestamps.len() >= 2 {
+            (step_timestamps[1] - step_timestamps[0]) / 2.0
+        } else {
+            lookback.max(5.0)
+        };
+        series
+            .into_iter()
+            .map(|ts| {
+                let samples: Vec<(f64, f64)> = step_timestamps
+                    .iter()
+                    .filter_map(|&t| {
+                        ts.samples
+                            .iter()
+                            .rev()
+                            .find(|(st, _)| *st <= t + half_step && *st >= t - half_step)
+                            .map(|(_, v)| (t, *v))
+                    })
+                    .collect();
+                TimeSeries { labels: ts.labels, samples }
+            })
+            .collect()
+    }
+
+    fn series_with(samples: Vec<(f64, f64)>) -> Vec<TimeSeries> {
+        vec![TimeSeries { labels: BTreeMap::new(), samples }]
+    }
+
+    fn assert_align_matches_reference(samples: Vec<(f64, f64)>, steps: &[f64], lookback: f64) {
+        let got = step_align_series(series_with(samples.clone()), steps, lookback);
+        let want = step_align_reference(series_with(samples), steps, lookback);
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.samples, w.samples);
+        }
+    }
+
+    #[test]
+    fn step_align_matches_reference_on_regular_grid() {
+        // 15s scrape on a 30s step grid.
+        let samples: Vec<(f64, f64)> = (0..40).map(|i| (i as f64 * 15.0, i as f64)).collect();
+        let steps: Vec<f64> = (0..20).map(|i| i as f64 * 30.0).collect();
+        assert_align_matches_reference(samples, &steps, 30.0);
+    }
+
+    #[test]
+    fn step_align_matches_reference_on_sparse_and_gappy_data() {
+        // Irregular timestamps with gaps larger than the step.
+        let samples = vec![
+            (3.0, 1.0),
+            (14.5, 2.0),
+            (15.0, 2.5),
+            (61.0, 3.0),
+            (200.0, 4.0),
+            (201.0, 5.0),
+        ];
+        let steps: Vec<f64> = (0..30).map(|i| i as f64 * 10.0).collect();
+        assert_align_matches_reference(samples, &steps, 10.0);
+    }
+
+    #[test]
+    fn step_align_matches_reference_for_instant_query_single_step() {
+        // Single step timestamp → lookback window semantics.
+        let samples = vec![(100.0, 1.0), (250.0, 2.0), (290.0, 3.0)];
+        let steps = vec![300.0];
+        assert_align_matches_reference(samples.clone(), &steps, 300.0);
+        // And one where the only samples are outside the window.
+        let far = vec![(1.0, 9.0)];
+        assert_align_matches_reference(far, &steps, 5.0);
+    }
+
+    #[test]
+    fn step_align_matches_reference_at_window_boundaries() {
+        // Samples landing exactly on t ± half_step (half_step = 5 here).
+        let samples = vec![(5.0, 1.0), (15.0, 2.0), (25.0, 3.0)];
+        let steps = vec![0.0, 10.0, 20.0, 30.0];
+        assert_align_matches_reference(samples, &steps, 10.0);
+    }
+
+    #[test]
+    fn step_align_empty_samples_yields_empty() {
+        let steps = vec![0.0, 10.0];
+        let got = step_align_series(series_with(vec![]), &steps, 10.0);
+        assert!(got[0].samples.is_empty());
+    }
+
+    // ── rows_to_series ──
+
+    fn sample(metric: &str, service: &str, attrs: &[(&str, &str)], ts_ms: i64, value: f64) -> MetricSample {
+        MetricSample {
+            metric_name: metric.to_string(),
+            service_name: service.to_string(),
+            attributes: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ts_ms,
+            value,
+        }
+    }
+
+    /// rows_to_series must produce exactly what the old per-row group_into_series
+    /// produced (label-sorted series, time-sorted samples, duplicates merged).
+    fn assert_matches_group_into_series(gauge: Vec<MetricSample>, sum: Vec<MetricSample>) {
+        let got = rows_to_series(&gauge, &sum);
+        let all: Vec<(BTreeMap<String, String>, f64, f64)> = gauge
+            .iter()
+            .chain(sum.iter())
+            .map(|s| {
+                (
+                    types::build_label_set(&s.metric_name, &s.service_name, &s.attributes),
+                    s.ts_ms as f64 / 1000.0,
+                    s.value,
+                )
+            })
+            .collect();
+        let want = types::group_into_series(all);
+        assert_eq!(got.len(), want.len(), "series count mismatch");
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.labels, w.labels);
+            assert_eq!(g.samples, w.samples);
+        }
+    }
+
+    #[test]
+    fn rows_to_series_groups_ordered_rows_per_series() {
+        // Rows ordered by (metric, service, attrs, time) as the SQL guarantees.
+        let gauge = vec![
+            sample("cpu", "api", &[("host", "a")], 1_000, 1.0),
+            sample("cpu", "api", &[("host", "a")], 2_000, 2.0),
+            sample("cpu", "api", &[("host", "b")], 1_000, 3.0),
+            sample("mem", "api", &[], 1_000, 4.0),
+        ];
+        assert_matches_group_into_series(gauge, vec![]);
+    }
+
+    #[test]
+    fn rows_to_series_merges_same_labels_across_tables() {
+        // Same label set in both tables must merge into one time-sorted series.
+        let gauge = vec![
+            sample("up", "api", &[], 2_000, 1.0),
+            sample("up", "api", &[], 4_000, 1.0),
+        ];
+        let sum = vec![
+            sample("up", "api", &[], 1_000, 0.0),
+            sample("up", "api", &[], 3_000, 1.0),
+        ];
+        assert_matches_group_into_series(gauge, sum);
+    }
+
+    #[test]
+    fn rows_to_series_merges_keys_that_collapse_to_same_label_set() {
+        // Empty-valued attributes are dropped by build_label_set, so distinct raw
+        // keys can collapse to the same label set and must be merged.
+        let gauge = vec![
+            sample("up", "api", &[("dc", "")], 2_000, 1.0),
+            sample("up", "api", &[], 1_000, 0.0),
+        ];
+        assert_matches_group_into_series(gauge, vec![]);
+    }
+
+    #[test]
+    fn rows_to_series_empty_input() {
+        assert!(rows_to_series(&[], &[]).is_empty());
     }
 }

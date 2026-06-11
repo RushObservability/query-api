@@ -30,7 +30,13 @@ pub async fn execute_query(
             return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
         }
     }
-    let offset = req.offset.min(100_000);
+    // Deep OFFSET pagination materializes and discards full wide rows server-side, so
+    // cap how deep a client can page (50k rows ≈ 500 pages at the default page size).
+    // Follow-up (intentionally not done here to preserve the API contract the UI
+    // depends on — offset-based paging + wide rows for the detail panel): switch to
+    // keyset pagination on (timestamp, span_id) and return a slim column list for the
+    // list view, fetching wide columns only on row-expand.
+    let offset = req.offset.min(50_000);
 
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
@@ -199,7 +205,12 @@ pub async fn count_query(
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
-    let interval_fn = match req.interval.as_str() {
+    // The interval is client-supplied: clamp so (range / interval) <= 2000 buckets
+    // (a 1s interval over 30d would otherwise be ~2.6M GROUP BY buckets).
+    let interval = crate::query_builder::clamp_bucket_interval(
+        &req.interval, &req.time_range.from, &req.time_range.to, 2000,
+    ).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let interval_fn = match interval {
         "1s" => "toStartOfSecond(timestamp)",
         "10s" => "toStartOfTenSeconds(timestamp)",
         "1m" => "toStartOfMinute(timestamp)",
@@ -245,6 +256,14 @@ pub async fn group_query(
             "group_by must have at least one field".to_string(),
         ));
     }
+    // Multi-column group_by used to silently return the generated SQL text instead of
+    // executing it. Fail loudly instead — the UI only ever sends a single group_by.
+    if req.group_by.len() > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "multi-column group_by is not supported yet; pass a single group_by field".to_string(),
+        ));
+    }
 
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
@@ -273,41 +292,34 @@ pub async fn group_query(
         req.limit.min(1000),
     );
 
-    if req.group_by.len() == 1 {
-        #[derive(Debug, serde::Serialize, serde::Deserialize, clickhouse::Row)]
-        struct SingleGroupRow {
-            group_0: String,
-            count: u64,
-        }
-
-        let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-            .fetch_all::<SingleGroupRow>()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, signal = "traces", handler = "group_query", "query failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "query failed".into(),
-                )
-            })?;
-
-        let json_rows: Vec<serde_json::Value> = rows
-            .into_iter()
-            .map(|r| {
-                serde_json::json!({
-                    &req.group_by[0]: r.group_0,
-                    "count": r.count,
-                })
-            })
-            .collect();
-
-        Ok(Json(serde_json::json!({ "groups": json_rows })))
-    } else {
-        Ok(Json(serde_json::json!({
-            "sql": sql,
-            "note": "Execute via ClickHouse HTTP interface with FORMAT JSONEachRow for multi-column group-by"
-        })))
+    #[derive(Debug, serde::Serialize, serde::Deserialize, clickhouse::Row)]
+    struct SingleGroupRow {
+        group_0: String,
+        count: u64,
     }
+
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<SingleGroupRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "traces", handler = "group_query", "query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "query failed".into(),
+            )
+        })?;
+
+    let json_rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                &req.group_by[0]: r.group_0,
+                "count": r.count,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "groups": json_rows })))
 }
 
 /// Timeseries query — returns time-bucketed RED metrics (Rate, Errors, Duration percentiles).

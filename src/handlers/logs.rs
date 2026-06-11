@@ -130,10 +130,13 @@ pub async fn query_logs(
     let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
     let (rows, total) = if req.search.is_none() && req.offset == 0 {
-        // Fire narrow (last 1h) and full-range queries in parallel.
-        // Use the narrow result when it has enough rows — avoids serialising two
-        // round-trips in the common "browsing recent logs" case while paying at
-        // most one extra full-range scan when data is sparse.
+        // Fast path: try a narrow (last 1h) window first and ONLY run the full-range
+        // query when the narrow one doesn't fill the limit. The previous version
+        // join!'ed both queries, so the full-range scan always ran to completion even
+        // when the narrow result won — pure wasted I/O (up to range/1h × the work)
+        // for the common "browsing recent logs" case. The full query is now built and
+        // executed lazily, so the fast path never touches the full window. Trade-off:
+        // when data is sparse the two queries run sequentially instead of in parallel.
         let narrow_to = &req.time_range.to;
         let narrow_from = {
             let to_dt = chrono::DateTime::parse_from_rfc3339(narrow_to)
@@ -147,27 +150,30 @@ pub async fn query_logs(
              ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
             narrow_clauses.to_sql(),
         );
-        let full_sql = format!(
-            "SELECT {select_cols} FROM logs {} \
-             ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
-            clauses.to_sql(),
-        );
-        let (narrow_res, full_res) = tokio::join!(
-            crate::tenant_query(&state.ch, &narrow_sql, tenant_id).fetch_all::<LogRecord>(),
-            crate::tenant_query(&state.ch, &full_sql, tenant_id).fetch_all::<LogRecord>(),
-        );
-        let narrow_rows = narrow_res.map_err(|e| {
-            tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-        })?;
+        let narrow_rows = crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
+            .fetch_all::<LogRecord>()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+            })?;
         if (narrow_rows.len() as u64) >= limit {
             let total = narrow_rows.len() as u64;
             (narrow_rows, total)
         } else {
-            let rows = full_res.map_err(|e| {
-                tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-            })?;
+            // Sparse case: the recent window didn't fill the page — scan the full range.
+            let full_sql = format!(
+                "SELECT {select_cols} FROM logs {} \
+                 ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+                clauses.to_sql(),
+            );
+            let rows = crate::tenant_query(&state.ch, &full_sql, tenant_id)
+                .fetch_all::<LogRecord>()
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+                })?;
             let total = rows.len() as u64;
             (rows, total)
         }
@@ -314,7 +320,12 @@ pub async fn count_logs(
     let tenant_id = &tenant.tenant_id;
     let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
-    let interval_fn = match req.interval.as_str() {
+    // The interval is client-supplied: clamp so (range / interval) <= 2000 buckets
+    // (a 1s interval over 30d would otherwise be ~2.6M GROUP BY buckets).
+    let interval = crate::query_builder::clamp_bucket_interval(
+        &req.interval, &req.time_range.from, &req.time_range.to, 2000,
+    ).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let interval_fn = match interval {
         "1s" => "toStartOfSecond(Timestamp)",
         "10s" => "toStartOfTenSeconds(Timestamp)",
         "1m" => "toStartOfMinute(Timestamp)",
