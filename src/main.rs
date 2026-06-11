@@ -379,9 +379,29 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(true);
 
     // Spawn background engines (skipped in drain-worker-only mode)
+    //
+    // Each rule-evaluation engine runs in-process by default (single-binary /
+    // local dev) and can be disabled per-replica with RUSH_RUN_<X>_ENGINE=false
+    // so that in HA only one replica evaluates rules — N replicas would mean N×
+    // rule-eval load on ClickHouse and N× duplicate notifications (the
+    // last_eval_at gate is racy across replicas: ReplacingMergeTree is
+    // eventually consistent). Same semantics as RUSH_RUN_ANOMALY_ENGINE below.
+    let engine_enabled = |var: &str| -> bool {
+        std::env::var(var)
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+            .unwrap_or(true)
+    };
     if !drain_only {
-    alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config.clone());
-    slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
+    if engine_enabled("RUSH_RUN_ALERT_ENGINE") {
+        alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config.clone());
+    } else {
+        tracing::info!("in-process alert engine disabled (RUSH_RUN_ALERT_ENGINE=false); expecting a dedicated alert-engine deployment");
+    }
+    if engine_enabled("RUSH_RUN_SLO_ENGINE") {
+        slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
+    } else {
+        tracing::info!("in-process slo engine disabled (RUSH_RUN_SLO_ENGINE=false); expecting a dedicated slo-engine deployment");
+    }
 
     // Anomaly detection engine — evaluates anomaly rules, persists events, and
     // sends notifications. Queries Prometheus-source rules against the API's own
@@ -405,11 +425,19 @@ async fn main() -> anyhow::Result<()> {
     // stats_engine is spawned after the ingest buffer is built (it emits buffer metrics).
 
     // Spawn the Datadog-style monitor engine (v2 alerting)
-    monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config);
+    if engine_enabled("RUSH_RUN_MONITOR_ENGINE") {
+        monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config);
+    } else {
+        tracing::info!("in-process monitor engine disabled (RUSH_RUN_MONITOR_ENGINE=false); expecting a dedicated monitor-engine deployment");
+    }
 
     // Seed built-in SIEM detection rules and spawn the SIEM detection engine
     config_db.ensure_default_detection_rules().await?;
-    siem_engine::spawn(ch.clone(), config_db.clone());
+    if engine_enabled("RUSH_RUN_SIEM_ENGINE") {
+        siem_engine::spawn(ch.clone(), config_db.clone());
+    } else {
+        tracing::info!("in-process siem engine disabled (RUSH_RUN_SIEM_ENGINE=false); expecting a dedicated siem-engine deployment");
+    }
     } // end `if !drain_only` (background engines)
 
     // ── Durable write path: spool + writer ──
@@ -823,6 +851,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/settings/sre-agent",
             get(handlers::settings::get_sre_agent_settings).put(handlers::settings::set_sre_agent_settings),
+        )
+        .route(
+            "/api/v1/settings/deploy-markers",
+            get(handlers::settings::get_deploy_markers_setting).put(handlers::settings::set_deploy_markers_setting),
         )
         // API Keys (settings)
         .route(

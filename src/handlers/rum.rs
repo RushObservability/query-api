@@ -232,11 +232,17 @@ pub struct RumSessionRow {
 // ── Handlers ──
 
 /// POST /api/v1/rum/ingest — SDK sends batched events
+///
+/// Takes the raw body so the payload size for usage metering is just
+/// `body.len()` — previously the deserialized struct was re-serialized with
+/// serde_json::to_string solely to count bytes.
 pub async fn ingest(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
-    Json(payload): Json<RumIngestPayload>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let payload: RumIngestPayload = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid RUM payload: {e}")))?;
     let tenant_id = &tenant.tenant_id;
     let meta = &payload.meta;
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -344,10 +350,8 @@ pub async fn ingest(
         }
     }
 
-    // Record usage for per-tenant ingest metering
-    // Estimate payload bytes from the serialized JSON size since we consumed the deserialized struct
-    let estimated_bytes = serde_json::to_string(&payload).map(|s| s.len() as u64).unwrap_or(0);
-    state.usage_accumulator.record(tenant_id, "rum", payload.events.len() as u64, estimated_bytes);
+    // Record usage for per-tenant ingest metering — exact wire bytes received.
+    state.usage_accumulator.record(tenant_id, "rum", payload.events.len() as u64, body.len() as u64);
 
     tracing::info!(
         signal = "rum",
