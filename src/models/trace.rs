@@ -27,6 +27,24 @@ pub struct WideEvent {
     pub link_span_ids: Vec<String>,
 }
 
+/// A slim span row for the Explore list view — only the columns the table renders.
+/// Used when a query requests `columns: "list"`. Field names match `WideEvent` so a
+/// slim row is a forward-compatible subset on the wire (the wide-only fields are simply
+/// absent from the JSON). Column order must match the slim SELECT list exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, Row)]
+pub struct SlimEvent {
+    pub timestamp: i64,
+    pub service_name: String,
+    pub span_name: String,
+    pub http_method: String,
+    pub http_path: String,
+    pub http_status_code: u16,
+    pub duration_ns: u64,
+    pub status: String,
+    pub trace_id: String,
+    pub span_id: String,
+}
+
 /// A lightweight span row from the spans_by_trace materialized view.
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct TraceIndexRow {

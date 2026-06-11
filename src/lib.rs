@@ -13,6 +13,7 @@ pub mod object_store_spool;
 pub mod promql;
 pub mod query_builder;
 pub mod retention_enforcer;
+pub mod rollup;
 pub mod saml;
 pub mod siem_engine;
 pub mod slo_engine;

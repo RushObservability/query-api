@@ -162,7 +162,13 @@ pub async fn prom_remote_write(
         "remote write payload decoded"
     );
 
-    // Build all gauge rows for metrics_gauge
+    // Build all gauge rows for metrics_gauge.
+    // Arc refactor: tenant_id and the constant scope fields are shared across
+    // every sample in the request; allocate each once and Arc-clone per row.
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let empty_str: std::sync::Arc<str> = "".into();
+    let scope_prom: std::sync::Arc<str> = "prometheus".into();
+    let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
     let mut rows: Vec<GaugeRow> = Vec::new();
 
     for ts in &write_req.timeseries {
@@ -192,18 +198,18 @@ pub async fn prom_remote_write(
 
         // P1: Build template row once per timeseries, only update time+value per sample
         let template = GaugeRow {
-            tenant_id: tenant_id.clone(),
-            resource_attributes: Vec::new(),
-            resource_schema_url: String::new(),
-            scope_name: "prometheus".to_string(),
-            scope_version: String::new(),
-            scope_attributes: Vec::new(),
+            tenant_id: tenant_arc.clone(),
+            resource_attributes: empty_attrs.clone(),
+            resource_schema_url: empty_str.clone(),
+            scope_name: scope_prom.clone(),
+            scope_version: empty_str.clone(),
+            scope_attributes: empty_attrs.clone(),
             scope_dropped_attr_count: 0,
-            scope_schema_url: String::new(),
-            service_name,
-            metric_name,
-            metric_description: description,
-            metric_unit: unit,
+            scope_schema_url: empty_str.clone(),
+            service_name: service_name.as_str().into(),
+            metric_name: metric_name.as_str().into(),
+            metric_description: description.as_str().into(),
+            metric_unit: unit.as_str().into(),
             attributes: attrs,
             start_time_unix: 0,
             time_unix: 0,

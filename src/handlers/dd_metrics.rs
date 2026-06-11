@@ -132,25 +132,25 @@ fn build_template(
     unit: String,
     attrs: Vec<(String, String)>,
     host: &str,
-    tenant_id: &str,
+    tenant_id: &std::sync::Arc<str>,
 ) -> GaugeRow {
     let mut resource_attributes = Vec::new();
     if !host.is_empty() {
         resource_attributes.push(("host.name".to_string(), host.to_string()));
     }
     GaugeRow {
-        tenant_id: tenant_id.to_string(),
-        resource_attributes,
-        resource_schema_url: String::new(),
-        scope_name: "datadog".to_string(),
-        scope_version: String::new(),
-        scope_attributes: Vec::new(),
+        tenant_id: tenant_id.clone(),
+        resource_attributes: std::sync::Arc::new(resource_attributes),
+        resource_schema_url: "".into(),
+        scope_name: "datadog".into(),
+        scope_version: "".into(),
+        scope_attributes: std::sync::Arc::new(Vec::new()),
         scope_dropped_attr_count: 0,
-        scope_schema_url: String::new(),
-        service_name,
-        metric_name,
-        metric_description: String::new(),
-        metric_unit: unit,
+        scope_schema_url: "".into(),
+        service_name: service_name.as_str().into(),
+        metric_name: metric_name.as_str().into(),
+        metric_description: "".into(),
+        metric_unit: unit.as_str().into(),
         attributes: attrs,
         start_time_unix: 0,
         time_unix: 0,
@@ -172,6 +172,7 @@ pub async fn ingest_v1(
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
     let raw = decompress_body(&headers, body).await?;
 
@@ -196,7 +197,7 @@ pub async fn ingest_v1(
             String::new(),
             attrs,
             &series.host,
-            tenant_id,
+            &tenant_arc,
         );
 
         // Clone template once per series; only time_unix/value (scalars) change per point.
@@ -268,6 +269,7 @@ pub async fn ingest_v2(
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
     let raw = decompress_body(&headers, body).await?;
 
@@ -320,7 +322,7 @@ pub async fn ingest_v2(
             series.unit.clone(),
             attrs,
             host,
-            tenant_id,
+            &tenant_arc,
         );
 
         // Clone template once per series; only time_unix/value (scalars) change per point.
@@ -385,6 +387,7 @@ pub async fn check_run(
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
     let raw = decompress_body(&headers, body).await?;
 
@@ -418,7 +421,7 @@ pub async fn check_run(
             String::new(),
             attrs,
             &check.host_name,
-            tenant_id,
+            &tenant_arc,
         );
         row.time_unix = ts;
         row.value = check.status as f64;

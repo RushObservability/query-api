@@ -2,14 +2,51 @@
 ///
 /// These structs are intentionally `pub` so that `ch_writer` can reference them
 /// in the `SpoolBatch` enum without depending on the handler crates.
+use std::sync::Arc;
+
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
+
+// ═══ The "Arc refactor": shared per-resource/per-scope data ═════════════════
+//
+// A single OTLP/Datadog batch fans one resource (+ scope, + metric) out across
+// thousands of datapoints. Previously every datapoint row owned its own copy of
+// the resource/scope strings and the resource/scope attribute Vecs, so a 10k-
+// datapoint batch with 15 resource attrs re-allocated those strings/Vecs 10k
+// times.
+//
+// The genuinely-shared, immutable-per-row fields are now `Arc`-wrapped:
+//   - `Arc<str>`               for the repeated scalar strings (tenant_id,
+//                              service_name, scope_name/version, schema URLs,
+//                              metric_name/description/unit)
+//   - `Arc<Vec<(String,String)>>` for the repeated attribute lists
+//                              (resource_attributes, scope_attributes)
+// The conversion code allocates each shared value ONCE per resource/scope/metric
+// and hands a cheap Arc clone to every datapoint row.
+//
+// WIRE COMPATIBILITY: serde's `Arc<T>` impls (enabled via the `rc` feature, see
+// Cargo.toml) delegate directly to `T` — `serialize` is `(**self).serialize(..)`
+// and `deserialize` is `Box::<T>::deserialize(..).map(Into::into)`, with no
+// added type tag or wrapper. So `Arc<str>` is wire-identical to `String`/`&str`
+// and `Arc<Vec<_>>` is wire-identical to `Vec<_>` in BOTH the clickhouse 0.13
+// RowBinary encoding (insert path) and serde_json (spool path). The
+// `clickhouse::Row` derive only reads field NAMES for COLUMN_NAMES; it is
+// type-agnostic, so column mapping is unchanged.
+//
+// NOT shared: the per-datapoint `attributes` field stays an owned
+// `Vec<(String,String)>` because the metric firewall mutates it in place per
+// row (drops labels). Sharing it would be incorrect.
+
+/// The per-metric `attributes` set — owned & mutable (firewall strips labels).
+pub type Attrs = Vec<(String, String)>;
+/// Shared (immutable per row) attribute list, allocated once per resource/scope.
+pub type SharedAttrs = Arc<Vec<(String, String)>>;
 
 // ═══ spans_raw (Datadog traces) ═══
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct TraceInsertRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     #[serde(rename = "Timestamp")]
     pub timestamp: i64,
     #[serde(rename = "TraceId")]
@@ -25,13 +62,13 @@ pub struct TraceInsertRow {
     #[serde(rename = "SpanKind")]
     pub span_kind: String,
     #[serde(rename = "ServiceName")]
-    pub service_name: String,
+    pub service_name: Arc<str>,
     #[serde(rename = "ResourceAttributes")]
-    pub resource_attributes: Vec<(String, String)>,
+    pub resource_attributes: SharedAttrs,
     #[serde(rename = "ScopeName")]
-    pub scope_name: String,
+    pub scope_name: Arc<str>,
     #[serde(rename = "ScopeVersion")]
-    pub scope_version: String,
+    pub scope_version: Arc<str>,
     #[serde(rename = "SpanAttributes")]
     pub span_attributes: Vec<(String, String)>,
     #[serde(rename = "Duration")]
@@ -60,7 +97,7 @@ pub struct TraceInsertRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct LogInsertRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     #[serde(rename = "Timestamp")]
     pub timestamp: i64,
     #[serde(rename = "TraceId")]
@@ -78,17 +115,17 @@ pub struct LogInsertRow {
     #[serde(rename = "ServiceName")]
     pub service_name: String,
     #[serde(rename = "ResourceSchemaUrl")]
-    pub resource_schema_url: String,
+    pub resource_schema_url: Arc<str>,
     #[serde(rename = "ResourceAttributes")]
-    pub resource_attributes: Vec<(String, String)>,
+    pub resource_attributes: SharedAttrs,
     #[serde(rename = "ScopeSchemaUrl")]
-    pub scope_schema_url: String,
+    pub scope_schema_url: Arc<str>,
     #[serde(rename = "ScopeName")]
-    pub scope_name: String,
+    pub scope_name: Arc<str>,
     #[serde(rename = "ScopeVersion")]
-    pub scope_version: String,
+    pub scope_version: Arc<str>,
     #[serde(rename = "ScopeAttributes")]
-    pub scope_attributes: Vec<(String, String)>,
+    pub scope_attributes: SharedAttrs,
     #[serde(rename = "LogAttributes")]
     pub log_attributes: Vec<(String, String)>,
     #[serde(rename = "EventName")]
@@ -99,31 +136,31 @@ pub struct LogInsertRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct GaugeRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     #[serde(rename = "ResourceAttributes")]
-    pub resource_attributes: Vec<(String, String)>,
+    pub resource_attributes: SharedAttrs,
     #[serde(rename = "ResourceSchemaUrl")]
-    pub resource_schema_url: String,
+    pub resource_schema_url: Arc<str>,
     #[serde(rename = "ScopeName")]
-    pub scope_name: String,
+    pub scope_name: Arc<str>,
     #[serde(rename = "ScopeVersion")]
-    pub scope_version: String,
+    pub scope_version: Arc<str>,
     #[serde(rename = "ScopeAttributes")]
-    pub scope_attributes: Vec<(String, String)>,
+    pub scope_attributes: SharedAttrs,
     #[serde(rename = "ScopeDroppedAttrCount")]
     pub scope_dropped_attr_count: u32,
     #[serde(rename = "ScopeSchemaUrl")]
-    pub scope_schema_url: String,
+    pub scope_schema_url: Arc<str>,
     #[serde(rename = "ServiceName")]
-    pub service_name: String,
+    pub service_name: Arc<str>,
     #[serde(rename = "MetricName")]
-    pub metric_name: String,
+    pub metric_name: Arc<str>,
     #[serde(rename = "MetricDescription")]
-    pub metric_description: String,
+    pub metric_description: Arc<str>,
     #[serde(rename = "MetricUnit")]
-    pub metric_unit: String,
+    pub metric_unit: Arc<str>,
     #[serde(rename = "Attributes")]
-    pub attributes: Vec<(String, String)>,
+    pub attributes: Attrs,
     #[serde(rename = "StartTimeUnix")]
     pub start_time_unix: i64,
     #[serde(rename = "TimeUnix")]
@@ -148,31 +185,31 @@ pub struct GaugeRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct SumRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     #[serde(rename = "ResourceAttributes")]
-    pub resource_attributes: Vec<(String, String)>,
+    pub resource_attributes: SharedAttrs,
     #[serde(rename = "ResourceSchemaUrl")]
-    pub resource_schema_url: String,
+    pub resource_schema_url: Arc<str>,
     #[serde(rename = "ScopeName")]
-    pub scope_name: String,
+    pub scope_name: Arc<str>,
     #[serde(rename = "ScopeVersion")]
-    pub scope_version: String,
+    pub scope_version: Arc<str>,
     #[serde(rename = "ScopeAttributes")]
-    pub scope_attributes: Vec<(String, String)>,
+    pub scope_attributes: SharedAttrs,
     #[serde(rename = "ScopeDroppedAttrCount")]
     pub scope_dropped_attr_count: u32,
     #[serde(rename = "ScopeSchemaUrl")]
-    pub scope_schema_url: String,
+    pub scope_schema_url: Arc<str>,
     #[serde(rename = "ServiceName")]
-    pub service_name: String,
+    pub service_name: Arc<str>,
     #[serde(rename = "MetricName")]
-    pub metric_name: String,
+    pub metric_name: Arc<str>,
     #[serde(rename = "MetricDescription")]
-    pub metric_description: String,
+    pub metric_description: Arc<str>,
     #[serde(rename = "MetricUnit")]
-    pub metric_unit: String,
+    pub metric_unit: Arc<str>,
     #[serde(rename = "Attributes")]
-    pub attributes: Vec<(String, String)>,
+    pub attributes: Attrs,
     #[serde(rename = "StartTimeUnix")]
     pub start_time_unix: i64,
     #[serde(rename = "TimeUnix")]
@@ -232,31 +269,31 @@ impl SumRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct HistogramRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     #[serde(rename = "ResourceAttributes")]
-    pub resource_attributes: Vec<(String, String)>,
+    pub resource_attributes: SharedAttrs,
     #[serde(rename = "ResourceSchemaUrl")]
-    pub resource_schema_url: String,
+    pub resource_schema_url: Arc<str>,
     #[serde(rename = "ScopeName")]
-    pub scope_name: String,
+    pub scope_name: Arc<str>,
     #[serde(rename = "ScopeVersion")]
-    pub scope_version: String,
+    pub scope_version: Arc<str>,
     #[serde(rename = "ScopeAttributes")]
-    pub scope_attributes: Vec<(String, String)>,
+    pub scope_attributes: SharedAttrs,
     #[serde(rename = "ScopeDroppedAttrCount")]
     pub scope_dropped_attr_count: u32,
     #[serde(rename = "ScopeSchemaUrl")]
-    pub scope_schema_url: String,
+    pub scope_schema_url: Arc<str>,
     #[serde(rename = "ServiceName")]
-    pub service_name: String,
+    pub service_name: Arc<str>,
     #[serde(rename = "MetricName")]
-    pub metric_name: String,
+    pub metric_name: Arc<str>,
     #[serde(rename = "MetricDescription")]
-    pub metric_description: String,
+    pub metric_description: Arc<str>,
     #[serde(rename = "MetricUnit")]
-    pub metric_unit: String,
+    pub metric_unit: Arc<str>,
     #[serde(rename = "Attributes")]
-    pub attributes: Vec<(String, String)>,
+    pub attributes: Attrs,
     #[serde(rename = "StartTimeUnix")]
     pub start_time_unix: i64,
     #[serde(rename = "TimeUnix")]
@@ -293,31 +330,31 @@ pub struct HistogramRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct ExpHistogramRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     #[serde(rename = "ResourceAttributes")]
-    pub resource_attributes: Vec<(String, String)>,
+    pub resource_attributes: SharedAttrs,
     #[serde(rename = "ResourceSchemaUrl")]
-    pub resource_schema_url: String,
+    pub resource_schema_url: Arc<str>,
     #[serde(rename = "ScopeName")]
-    pub scope_name: String,
+    pub scope_name: Arc<str>,
     #[serde(rename = "ScopeVersion")]
-    pub scope_version: String,
+    pub scope_version: Arc<str>,
     #[serde(rename = "ScopeAttributes")]
-    pub scope_attributes: Vec<(String, String)>,
+    pub scope_attributes: SharedAttrs,
     #[serde(rename = "ScopeDroppedAttrCount")]
     pub scope_dropped_attr_count: u32,
     #[serde(rename = "ScopeSchemaUrl")]
-    pub scope_schema_url: String,
+    pub scope_schema_url: Arc<str>,
     #[serde(rename = "ServiceName")]
-    pub service_name: String,
+    pub service_name: Arc<str>,
     #[serde(rename = "MetricName")]
-    pub metric_name: String,
+    pub metric_name: Arc<str>,
     #[serde(rename = "MetricDescription")]
-    pub metric_description: String,
+    pub metric_description: Arc<str>,
     #[serde(rename = "MetricUnit")]
-    pub metric_unit: String,
+    pub metric_unit: Arc<str>,
     #[serde(rename = "Attributes")]
-    pub attributes: Vec<(String, String)>,
+    pub attributes: Attrs,
     #[serde(rename = "StartTimeUnix")]
     pub start_time_unix: i64,
     #[serde(rename = "TimeUnix")]
@@ -362,31 +399,31 @@ pub struct ExpHistogramRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct SummaryRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     #[serde(rename = "ResourceAttributes")]
-    pub resource_attributes: Vec<(String, String)>,
+    pub resource_attributes: SharedAttrs,
     #[serde(rename = "ResourceSchemaUrl")]
-    pub resource_schema_url: String,
+    pub resource_schema_url: Arc<str>,
     #[serde(rename = "ScopeName")]
-    pub scope_name: String,
+    pub scope_name: Arc<str>,
     #[serde(rename = "ScopeVersion")]
-    pub scope_version: String,
+    pub scope_version: Arc<str>,
     #[serde(rename = "ScopeAttributes")]
-    pub scope_attributes: Vec<(String, String)>,
+    pub scope_attributes: SharedAttrs,
     #[serde(rename = "ScopeDroppedAttrCount")]
     pub scope_dropped_attr_count: u32,
     #[serde(rename = "ScopeSchemaUrl")]
-    pub scope_schema_url: String,
+    pub scope_schema_url: Arc<str>,
     #[serde(rename = "ServiceName")]
-    pub service_name: String,
+    pub service_name: Arc<str>,
     #[serde(rename = "MetricName")]
-    pub metric_name: String,
+    pub metric_name: Arc<str>,
     #[serde(rename = "MetricDescription")]
-    pub metric_description: String,
+    pub metric_description: Arc<str>,
     #[serde(rename = "MetricUnit")]
-    pub metric_unit: String,
+    pub metric_unit: Arc<str>,
     #[serde(rename = "Attributes")]
-    pub attributes: Vec<(String, String)>,
+    pub attributes: Attrs,
     #[serde(rename = "StartTimeUnix")]
     pub start_time_unix: i64,
     #[serde(rename = "TimeUnix")]

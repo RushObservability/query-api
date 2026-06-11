@@ -266,34 +266,52 @@ pub async fn export_logs(
          ORDER BY TimestampTime DESC, Timestamp DESC LIMIT {limit}",
         clauses.to_sql(),
     );
-    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-        .fetch_all::<LogRecord>().await
-        .map_err(|e| {
-            tracing::error!(error = %e, signal = "logs", handler = "export_logs", "export query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
-        })?;
 
     let unix = chrono::Utc::now().timestamp();
     match req.format {
         export::ExportFormat::Csv => {
-            let mut out = export::csv_query_preamble(
+            // Stream rows from the ClickHouse cursor instead of buffering the full
+            // result set + the concatenated CSV string in memory. Peak memory is one
+            // row at a time, so a million-row export no longer materializes hundreds of
+            // MB. Output bytes (preamble, header, per-row escaping) are byte-identical
+            // to the previous fetch_all path. The LIMIT in the SQL still enforces the
+            // configured row cap. tenant_query carries tenant settings/row-policy.
+            let mut prelude = export::csv_query_preamble(
                 "logs", &req.time_range.from, &req.time_range.to,
                 req.search.as_deref(), req.query_text.as_deref(),
             );
-            out.push_str("Timestamp,Severity,ServiceName,Body,TraceId\n");
-            for r in &rows {
-                out.push_str(&format!(
+            prelude.push_str("Timestamp,Severity,ServiceName,Body,TraceId\n");
+
+            let cursor = crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch::<LogRecord>()
+                .map_err(|e| {
+                    tracing::error!(error = %e, signal = "logs", handler = "export_logs", "export stream init failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
+                })?;
+
+            let fmt_row = |r: &LogRecord| -> String {
+                format!(
                     "{},{},{},{},{}\n",
                     export::csv_field(&export::ts_rfc3339(r.timestamp)),
                     export::csv_field(&r.severity_text),
                     export::csv_field(&r.service_name),
                     export::csv_field(&r.body),
                     export::csv_field(&r.trace_id),
-                ));
-            }
-            Ok(export::file_response(out, "text/csv; charset=utf-8", &format!("rush-logs-{unix}.csv")))
+                )
+            };
+            Ok(export::stream_csv_response(cursor, prelude, fmt_row, &format!("rush-logs-{unix}.csv")))
         }
         export::ExportFormat::Json => {
+            // JSON export stays on the buffered fetch_all path: its output is
+            // serde_json::to_string_pretty over the full envelope, which can't be
+            // reproduced byte-for-byte while streaming row-by-row. Row count is still
+            // capped by LIMIT, so memory is bounded by the cap (default 1000). See report.
+            let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch_all::<LogRecord>().await
+                .map_err(|e| {
+                    tracing::error!(error = %e, signal = "logs", handler = "export_logs", "export query failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
+                })?;
             let body = serde_json::json!({
                 "query": {
                     "signal": "logs",

@@ -365,16 +365,36 @@ async fn query_clickhouse(
 
     let where_clause = where_parts.join(" AND ");
 
-    // NOTE on SQL-side bucketing: we deliberately still pull raw samples here rather
-    // than pushing step-bucketing into SQL (GROUP BY toStartOfInterval + argMax/avg),
-    // because rate()/increase() counter-reset detection requires adjacent raw samples;
-    // pre-bucketing would silently change their semantics. Revisit by splitting the
-    // align=true (instant vector) path, which CAN be bucketed server-side safely.
+    // ── SQL-side step bucketing for the align=true (instant-vector) path ──
     //
-    // ORDER BY series key first, then time: rows arrive grouped per series so the
-    // label set is built once per series (key-change detection) instead of once per
-    // sample row, and per-series samples arrive already time-sorted.
-    let make_sql = |table: &str| {
+    // rate()/increase()/delta() and the *_over_time range functions reach this code with
+    // align=false (via MatrixSelector); they need every adjacent RAW sample for
+    // counter-reset detection, so that path below still streams all raw rows.
+    //
+    // The align=true path only ever needs ONE value per series per step: the latest
+    // sample (by TimeUnix) inside the centered window [t - half_step, t + half_step].
+    // That is reproducible server-side with a per-step argMax(Value, TimeUnix) (see
+    // make_bucketed_sql), so we push it down — turning "stream N raw samples to Rust"
+    // into "stream one row per (series, step)". We deliberately read RAW here (not the
+    // rollups): the rollups bucket by left-aligned wall-clock toStartOfInterval, which
+    // does NOT match the centered, arbitrary-grid windows step_align_series uses, so the
+    // rollups are not numerically identical for this path.
+    //
+    // grid_step / grid_start come from the step grid; these are f64s we control (never
+    // user SQL).
+    let grid_step: f64 = if step_timestamps.len() >= 2 {
+        step_timestamps[1] - step_timestamps[0]
+    } else {
+        // Single step (instant query): step_align_series uses half_step = lookback, i.e.
+        // the whole [start,end] window collapses to one bucket. Model that as a single
+        // step of width 2*half_step so every in-window sample maps to k=0.
+        let hs = (end_secs - start_secs).max(5.0);
+        2.0 * hs
+    };
+    let grid_start: f64 = step_timestamps.first().copied().unwrap_or(start_secs);
+
+    // Raw-streaming SQL (align=false): all samples, ordered by series then time.
+    let make_raw_sql = |table: &str| {
         format!(
             "SELECT MetricName, ServiceName, Attributes, \
              toInt64(toUnixTimestamp64Milli(TimeUnix)) AS ts_ms, Value \
@@ -382,6 +402,48 @@ async fn query_clickhouse(
              WHERE {where_clause} \
              ORDER BY MetricName, ServiceName, Attributes, TimeUnix"
         )
+    };
+
+    // Bucketed SQL (align=true): one argMax-by-time value per (series, step k).
+    //
+    // step_align_series does a per-step *windowed lookup* (latest sample in the centered
+    // window [t_k - hs, t_k + hs], hs = grid_step/2), and the windows are inclusive at
+    // BOTH ends — so a sample sitting exactly on a shared boundary t_k + hs == t_{k+1} - hs
+    // populates BOTH step k and step k+1 (a carry-forward). A naive GROUP BY can't
+    // reproduce that because it partitions each sample into one bucket.
+    //
+    // We reproduce it exactly: each sample emits the FULL set of step indices whose
+    // window contains it, via arrayJoin(range(klo, khi+1)), where
+    //     klo = ceil ((st - hs - grid_start) / grid_step)
+    //     khi = floor((st + hs - grid_start) / grid_step)
+    // (almost always klo == khi; klo == khi-1 only at an exact shared boundary). Then
+    // argMax(Value, TimeUnix) per (series, k) picks the latest sample in each step's
+    // window — identical to step_align_series. Out-of-grid k are dropped in Rust.
+    //
+    // hs and grid_start/grid_step are f64s we control (never user SQL).
+    let hs = grid_step / 2.0;
+    let make_bucketed_sql = |table: &str| {
+        format!(
+            "SELECT MetricName, ServiceName, Attributes, k AS ts_ms, \
+             argMax(Value, TimeUnix) AS Value FROM ( \
+                SELECT MetricName, ServiceName, Attributes, Value, TimeUnix, \
+                arrayJoin(range( \
+                    toInt64(ceil ((toFloat64(toUnixTimestamp64Nano(TimeUnix)) / 1e9 - {hs} - {grid_start}) / {grid_step})), \
+                    toInt64(floor((toFloat64(toUnixTimestamp64Nano(TimeUnix)) / 1e9 + {hs} - {grid_start}) / {grid_step})) + 1 \
+                )) AS k \
+                FROM {table} WHERE {where_clause} \
+             ) \
+             GROUP BY MetricName, ServiceName, Attributes, k \
+             ORDER BY MetricName, ServiceName, Attributes, k"
+        )
+    };
+
+    let make_sql = |table: &str| {
+        if align {
+            make_bucketed_sql(table)
+        } else {
+            make_raw_sql(table)
+        }
     };
 
     // Table-routing cache (tenant, metric) → gauge/sum/both: skip the table that
@@ -450,16 +512,79 @@ async fn query_clickhouse(
         }
     };
 
-    let series = rows_to_series(&gauge_rows, &sum_rows);
-
     if align {
-        // Step-align for VectorSelector (instant vectors)
-        let lookback = end_secs - start_secs;
-        Ok(step_align_series(series, step_timestamps, lookback))
+        // Bucketed path: ts_ms holds the step bucket index k; value is the per-bucket
+        // argMax. Map k → step_timestamps[k] (dropping out-of-grid indices). This is
+        // exactly what step_align_series would have produced from the raw samples, but
+        // computed server-side.
+        Ok(bucketed_rows_to_series(&gauge_rows, &sum_rows, step_timestamps))
     } else {
-        // Return all raw samples for MatrixSelector (range vectors)
-        Ok(series)
+        // Return all raw samples for MatrixSelector (range vectors).
+        Ok(rows_to_series(&gauge_rows, &sum_rows))
     }
+}
+
+/// Convert SQL-bucketed rows (one row per series per step bucket, `ts_ms` reused as the
+/// integer bucket index k, `value` = argMax-by-time within the bucket) into TimeSeries
+/// with samples placed at `step_timestamps[k]`. Bucket indices outside `[0, n)` (samples
+/// from the lookback skirt that fall before the first / after the last step's centered
+/// window) are dropped — exactly as step_align_series drops them.
+///
+/// Mirrors `rows_to_series`: series sorted by label set, samples step-time-sorted,
+/// identical label sets merged (e.g. same labels in both tables, or distinct raw keys
+/// that collapse after empty-value attributes are dropped). When a merge produces two
+/// values at the same step (only possible across gauge+sum tables for the same label
+/// set), the later one by step order wins — same effective last-write behavior.
+fn bucketed_rows_to_series(
+    gauge_rows: &[MetricSample],
+    sum_rows: &[MetricSample],
+    step_timestamps: &[f64],
+) -> Vec<TimeSeries> {
+    let n = step_timestamps.len() as i64;
+    let mut series: Vec<TimeSeries> = Vec::new();
+
+    for rows in [gauge_rows, sum_rows] {
+        let mut prev_key: Option<(&str, &str, &[(String, String)])> = None;
+        for s in rows {
+            let k = s.ts_ms; // bucket index reused in the ts_ms slot
+            if k < 0 || k >= n {
+                continue; // outside the step grid (lookback skirt) — dropped
+            }
+            let key = (
+                s.metric_name.as_str(),
+                s.service_name.as_str(),
+                s.attributes.as_slice(),
+            );
+            if prev_key != Some(key) {
+                series.push(TimeSeries {
+                    labels: types::build_label_set(&s.metric_name, &s.service_name, &s.attributes),
+                    samples: Vec::new(),
+                });
+                prev_key = Some(key);
+            }
+            series
+                .last_mut()
+                .expect("series pushed above")
+                .samples
+                .push((step_timestamps[k as usize], s.value));
+        }
+    }
+
+    // Merge duplicate label sets and restore label-sorted output order, matching
+    // rows_to_series. Samples within a series are sorted by step time.
+    series.sort_by(|a, b| a.labels.cmp(&b.labels));
+    let mut merged: Vec<TimeSeries> = Vec::with_capacity(series.len());
+    for ts in series {
+        match merged.last_mut() {
+            Some(last) if last.labels == ts.labels => {
+                last.samples.extend(ts.samples);
+                last.samples
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            _ => merged.push(ts),
+        }
+    }
+    merged
 }
 
 /// Convert raw sample rows into TimeSeries. Rows must arrive ordered by
@@ -515,6 +640,11 @@ fn rows_to_series(gauge_rows: &[MetricSample], sum_rows: &[MetricSample]) -> Vec
 }
 
 /// Snap raw series to step timestamps, picking the latest sample within tolerance.
+///
+/// Retained as the executable reference for the SQL-side bucketing rewrite: the new
+/// `align=true` path computes the same assignment server-side (see `query_clickhouse`),
+/// and tests pin the SQL bucket-index formula against this function.
+#[cfg_attr(not(test), allow(dead_code))]
 fn step_align_series(
     series: Vec<TimeSeries>,
     step_timestamps: &[f64],
@@ -847,5 +977,121 @@ mod tests {
     #[test]
     fn rows_to_series_empty_input() {
         assert!(rows_to_series(&[], &[]).is_empty());
+    }
+
+    // ── SQL-side bucketing equivalence (Part B) ──
+    //
+    // These pin the new align=true server-side bucketing against step_align_series, the
+    // pre-existing Rust reference. We replicate exactly what ClickHouse computes:
+    //   1. bucket index k = ceil((st - grid_start)/grid_step - 0.5)   [the SQL expr]
+    //   2. argMax(Value, TimeUnix) within each (series, k)            [the SQL GROUP BY]
+    //   3. map k -> step_timestamps[k], drop k outside [0, n)         [bucketed_rows_to_series]
+    // and assert the resulting samples equal step_align_series on the same raw input.
+
+    /// Mirror of the SQL `make_bucketed_sql` aggregation, computed in Rust over raw
+    /// samples: returns rows where ts_ms carries the integer bucket index and value is
+    /// argMax-by-time within the bucket.
+    fn bucketize_like_sql(
+        raw: &[(f64, f64)],
+        grid_start: f64,
+        grid_step: f64,
+    ) -> Vec<MetricSample> {
+        use std::collections::BTreeMap;
+        let hs = grid_step / 2.0;
+        // (bucket index) -> (best_time, value)
+        let mut buckets: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+        for &(st, v) in raw {
+            // Each sample emits every step index whose centered window contains it —
+            // mirrors arrayJoin(range(klo, khi+1)) in make_bucketed_sql.
+            let klo = ((st - hs - grid_start) / grid_step).ceil() as i64;
+            let khi = ((st + hs - grid_start) / grid_step).floor() as i64;
+            for k in klo..=khi {
+                buckets
+                    .entry(k)
+                    .and_modify(|(bt, bv)| {
+                        if st >= *bt {
+                            // argMax(Value, TimeUnix): latest time wins.
+                            *bt = st;
+                            *bv = v;
+                        }
+                    })
+                    .or_insert((st, v));
+            }
+        }
+        buckets
+            .into_iter()
+            .map(|(k, (_, v))| MetricSample {
+                metric_name: "m".to_string(),
+                service_name: "s".to_string(),
+                attributes: vec![],
+                ts_ms: k,
+                value: v,
+            })
+            .collect()
+    }
+
+    fn assert_sql_bucketing_matches_step_align(samples: Vec<(f64, f64)>, steps: &[f64]) {
+        assert!(steps.len() >= 2, "helper only covers multi-step grids");
+        let grid_step = steps[1] - steps[0];
+        let grid_start = steps[0];
+        let rows = bucketize_like_sql(&samples, grid_start, grid_step);
+        let got = bucketed_rows_to_series(&rows, &[], steps);
+
+        // Reference: step_align_series with the matching half_step (= grid_step/2 for
+        // multi-step grids).
+        let lookback = grid_step / 2.0;
+        let want = step_align_series(series_with(samples), steps, lookback);
+
+        let got_samples = got.first().map(|s| s.samples.clone()).unwrap_or_default();
+        let want_samples = want.first().map(|s| s.samples.clone()).unwrap_or_default();
+        assert_eq!(got_samples, want_samples, "grid_start={grid_start} grid_step={grid_step}");
+    }
+
+    #[test]
+    fn sql_bucketing_matches_step_align_regular_grid() {
+        // 15s scrape on a 30s step grid (same fixture as the two-pointer test).
+        let samples: Vec<(f64, f64)> = (0..40).map(|i| (i as f64 * 15.0, i as f64)).collect();
+        let steps: Vec<f64> = (0..20).map(|i| i as f64 * 30.0).collect();
+        assert_sql_bucketing_matches_step_align(samples, &steps);
+    }
+
+    #[test]
+    fn sql_bucketing_matches_step_align_sparse_gappy() {
+        let samples = vec![
+            (3.0, 1.0),
+            (14.5, 2.0),
+            (15.0, 2.5),
+            (61.0, 3.0),
+            (200.0, 4.0),
+            (201.0, 5.0),
+        ];
+        let steps: Vec<f64> = (0..30).map(|i| i as f64 * 10.0).collect();
+        assert_sql_bucketing_matches_step_align(samples, &steps);
+    }
+
+    #[test]
+    fn sql_bucketing_matches_step_align_at_boundaries() {
+        // Samples landing exactly on t ± half_step (half_step = 5, step = 10). The tie
+        // must go to the LOWER step, matching step_align_series. This is the case where
+        // round() / floor(x+0.5) would diverge — ceil(x - 0.5) must be used.
+        let samples = vec![(5.0, 1.0), (15.0, 2.0), (25.0, 3.0)];
+        let steps = vec![0.0, 10.0, 20.0, 30.0];
+        assert_sql_bucketing_matches_step_align(samples, &steps);
+    }
+
+    #[test]
+    fn sql_bucketing_drops_out_of_grid_indices() {
+        // Samples far before the first step and after the last must be dropped (k<0 or
+        // k>=n), exactly as step_align_series's window check drops them.
+        let samples = vec![(-1000.0, 9.0), (5.0, 1.0), (10_000.0, 9.0)];
+        let steps = vec![0.0, 10.0, 20.0];
+        assert_sql_bucketing_matches_step_align(samples, &steps);
+    }
+
+    #[test]
+    fn sql_bucketing_empty_yields_empty() {
+        let steps = vec![0.0, 10.0, 20.0];
+        let got = bucketed_rows_to_series(&[], &[], &steps);
+        assert!(got.is_empty());
     }
 }

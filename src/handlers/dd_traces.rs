@@ -142,7 +142,7 @@ fn convert_span(
     span: &DdSpan,
     env: &str,
     hostname: &str,
-    tenant_id: &str,
+    tenant_id: &std::sync::Arc<str>,
 ) -> TraceInsertRow {
     let trace_id = id_to_hex(span.trace_id, 32);
     let span_id = id_to_hex(span.span_id, 16);
@@ -187,7 +187,7 @@ fn convert_span(
     }
 
     TraceInsertRow {
-        tenant_id: tenant_id.to_string(),
+        tenant_id: tenant_id.clone(),
         timestamp: span.start,
         trace_id,
         span_id,
@@ -195,10 +195,10 @@ fn convert_span(
         trace_state: String::new(),
         span_name: span.name.clone(),
         span_kind: span_kind.to_string(),
-        service_name: span.service.clone(),
-        resource_attributes: resource_attrs,
-        scope_name: "datadog".to_string(),
-        scope_version: String::new(),
+        service_name: span.service.as_str().into(),
+        resource_attributes: std::sync::Arc::new(resource_attrs),
+        scope_name: "datadog".into(),
+        scope_version: "".into(),
         span_attributes: span_attrs,
         duration: span.duration.max(0) as u64,
         status_code: status_code.to_string(),
@@ -239,11 +239,13 @@ pub async fn ingest_v04(
         return Ok(Json(serde_json::json!({"rate_by_service": {}})));
     }
 
+    // Arc refactor: tenant_id is shared across every span — allocate once.
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     let rows: Vec<TraceInsertRow> = traces.iter().flat_map(|trace| {
         trace.iter().map(|span| {
             let env = span.meta.get("env").cloned().unwrap_or_default();
             let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-            convert_span(span, &env, &hostname, tenant_id)
+            convert_span(span, &env, &hostname, &tenant_arc)
         })
     }).collect();
 
@@ -291,6 +293,8 @@ pub async fn ingest_agent(
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
+    // Arc refactor: tenant_id is shared across every span in this request.
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     let _ = validate_api_key(&headers);
     let raw = decompress_body(&headers, body).await?;
 
@@ -379,7 +383,7 @@ pub async fn ingest_agent(
         let rows: Vec<TraceInsertRow> = all_spans.iter().map(|span| {
             let span_env = span.meta.get("env").cloned().unwrap_or_default();
             let span_host = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-            convert_span(span, &span_env, &span_host, tenant_id)
+            convert_span(span, &span_env, &span_host, &tenant_arc)
         }).collect();
 
         state.writer.write(SpoolBatch::SpansRaw(rows)).await.map_err(|e| match e {
@@ -415,7 +419,7 @@ pub async fn ingest_agent(
                 trace.iter().map(|span| {
                     let env = span.meta.get("env").cloned().unwrap_or_default();
                     let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-                    convert_span(span, &env, &hostname, tenant_id)
+                    convert_span(span, &env, &hostname, &tenant_arc)
                 })
             }).collect();
 

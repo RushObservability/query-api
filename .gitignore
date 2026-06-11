@@ -8,3 +8,4 @@ rush_config.db-shm
 rush_config.db-wal
 /static_analysis_semgrep_1
 /static_analysis_semgrep_2
+/graphify-out

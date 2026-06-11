@@ -89,8 +89,37 @@ async fn eval_trace_latency(
     Ok((row.bad as i64, row.total as i64))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Metric SLO evaluators: ALL stay on RAW (no rollup), deliberately.
+//
+// The 1m/1h metric rollups store per-bucket avg/min/max/last/count (gauge) and
+// last/min/max/count (sum). The three metric SLO evaluators below each need something
+// the rollups cannot reproduce without approximation, so per the correctness mandate
+// they are NOT rolled up:
+//
+//   * eval_metric_availability — `sumIf(Value, pred)` over metrics_sum: the arithmetic
+//     SUM of all sample Values in the window. The sum rollup intentionally stores
+//     last/min/max/count (a counter's instant value), NOT sum-of-values, so a windowed
+//     sumIf is unrecoverable. (Storing sum-of-values for a monotonic counter would also
+//     be meaningless.)
+//   * eval_metric_latency — histogram-bucket math on metrics_histogram. Histograms are
+//     not rolled up at all (only gauge + sum are), and per-bucket counts can't be
+//     derived from scalar aggregates.
+//   * eval_metric_threshold — `countIf(Value <op> threshold)` over metrics_gauge: the
+//     number of individual samples crossing a threshold. avg/min/max/last/count per
+//     bucket cannot tell you how many of the underlying samples exceeded a value
+//     (that's a per-sample predicate), so this is unrecoverable from the rollup.
+//
+// These are long rolling-window scans (up to 30d), so they are the queries that would
+// benefit most — but a wrong availability ratio is far worse than a slow one. They read
+// raw, scoped by tenant + service_name + the SLO filters, with max_execution_time capped.
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// metric + availability: SUM(Value) error / SUM(Value) total on metrics_sum — ONE scan,
 /// same predicate-pushdown shape as trace availability but with sumIf.
+///
+/// Stays on RAW (see the block comment above): a windowed sumIf(Value) is not derivable
+/// from the sum rollup's last/min/max/count aggregates.
 async fn eval_metric_availability(
     ch: &Client,
     common_filters: &[Filter],
