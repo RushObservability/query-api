@@ -26,21 +26,76 @@ pub async fn get_trace(
     }
 
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
-    // Use FINAL to deduplicate (MergeTree may have duplicate span_ids from MV + direct insert)
-    let rows = crate::tenant_query(
+
+    // Fast path: the spans_by_trace MV is ORDER BY (tenant_id, trace_id, timestamp), so
+    // resolving the trace's time bounds is a primary-key lookup instead of a
+    // whole-retention bloom-filter probe. The wide-column spans fetch is then bounded
+    // to that window (±5 min for clock skew), pruning to a handful of granules.
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct TraceTimeBounds {
+        min_ns: i64,
+        max_ns: i64,
+        cnt: u64,
+    }
+
+    let bounds = crate::tenant_query(
             &state.ch,
             &format!(
-                "SELECT * FROM spans PREWHERE tenant_id = '{escaped_tenant}' WHERE trace_id = ? ORDER BY timestamp ASC"
+                "SELECT min(toUnixTimestamp64Nano(timestamp)) AS min_ns, \
+                 max(toUnixTimestamp64Nano(timestamp)) AS max_ns, count() AS cnt \
+                 FROM spans_by_trace \
+                 PREWHERE tenant_id = '{escaped_tenant}' WHERE trace_id = ?"
             ),
             tenant_id,
         )
         .bind(&trace_id)
-        .fetch_all::<WideEvent>()
+        .fetch_one::<TraceTimeBounds>()
+        .await;
+
+    // Time bound for the spans fetch, when the MV knows the trace. lo/hi are
+    // server-computed i64 nanoseconds (not user input). ±5 min pad for clock skew.
+    const PAD_NS: i64 = 300_000_000_000;
+    let time_bound = match &bounds {
+        Ok(b) if b.cnt > 0 => {
+            let lo = b.min_ns.saturating_sub(PAD_NS);
+            let hi = b.max_ns.saturating_add(PAD_NS);
+            format!(" AND timestamp >= fromUnixTimestamp64Nano({lo}) AND timestamp <= fromUnixTimestamp64Nano({hi})")
+        }
+        Ok(_) => String::new(),
+        Err(e) => {
+            // MV missing/unhealthy: fall back to the unbounded scan rather than 404ing.
+            tracing::warn!(error = %e, signal = "traces", handler = "get_trace", "spans_by_trace bounds lookup failed; falling back to unbounded scan");
+            String::new()
+        }
+    };
+
+    let fetch_spans = |time_bound: String| {
+        let sql = format!(
+            "SELECT * FROM spans PREWHERE tenant_id = '{escaped_tenant}'{time_bound} WHERE trace_id = ? ORDER BY timestamp ASC"
+        );
+        let q = crate::tenant_query(&state.ch, &sql, tenant_id).bind(&trace_id);
+        async move { q.fetch_all::<WideEvent>().await }
+    };
+
+    let mut rows = fetch_spans(time_bound.clone())
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "traces", handler = "get_trace", "ClickHouse query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
+
+    // Defensive fallback: the MV is populated asynchronously, so if the bounded fetch
+    // found nothing while the MV claimed knowledge (or the MV had no rows but the
+    // trace exists only in spans, e.g. data ingested before the MV was created),
+    // retry without the time bound before declaring 404.
+    if rows.is_empty() && !time_bound.is_empty() {
+        rows = fetch_spans(String::new())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, signal = "traces", handler = "get_trace", "ClickHouse fallback query failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+            })?;
+    }
 
     if rows.is_empty() {
         return Err((StatusCode::NOT_FOUND, "trace not found".to_string()));

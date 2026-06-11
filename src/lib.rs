@@ -79,7 +79,15 @@ pub fn row_policy_supported() -> bool {
 /// configured), the query runs without it — the API-layer WHERE clause is still the primary
 /// tenant isolation mechanism.
 pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
-    let q = ch.query(sql);
+    // Read guardrails: cap result sets so a single pathological query (PromQL over a
+    // huge range, export with a wide window, etc.) cannot stream unbounded rows into
+    // this process. `break` truncates silently at the cap instead of erroring, which
+    // is acceptable for the read path. Note: deliberately NOT setting readonly=2 here
+    // because this client is shared with paths that set their own settings.
+    let q = ch
+        .query(sql)
+        .with_option("max_result_rows", "500000")
+        .with_option("result_overflow_mode", "break");
     if ROW_POLICY_SUPPORTED.load(Ordering::Relaxed) == 1 {
         q.with_option("rush_tenant_id", tenant_id)
     } else {

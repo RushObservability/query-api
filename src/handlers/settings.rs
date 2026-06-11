@@ -186,7 +186,11 @@ pub async fn get_sre_agent_settings(
     };
     let max_tool_steps = read("sre_agent_max_tool_steps", SRE_AGENT_DEFAULT_MAX_TOOL_STEPS).await;
     let max_llm_calls = read("sre_agent_max_llm_calls", SRE_AGENT_DEFAULT_MAX_LLM_CALLS).await;
+    // Same key /api/v1/features exposes as `sre_agent` — this is the UI switch.
+    let enabled = state.config_db.get_setting("sre_agent_enabled").await
+        .ok().flatten().map(|v| v == "true").unwrap_or(false);
     Ok(Json(serde_json::json!({
+        "enabled": enabled,
         "max_tool_steps": max_tool_steps,
         "max_llm_calls": max_llm_calls,
         "defaults": {
@@ -206,6 +210,21 @@ pub async fn set_sre_agent_settings(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
+
+    // Optional `enabled` toggle: strictly a JSON bool when present.
+    if let Some(enabled_val) = body.get("enabled") {
+        let enabled = enabled_val.as_bool().ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
+        })?;
+        state.config_db.set_setting("sre_agent_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to save sre_agent_enabled");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+        })?;
+        // Toggle-only update: budget fields are optional in this case.
+        if body.get("max_tool_steps").is_none() && body.get("max_llm_calls").is_none() {
+            return Ok(Json(serde_json::json!({ "enabled": enabled })));
+        }
+    }
 
     let steps = body.get("max_tool_steps").and_then(|v| v.as_u64()).ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "missing or invalid 'max_tool_steps' (expected a positive integer)".to_string())

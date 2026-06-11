@@ -624,6 +624,82 @@ pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> Quer
     QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
 }
 
+/// Whitelisted time-bucket intervals (token, seconds), ascending.
+/// Must stay in sync with the `interval_fn` match arms in the count/timeseries handlers.
+const BUCKET_INTERVALS: &[(&str, u64)] = &[
+    ("1s", 1),
+    ("10s", 10),
+    ("1m", 60),
+    ("5m", 300),
+    ("15m", 900),
+    ("1h", 3600),
+    ("1d", 86400),
+];
+
+/// Best-effort parse of the datetime formats accepted by the API (RFC3339, with or
+/// without an explicit offset, or a plain `YYYY-MM-DD HH:MM:SS`).
+fn parse_datetime_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&format!("{s}Z")) {
+        return Some(dt.timestamp());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(naive.and_utc().timestamp());
+        }
+    }
+    None
+}
+
+/// Clamp a client-supplied bucket interval so the expected bucket count
+/// (time range / interval) stays <= `max_buckets`. The interval is untrusted:
+/// a `1s` interval over 30 days would otherwise produce ~2.6M GROUP BY buckets.
+///
+/// - Unknown interval tokens fall back to `1m` (mirrors the handlers' default arm).
+/// - If the bucket count would exceed `max_buckets`, the interval is snapped UP to
+///   the smallest whitelisted interval that fits (i.e. interval >= range/max_buckets).
+/// - Returns Err only on nonsensical input: a zero or negative time range.
+/// - If the range cannot be parsed at all, the interval is returned unclamped and
+///   ClickHouse's own parseDateTimeBestEffort handles (or rejects) the range.
+pub fn clamp_bucket_interval(
+    interval: &str,
+    from: &str,
+    to: &str,
+    max_buckets: u64,
+) -> Result<&'static str, String> {
+    // Unknown tokens fall back to 1m, mirroring the handlers' default match arm.
+    let (effective, requested_secs) = BUCKET_INTERVALS
+        .iter()
+        .find(|(tok, _)| *tok == interval)
+        .copied()
+        .unwrap_or(("1m", 60));
+
+    let (Some(from_secs), Some(to_secs)) = (parse_datetime_secs(from), parse_datetime_secs(to)) else {
+        // Unparsable range: leave as-is, the SQL layer validates the range itself.
+        return Ok(effective);
+    };
+    let range_secs = to_secs - from_secs;
+    if range_secs <= 0 {
+        return Err("time range must be positive (to must be after from)".to_string());
+    }
+
+    let min_interval_secs = (range_secs as u64).div_ceil(max_buckets.max(1));
+    if requested_secs >= min_interval_secs {
+        return Ok(effective);
+    }
+    // Snap up to the smallest whitelisted interval that keeps buckets <= max_buckets.
+    for (tok, secs) in BUCKET_INTERVALS {
+        if *secs >= min_interval_secs {
+            return Ok(tok);
+        }
+    }
+    // Range too large even for the coarsest interval — use the coarsest.
+    Ok(BUCKET_INTERVALS.last().map(|(tok, _)| *tok).unwrap_or("1d"))
+}
+
 #[cfg(test)]
 mod search_tests {
     use super::*;
@@ -701,5 +777,89 @@ mod search_tests {
         assert_eq!(sql, "TraceId = 'a1b2c3d4e5f6071829304a5b6c7d8e9f'");
         let sql = build_log_search_sql("a1b2c3d4e5f60718").unwrap();
         assert_eq!(sql, "SpanId = 'a1b2c3d4e5f60718'");
+    }
+}
+
+#[cfg(test)]
+mod bucket_interval_tests {
+    use super::*;
+
+    // 1h range at 1s interval = 3600 buckets > 2000 → snaps up to 10s (360 buckets).
+    #[test]
+    fn snaps_interval_up_when_bucket_count_exceeds_cap() {
+        let got = clamp_bucket_interval(
+            "1s",
+            "2026-06-10T00:00:00Z",
+            "2026-06-10T01:00:00Z",
+            2000,
+        )
+        .unwrap();
+        assert_eq!(got, "10s");
+    }
+
+    // 30d range at 1s = 2.59M buckets → snaps far up (30d/2000 = 1296s → 1h).
+    #[test]
+    fn snaps_to_hour_for_month_range_at_one_second() {
+        let got = clamp_bucket_interval(
+            "1s",
+            "2026-05-11T00:00:00Z",
+            "2026-06-10T00:00:00Z",
+            2000,
+        )
+        .unwrap();
+        assert_eq!(got, "1h");
+    }
+
+    // Interval already coarse enough is returned unchanged.
+    #[test]
+    fn keeps_interval_when_within_cap() {
+        let got = clamp_bucket_interval(
+            "1m",
+            "2026-06-10T00:00:00Z",
+            "2026-06-10T06:00:00Z",
+            2000,
+        )
+        .unwrap();
+        assert_eq!(got, "1m");
+    }
+
+    // Unknown token falls back to the handlers' 1m default before clamping.
+    #[test]
+    fn unknown_token_defaults_to_one_minute() {
+        let got = clamp_bucket_interval(
+            "7m",
+            "2026-06-10T00:00:00Z",
+            "2026-06-10T01:00:00Z",
+            2000,
+        )
+        .unwrap();
+        assert_eq!(got, "1m");
+    }
+
+    // Zero / negative range is the only 400 case.
+    #[test]
+    fn rejects_non_positive_range() {
+        assert!(clamp_bucket_interval("1m", "2026-06-10T01:00:00Z", "2026-06-10T01:00:00Z", 2000).is_err());
+        assert!(clamp_bucket_interval("1m", "2026-06-10T02:00:00Z", "2026-06-10T01:00:00Z", 2000).is_err());
+    }
+
+    // Unparsable range strings are passed through (ClickHouse validates them later).
+    #[test]
+    fn unparsable_range_leaves_interval_unchanged() {
+        let got = clamp_bucket_interval("1s", "not-a-date", "also-not-a-date", 2000).unwrap();
+        assert_eq!(got, "1s");
+    }
+
+    // A range bigger than max_buckets days still resolves to the coarsest interval.
+    #[test]
+    fn huge_range_clamps_to_coarsest() {
+        let got = clamp_bucket_interval(
+            "1s",
+            "2016-06-10T00:00:00Z",
+            "2026-06-10T00:00:00Z",
+            2000,
+        )
+        .unwrap();
+        assert_eq!(got, "1d");
     }
 }

@@ -416,12 +416,16 @@ pub async fn query_events(
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
-    let json_rows: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
-        .collect();
-
-    Ok(Json(serde_json::json!({ "rows": json_rows, "total": json_rows.len() })))
+    // Serialize the typed rows directly — RumRecord's serde rename attributes already
+    // produce the exact field names the previous per-row Value conversion emitted, so
+    // the intermediate Vec<serde_json::Value> was pure allocation overhead.
+    #[derive(serde::Serialize)]
+    struct Resp {
+        rows: Vec<RumRecord>,
+        total: usize,
+    }
+    let total = rows.len();
+    Ok(Json(Resp { rows, total }))
 }
 
 /// POST /api/v1/rum/vitals — web vitals aggregation
@@ -612,12 +616,13 @@ pub async fn session_detail(
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
-    let json_rows: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
-        .collect();
-
-    Ok(Json(serde_json::json!({ "events": json_rows })))
+    // Serialize typed rows directly (see query_events) — same JSON shape, no
+    // intermediate serde_json::Value per row.
+    #[derive(serde::Serialize)]
+    struct Resp {
+        events: Vec<RumRecord>,
+    }
+    Ok(Json(Resp { events: rows }))
 }
 
 // ── Session Replay ──

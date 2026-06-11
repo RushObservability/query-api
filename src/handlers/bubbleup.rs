@@ -64,6 +64,7 @@ pub struct ValueComparison {
 
 #[derive(Debug, clickhouse::Row, Deserialize)]
 struct DimensionRow {
+    dim_idx: u8,
     value: String,
     sel_count: u64,
     base_count: u64,
@@ -246,47 +247,63 @@ pub async fn bubbleup(
          WHERE TRUE {additional_filters}"
     );
 
-    // ── Dimension queries ──
-    // Build all SQL strings up front, then execute everything in parallel.
-    let dimension_sqls: Vec<(&str, String)> = dimensions
+    // ── Dimension query ──
+    // One GROUPING SETS query replaces the previous per-dimension parallel queries:
+    // the (identical) filtered window is scanned ONCE instead of once per dimension
+    // (7-8×). grouping(col) = 0 identifies which set a result row belongs to, and
+    // `LIMIT {top_k} BY dim_idx` (after ORDER BY dim_idx, sel_count DESC) reproduces
+    // each per-dimension `ORDER BY sel_count DESC LIMIT {top_k}` exactly — validated
+    // against the per-dimension queries on live ClickHouse 26.1 (identical rows; only
+    // tie order among equal sel_counts differs, which the old parallel queries didn't
+    // guarantee either).
+    let dim_idx_expr = {
+        let mut args: Vec<String> = dimensions
+            .iter()
+            .take(dimensions.len() - 1)
+            .enumerate()
+            .map(|(i, dim)| format!("grouping({dim}) = 0, {i}"))
+            .collect();
+        args.push(format!("{}", dimensions.len() - 1));
+        format!("multiIf({})", args.join(", "))
+    };
+    let value_expr = {
+        let mut args: Vec<String> = dimensions
+            .iter()
+            .take(dimensions.len() - 1)
+            .map(|dim| format!("grouping({dim}) = 0, toString({dim})"))
+            .collect();
+        args.push(format!("toString({})", dimensions.last().expect("non-empty dimensions")));
+        format!("multiIf({})", args.join(", "))
+    };
+    let grouping_sets = dimensions
         .iter()
-        .map(|dim| {
-            let sql = format!(
-                "SELECT \
-                    toString({dim}) AS value, \
-                    countIf({ts_col} >= parseDateTimeBestEffort('{sel_from}') \
-                        AND {ts_col} <= parseDateTimeBestEffort('{sel_to}')) AS sel_count, \
-                    countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
-                        AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS base_count \
-                 FROM {table} \
-                 PREWHERE tenant_id = '{escaped_tenant}' \
-                   AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
-                   AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
-                 WHERE TRUE {additional_filters} \
-                 GROUP BY value \
-                 HAVING sel_count > 0 OR base_count > 0 \
-                 ORDER BY sel_count DESC \
-                 LIMIT {top_k}"
-            );
-            (*dim, sql)
-        })
-        .collect();
+        .map(|dim| format!("({dim})"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    // Execute totals + all dimension queries in parallel.
-    let totals_future = crate::tenant_query(&state.ch, &totals_sql, tenant_id)
-        .fetch_one::<TotalRow>();
+    let dimensions_sql = format!(
+        "SELECT \
+            toUInt8({dim_idx_expr}) AS dim_idx, \
+            {value_expr} AS value, \
+            countIf({ts_col} >= parseDateTimeBestEffort('{sel_from}') \
+                AND {ts_col} <= parseDateTimeBestEffort('{sel_to}')) AS sel_count, \
+            countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
+                AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS base_count \
+         FROM {table} \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+           AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
+           AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
+         WHERE TRUE {additional_filters} \
+         GROUP BY GROUPING SETS ({grouping_sets}) \
+         HAVING sel_count > 0 OR base_count > 0 \
+         ORDER BY dim_idx ASC, sel_count DESC \
+         LIMIT {top_k} BY dim_idx"
+    );
 
-    let dimension_futures: Vec<_> = dimension_sqls
-        .iter()
-        .map(|(_dim, sql)| {
-            crate::tenant_query(&state.ch, sql, tenant_id)
-                .fetch_all::<DimensionRow>()
-        })
-        .collect();
-
-    let (totals_result, dimension_results) = tokio::join!(
-        totals_future,
-        futures_util::future::join_all(dimension_futures),
+    // Execute totals + dimensions queries in parallel.
+    let (totals_result, dimension_result) = tokio::join!(
+        crate::tenant_query(&state.ch, &totals_sql, tenant_id).fetch_one::<TotalRow>(),
+        crate::tenant_query(&state.ch, &dimensions_sql, tenant_id).fetch_all::<DimensionRow>(),
     );
 
     let totals = totals_result.map_err(|e| {
@@ -297,20 +314,24 @@ pub async fn bubbleup(
     let selection_count = totals.selection_count;
     let baseline_count = totals.baseline_count;
 
+    let dimension_rows = dimension_result.map_err(|e| {
+        tracing::error!(error = %e, signal = %req.signal, handler = "bubbleup", "dimensions query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("dimensions query failed: {e}"))
+    })?;
+
+    // Bucket rows back into per-dimension lists (rows arrive ordered by dim_idx).
+    let mut per_dim_rows: Vec<Vec<DimensionRow>> = (0..dimensions.len()).map(|_| Vec::new()).collect();
+    for row in dimension_rows {
+        let idx = row.dim_idx as usize;
+        if idx < per_dim_rows.len() {
+            per_dim_rows[idx].push(row);
+        }
+    }
+
     // ── Compute percentages and lift for each dimension ──
     let mut dim_comparisons = Vec::with_capacity(dimensions.len());
-    for (i, result) in dimension_results.into_iter().enumerate() {
+    for (i, rows) in per_dim_rows.into_iter().enumerate() {
         let dim_name = dimensions[i];
-        let rows = result.map_err(|e| {
-            tracing::error!(
-                error = %e,
-                signal = %req.signal,
-                handler = "bubbleup",
-                dimension = %dim_name,
-                "dimension query failed"
-            );
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("dimension query failed for {dim_name}: {e}"))
-        })?;
 
         let mut values: Vec<ValueComparison> = rows
             .into_iter()

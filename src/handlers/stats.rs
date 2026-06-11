@@ -1,9 +1,24 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse, Extension};
 use clickhouse::Row;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::sync::{LazyLock, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::AppState;
 use crate::TenantContext;
+
+/// Whether any object-storage (S3/MinIO) disk is configured. Disk topology only
+/// changes with a ClickHouse config reload + restart, so probe once per process.
+static OBJECT_STORE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Short-TTL response cache: stats are dashboard eye-candy, recomputing 12+
+/// aggregate scans per tenant per refresh is wasted I/O. Keyed by
+/// (tenant_id + requested range) so explicit time ranges never cross-contaminate.
+static STATS_CACHE: LazyLock<DashMap<String, (serde_json::Value, Instant)>> =
+    LazyLock::new(DashMap::new);
+const STATS_CACHE_TTL: Duration = Duration::from_secs(15);
+const STATS_CACHE_MAX: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
 pub struct StatsRequest {
@@ -85,11 +100,6 @@ struct CountResult {
     count: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Row)]
-struct RateResult {
-    rate: f64,
-}
-
 /// Combined total + rate in a single query to save a round-trip per signal.
 #[derive(Debug, Clone, Deserialize, Row)]
 struct TotalRateResult {
@@ -111,6 +121,20 @@ pub async fn get_stats(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+
+    // 15s response cache. The default (no explicit range) path uses a stable key so
+    // consecutive dashboard refreshes hit the cache even though from/to are
+    // recomputed from `now()` on every call.
+    let cache_key = match &req.time_range {
+        Some(tr) => format!("{tenant_id}|{}|{}", tr.from, tr.to),
+        None => format!("{tenant_id}|default"),
+    };
+    if let Some(entry) = STATS_CACHE.get(&cache_key) {
+        if entry.1.elapsed() < STATS_CACHE_TTL {
+            return Ok(Json(entry.0.clone()));
+        }
+    }
+
     let (from, to) = if let Some(tr) = &req.time_range {
         (tr.from.clone(), tr.to.clone())
     } else {
@@ -152,19 +176,20 @@ pub async fn get_stats(
          PREWHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
     ), tenant_id).fetch_one::<CountResult>();
 
-    let mg_total_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as count FROM metrics_gauge \
+    // Combined total + rate per metrics table (was two scans of the same window each).
+    let mg_stats_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as total, count() / {range_secs} as rate FROM metrics_gauge \
          PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<CountResult>();
+    ), tenant_id).fetch_one::<TotalRateResult>();
 
-    let ms_total_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as count FROM metrics_sum \
+    let ms_stats_fut = crate::tenant_query(&state.ch, &format!(
+        "SELECT count() as total, count() / {range_secs} as rate FROM metrics_sum \
          PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<CountResult>();
+    ), tenant_id).fetch_one::<TotalRateResult>();
 
     let mh_total_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM metrics_histogram \
@@ -172,20 +197,6 @@ pub async fn get_stats(
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<CountResult>();
-
-    let mg_rate_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() / {range_secs} as rate FROM metrics_gauge \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
-           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<RateResult>();
-
-    let ms_rate_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() / {range_secs} as rate FROM metrics_sum \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
-           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<RateResult>();
 
     let mg_today_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM metrics_gauge \
@@ -225,20 +236,18 @@ pub async fn get_stats(
          GROUP BY signal"
     )).fetch_all::<UsageRow>();
 
-    // ── Fire all 14 queries concurrently ──
+    // ── Fire all 12 queries concurrently ──
     let (
         span_stats_res, span_today_res,
         log_stats_res, log_today_res,
-        mg_total_res, ms_total_res, mh_total_res,
-        mg_rate_res, ms_rate_res,
+        mg_stats_res, ms_stats_res, mh_total_res,
         mg_today_res, ms_today_res,
         unique_series_res,
         storage_res, usage_rows_res,
     ) = tokio::join!(
         span_stats_fut, span_today_fut,
         log_stats_fut, log_today_fut,
-        mg_total_fut, ms_total_fut, mh_total_fut,
-        mg_rate_fut, ms_rate_fut,
+        mg_stats_fut, ms_stats_fut, mh_total_fut,
         mg_today_fut, ms_today_fut,
         unique_series_fut,
         storage_fut, usage_fut,
@@ -249,11 +258,12 @@ pub async fn get_stats(
     let span_today = span_today_res.map(|r| r.count).unwrap_or(0);
     let log_stats = log_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
     let log_today = log_today_res.map(|r| r.count).unwrap_or(0);
-    let metric_total = mg_total_res.map(|r| r.count).unwrap_or(0)
-        + ms_total_res.map(|r| r.count).unwrap_or(0)
+    let mg_stats = mg_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
+    let ms_stats = ms_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
+    let metric_total = mg_stats.total
+        + ms_stats.total
         + mh_total_res.map(|r| r.count).unwrap_or(0);
-    let metric_rate = mg_rate_res.map(|r| r.rate).unwrap_or(0.0)
-        + ms_rate_res.map(|r| r.rate).unwrap_or(0.0);
+    let metric_rate = mg_stats.rate + ms_stats.rate;
     let metric_today = mg_today_res.map(|r| r.count).unwrap_or(0)
         + ms_today_res.map(|r| r.count).unwrap_or(0);
     let unique_series = unique_series_res.map(|r| r.count).unwrap_or(0);
@@ -277,9 +287,17 @@ pub async fn get_stats(
 
     // Is any object-storage (S3/MinIO) disk configured? Distinguishes "tiering
     // off" from "on but nothing moved to cold yet" (when object-store bytes = 0).
-    let object_store_enabled = state.ch.query(
-        "SELECT count() AS count FROM system.disks WHERE type != 'Local'"
-    ).fetch_one::<CountResult>().await.map(|r| r.count > 0).unwrap_or(false);
+    // Disk topology requires a server restart to change, so resolve once per process.
+    // (A racing first call may probe twice; OnceLock keeps the first answer.)
+    let object_store_enabled = match OBJECT_STORE_ENABLED.get() {
+        Some(v) => *v,
+        None => {
+            let probed = state.ch.query(
+                "SELECT count() AS count FROM system.disks WHERE type != 'Local'"
+            ).fetch_one::<CountResult>().await.map(|r| r.count > 0).unwrap_or(false);
+            *OBJECT_STORE_ENABLED.get_or_init(|| probed)
+        }
+    };
 
     let stats_usage = if usage_rows.is_empty() {
         None
@@ -292,7 +310,7 @@ pub async fn get_stats(
         })
     };
 
-    Ok(Json(StatsResponse {
+    let response = StatsResponse {
         spans: SignalStats {
             total_events: span_stats.total,
             events_per_sec: span_stats.rate,
@@ -312,5 +330,17 @@ pub async fn get_stats(
         storage,
         object_store_enabled,
         usage: stats_usage,
-    }))
+    };
+
+    // Cache the serialized response (same JSON the client receives).
+    let value = serde_json::to_value(&response)
+        .map_err(|e| {
+            tracing::error!(error = %e, handler = "get_stats", "response serialization failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "serialization failed".into())
+        })?;
+    if STATS_CACHE.len() > STATS_CACHE_MAX {
+        STATS_CACHE.clear(); // defensive: don't let unbounded distinct ranges grow the map
+    }
+    STATS_CACHE.insert(cache_key, (value.clone(), Instant::now()));
+    Ok(Json(value))
 }
