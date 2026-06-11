@@ -472,6 +472,18 @@ async fn main() -> anyhow::Result<()> {
     if drain_only || run_replayer {
         writer.clone().spawn_replayer();
     }
+    // Cross-request insert batching: only the HTTP-serving process buffers
+    // ingest rows. The drain-only process never calls `write`, so it needs no
+    // flusher (and must not buffer — it only replays the spool).
+    if !drain_only {
+        let bc = writer.batch_config();
+        writer.spawn_flusher();
+        tracing::info!(
+            batch_rows = bc.max_rows,
+            batch_ms = bc.max_age.as_millis() as u64,
+            "ingest insert batching configured"
+        );
+    }
     // Stats engine (emits ingest-buffer depth/age/drain metrics). API process only.
     if !drain_only {
         stats_engine::spawn_stats_engine(ch.clone(), writer.buffer.clone());
@@ -1126,7 +1138,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware))
-        .with_state(state);
+        // Keep a writer handle for the graceful-shutdown flush before `state` is
+        // consumed by `with_state`.
+        .with_state(state.clone());
+    let shutdown_writer = state.writer.clone();
 
     let port: u16 = std::env::var("RUSH_PORT")
         .ok()
@@ -1180,7 +1195,38 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: on SIGINT/SIGTERM, stop accepting new connections, let
+    // in-flight requests finish, then flush any buffered ingest rows so the
+    // cross-request batcher never drops in-memory rows on a clean shutdown.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!("graceful shutdown: flushing buffered ingest batches");
+    shutdown_writer.flush_all().await;
 
     Ok(())
+}
+
+/// Resolve when a shutdown signal (Ctrl-C / SIGTERM) is received.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

@@ -32,22 +32,43 @@ pub async fn execute_query(
     }
     // Deep OFFSET pagination materializes and discards full wide rows server-side, so
     // cap how deep a client can page (50k rows ≈ 500 pages at the default page size).
-    // Follow-up (intentionally not done here to preserve the API contract the UI
-    // depends on — offset-based paging + wide rows for the detail panel): switch to
-    // keyset pagination on (timestamp, span_id) and return a slim column list for the
-    // list view, fetching wide columns only on row-expand.
     let offset = req.offset.min(50_000);
+    let limit = req.limit.min(1000);
 
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
-    let sql = format!(
-        "SELECT * FROM spans {} ORDER BY timestamp DESC LIMIT {} OFFSET {}",
-        clauses.to_sql(),
-        req.limit.min(1000),
-        offset,
-    );
+    // ── Additive pagination mode ──
+    // Keyset (cursor) pagination is opt-in: when the client sends a `cursor`, page via a
+    // bound `(timestamp, span_id)` WHERE predicate + `ORDER BY timestamp DESC, span_id
+    // DESC` (aligns with the (tenant,timestamp,...,span_id) sort key) instead of OFFSET,
+    // so deep pages don't scan+discard rows. A malformed/garbage cursor decodes to None
+    // and falls back to the offset path (non-fatal). When `cursor` is absent the SQL is
+    // byte-identical to the original offset query — existing callers see no change.
+    let keyset = req.cursor.as_deref().and_then(crate::query_builder::KeysetCursor::decode);
+
+    // Slim projection is opt-in via `columns: "list"`: select only the ~10 columns the
+    // Explore table renders. Default (absent/other) returns the full wide `SELECT *`.
+    let slim = req.columns.as_deref() == Some("list");
+    const SLIM_COLS: &str = "timestamp, service_name, span_name, http_method, http_path, \
+         http_status_code, duration_ns, status, trace_id, span_id";
+
+    let projection = if slim { SLIM_COLS } else { "*" };
+    let sql = if let Some(ref cur) = keyset {
+        // Keyset path: no OFFSET; deterministic (timestamp, span_id) ordering.
+        format!(
+            "SELECT {projection} FROM spans {} AND {} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}",
+            clauses.to_sql(),
+            cur.before_predicate(),
+        )
+    } else {
+        // Offset path: unchanged from the original behavior (ORDER BY timestamp DESC).
+        format!(
+            "SELECT {projection} FROM spans {} ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}",
+            clauses.to_sql(),
+        )
+    };
 
     // Capped count: an exact count() re-scans the entire lookback window with the same
     // predicate as the data fetch (doubling the work) just to render "N results". Wrap
@@ -60,20 +81,60 @@ pub async fn execute_query(
         clauses.to_sql(),
     );
 
-    // P0: Run data fetch and count in parallel
-    let (rows_result, count_result) = tokio::join!(
-        crate::tenant_query(&state.ch, &sql, tenant_id).fetch_all::<WideEvent>(),
-        crate::tenant_query(&state.ch, &count_sql, tenant_id).fetch_one::<CountRow>(),
-    );
+    // Run data fetch and count in parallel. Wide vs slim deserialize into different row
+    // types, but we normalize both into the same JSON `rows` array and compute the same
+    // `next_cursor` from the last row's (timestamp, span_id).
+    let (rows_json, next_cursor) = if slim {
+        let (rows_result, count_result) = tokio::join!(
+            crate::tenant_query(&state.ch, &sql, tenant_id).fetch_all::<crate::models::trace::SlimEvent>(),
+            crate::tenant_query(&state.ch, &count_sql, tenant_id).fetch_one::<CountRow>(),
+        );
+        let rows = rows_result.map_err(|e| {
+            tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
+        let total = count_result.map(|r| r.count).unwrap_or(0);
+        let next = rows.last().map(|r| crate::query_builder::KeysetCursor {
+            timestamp: r.timestamp,
+            span_id: r.span_id.clone(),
+        }.encode());
+        emit_usage_and_log(&state, &req, total, rows.len(), start);
+        (serde_json::json!({ "rows": rows, "total": total }), next)
+    } else {
+        let (rows_result, count_result) = tokio::join!(
+            crate::tenant_query(&state.ch, &sql, tenant_id).fetch_all::<WideEvent>(),
+            crate::tenant_query(&state.ch, &count_sql, tenant_id).fetch_one::<CountRow>(),
+        );
+        let rows = rows_result.map_err(|e| {
+            tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
+        let total = count_result.map(|r| r.count).unwrap_or(0);
+        let next = rows.last().map(|r| crate::query_builder::KeysetCursor {
+            timestamp: r.timestamp,
+            span_id: r.span_id.clone(),
+        }.encode());
+        emit_usage_and_log(&state, &req, total, rows.len(), start);
+        (serde_json::json!({ "rows": rows, "total": total }), next)
+    };
 
-    let rows = rows_result.map_err(|e| {
-        tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-    })?;
+    // Merge `next_cursor` additively into the existing `{rows, total}` envelope. Existing
+    // callers ignore the extra field; keyset-aware callers use it for the next page.
+    let mut resp = rows_json;
+    if let (Some(obj), Some(cursor)) = (resp.as_object_mut(), next_cursor) {
+        obj.insert("next_cursor".to_string(), serde_json::Value::String(cursor));
+    }
+    Ok(Json(resp))
+}
 
-    let total = count_result.map(|r| r.count).unwrap_or(0);
-
-    // Only track usage if the query returned results
+/// Shared usage-tracking + structured log for the explore query handler (wide & slim).
+fn emit_usage_and_log(
+    state: &AppState,
+    req: &QueryRequest,
+    total: u64,
+    row_count: usize,
+    start: std::time::Instant,
+) {
     if total > 0 {
         let filter_pairs: Vec<(String, String)> = req.filters.iter()
             .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
@@ -81,21 +142,15 @@ pub async fn execute_query(
         let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
         state.usage.track_many(signals, "span", "explore");
     }
-
     tracing::info!(
         signal = "traces",
-        tenant_id = %tenant_id,
         query = "explore",
-        rows = rows.len(),
+        rows = row_count,
         total = total,
         duration_ms = start.elapsed().as_millis() as u64,
         filters = req.filters.len(),
         "query completed"
     );
-
-    #[derive(serde::Serialize)]
-    struct Resp { rows: Vec<WideEvent>, total: u64 }
-    Ok(Json(Resp { rows, total }))
 }
 
 /// Span export request — same shape as a span query plus output format and an
@@ -141,29 +196,34 @@ pub async fn export_query(
         "SELECT * FROM spans {} ORDER BY timestamp DESC LIMIT {limit}",
         clauses.to_sql(),
     );
-    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-        .fetch_all::<WideEvent>().await
-        .map_err(|e| {
-            tracing::error!(error = %e, signal = "traces", handler = "export_query", "export query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
-        })?;
 
     let unix = chrono::Utc::now().timestamp();
     match req.format {
         export::ExportFormat::Csv => {
-            let mut out = export::csv_query_preamble(
+            // Stream span rows from the ClickHouse cursor (see export_logs / export.rs
+            // for rationale). Byte-identical CSV output to the prior fetch_all path;
+            // peak memory is one row regardless of the configured row cap.
+            let mut prelude = export::csv_query_preamble(
                 "spans", &req.time_range.from, &req.time_range.to,
                 req.search.as_deref(), req.query_text.as_deref(),
             );
-            out.push_str("Timestamp,Service,Method,Resource,Status,DurationMs,TraceId\n");
-            for r in &rows {
+            prelude.push_str("Timestamp,Service,Method,Resource,Status,DurationMs,TraceId\n");
+
+            let cursor = crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch::<WideEvent>()
+                .map_err(|e| {
+                    tracing::error!(error = %e, signal = "traces", handler = "export_query", "export stream init failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
+                })?;
+
+            let fmt_row = |r: &WideEvent| -> String {
                 let duration_ms = format!("{:.3}", r.duration_ns as f64 / 1_000_000.0);
                 let status = if r.http_status_code > 0 {
                     r.http_status_code.to_string()
                 } else {
                     r.status.clone()
                 };
-                out.push_str(&format!(
+                format!(
                     "{},{},{},{},{},{},{}\n",
                     export::csv_field(&export::ts_rfc3339(r.timestamp)),
                     export::csv_field(&r.service_name),
@@ -172,11 +232,19 @@ pub async fn export_query(
                     export::csv_field(&status),
                     export::csv_field(&duration_ms),
                     export::csv_field(&r.trace_id),
-                ));
-            }
-            Ok(export::file_response(out, "text/csv; charset=utf-8", &format!("rush-spans-{unix}.csv")))
+                )
+            };
+            Ok(export::stream_csv_response(cursor, prelude, fmt_row, &format!("rush-spans-{unix}.csv")))
         }
         export::ExportFormat::Json => {
+            // JSON export stays buffered (to_string_pretty envelope can't stream
+            // byte-identically). Row count is capped by LIMIT. See report.
+            let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch_all::<WideEvent>().await
+                .map_err(|e| {
+                    tracing::error!(error = %e, signal = "traces", handler = "export_query", "export query failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
+                })?;
             let body = serde_json::json!({
                 "query": {
                     "signal": "spans",
@@ -333,7 +401,12 @@ pub async fn timeseries_query(
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
         .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
-    let interval_fn = match req.interval.as_str() {
+    // The interval is client-supplied: clamp so (range / interval) <= 2000 buckets
+    // (a 1s interval over 30d would otherwise be ~2.6M GROUP BY buckets). Mirrors count_query.
+    let interval = crate::query_builder::clamp_bucket_interval(
+        &req.interval, &req.time_range.from, &req.time_range.to, 2000,
+    ).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let interval_fn = match interval {
         "1s" => "toStartOfSecond(timestamp)",
         "10s" => "toStartOfTenSeconds(timestamp)",
         "1m" => "toStartOfMinute(timestamp)",

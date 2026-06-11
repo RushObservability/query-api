@@ -17,6 +17,17 @@ pub struct QueryRequest {
     /// Free-text search across http_path, attributes, event_names, event_attributes
     #[serde(default)]
     pub search: Option<String>,
+    /// Optional keyset-pagination cursor (opaque base64 token from a previous
+    /// response's `next_cursor`). When present, the handler pages via a
+    /// `(timestamp, span_id)` WHERE predicate instead of OFFSET. Additive: callers
+    /// that omit it get the exact offset-based behavior as before.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Optional column projection. `Some("list")` selects only the ~10 columns the
+    /// Explore table renders (slim rows). Absent/any other value returns the full
+    /// wide row (`SELECT *`) exactly as before — the default contract.
+    #[serde(default)]
+    pub columns: Option<String>,
 }
 
 fn default_aggregation() -> String {

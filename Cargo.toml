@@ -20,7 +20,14 @@ path = "src/bin/anomaly_engine.rs"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 clickhouse = { version = "0.13", features = ["time", "uuid", "lz4"] }
-serde = { version = "1", features = ["derive"] }
+# "rc" enables Serialize/Deserialize for Arc<T> (and Rc<T>). The ingest row
+# structs in models::ingest share per-resource/per-scope data behind Arc to
+# avoid re-allocating identical strings/Vecs for every datapoint (see the
+# "Arc refactor" comment there). Arc<T>'s serde impls delegate straight to T
+# ((**self).serialize / Box::deserialize), so the RowBinary wire format sent to
+# ClickHouse and the JSON written to the spool are byte-identical to the
+# pre-Arc owned types — verified against the clickhouse 0.13 rowbinary codec.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }

@@ -255,20 +255,27 @@ pub async fn ingest_otlp_traces(
 
     let mut rows: Vec<TraceInsertRow> = Vec::new();
 
+    // Arc refactor: tenant_id is shared across the whole batch — allocate once.
+    let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
+
     for rs in &req.resource_spans {
         let resource = rs.resource.as_ref();
-        let resource_attrs: Vec<(String, String)> = resource
-            .map(|r| kv_to_attrs(&r.attributes))
-            .unwrap_or_default();
-        let service_name = resource
+        // Per-resource shared data: build the resource attribute Vec + the
+        // service.name/schema_url strings ONCE, behind Arc, then hand cheap Arc
+        // clones to every span row instead of re-allocating per span.
+        let resource_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
+            resource.map(|r| kv_to_attrs(&r.attributes)).unwrap_or_default(),
+        );
+        let service_name: std::sync::Arc<str> = resource
             .map(|r| resource_service_name(r))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into();
         let resource_schema_url = rs.schema_url.clone();
 
         for ss in &rs.scope_spans {
             let scope = ss.scope.as_ref();
-            let scope_name = scope.map(|s| s.name.clone()).unwrap_or_default();
-            let scope_version = scope.map(|s| s.version.clone()).unwrap_or_default();
+            let scope_name: std::sync::Arc<str> = scope.map(|s| s.name.as_str()).unwrap_or("").into();
+            let scope_version: std::sync::Arc<str> = scope.map(|s| s.version.as_str()).unwrap_or("").into();
             let scope_schema_url = ss.schema_url.clone();
 
             for span in &ss.spans {
@@ -347,7 +354,7 @@ pub async fn ingest_otlp_traces(
                     span_name: span.name.clone(),
                     span_kind: span_kind_name(span.kind).to_string(),
                     service_name: service_name.clone(),
-                    resource_attributes: resource_attrs.clone(),
+                    resource_attributes: resource_attributes.clone(),
                     scope_name: scope_name.clone(),
                     scope_version: scope_version.clone(),
                     span_attributes: all_span_attrs,
@@ -379,7 +386,7 @@ pub async fn ingest_otlp_traces(
 
     state
         .usage_accumulator
-        .record(tenant_id, "traces", count as u64, body.len() as u64);
+        .record(&tenant_id, "traces", count as u64, body.len() as u64);
 
     tracing::debug!(
         signal = "traces",
@@ -410,24 +417,29 @@ pub async fn ingest_otlp_logs(
         .timestamp_nanos_opt()
         .unwrap_or(0);
 
+    // Arc refactor: tenant_id is shared across the whole batch — allocate once.
+    let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
+
     for rl in &req.resource_logs {
         let resource = rl.resource.as_ref();
-        let resource_attrs = resource
-            .map(|r| kv_to_attrs(&r.attributes))
-            .unwrap_or_default();
+        // Per-resource shared data behind Arc (allocated once, cheaply cloned
+        // into each log row).
+        let resource_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
+            resource.map(|r| kv_to_attrs(&r.attributes)).unwrap_or_default(),
+        );
         let service_name = resource
             .map(|r| resource_service_name(r))
             .unwrap_or_default();
-        let resource_schema_url = rl.schema_url.clone();
+        let resource_schema_url: std::sync::Arc<str> = rl.schema_url.as_str().into();
 
         for sl in &rl.scope_logs {
             let scope = sl.scope.as_ref();
-            let scope_name = scope.map(|s| s.name.clone()).unwrap_or_default();
-            let scope_version = scope.map(|s| s.version.clone()).unwrap_or_default();
-            let scope_attrs = scope
-                .map(|s| kv_to_attrs(&s.attributes))
-                .unwrap_or_default();
-            let scope_schema_url = sl.schema_url.clone();
+            let scope_name: std::sync::Arc<str> = scope.map(|s| s.name.as_str()).unwrap_or("").into();
+            let scope_version: std::sync::Arc<str> = scope.map(|s| s.version.as_str()).unwrap_or("").into();
+            let scope_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
+                scope.map(|s| kv_to_attrs(&s.attributes)).unwrap_or_default(),
+            );
+            let scope_schema_url: std::sync::Arc<str> = sl.schema_url.as_str().into();
 
             for lr in &sl.log_records {
                 let ts = if lr.time_unix_nano != 0 {
@@ -460,11 +472,11 @@ pub async fn ingest_otlp_logs(
                     body: body_str,
                     service_name: service_name.clone(),
                     resource_schema_url: resource_schema_url.clone(),
-                    resource_attributes: resource_attrs.clone(),
+                    resource_attributes: resource_attributes.clone(),
                     scope_schema_url: scope_schema_url.clone(),
                     scope_name: scope_name.clone(),
                     scope_version: scope_version.clone(),
-                    scope_attributes: scope_attrs.clone(),
+                    scope_attributes: scope_attributes.clone(),
                     log_attributes: log_attrs,
                     event_name: String::new(),
                 });
@@ -485,7 +497,7 @@ pub async fn ingest_otlp_logs(
 
     state
         .usage_accumulator
-        .record(tenant_id, "logs", count as u64, body.len() as u64);
+        .record(&tenant_id, "logs", count as u64, body.len() as u64);
 
     tracing::debug!(
         signal = "logs",
@@ -516,32 +528,39 @@ pub async fn ingest_otlp_metrics(
     let mut exp_histogram_rows: Vec<ExpHistogramRow> = Vec::new();
     let mut summary_rows: Vec<SummaryRow> = Vec::new();
 
+    // Arc refactor: tenant_id is shared across the whole batch — allocate once.
+    // For a 10k-datapoint batch the per-resource/scope/metric values below are
+    // each allocated once and cheaply Arc-cloned into every datapoint row, in
+    // place of the previous per-datapoint String/Vec clones.
+    let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
+
     for rm in &req.resource_metrics {
         let resource = rm.resource.as_ref();
-        let resource_attrs = resource
-            .map(|r| kv_to_attrs(&r.attributes))
-            .unwrap_or_default();
-        let service_name = resource
+        let resource_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
+            resource.map(|r| kv_to_attrs(&r.attributes)).unwrap_or_default(),
+        );
+        let service_name: std::sync::Arc<str> = resource
             .map(|r| resource_service_name(r))
-            .unwrap_or_default();
-        let resource_schema_url = rm.schema_url.clone();
+            .unwrap_or_default()
+            .into();
+        let resource_schema_url: std::sync::Arc<str> = rm.schema_url.as_str().into();
 
         for sm in &rm.scope_metrics {
             let scope = sm.scope.as_ref();
-            let scope_name = scope.map(|s| s.name.clone()).unwrap_or_default();
-            let scope_version = scope.map(|s| s.version.clone()).unwrap_or_default();
-            let scope_attrs = scope
-                .map(|s| kv_to_attrs(&s.attributes))
-                .unwrap_or_default();
+            let scope_name: std::sync::Arc<str> = scope.map(|s| s.name.as_str()).unwrap_or("").into();
+            let scope_version: std::sync::Arc<str> = scope.map(|s| s.version.as_str()).unwrap_or("").into();
+            let scope_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
+                scope.map(|s| kv_to_attrs(&s.attributes)).unwrap_or_default(),
+            );
             let scope_dropped = scope
                 .map(|s| s.dropped_attributes_count)
                 .unwrap_or(0);
-            let scope_schema_url = sm.schema_url.clone();
+            let scope_schema_url: std::sync::Arc<str> = sm.schema_url.as_str().into();
 
             for metric in &sm.metrics {
-                let metric_name = metric.name.clone();
-                let metric_description = metric.description.clone();
-                let metric_unit = metric.unit.clone();
+                let metric_name: std::sync::Arc<str> = metric.name.as_str().into();
+                let metric_description: std::sync::Arc<str> = metric.description.as_str().into();
+                let metric_unit: std::sync::Arc<str> = metric.unit.as_str().into();
 
                 match &metric.data {
                     Some(MetricData::Gauge(g)) => {
@@ -556,11 +575,11 @@ pub async fn ingest_otlp_metrics(
                             };
                             gauge_rows.push(GaugeRow {
                                 tenant_id: tenant_id.clone(),
-                                resource_attributes: resource_attrs.clone(),
+                                resource_attributes: resource_attributes.clone(),
                                 resource_schema_url: resource_schema_url.clone(),
                                 scope_name: scope_name.clone(),
                                 scope_version: scope_version.clone(),
-                                scope_attributes: scope_attrs.clone(),
+                                scope_attributes: scope_attributes.clone(),
                                 scope_dropped_attr_count: scope_dropped,
                                 scope_schema_url: scope_schema_url.clone(),
                                 service_name: service_name.clone(),
@@ -594,11 +613,11 @@ pub async fn ingest_otlp_metrics(
                             };
                             sum_rows.push(SumRow {
                                 tenant_id: tenant_id.clone(),
-                                resource_attributes: resource_attrs.clone(),
+                                resource_attributes: resource_attributes.clone(),
                                 resource_schema_url: resource_schema_url.clone(),
                                 scope_name: scope_name.clone(),
                                 scope_version: scope_version.clone(),
-                                scope_attributes: scope_attrs.clone(),
+                                scope_attributes: scope_attributes.clone(),
                                 scope_dropped_attr_count: scope_dropped,
                                 scope_schema_url: scope_schema_url.clone(),
                                 service_name: service_name.clone(),
@@ -627,11 +646,11 @@ pub async fn ingest_otlp_metrics(
                             let ex = extract_exemplars(&dp.exemplars);
                             histogram_rows.push(HistogramRow {
                                 tenant_id: tenant_id.clone(),
-                                resource_attributes: resource_attrs.clone(),
+                                resource_attributes: resource_attributes.clone(),
                                 resource_schema_url: resource_schema_url.clone(),
                                 scope_name: scope_name.clone(),
                                 scope_version: scope_version.clone(),
-                                scope_attributes: scope_attrs.clone(),
+                                scope_attributes: scope_attributes.clone(),
                                 scope_dropped_attr_count: scope_dropped,
                                 scope_schema_url: scope_schema_url.clone(),
                                 service_name: service_name.clone(),
@@ -674,11 +693,11 @@ pub async fn ingest_otlp_metrics(
                                 .unwrap_or((0, Vec::new()));
                             exp_histogram_rows.push(ExpHistogramRow {
                                 tenant_id: tenant_id.clone(),
-                                resource_attributes: resource_attrs.clone(),
+                                resource_attributes: resource_attributes.clone(),
                                 resource_schema_url: resource_schema_url.clone(),
                                 scope_name: scope_name.clone(),
                                 scope_version: scope_version.clone(),
-                                scope_attributes: scope_attrs.clone(),
+                                scope_attributes: scope_attributes.clone(),
                                 scope_dropped_attr_count: scope_dropped,
                                 scope_schema_url: scope_schema_url.clone(),
                                 service_name: service_name.clone(),
@@ -719,11 +738,11 @@ pub async fn ingest_otlp_metrics(
                             }
                             summary_rows.push(SummaryRow {
                                 tenant_id: tenant_id.clone(),
-                                resource_attributes: resource_attrs.clone(),
+                                resource_attributes: resource_attributes.clone(),
                                 resource_schema_url: resource_schema_url.clone(),
                                 scope_name: scope_name.clone(),
                                 scope_version: scope_version.clone(),
-                                scope_attributes: scope_attrs.clone(),
+                                scope_attributes: scope_attributes.clone(),
                                 scope_dropped_attr_count: scope_dropped,
                                 scope_schema_url: scope_schema_url.clone(),
                                 service_name: service_name.clone(),
@@ -796,7 +815,7 @@ pub async fn ingest_otlp_metrics(
 
     state
         .usage_accumulator
-        .record(tenant_id, "metrics", total as u64, body.len() as u64);
+        .record(&tenant_id, "metrics", total as u64, body.len() as u64);
 
     tracing::debug!(
         signal = "metrics",
@@ -912,14 +931,20 @@ pub async fn ingest_vector_logs(
 
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
+    // Arc refactor: tenant_id is shared across all entries; the empty scope
+    // strings/attrs are shared constants — allocate each once per request.
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let empty_str: std::sync::Arc<str> = "".into();
+    let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
+
     let rows: Vec<LogInsertRow> = entries
         .into_iter()
         .map(|e| {
             let ts = if e.timestamp != 0 { e.timestamp } else { now_ns };
-            let resource_attributes = json_obj_to_attrs(&e.resource_attributes);
+            let resource_attributes = std::sync::Arc::new(json_obj_to_attrs(&e.resource_attributes));
             let log_attributes = json_obj_to_attrs(&e.log_attributes);
             LogInsertRow {
-                tenant_id: tenant_id.clone(),
+                tenant_id: tenant_arc.clone(),
                 timestamp: ts,
                 trace_id: e.trace_id,
                 span_id: e.span_id,
@@ -928,12 +953,12 @@ pub async fn ingest_vector_logs(
                 severity_number: e.severity_number,
                 body: e.body,
                 service_name: e.service_name,
-                resource_schema_url: String::new(),
+                resource_schema_url: empty_str.clone(),
                 resource_attributes,
-                scope_schema_url: String::new(),
-                scope_name: e.scope_name,
-                scope_version: String::new(),
-                scope_attributes: Vec::new(),
+                scope_schema_url: empty_str.clone(),
+                scope_name: e.scope_name.into(),
+                scope_version: empty_str.clone(),
+                scope_attributes: empty_attrs.clone(),
                 log_attributes,
                 event_name: e.event_name,
             }

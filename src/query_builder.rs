@@ -700,6 +700,104 @@ pub fn clamp_bucket_interval(
     Ok(BUCKET_INTERVALS.last().map(|(tok, _)| *tok).unwrap_or("1d"))
 }
 
+// ── Explore keyset pagination ──
+
+/// An opaque keyset cursor identifying the last row of a page: the row's
+/// `(timestamp_nanos, span_id)`. Encoded as base64 of `"{ts}:{span_id}"` so the wire
+/// token is opaque to clients; values are validated + bound/escaped before they ever
+/// reach SQL (never naively interpolated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysetCursor {
+    pub timestamp: i64,
+    pub span_id: String,
+}
+
+impl KeysetCursor {
+    /// Encode to the opaque base64 token returned in `next_cursor`.
+    pub fn encode(&self) -> String {
+        use base64::Engine;
+        let raw = format!("{}:{}", self.timestamp, self.span_id);
+        base64::engine::general_purpose::STANDARD.encode(raw.as_bytes())
+    }
+
+    /// Decode a client-supplied token. Rejects malformed tokens, non-numeric
+    /// timestamps, and span_ids that aren't hex (so the value is always safe to embed
+    /// as a SQL string literal even though we also escape it). Returns None on any
+    /// invalid input — the handler then falls back to a fresh (offset 0) page rather
+    /// than erroring, keeping a stale/garbage cursor non-fatal.
+    pub fn decode(token: &str) -> Option<KeysetCursor> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(token.as_bytes()).ok()?;
+        let s = String::from_utf8(bytes).ok()?;
+        let (ts_str, span_id) = s.split_once(':')?;
+        let timestamp: i64 = ts_str.parse().ok()?;
+        // span_id must be hex (16 chars for OTel, but accept any hex length defensively).
+        if span_id.is_empty() || !span_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(KeysetCursor { timestamp, span_id: span_id.to_string() })
+    }
+
+    /// SQL predicate for "rows strictly before this cursor" under
+    /// `ORDER BY timestamp DESC, span_id DESC`.
+    ///
+    /// The `spans.timestamp` column is `DateTime64(9)`. Comparing it directly against a
+    /// bare nanosecond integer this large overflows ClickHouse's decimal arithmetic
+    /// (`DECIMAL_OVERFLOW`, verified against live CH 26.1), so the cursor nanos are
+    /// wrapped in `fromUnixTimestamp64Nano(...)` to produce a matching DateTime64(9).
+    /// The integer is a parsed `i64` (never client text); the span_id is hex-validated
+    /// at decode time AND escaped here, so the literal is injection-safe.
+    pub fn before_predicate(&self) -> String {
+        let span_id = escape_string_literal(&self.span_id);
+        format!(
+            "(timestamp < fromUnixTimestamp64Nano({ts}) OR (timestamp = fromUnixTimestamp64Nano({ts}) AND span_id < '{span_id}'))",
+            ts = self.timestamp,
+        )
+    }
+}
+
+#[cfg(test)]
+mod keyset_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_roundtrips() {
+        let c = KeysetCursor { timestamp: 1_749_600_000_123_456_789, span_id: "a1b2c3d4e5f60718".to_string() };
+        let token = c.encode();
+        let decoded = KeysetCursor::decode(&token).unwrap();
+        assert_eq!(decoded, c);
+    }
+
+    #[test]
+    fn decode_rejects_garbage() {
+        assert!(KeysetCursor::decode("not base64!!!").is_none());
+        // valid base64 but wrong shape
+        use base64::Engine;
+        let bad = base64::engine::general_purpose::STANDARD.encode(b"no-colon-here");
+        assert!(KeysetCursor::decode(&bad).is_none());
+        let non_numeric = base64::engine::general_purpose::STANDARD.encode(b"abc:a1b2");
+        assert!(KeysetCursor::decode(&non_numeric).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_non_hex_span_id() {
+        use base64::Engine;
+        // a span_id with a SQL-injection attempt is rejected at decode (non-hex chars).
+        let inj = base64::engine::general_purpose::STANDARD.encode(b"123:' OR 1=1 --");
+        assert!(KeysetCursor::decode(&inj).is_none());
+    }
+
+    #[test]
+    fn before_predicate_binds_timestamp_and_escapes_span_id() {
+        let c = KeysetCursor { timestamp: 42, span_id: "deadbeefcafe0001".to_string() };
+        let pred = c.before_predicate();
+        assert_eq!(
+            pred,
+            "(timestamp < fromUnixTimestamp64Nano(42) OR (timestamp = fromUnixTimestamp64Nano(42) AND span_id < 'deadbeefcafe0001'))"
+        );
+    }
+}
+
 #[cfg(test)]
 mod search_tests {
     use super::*;
@@ -848,6 +946,20 @@ mod bucket_interval_tests {
     fn unparsable_range_leaves_interval_unchanged() {
         let got = clamp_bucket_interval("1s", "not-a-date", "also-not-a-date", 2000).unwrap();
         assert_eq!(got, "1s");
+    }
+
+    // The clamp helper is shared by count_query AND timeseries_query; both handlers
+    // share the same interval_fn match arms, so the tokens it can return must all be
+    // recognized there. This guards that the whitelist stays in sync with both handlers.
+    #[test]
+    fn every_returnable_token_is_a_handler_interval_arm() {
+        let handler_arms = ["1s", "10s", "1m", "5m", "15m", "1h", "1d"];
+        for (tok, _) in BUCKET_INTERVALS {
+            assert!(
+                handler_arms.contains(tok),
+                "interval token {tok} returned by clamp has no handler match arm"
+            );
+        }
     }
 
     // A range bigger than max_buckets days still resolves to the coarsest interval.

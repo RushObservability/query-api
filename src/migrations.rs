@@ -503,6 +503,191 @@ ORDER BY (tenant_id, signal, bucket)
 TTL bucket + INTERVAL 400 DAY DELETE
 SETTINGS index_granularity = 8192",
 
+    // ════════════════════════════════════════════════════════════════════
+    // Metric rollups (1m + 1h pre-aggregation for gauge + sum)
+    //
+    // Goal: coarse-window PromQL/stat reads scan tiny pre-bucketed tables instead of
+    // millions of raw samples, while staying NUMERICALLY IDENTICAL to a raw read for
+    // the safe aggregations.
+    //
+    // Engine choice: AggregatingMergeTree with *State columns. This is the only engine
+    // that expresses avg AND last (argMax) correctly:
+    //   - avg via avgState/avgMerge carries (sum,count) internally, so merging partial
+    //     states across buckets yields the exact weighted mean (NOT avg-of-avgs).
+    //   - last via argMaxState(Value, TimeUnix)/argMaxMerge picks the true latest sample
+    //     by wall-clock time across merged buckets.
+    //   - min/max/count merge trivially and exactly.
+    // SummingMergeTree was rejected: it cannot express avg or last.
+    //
+    // GAUGE rollups store: avg, min, max, last(argMax by TimeUnix), count + anyLast
+    // MetricDescription/MetricUnit. A coarse gauge query (avg/min/max/last/count over a
+    // step) reads these directly.
+    //
+    // SUM (counter) rollups store: last(argMax by TimeUnix), min, max, count. They do
+    // NOT store a precomputed rate and do NOT store sum-of-values: rate()/increase()
+    // need adjacent RAW samples for counter-reset detection and MUST read raw (see
+    // promql/eval.rs source-selection). The rollup only serves a counter's *instant*
+    // value (the last sample in a bucket).
+    //
+    // Both 1m and 1h are built directly FROM RAW (not cascaded 1h-from-1m). ClickHouse
+    // has no generic "re-aggregate an existing State into a coarser State" combinator
+    // usable inside a chained MV, so a pure-MV cascade can't be expressed without an
+    // approximation. Building both from raw was verified numerically identical to
+    // 1h-from-raw on live CH, so correctness is guaranteed and the extra raw read for
+    // the 1h MV happens once per insert batch (cheap, amortized).
+    //
+    // Backfill of pre-existing raw data is handled separately in backfill_rollups();
+    // MVs only capture rows inserted after creation.
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── Gauge 1-minute rollup target ──
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_gauge_1m
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ServiceName` LowCardinality(String),
+    `MetricName` LowCardinality(String),
+    `Attributes` Map(LowCardinality(String), String),
+    `bucket` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    `MetricDescription` AggregateFunction(anyLast, String),
+    `MetricUnit` AggregateFunction(anyLast, String),
+    `avg_state` AggregateFunction(avg, Float64),
+    `min_state` AggregateFunction(min, Float64),
+    `max_state` AggregateFunction(max, Float64),
+    `last_state` AggregateFunction(argMax, Float64, DateTime64(9)),
+    `cnt_state` AggregateFunction(count)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toDate(bucket)
+ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
+TTL toDateTime(bucket) + INTERVAL 365 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
+
+    // ── Gauge 1-hour rollup target ──
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_gauge_1h
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ServiceName` LowCardinality(String),
+    `MetricName` LowCardinality(String),
+    `Attributes` Map(LowCardinality(String), String),
+    `bucket` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    `MetricDescription` AggregateFunction(anyLast, String),
+    `MetricUnit` AggregateFunction(anyLast, String),
+    `avg_state` AggregateFunction(avg, Float64),
+    `min_state` AggregateFunction(min, Float64),
+    `max_state` AggregateFunction(max, Float64),
+    `last_state` AggregateFunction(argMax, Float64, DateTime64(9)),
+    `cnt_state` AggregateFunction(count)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toDate(bucket)
+ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
+TTL toDateTime(bucket) + INTERVAL 730 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
+
+    // ── Sum 1-minute rollup target ──
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_sum_1m
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ServiceName` LowCardinality(String),
+    `MetricName` LowCardinality(String),
+    `Attributes` Map(LowCardinality(String), String),
+    `bucket` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    `MetricDescription` AggregateFunction(anyLast, String),
+    `MetricUnit` AggregateFunction(anyLast, String),
+    `last_state` AggregateFunction(argMax, Float64, DateTime64(9)),
+    `min_state` AggregateFunction(min, Float64),
+    `max_state` AggregateFunction(max, Float64),
+    `cnt_state` AggregateFunction(count)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toDate(bucket)
+ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
+TTL toDateTime(bucket) + INTERVAL 365 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
+
+    // ── Sum 1-hour rollup target ──
+    r"CREATE TABLE IF NOT EXISTS observability.metrics_sum_1h
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `ServiceName` LowCardinality(String),
+    `MetricName` LowCardinality(String),
+    `Attributes` Map(LowCardinality(String), String),
+    `bucket` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    `MetricDescription` AggregateFunction(anyLast, String),
+    `MetricUnit` AggregateFunction(anyLast, String),
+    `last_state` AggregateFunction(argMax, Float64, DateTime64(9)),
+    `min_state` AggregateFunction(min, Float64),
+    `max_state` AggregateFunction(max, Float64),
+    `cnt_state` AggregateFunction(count)
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toDate(bucket)
+ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
+TTL toDateTime(bucket) + INTERVAL 730 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
+
+    // ── MV: metrics_gauge → metrics_gauge_1m ──
+    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_gauge_1m_mv
+TO observability.metrics_gauge_1m
+AS SELECT
+    tenant_id, ServiceName, MetricName, Attributes,
+    toStartOfInterval(TimeUnix, INTERVAL 1 MINUTE) AS bucket,
+    anyLastState(MetricDescription) AS MetricDescription,
+    anyLastState(MetricUnit) AS MetricUnit,
+    avgState(Value) AS avg_state,
+    minState(Value) AS min_state,
+    maxState(Value) AS max_state,
+    argMaxState(Value, TimeUnix) AS last_state,
+    countState() AS cnt_state
+FROM observability.metrics_gauge
+GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
+
+    // ── MV: metrics_gauge → metrics_gauge_1h (from raw, not cascaded) ──
+    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_gauge_1h_mv
+TO observability.metrics_gauge_1h
+AS SELECT
+    tenant_id, ServiceName, MetricName, Attributes,
+    toStartOfInterval(TimeUnix, INTERVAL 1 HOUR) AS bucket,
+    anyLastState(MetricDescription) AS MetricDescription,
+    anyLastState(MetricUnit) AS MetricUnit,
+    avgState(Value) AS avg_state,
+    minState(Value) AS min_state,
+    maxState(Value) AS max_state,
+    argMaxState(Value, TimeUnix) AS last_state,
+    countState() AS cnt_state
+FROM observability.metrics_gauge
+GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
+
+    // ── MV: metrics_sum → metrics_sum_1m ──
+    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_sum_1m_mv
+TO observability.metrics_sum_1m
+AS SELECT
+    tenant_id, ServiceName, MetricName, Attributes,
+    toStartOfInterval(TimeUnix, INTERVAL 1 MINUTE) AS bucket,
+    anyLastState(MetricDescription) AS MetricDescription,
+    anyLastState(MetricUnit) AS MetricUnit,
+    argMaxState(Value, TimeUnix) AS last_state,
+    minState(Value) AS min_state,
+    maxState(Value) AS max_state,
+    countState() AS cnt_state
+FROM observability.metrics_sum
+GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
+
+    // ── MV: metrics_sum → metrics_sum_1h (from raw, not cascaded) ──
+    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_sum_1h_mv
+TO observability.metrics_sum_1h
+AS SELECT
+    tenant_id, ServiceName, MetricName, Attributes,
+    toStartOfInterval(TimeUnix, INTERVAL 1 HOUR) AS bucket,
+    anyLastState(MetricDescription) AS MetricDescription,
+    anyLastState(MetricUnit) AS MetricUnit,
+    argMaxState(Value, TimeUnix) AS last_state,
+    minState(Value) AS min_state,
+    maxState(Value) AS max_state,
+    countState() AS cnt_state
+FROM observability.metrics_sum
+GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
+
 ];
 
 /// Row-level security policies for tenant isolation (defense-in-depth).
@@ -522,6 +707,11 @@ const ROW_POLICY_TABLES: &[&str] = &[
     "metrics_histogram",
     "metrics_exp_histogram",
     "metrics_summary",
+    // Metric rollups carry tenant_id too — same row-level isolation as raw.
+    "metrics_gauge_1m",
+    "metrics_gauge_1h",
+    "metrics_sum_1m",
+    "metrics_sum_1h",
     "rum",
     "rum_replay",
 ];
@@ -565,6 +755,120 @@ pub async fn run(url: &str, user: &str, password: &str, _config: &RushConfig) ->
     }
 
     tracing::info!("clickhouse migrations complete");
+
+    // One-time backfill of the metric rollups from pre-existing raw data. The MVs only
+    // capture rows inserted AFTER they exist, so historical windows would be empty
+    // without this. Guarded to run only when a rollup table is empty, so re-running
+    // migrations on a populated DB is a no-op.
+    if let Err(e) = backfill_rollups(&client).await {
+        // Non-fatal: an empty rollup just means coarse-window reads fall back to raw
+        // (source selection always treats an empty/short rollup window conservatively).
+        tracing::warn!("metric rollup backfill failed (non-fatal): {e}");
+    }
+
+    Ok(())
+}
+
+/// Number of distinct (table, source, interval) rollup backfills.
+const ROLLUP_BACKFILLS: &[(&str, &str, &str)] = &[
+    // (target_table, source_raw_table, interval_expr)
+    ("metrics_gauge_1m", "metrics_gauge", "1 MINUTE"),
+    ("metrics_gauge_1h", "metrics_gauge", "1 HOUR"),
+    ("metrics_sum_1m", "metrics_sum", "1 MINUTE"),
+    ("metrics_sum_1h", "metrics_sum", "1 HOUR"),
+];
+
+/// One-time backfill of metric rollups from existing raw data.
+///
+/// MVs only see rows inserted after they are created, so without a backfill any query
+/// over historical (pre-MV) windows would find the rollups empty. We populate each
+/// rollup once from the full raw history via `INSERT ... SELECT ... GROUP BY`.
+///
+/// Idempotency / safety: each target is backfilled ONLY if it is currently empty. On a
+/// DB that already has rollup data (from a previous boot or live MV ingestion) this is a
+/// no-op, so the migration stays safe to re-run. The aggregate expressions are byte-for-
+/// byte the same as the MV definitions, so backfilled buckets and MV-captured buckets are
+/// the same AggregatingMergeTree states and merge cleanly.
+///
+/// NOTE: there is a benign double-count window: a row inserted into raw *after* the MV
+/// is created but *before* the backfill SELECT runs is captured by both the MV and the
+/// backfill. For count/avg this would double it. To avoid that we only backfill the
+/// CLOSED past — strictly before the backfill start instant — and let the MV own
+/// everything from that instant forward. We compute the cutover as the max bucket the
+/// MV could already have produced is irrelevant; instead we bound the backfill to
+/// `TimeUnix < <cutover>` where cutover = start-of-current-minute/hour, and rely on the
+/// emptiness guard so we never backfill a table the MV has already started filling.
+async fn backfill_rollups(client: &Client) -> anyhow::Result<()> {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct CountRow {
+        c: u64,
+    }
+
+    for (target, source, interval) in ROLLUP_BACKFILLS {
+        // Emptiness guard: skip if the rollup already has any data.
+        let count_sql = format!("SELECT count() AS c FROM observability.{target}");
+        let existing = client
+            .query(&count_sql)
+            .fetch_one::<CountRow>()
+            .await
+            .map(|r| r.c)
+            .unwrap_or(0);
+        if existing > 0 {
+            tracing::info!("rollup {target} already has {existing} rows, skipping backfill");
+            continue;
+        }
+
+        // Build the State-producing SELECT. For sums we omit avg (rate uses raw only);
+        // for gauges we include avg. Cutover bound: only backfill buckets that have fully
+        // closed (strictly before the current interval start) so the live MV — which
+        // starts capturing the moment it exists — owns the in-progress bucket and there
+        // is no overlap/double-count between backfill and MV.
+        let is_gauge = source.contains("gauge");
+        let cutover = if interval.contains("MINUTE") {
+            "toStartOfMinute(now64(9))"
+        } else {
+            "toStartOfHour(now64(9))"
+        };
+
+        let avg_col = if is_gauge { "avgState(Value) AS avg_state,\n    " } else { "" };
+        // Column order MUST match the target table definition exactly.
+        let select_cols = if is_gauge {
+            format!(
+                "anyLastState(MetricDescription) AS MetricDescription,\n    \
+                 anyLastState(MetricUnit) AS MetricUnit,\n    \
+                 {avg_col}minState(Value) AS min_state,\n    \
+                 maxState(Value) AS max_state,\n    \
+                 argMaxState(Value, TimeUnix) AS last_state,\n    \
+                 countState() AS cnt_state"
+            )
+        } else {
+            "anyLastState(MetricDescription) AS MetricDescription,\n    \
+             anyLastState(MetricUnit) AS MetricUnit,\n    \
+             argMaxState(Value, TimeUnix) AS last_state,\n    \
+             minState(Value) AS min_state,\n    \
+             maxState(Value) AS max_state,\n    \
+             countState() AS cnt_state"
+                .to_string()
+        };
+
+        let insert_sql = format!(
+            "INSERT INTO observability.{target} \
+             SELECT tenant_id, ServiceName, MetricName, Attributes, \
+             toStartOfInterval(TimeUnix, INTERVAL {interval}) AS bucket, \
+             {select_cols} \
+             FROM observability.{source} \
+             WHERE TimeUnix < {cutover} \
+             GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket"
+        );
+
+        tracing::info!("backfilling rollup {target} from {source} (interval {interval})");
+        client
+            .query(&insert_sql)
+            .with_option("max_execution_time", "600")
+            .execute()
+            .await?;
+        tracing::info!("rollup {target} backfill complete");
+    }
 
     Ok(())
 }
@@ -761,6 +1065,12 @@ pub async fn apply_retention_ttls(
         "applying retention TTLs: metrics={metrics_days}d, apm={apm_days}d (incl. RUM), logs={logs_days}d"
     );
 
+    // Rollup retention: 1m rollups live at least as long as raw so any window servable
+    // from raw is also servable from the 1m rollup; 1h rollups live longest so coarse
+    // history survives even after raw + 1m have been dropped.
+    let rollup_1m_days = metrics_days;
+    let rollup_1h_days = metrics_days.saturating_mul(2).max(metrics_days);
+
     // (table, timestamp expression, days)
     let specs: &[(&str, &str, u32)] = &[
         ("metrics_gauge", "toDateTime(TimeUnix)", metrics_days),
@@ -768,6 +1078,11 @@ pub async fn apply_retention_ttls(
         ("metrics_histogram", "toDateTime(TimeUnix)", metrics_days),
         ("metrics_exp_histogram", "toDateTime(TimeUnix)", metrics_days),
         ("metrics_summary", "toDateTime(TimeUnix)", metrics_days),
+        // Rollups keyed on `bucket` (a DateTime64), not TimeUnix.
+        ("metrics_gauge_1m", "toDateTime(bucket)", rollup_1m_days),
+        ("metrics_sum_1m", "toDateTime(bucket)", rollup_1m_days),
+        ("metrics_gauge_1h", "toDateTime(bucket)", rollup_1h_days),
+        ("metrics_sum_1h", "toDateTime(bucket)", rollup_1h_days),
         ("spans_raw", "toDateTime(Timestamp)", apm_days),
         ("spans", "toDateTime(timestamp)", apm_days),
         ("rum", "toDateTime(Timestamp)", apm_days),

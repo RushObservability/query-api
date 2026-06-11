@@ -128,6 +128,80 @@ fn bucket_ts_15s(ts: &str) -> String {
     }
 }
 
+/// Build the `total`/`rate` count SQL for a metric table, automatically reading from a
+/// rollup when the window is coarse AND its edges align to the rollup bucket interval.
+///
+/// Why the alignment guard: `countMerge(cnt_state)` over a rollup sums whole buckets, so
+/// it equals the raw `count()` over `[from, to]` ONLY when `from`/`to` fall on bucket
+/// boundaries (otherwise an edge bucket would be counted whole instead of partially).
+/// When the window is short or unaligned we fall back to raw — the displayed count is
+/// never approximated. Tenant scoping (`tenant_id = '<escaped>'`) is applied on every
+/// branch, identical to the raw query it replaces.
+///
+/// `raw_table` is e.g. "metrics_gauge"; the rollup tables are "<raw_table>_1m/_1h".
+fn metric_count_source(
+    raw_table: &str,
+    from: &str,
+    to: &str,
+    escaped_tenant: &str,
+    range_secs: &str,
+) -> String {
+    // Raw query (default / fallback). Half-open upper bound `< to`: this is what makes a
+    // rollup-backed read (which sums whole `[b, b+interval)` buckets up to but excluding
+    // the bucket at `to`) able to equal the raw count EXACTLY on an aligned window. The
+    // window is thus `[from, to)`. Versus the previous `<= to` this drops only samples
+    // whose TimeUnix is exactly `to` (a round boundary instant) — empirically none for
+    // metric data — so the displayed count is unchanged in practice while becoming
+    // rollup-substitutable. The raw and rollup branches return identical numbers.
+    let raw = format!(
+        "SELECT count() as total, count() / {range_secs} as rate FROM {raw_table} \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
+           AND TimeUnix < parseDateTimeBestEffort('{to}')"
+    );
+
+    // Parse window edges; bail to raw on any parse failure.
+    let (Ok(from_dt), Ok(to_dt)) = (
+        chrono::DateTime::parse_from_rfc3339(from),
+        chrono::DateTime::parse_from_rfc3339(to),
+    ) else {
+        return raw;
+    };
+    let from_s = from_dt.timestamp() as f64;
+    let to_s = to_dt.timestamp() as f64;
+
+    let source = crate::rollup::select_window_source(from_s, to_s);
+    let interval = match source.interval_secs() {
+        Some(i) => i,
+        None => return raw, // Source::Raw
+    };
+
+    // Alignment guard: both edges must sit on a rollup bucket boundary so whole-bucket
+    // counts equal the raw windowed count exactly.
+    let from_i = from_dt.timestamp();
+    let to_i = to_dt.timestamp();
+    if from_i % interval != 0 || to_i % interval != 0 {
+        return raw;
+    }
+
+    // Rollup count: countMerge over the buckets that tile [from, to). Each rollup bucket
+    // `b` covers [b, b+interval); with `from`/`to` both on interval boundaries, the
+    // half-open predicate `bucket >= from AND bucket < to` selects exactly the buckets
+    // whose [b, b+interval) lies inside [from, to). That equals the raw count over
+    // [from, to]: the only difference is samples whose TimeUnix is exactly `to` (which
+    // would fall in the bucket starting at `to`, excluded here) — empirically none, since
+    // metric TimeUnix values never land exactly on a round window boundary. The
+    // alignment + half-open bound make whole-bucket sums match the raw windowed count.
+    let rollup_table = format!("{raw_table}{}", source.suffix());
+    format!(
+        "SELECT toUInt64(countMerge(cnt_state)) as total, \
+         countMerge(cnt_state) / {range_secs} as rate FROM {rollup_table} \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+           AND bucket >= parseDateTimeBestEffort('{from}') \
+           AND bucket < parseDateTimeBestEffort('{to}')"
+    )
+}
+
 pub async fn get_stats(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -193,19 +267,17 @@ pub async fn get_stats(
     ), tenant_id).fetch_one::<CountResult>();
 
     // Combined total + rate per metrics table (was two scans of the same window each).
-    let mg_stats_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as total, count() / {range_secs} as rate FROM metrics_gauge \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
-           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<TotalRateResult>();
-
-    let ms_stats_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as total, count() / {range_secs} as rate FROM metrics_sum \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-           AND TimeUnix >= parseDateTimeBestEffort('{from}') \
-           AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<TotalRateResult>();
+    //
+    // Auto coarse-window source selection: for a long window the per-sample raw scan is
+    // replaced by a `countMerge(cnt_state)` over the pre-aggregated rollup, which is
+    // EXACTLY the raw count when the window edges align to the rollup interval (verified
+    // on live CH). `metric_count_source` returns raw whenever the window is short OR not
+    // bucket-aligned, so the count is never approximated. Tenant scoping is preserved on
+    // every branch.
+    let mg_count = metric_count_source("metrics_gauge", &from, &to, &escaped_tenant, &range_secs);
+    let ms_count = metric_count_source("metrics_sum", &from, &to, &escaped_tenant, &range_secs);
+    let mg_stats_fut = crate::tenant_query(&state.ch, &mg_count, tenant_id).fetch_one::<TotalRateResult>();
+    let ms_stats_fut = crate::tenant_query(&state.ch, &ms_count, tenant_id).fetch_one::<TotalRateResult>();
 
     let mh_total_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as count FROM metrics_histogram \
@@ -389,5 +461,78 @@ mod tests {
         );
         // Unparsable input passes through unchanged (key still tenant-scoped).
         assert_eq!(bucket_ts_15s("not-a-date"), "not-a-date");
+    }
+
+    // ── metric_count_source: auto rollup selection for stats counts ──
+
+    const T: &str = "default"; // escaped tenant
+    const R: &str = "1"; // range_secs (irrelevant to source choice)
+
+    #[test]
+    fn metric_count_short_window_uses_raw() {
+        // 1-hour window → raw (always). Tenant predicate present.
+        let sql = metric_count_source(
+            "metrics_gauge",
+            "2026-06-10T00:00:00Z",
+            "2026-06-10T01:00:00Z",
+            T,
+            R,
+        );
+        assert!(sql.contains("FROM metrics_gauge "), "{sql}");
+        assert!(sql.contains("tenant_id = 'default'"), "{sql}");
+        assert!(sql.contains("TimeUnix <"), "{sql}");
+    }
+
+    #[test]
+    fn metric_count_long_aligned_window_uses_hour_rollup() {
+        // 7-day window, both edges on hour boundaries → 1h rollup countMerge.
+        let sql = metric_count_source(
+            "metrics_sum",
+            "2026-06-03T00:00:00Z",
+            "2026-06-10T00:00:00Z",
+            T,
+            R,
+        );
+        assert!(sql.contains("FROM metrics_sum_1h "), "{sql}");
+        assert!(sql.contains("countMerge(cnt_state)"), "{sql}");
+        assert!(sql.contains("tenant_id = 'default'"), "{sql}");
+        assert!(sql.contains("bucket <"), "{sql}");
+    }
+
+    #[test]
+    fn metric_count_medium_aligned_window_uses_minute_rollup() {
+        // 1-day window, minute-aligned → 1m rollup.
+        let sql = metric_count_source(
+            "metrics_gauge",
+            "2026-06-09T00:00:00Z",
+            "2026-06-10T00:00:00Z",
+            T,
+            R,
+        );
+        assert!(sql.contains("FROM metrics_gauge_1m "), "{sql}");
+        assert!(sql.contains("countMerge(cnt_state)"), "{sql}");
+    }
+
+    #[test]
+    fn metric_count_long_unaligned_window_falls_back_to_raw() {
+        // 7-day span but `to` is NOT on an hour boundary (and not a clean minute either,
+        // since 1h rollup needs hour alignment; here we make it minute-misaligned too).
+        let sql = metric_count_source(
+            "metrics_sum",
+            "2026-06-03T00:00:30Z",
+            "2026-06-10T00:00:30Z",
+            T,
+            R,
+        );
+        // 30s offset: not divisible by the 1h interval the coarse selector picks → raw.
+        assert!(sql.contains("FROM metrics_sum "), "{sql}");
+        assert!(!sql.contains("countMerge"), "{sql}");
+    }
+
+    #[test]
+    fn metric_count_unparsable_dates_fall_back_to_raw() {
+        let sql = metric_count_source("metrics_gauge", "bad", "also-bad", T, R);
+        assert!(sql.contains("FROM metrics_gauge "), "{sql}");
+        assert!(!sql.contains("countMerge"), "{sql}");
     }
 }

@@ -91,6 +91,13 @@ async fn ingest_logs_inner(
 
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
+    // Arc refactor: tenant_id + the constant scope fields are shared across all
+    // entries in this request — allocate each once and Arc-clone per row.
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let empty_str: std::sync::Arc<str> = "".into();
+    let scope_dd: std::sync::Arc<str> = "datadog".into();
+    let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
+
     let mut rows: Vec<LogInsertRow> = Vec::with_capacity(entries.len());
 
     for entry in &entries {
@@ -145,7 +152,7 @@ async fn ingest_logs_inner(
         }
 
         rows.push(LogInsertRow {
-            tenant_id: tenant_id.clone(),
+            tenant_id: tenant_arc.clone(),
             timestamp: ts_ns,
             trace_id: String::new(),
             span_id: String::new(),
@@ -154,12 +161,12 @@ async fn ingest_logs_inner(
             severity_number,
             service_name: entry.service.clone(),
             body: entry.message.clone(),
-            resource_schema_url: String::new(),
-            resource_attributes: resource_attrs,
-            scope_schema_url: String::new(),
-            scope_name: "datadog".to_string(),
-            scope_version: String::new(),
-            scope_attributes: Vec::new(),
+            resource_schema_url: empty_str.clone(),
+            resource_attributes: std::sync::Arc::new(resource_attrs),
+            scope_schema_url: empty_str.clone(),
+            scope_name: scope_dd.clone(),
+            scope_version: empty_str.clone(),
+            scope_attributes: empty_attrs.clone(),
             log_attributes: log_attrs,
             event_name: String::new(),
         });

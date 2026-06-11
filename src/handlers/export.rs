@@ -3,8 +3,11 @@
 //! The interactive query endpoints stay capped at 1000 rows; exports use the
 //! admin-configurable `export_max_rows` setting (default 1000) instead.
 
+use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use clickhouse::query::RowCursor;
 
 use crate::AppState;
 
@@ -90,4 +93,83 @@ pub fn csv_query_preamble(signal: &str, from: &str, to: &str, search: Option<&st
     }
     out.push_str(&format!("# exported_at: {}\n", chrono::Utc::now().to_rfc3339()));
     out
+}
+
+/// State for the streaming-export body generator.
+///
+/// `prelude` (preamble + header) is emitted as the first chunk, then rows are pulled
+/// from the ClickHouse `RowCursor` one at a time and formatted via `fmt_row`. Peak
+/// memory is one row + one formatted line, regardless of total row count, so a
+/// million-row CSV export no longer buffers hundreds of MB in this process.
+///
+/// The cursor honors the row cap via a `LIMIT` baked into the SQL by the caller (same
+/// cap as the non-streaming path), so streaming does not change the row-count contract.
+struct CsvStreamState<T> {
+    cursor: RowCursor<T>,
+    fmt_row: Box<dyn Fn(&T) -> String + Send>,
+    prelude: Option<String>,
+    done: bool,
+}
+
+/// Build a streaming CSV file-download response.
+///
+/// `prelude` is the CSV preamble + header line (emitted verbatim as the first chunk).
+/// `fmt_row` formats a single row into its CSV line (including the trailing `\n`),
+/// using the exact same `csv_field`/`ts_rfc3339` escaping as the buffered path.
+///
+/// Errors mid-stream terminate the body with an `io::Error`; axum surfaces that as a
+/// truncated/aborted response. The initial query has already executed by the time the
+/// first row is pulled, so query-level failures still abort the download cleanly.
+pub fn stream_csv_response<T>(
+    cursor: RowCursor<T>,
+    prelude: String,
+    fmt_row: impl Fn(&T) -> String + Send + 'static,
+    filename: &str,
+) -> Response
+where
+    T: clickhouse::Row + for<'b> serde::Deserialize<'b> + Send + 'static,
+{
+    let state = CsvStreamState {
+        cursor,
+        fmt_row: Box::new(fmt_row),
+        prelude: Some(prelude),
+        done: false,
+    };
+
+    let stream = futures_util::stream::unfold(state, |mut st| async move {
+        if st.done {
+            return None;
+        }
+        // First poll: emit the preamble + header before touching the cursor.
+        if let Some(prelude) = st.prelude.take() {
+            return Some((Ok::<Bytes, std::io::Error>(Bytes::from(prelude)), st));
+        }
+        match st.cursor.next().await {
+            Ok(Some(row)) => {
+                let line = (st.fmt_row)(&row);
+                Some((Ok(Bytes::from(line)), st))
+            }
+            Ok(None) => {
+                st.done = true;
+                None
+            }
+            Err(e) => {
+                st.done = true;
+                Some((
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                    st,
+                ))
+            }
+        }
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    if let Ok(cd) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, cd);
+    }
+    (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
 }
