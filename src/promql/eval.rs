@@ -436,7 +436,11 @@ async fn query_clickhouse(
                     };
                     if let Some(observed) = observed {
                         if METRIC_TABLE_CACHE.len() > METRIC_TABLE_CACHE_MAX {
-                            METRIC_TABLE_CACHE.clear(); // defensive cap
+                            // Evict only expired entries; clear() would also wipe hot ones.
+                            METRIC_TABLE_CACHE.retain(|_, v| v.1.elapsed() < METRIC_TABLE_TTL);
+                            if METRIC_TABLE_CACHE.len() > METRIC_TABLE_CACHE_MAX {
+                                METRIC_TABLE_CACHE.clear(); // backstop: still over cap after pruning
+                            }
                         }
                         METRIC_TABLE_CACHE.insert(key, (observed, Instant::now()));
                     }

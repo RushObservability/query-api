@@ -135,11 +135,56 @@ pub async fn get_features(
 
     let export_max_rows = crate::handlers::export::read_export_max_rows(&state).await;
 
+    // Deploy markers on charts — display enhancement over existing deploy data.
+    // Defaults ON (unset → true); only an explicit "false" disables it.
+    let deploy_markers_enabled = state
+        .config_db
+        .get_setting("deploy_markers_enabled").await
+        .ok()
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true);
+
     Json(serde_json::json!({
         "argocd": argocd_enabled,
         "sre_agent": sre_agent_enabled,
         "export_max_rows": export_max_rows,
+        "deploy_markers": deploy_markers_enabled,
     }))
+}
+
+/// GET /api/v1/settings/deploy-markers — admin only. Returns { enabled }.
+pub async fn get_deploy_markers_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let enabled = state
+        .config_db
+        .get_setting("deploy_markers_enabled").await
+        .ok()
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    Ok(Json(serde_json::json!({ "enabled": enabled })))
+}
+
+/// PUT /api/v1/settings/deploy-markers — admin only. Body: { enabled: bool }.
+/// Toggles whether deploy markers are drawn on service charts.
+pub async fn set_deploy_markers_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
+    })?;
+    state.config_db.set_setting("deploy_markers_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to save deploy_markers_enabled");
+        (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+    })?;
+    Ok(Json(serde_json::json!({ "enabled": enabled })))
 }
 
 /// PUT /api/v1/settings/export-max-rows — admin only.

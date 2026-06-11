@@ -33,7 +33,12 @@ fn prom_meta_cache_get(key: &str) -> Option<Vec<String>> {
 
 fn prom_meta_cache_put(key: String, values: Vec<String>) {
     if PROM_META_CACHE.len() > PROM_META_CACHE_MAX {
-        PROM_META_CACHE.clear(); // defensive cap against unbounded distinct exprs
+        // Evict only expired entries first — clear() would also wipe hot entries
+        // (keys embed client-controllable match exprs, so churn is expected).
+        PROM_META_CACHE.retain(|_, v| v.1.elapsed() < PROM_META_TTL);
+        if PROM_META_CACHE.len() > PROM_META_CACHE_MAX {
+            PROM_META_CACHE.clear(); // backstop: still over cap after pruning
+        }
     }
     PROM_META_CACHE.insert(key, (values, Instant::now()));
 }

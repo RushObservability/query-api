@@ -9,6 +9,11 @@ struct CountRow {
     count: u64,
 }
 
+/// Max rules evaluated concurrently per cycle (bounds parallel CH data queries).
+const ENGINE_CONCURRENCY: usize = 6;
+/// Flush `last_eval_at` to the config table once per this many evals per rule.
+const EVAL_FLUSH_EVERY: u32 = 10;
+
 /// Spawn the SIEM detection engine as a background task.
 /// Runs every 60 seconds, evaluating all enabled detection rules that are due.
 pub fn spawn(ch: Client, config_db: Arc<ConfigDb>) {
@@ -16,10 +21,11 @@ pub fn spawn(ch: Client, config_db: Arc<ConfigDb>) {
         let http_client = reqwest::Client::new();
         tracing::info!(engine = "siem", interval_secs = 60, "detection engine started");
 
+        let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            if let Err(e) = run_detection_cycle(&ch, &config_db, &http_client).await {
+            if let Err(e) = run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state).await {
                 tracing::error!(error = %e, engine = "siem", "detection cycle failed");
             }
         }
@@ -30,7 +36,10 @@ async fn run_detection_cycle(
     ch: &Client,
     config_db: &ConfigDb,
     http_client: &reqwest::Client,
+    eval_state: &mut crate::eval_state::EvalState,
 ) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -40,22 +49,25 @@ async fn run_detection_cycle(
         return Ok(());
     }
 
-    let mut evaluated = 0u32;
-    let mut fired = 0u32;
+    // Due = DB-side last_eval_at check (coarse: flushed 1-in-N) AND in-memory
+    // check ⇒ max(db, mem) + interval <= now semantics. The in-memory state
+    // also paces retries after evaluation errors, replacing the old
+    // write-last_eval_at-on-error round-trip.
+    let jobs: Vec<(DetectionRule, bool)> = rules
+        .into_iter()
+        .filter(|r| is_rule_due(r, &now) && eval_state.is_due(&r.id, now, r.interval_secs))
+        .map(|r| {
+            let flush = eval_state.should_flush(&r.id);
+            (r, flush)
+        })
+        .collect();
 
-    for rule in &rules {
-        // Check if the rule is due based on its interval and last_eval_at
-        if !is_rule_due(rule, &now) {
-            continue;
-        }
+    let evaluated = jobs.len() as u32;
+    let now_str_ref = now_str.as_str();
 
-        evaluated += 1;
-        match evaluate_rule(ch, config_db, http_client, rule, &now, &now_str).await {
-            Ok(did_fire) => {
-                if did_fire {
-                    fired += 1;
-                }
-            }
+    let outcomes: Vec<(String, bool, bool)> = futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
+        match evaluate_rule(ch, config_db, http_client, &rule, &now, now_str_ref, should_flush).await {
+            Ok((did_fire, persisted)) => (rule.id, did_fire, persisted),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -64,10 +76,20 @@ async fn run_detection_cycle(
                     rule_id = %rule.id,
                     "rule evaluation failed"
                 );
-                // Still update last_eval_at so we don't retry every tick
-                let _ = config_db.update_detection_rule_eval(&rule.id, &now_str, None).await;
+                (rule.id, false, false)
             }
         }
+    }))
+    .buffer_unordered(ENGINE_CONCURRENCY)
+    .collect()
+    .await;
+
+    let mut fired = 0u32;
+    for (id, did_fire, persisted) in outcomes {
+        if did_fire {
+            fired += 1;
+        }
+        eval_state.record(id, now, persisted);
     }
 
     if evaluated > 0 {
@@ -102,6 +124,7 @@ fn is_rule_due(rule: &DetectionRule, now: &chrono::DateTime<chrono::Utc>) -> boo
     }
 }
 
+/// Evaluate one detection rule. Returns (did_fire, persisted_to_db).
 async fn evaluate_rule(
     ch: &Client,
     config_db: &ConfigDb,
@@ -109,7 +132,8 @@ async fn evaluate_rule(
     rule: &DetectionRule,
     now: &chrono::DateTime<chrono::Utc>,
     now_str: &str,
-) -> anyhow::Result<bool> {
+    should_flush: bool,
+) -> anyhow::Result<(bool, bool)> {
     let window_end = *now;
     let window_start = window_end - chrono::Duration::seconds(rule.window_secs);
 
@@ -144,13 +168,20 @@ async fn evaluate_rule(
     let did_fire = match_count >= rule.threshold;
 
     if did_fire {
+        // Fires persist last_triggered_at immediately, from the rule row we
+        // already hold (no SELECT…FINAL re-read).
         fire_detection(config_db, http_client, rule, match_count, "[]", now_str).await;
-        config_db.update_detection_rule_eval(&rule.id, now_str, Some(now_str)).await?;
-    } else {
-        config_db.update_detection_rule_eval(&rule.id, now_str, None).await?;
+        config_db.persist_detection_rule_eval(rule, now_str, Some(now_str)).await?;
+        return Ok((true, true));
     }
 
-    Ok(did_fire)
+    // No fire: only flush last_eval_at on the coarse cadence.
+    if should_flush {
+        config_db.persist_detection_rule_eval(rule, now_str, None).await?;
+        return Ok((false, true));
+    }
+
+    Ok((false, false))
 }
 
 /// Build the final SQL with tenant_id injection and window placeholder replacement.

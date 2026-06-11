@@ -22,6 +22,11 @@ struct GroupedRow {
     value: f64,
 }
 
+/// Max monitors evaluated concurrently per cycle (bounds parallel CH data queries).
+const ENGINE_CONCURRENCY: usize = 6;
+/// Flush `last_eval_at` to the config table once per this many evals per monitor.
+const EVAL_FLUSH_EVERY: u32 = 10;
+
 /// Spawn the monitor evaluation engine. Runs every 60 seconds.
 pub fn spawn(
     ch: Client,
@@ -31,11 +36,12 @@ pub fn spawn(
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
         let smtp_transport = build_smtp_transport(&smtp_config);
+        let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
 
         loop {
             let start = Instant::now();
             let (evaluated, state_changes) =
-                match run_evaluation_cycle(&ch, &config_db, &http_client, &smtp_config, &smtp_transport)
+                match run_evaluation_cycle(&ch, &config_db, &http_client, &smtp_config, &smtp_transport, &mut eval_state)
                     .await
                 {
                     Ok(stats) => stats,
@@ -81,39 +87,66 @@ async fn run_evaluation_cycle(
     http_client: &reqwest::Client,
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
+    eval_state: &mut crate::eval_state::EvalState,
 ) -> anyhow::Result<(u64, u64)> {
+    use futures_util::StreamExt;
+
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let monitors = config_db.list_enabled_monitors().await?;
-    let mut evaluated: u64 = 0;
-    let mut state_changes: u64 = 0;
 
-    for monitor in monitors {
-        // Check if due for evaluation based on eval_interval_secs
-        if let Some(ref last_eval) = monitor.last_eval_at {
-            if let Ok(last) = chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%SZ") {
-                let last_utc = last.and_utc();
-                let elapsed = (now - last_utc).num_seconds();
-                if elapsed < monitor.eval_interval_secs {
-                    continue;
+    // States of every enabled monitor as fetched this cycle — composite monitors
+    // resolve their members from this map instead of one SELECT…FINAL per member.
+    // (Members may be evaluated concurrently this same cycle; composites see the
+    // cycle-start states, which matches the prior racy read-at-eval behavior to
+    // within one cycle.)
+    let monitor_states: HashMap<String, String> = monitors
+        .iter()
+        .map(|m| (m.id.clone(), m.state.clone()))
+        .collect();
+
+    // Due = DB-side last_eval_at check (coarse: flushed 1-in-N) AND in-memory
+    // check ⇒ max(db, mem) + interval <= now semantics.
+    let jobs: Vec<(Monitor, bool)> = monitors
+        .into_iter()
+        .filter(|monitor| {
+            if let Some(ref last_eval) = monitor.last_eval_at {
+                if let Ok(last) = chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%SZ") {
+                    let last_utc = last.and_utc();
+                    let elapsed = (now - last_utc).num_seconds();
+                    if elapsed < monitor.eval_interval_secs {
+                        return false;
+                    }
                 }
             }
-        }
+            eval_state.is_due(&monitor.id, now, monitor.eval_interval_secs)
+        })
+        .map(|m| {
+            let flush = eval_state.should_flush(&m.id);
+            (m, flush)
+        })
+        .collect();
 
-        evaluated += 1;
-        let changes = evaluate_monitor(
+    let evaluated = jobs.len() as u64;
+    let now_str_ref = now_str.as_str();
+    let monitor_states_ref = &monitor_states;
+
+    let outcomes: Vec<(String, u64, bool)> = futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
+        let result = evaluate_monitor(
             ch,
             config_db,
             &monitor,
-            &now_str,
+            now_str_ref,
             http_client,
             smtp_config,
             smtp_transport,
+            monitor_states_ref,
+            should_flush,
         )
         .await;
-        match changes {
-            Ok(c) => state_changes += c,
+        let (changes, persisted) = match result {
+            Ok(cp) => cp,
             Err(e) => {
                 tracing::warn!(
                     engine = "monitors",
@@ -123,15 +156,26 @@ async fn run_evaluation_cycle(
                     "monitor evaluation failed"
                 );
                 // On query failure, check no_data handling
-                handle_no_data(config_db, &monitor, &now_str, http_client, smtp_config, smtp_transport).await;
+                handle_no_data(config_db, &monitor, now_str_ref, http_client, smtp_config, smtp_transport, should_flush).await
             }
-        }
+        };
+        (monitor.id, changes, persisted)
+    }))
+    .buffer_unordered(ENGINE_CONCURRENCY)
+    .collect()
+    .await;
+
+    let mut state_changes: u64 = 0;
+    for (id, changes, persisted) in outcomes {
+        state_changes += changes;
+        eval_state.record(id, now, persisted);
     }
 
     Ok((evaluated, state_changes))
 }
 
-/// Evaluate a single monitor. Returns the number of state changes.
+/// Evaluate a single monitor. Returns (state_changes, persisted_to_db).
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_monitor(
     ch: &Client,
     config_db: &ConfigDb,
@@ -140,7 +184,9 @@ async fn evaluate_monitor(
     http_client: &reqwest::Client,
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
-) -> anyhow::Result<u64> {
+    monitor_states: &HashMap<String, String>,
+    should_flush: bool,
+) -> anyhow::Result<(u64, bool)> {
     let group_by: Vec<String> = serde_json::from_str(&monitor.group_by).unwrap_or_default();
     let has_groups = !group_by.is_empty();
 
@@ -151,17 +197,17 @@ async fn evaluate_monitor(
         "apm" => query_apm(ch, monitor, has_groups).await?,
         "composite" => {
             // Composite monitors combine other monitor states, not queries
-            return evaluate_composite(config_db, monitor, now_str, http_client, smtp_config, smtp_transport).await;
+            return evaluate_composite(config_db, monitor, now_str, http_client, smtp_config, smtp_transport, monitor_states, should_flush).await;
         }
         other => {
             tracing::warn!(engine = "monitors", monitor_id = %monitor.id, "unknown monitor type: {other}");
-            return Ok(0);
+            return Ok((0, false));
         }
     };
 
     if results.is_empty() {
         // No data returned
-        return Ok(handle_no_data(config_db, monitor, now_str, http_client, smtp_config, smtp_transport).await);
+        return Ok(handle_no_data(config_db, monitor, now_str, http_client, smtp_config, smtp_transport, should_flush).await);
     }
 
     // Evaluate thresholds for each group result
@@ -258,10 +304,19 @@ async fn evaluate_monitor(
             .unwrap_or("ok")
     };
 
-    let group_states_json = serde_json::to_string(&group_states).unwrap_or_else(|_| "{}".to_string());
-    config_db.update_monitor_state(&monitor.id, overall, &group_states_json, now_str).await?;
-
-    Ok(changes)
+    // Persist only on a real transition (a group changed or the overall state
+    // moved) — that path is identical to before. Otherwise just flush
+    // last_eval_at on the coarse cadence from the row we already hold.
+    if changes > 0 || overall != monitor.state.as_str() {
+        let group_states_json = serde_json::to_string(&group_states).unwrap_or_else(|_| "{}".to_string());
+        config_db.update_monitor_state(&monitor.id, overall, &group_states_json, now_str).await?;
+        Ok((changes, true))
+    } else if should_flush {
+        config_db.persist_monitor_eval(monitor, now_str).await?;
+        Ok((changes, true))
+    } else {
+        Ok((changes, false))
+    }
 }
 
 /// Determine the worst state from an iterator of state strings.
@@ -351,7 +406,8 @@ fn evaluate_threshold(
     }
 }
 
-/// Handle the no-data condition for a monitor.
+/// Handle the no-data condition for a monitor. Returns (state_changes, persisted_to_db).
+#[allow(clippy::too_many_arguments)]
 async fn handle_no_data(
     config_db: &ConfigDb,
     monitor: &Monitor,
@@ -359,7 +415,8 @@ async fn handle_no_data(
     http_client: &reqwest::Client,
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
-) -> u64 {
+    should_flush: bool,
+) -> (u64, bool) {
     let old_state = &monitor.state;
     let action = monitor.no_data_action.as_str();
 
@@ -401,10 +458,16 @@ async fn handle_no_data(
             )
             .await;
         }
-    }
 
-    let _ = config_db.update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str).await;
-    if new_state != old_state.as_str() { 1 } else { 0 }
+        // Transition persists immediately, exactly as before.
+        let _ = config_db.update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str).await;
+        (1, true)
+    } else if should_flush {
+        let _ = config_db.persist_monitor_eval(monitor, now_str).await;
+        (0, true)
+    } else {
+        (0, false)
+    }
 }
 
 /// Fire notifications to all configured channels for a monitor.
@@ -473,6 +536,8 @@ async fn fire_notifications(
 }
 
 /// Evaluate a composite monitor by examining the states of its component monitors.
+/// Returns (state_changes, persisted_to_db).
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_composite(
     config_db: &ConfigDb,
     monitor: &Monitor,
@@ -480,23 +545,37 @@ async fn evaluate_composite(
     http_client: &reqwest::Client,
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
-) -> anyhow::Result<u64> {
+    monitor_states: &HashMap<String, String>,
+    should_flush: bool,
+) -> anyhow::Result<(u64, bool)> {
     let monitor_ids: Vec<String> =
         serde_json::from_str(&monitor.composite_monitor_ids).unwrap_or_default();
     let formula = &monitor.composite_formula;
 
     if monitor_ids.is_empty() || formula.is_empty() {
-        let _ = config_db.update_monitor_state(&monitor.id, "no_data", "{}", now_str).await;
-        return Ok(0);
+        if monitor.state != "no_data" {
+            let _ = config_db.update_monitor_state(&monitor.id, "no_data", "{}", now_str).await;
+            return Ok((0, true));
+        }
+        if should_flush {
+            let _ = config_db.persist_monitor_eval(monitor, now_str).await;
+            return Ok((0, true));
+        }
+        return Ok((0, false));
     }
 
-    // Build a map: letter label (A, B, C...) -> is_alerting (bool)
+    // Build a map: letter label (A, B, C...) -> is_alerting (bool).
+    // Member states come from the monitors already fetched at cycle start;
+    // only members missing there (e.g. disabled) fall back to a point read.
     let mut letter_states: HashMap<char, bool> = HashMap::new();
     for (i, mid) in monitor_ids.iter().enumerate() {
         let letter = (b'A' + i as u8) as char;
-        let is_alerting = match config_db.get_monitor_by_id(mid).await {
-            Ok(Some(m)) => m.state == "alert" || m.state == "warn",
-            _ => false,
+        let is_alerting = match monitor_states.get(mid) {
+            Some(state) => state == "alert" || state == "warn",
+            None => match config_db.get_monitor_by_id(mid).await {
+                Ok(Some(m)) => m.state == "alert" || m.state == "warn",
+                _ => false,
+            },
         };
         letter_states.insert(letter, is_alerting);
     }
@@ -543,8 +622,16 @@ async fn evaluate_composite(
         }
     }
 
-    let _ = config_db.update_monitor_state(&monitor.id, new_state, "{}", now_str).await;
-    Ok(changes)
+    if changes > 0 {
+        // Transition persists immediately, exactly as before.
+        let _ = config_db.update_monitor_state(&monitor.id, new_state, "{}", now_str).await;
+        Ok((changes, true))
+    } else if should_flush {
+        let _ = config_db.persist_monitor_eval(monitor, now_str).await;
+        Ok((changes, true))
+    } else {
+        Ok((changes, false))
+    }
 }
 
 /// Evaluate a simple boolean formula like "A && B && !C" or "A || B".
@@ -653,13 +740,13 @@ async fn query_metric(
              FROM metrics_gauge WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch.query(&sql).fetch_all::<GroupedRow>().await?;
+        let rows = ch.query(&sql).with_option("max_execution_time", "30").fetch_all::<GroupedRow>().await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!(
             "SELECT {agg} AS value FROM metrics_gauge WHERE {where_clause}"
         );
-        let row = ch.query(&sql).fetch_one::<ValueRow>().await?;
+        let row = ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<ValueRow>().await?;
         Ok(vec![("".to_string(), row.value)])
     }
 }
@@ -778,13 +865,13 @@ async fn query_log(
              FROM logs WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch.query(&sql).fetch_all::<GroupedRow>().await?;
+        let rows = ch.query(&sql).with_option("max_execution_time", "30").fetch_all::<GroupedRow>().await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!(
             "SELECT count() AS value FROM logs WHERE {where_clause}"
         );
-        let row = ch.query(&sql).fetch_one::<ValueRow>().await?;
+        let row = ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<ValueRow>().await?;
         Ok(vec![("".to_string(), row.value)])
     }
 }
@@ -874,13 +961,13 @@ async fn query_apm(
              FROM spans WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch.query(&sql).fetch_all::<GroupedRow>().await?;
+        let rows = ch.query(&sql).with_option("max_execution_time", "30").fetch_all::<GroupedRow>().await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!(
             "SELECT {agg} AS value FROM spans WHERE {where_clause}"
         );
-        let row = ch.query(&sql).fetch_one::<ValueRow>().await?;
+        let row = ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<ValueRow>().await?;
         Ok(vec![("".to_string(), row.value)])
     }
 }

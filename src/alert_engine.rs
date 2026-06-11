@@ -43,6 +43,11 @@ fn build_smtp_transport(cfg: &SmtpConfig) -> Option<AsyncSmtpTransport<Tokio1Exe
     Some(builder.build())
 }
 
+/// Max rules evaluated concurrently per tick (bounds parallel CH data queries).
+const ENGINE_CONCURRENCY: usize = 6;
+/// Flush `last_eval_at` to the config table once per this many evals per rule.
+const EVAL_FLUSH_EVERY: u32 = 10;
+
 pub fn spawn_alert_engine(config_db: Arc<ConfigDb>, ch: Client, smtp_config: SmtpConfig) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
@@ -50,10 +55,11 @@ pub fn spawn_alert_engine(config_db: Arc<ConfigDb>, ch: Client, smtp_config: Smt
         if smtp_transport.is_some() {
             tracing::info!("alert engine: SMTP configured for email notifications");
         }
+        let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
-            if let Err(e) = eval_alerts(&config_db, &ch, &http_client, &smtp_config, &smtp_transport).await {
+            if let Err(e) = eval_alerts(&config_db, &ch, &http_client, &smtp_config, &smtp_transport, &mut eval_state).await {
                 tracing::error!("alert engine error: {e}");
             }
         }
@@ -455,160 +461,256 @@ pub async fn send_channel_notification(
     }
 }
 
+/// Build the count SQL for one alert rule. The metrics variant pushes `count()`
+/// into each UNION ALL leg (and sums the per-leg counts) instead of streaming
+/// every TimeUnix value out of 5 tables just to count rows in the outer query.
+fn build_alert_count_sql(signal_type: &str, query_config: &AlertQueryConfig, from: &str, to: &str) -> String {
+    match signal_type {
+        "metrics" => {
+            let mc = build_metrics_where_clause(&query_config.filters, from, to);
+            let s = mc.to_sql();
+            format!(
+                "SELECT sum(c) as count FROM (\
+                 SELECT count() AS c FROM observability.metrics_gauge {s} \
+                 UNION ALL SELECT count() AS c FROM observability.metrics_sum {s} \
+                 UNION ALL SELECT count() AS c FROM observability.metrics_histogram {s} \
+                 UNION ALL SELECT count() AS c FROM observability.metrics_exp_histogram {s} \
+                 UNION ALL SELECT count() AS c FROM observability.metrics_summary {s})"
+            )
+        }
+        "logs" => {
+            let lc = build_logs_where_clause(&query_config.filters, from, to);
+            format!("SELECT count() as count FROM observability.logs {}", lc.to_sql())
+        }
+        _ => {
+            // "apm" (default) — query spans
+            let wc = build_where_clause(&query_config.filters, from, to);
+            format!("SELECT count() as count FROM spans {}", wc.to_sql())
+        }
+    }
+}
+
 async fn eval_alerts(
     config_db: &ConfigDb,
     ch: &Client,
     http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+    eval_state: &mut crate::eval_state::EvalState,
 ) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    // DB-side due filter (coarse: last_eval_at is only flushed 1-in-N) combined
+    // with the in-memory check ⇒ max(db, mem) + interval <= now semantics.
     let due_alerts = config_db.get_due_alerts(&now_str).await?;
+    let jobs: Vec<(crate::models::alert::AlertRule, bool)> = due_alerts
+        .into_iter()
+        .filter(|r| eval_state.is_due(&r.id, now, r.eval_interval_secs))
+        .map(|r| {
+            let flush = eval_state.should_flush(&r.id);
+            (r, flush)
+        })
+        .collect();
 
-    for rule in due_alerts {
-        let query_config: AlertQueryConfig = match serde_json::from_str(&rule.query_config) {
-            Ok(c) => c,
+    let now_str_ref = now_str.as_str();
+    let outcomes: Vec<(String, bool)> = futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
+        let persisted = match eval_alert_rule(
+            config_db, ch, http_client, smtp_config, smtp_transport,
+            &rule, now, now_str_ref, should_flush,
+        ).await {
+            Ok(p) => p,
             Err(e) => {
-                tracing::warn!("alert {}: bad query_config: {e}", rule.id);
-                continue;
+                tracing::warn!("alert {}: evaluation error: {e}", rule.id);
+                false
             }
         };
+        (rule.id, persisted)
+    }))
+    .buffer_unordered(ENGINE_CONCURRENCY)
+    .collect()
+    .await;
 
-        let from = (now - chrono::Duration::minutes(query_config.time_range_minutes))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-
-        let sql = match rule.signal_type.as_str() {
-            "metrics" => {
-                let mc = build_metrics_where_clause(&query_config.filters, &from, &now_str);
-                let s = mc.to_sql();
-                format!(
-                    "SELECT count() as count FROM (\
-                     SELECT TimeUnix FROM observability.metrics_gauge {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.metrics_sum {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.metrics_histogram {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.metrics_exp_histogram {s} \
-                     UNION ALL SELECT TimeUnix FROM observability.metrics_summary {s})"
-                )
-            }
-            "logs" => {
-                let lc = build_logs_where_clause(&query_config.filters, &from, &now_str);
-                format!("SELECT count() as count FROM observability.logs {}", lc.to_sql())
-            }
-            _ => {
-                // "apm" (default) — query spans
-                let wc = build_where_clause(&query_config.filters, &from, &now_str);
-                format!("SELECT count() as count FROM spans {}", wc.to_sql())
-            }
-        };
-
-        let value = match ch.query(&sql).fetch_one::<CountRow>().await {
-            Ok(row) => row.count as f64,
-            Err(e) => {
-                tracing::warn!("alert {}: query failed: {e}", rule.id);
-                config_db.update_alert_state(&rule.id, "no_data", &now_str, None).await?;
-                continue;
-            }
-        };
-
-        let threshold = rule.condition_threshold;
-        let triggered = match rule.condition_op.as_str() {
-            ">" => value > threshold,
-            ">=" => value >= threshold,
-            "<" => value < threshold,
-            "<=" => value <= threshold,
-            "=" => (value - threshold).abs() < f64::EPSILON,
-            "!=" => (value - threshold).abs() >= f64::EPSILON,
-            _ => false,
-        };
-
-        let new_state = if triggered { "alerting" } else { "ok" };
-        let old_state = rule.state.as_str();
-
-        if new_state != old_state {
-            // State changed — record event and notify
-            let event_id = uuid::Uuid::new_v4().to_string();
-            let message = format!(
-                "Alert '{}': {} (value={}, threshold={} {})",
-                rule.name,
-                if triggered { "FIRING" } else { "RESOLVED" },
-                value,
-                threshold,
-                rule.condition_op,
-            );
-
-            config_db.create_alert_event(
-                &event_id,
-                &rule.id,
-                new_state,
-                value,
-                threshold,
-                &message,
-            ).await?;
-
-            let triggered_at = if triggered { Some(now_str.as_str()) } else { None };
-            config_db.update_alert_state(&rule.id, new_state, &now_str, triggered_at).await?;
-
-            // Skip notifications during active maintenance windows
-            if config_db.is_in_maintenance(&now_str, Some(&rule.id)).await {
-                tracing::debug!("alert '{}': skipping notification — maintenance window active", rule.id);
-                continue;
-            }
-
-            // Send notifications
-            let channel_ids: Vec<String> = serde_json::from_str(&rule.notification_channel_ids)
-                .unwrap_or_default();
-            let alert_state_str = if triggered { "FIRING" } else { "RESOLVED" };
-            for channel_id in &channel_ids {
-                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
-                    if !channel.enabled {
-                        continue;
-                    }
-                    let result = send_channel_notification(
-                        &channel,
-                        &message,
-                        &rule.name,
-                        alert_state_str,
-                        value,
-                        threshold,
-                        &rule.signal_type,
-                        &rule.condition_op,
-                        &rule.description,
-                        &rule.id,
-                        &rule.runbook_url,
-                        http_client,
-                        smtp_config,
-                        smtp_transport,
-                    ).await;
-
-                    let (status, error_msg) = match &result {
-                        Ok(()) => ("sent", String::new()),
-                        Err(e) => {
-                            tracing::warn!("alert {}: notification to {} failed: {e}", rule.id, channel.name);
-                            ("failed", e.clone())
-                        }
-                    };
-
-                    let _ = config_db.create_notification_log(
-                        channel_id,
-                        &channel.tenant_id,
-                        "alert_rule",
-                        &rule.name,
-                        "",
-                        status,
-                        &error_msg,
-                    ).await;
-                }
-            }
-
-            tracing::info!("alert '{}' state: {} -> {}", rule.name, old_state, new_state);
-        } else {
-            config_db.update_alert_state(&rule.id, new_state, &now_str, None).await?;
-        }
+    for (id, persisted) in outcomes {
+        eval_state.record(id, now, persisted);
     }
 
     Ok(())
+}
+
+/// Evaluate one alert rule. Returns Ok(true) iff the rule row was persisted to
+/// the config table (state transition or coarse `last_eval_at` flush).
+#[allow(clippy::too_many_arguments)]
+async fn eval_alert_rule(
+    config_db: &ConfigDb,
+    ch: &Client,
+    http_client: &reqwest::Client,
+    smtp_config: &SmtpConfig,
+    smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+    rule: &crate::models::alert::AlertRule,
+    now: chrono::DateTime<chrono::Utc>,
+    now_str: &str,
+    should_flush: bool,
+) -> anyhow::Result<bool> {
+    let query_config: AlertQueryConfig = match serde_json::from_str(&rule.query_config) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("alert {}: bad query_config: {e}", rule.id);
+            return Ok(false);
+        }
+    };
+
+    let from = (now - chrono::Duration::minutes(query_config.time_range_minutes))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+
+    let sql = build_alert_count_sql(&rule.signal_type, &query_config, &from, now_str);
+
+    let value = match ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<CountRow>().await {
+        Ok(row) => row.count as f64,
+        Err(e) => {
+            tracing::warn!("alert {}: query failed: {e}", rule.id);
+            if rule.state != "no_data" {
+                // Transition into no_data persists immediately, as before.
+                config_db.update_alert_state(&rule.id, "no_data", now_str, None).await?;
+                return Ok(true);
+            }
+            if should_flush {
+                config_db.persist_alert_rule_eval(rule, now_str).await?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+    };
+
+    let threshold = rule.condition_threshold;
+    let triggered = match rule.condition_op.as_str() {
+        ">" => value > threshold,
+        ">=" => value >= threshold,
+        "<" => value < threshold,
+        "<=" => value <= threshold,
+        "=" => (value - threshold).abs() < f64::EPSILON,
+        "!=" => (value - threshold).abs() >= f64::EPSILON,
+        _ => false,
+    };
+
+    let new_state = if triggered { "alerting" } else { "ok" };
+    let old_state = rule.state.as_str();
+
+    if new_state != old_state {
+        // State changed — record event, persist immediately, and notify.
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let message = format!(
+            "Alert '{}': {} (value={}, threshold={} {})",
+            rule.name,
+            if triggered { "FIRING" } else { "RESOLVED" },
+            value,
+            threshold,
+            rule.condition_op,
+        );
+
+        config_db.create_alert_event(
+            &event_id,
+            &rule.id,
+            new_state,
+            value,
+            threshold,
+            &message,
+        ).await?;
+
+        let triggered_at = if triggered { Some(now_str) } else { None };
+        config_db.update_alert_state(&rule.id, new_state, now_str, triggered_at).await?;
+
+        // Skip notifications during active maintenance windows
+        if config_db.is_in_maintenance(now_str, Some(&rule.id)).await {
+            tracing::debug!("alert '{}': skipping notification — maintenance window active", rule.id);
+            return Ok(true);
+        }
+
+        // Send notifications
+        let channel_ids: Vec<String> = serde_json::from_str(&rule.notification_channel_ids)
+            .unwrap_or_default();
+        let alert_state_str = if triggered { "FIRING" } else { "RESOLVED" };
+        for channel_id in &channel_ids {
+            if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
+                if !channel.enabled {
+                    continue;
+                }
+                let result = send_channel_notification(
+                    &channel,
+                    &message,
+                    &rule.name,
+                    alert_state_str,
+                    value,
+                    threshold,
+                    &rule.signal_type,
+                    &rule.condition_op,
+                    &rule.description,
+                    &rule.id,
+                    &rule.runbook_url,
+                    http_client,
+                    smtp_config,
+                    smtp_transport,
+                ).await;
+
+                let (status, error_msg) = match &result {
+                    Ok(()) => ("sent", String::new()),
+                    Err(e) => {
+                        tracing::warn!("alert {}: notification to {} failed: {e}", rule.id, channel.name);
+                        ("failed", e.clone())
+                    }
+                };
+
+                let _ = config_db.create_notification_log(
+                    channel_id,
+                    &channel.tenant_id,
+                    "alert_rule",
+                    &rule.name,
+                    "",
+                    status,
+                    &error_msg,
+                ).await;
+            }
+        }
+
+        tracing::info!("alert '{}' state: {} -> {}", rule.name, old_state, new_state);
+        Ok(true)
+    } else if should_flush {
+        // No transition: coarse last_eval_at flush from the row we already hold.
+        config_db.persist_alert_rule_eval(rule, now_str).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod count_sql_tests {
+    use super::*;
+
+    fn cfg() -> AlertQueryConfig {
+        serde_json::from_str(r#"{"time_range_minutes": 5, "filters": []}"#).unwrap()
+    }
+
+    // Regression: the metrics count must push count() into each UNION ALL leg
+    // (per-leg pushdown) instead of streaming TimeUnix rows to an outer count().
+    #[test]
+    fn metrics_count_uses_per_leg_pushdown() {
+        let sql = build_alert_count_sql("metrics", &cfg(), "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
+        assert!(sql.starts_with("SELECT sum(c) as count FROM ("), "outer sum over per-leg counts: {sql}");
+        assert_eq!(sql.matches("SELECT count() AS c FROM").count(), 5, "5 per-leg counts: {sql}");
+        assert!(!sql.contains("SELECT TimeUnix"), "must not stream TimeUnix rows: {sql}");
+    }
+
+    #[test]
+    fn logs_and_apm_counts_unchanged() {
+        let logs = build_alert_count_sql("logs", &cfg(), "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
+        assert!(logs.starts_with("SELECT count() as count FROM observability.logs"), "{logs}");
+        let apm = build_alert_count_sql("apm", &cfg(), "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
+        assert!(apm.starts_with("SELECT count() as count FROM spans"), "{apm}");
+    }
 }
 
 #[cfg(test)]

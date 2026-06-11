@@ -2641,6 +2641,27 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Narrow `last_eval_at` flush for the alert engine: re-inserts the rule row the
+    /// engine already fetched this tick (state unchanged), avoiding the SELECT…FINAL
+    /// read-modify-write of `update_alert_state`. Only call when no state transition
+    /// occurred — transitions must go through `update_alert_state`.
+    pub async fn persist_alert_rule_eval(&self, rule: &crate::models::alert::AlertRule, last_eval_at: &str) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_alert_rules (id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&rule.id).bind(&rule.name).bind(&rule.description)
+            .bind(if rule.enabled { 1u8 } else { 0u8 })
+            .bind(&rule.signal_type).bind(&rule.query_config).bind(&rule.condition_op)
+            .bind(rule.condition_threshold).bind(rule.eval_interval_secs)
+            .bind(&rule.notification_channel_ids).bind(&rule.runbook_url)
+            .bind(&rule.state).bind(last_eval_at)
+            .bind(rule.last_triggered_at.clone().unwrap_or_default())
+            .bind(&rule.created_at).bind(&now).bind(ver)
+            .execute().await?;
+        Ok(())
+    }
+
     pub async fn get_due_alerts(&self, now: &str) -> anyhow::Result<Vec<crate::models::alert::AlertRule>> {
         let rows = self.client
             .query("SELECT id, name, description, enabled, signal_type, query_config, condition_op, condition_threshold, eval_interval_secs, notification_channel_ids, runbook_url, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_alert_rules FINAL WHERE enabled = 1 AND is_deleted = 0 AND (last_eval_at = '' OR toUnixTimestamp(parseDateTimeBestEffort(?)) - toUnixTimestamp(parseDateTimeBestEffort(last_eval_at)) >= eval_interval_secs)")
@@ -2701,8 +2722,12 @@ impl ConfigDb {
         let sql = {
             let mut s = "SELECT id, service_name, version, commit_sha, description, environment, deployed_by, deployed_at FROM config_deploy_markers WHERE 1=1".to_string();
             if service_name.is_some() { s.push_str(" AND service_name = ?"); }
-            if from.is_some() { s.push_str(" AND deployed_at >= ?"); }
-            if to.is_some() { s.push_str(" AND deployed_at <= ?"); }
+            // deployed_at is a String column stored space-separated ("YYYY-MM-DD HH:MM:SS")
+            // while callers pass ISO ("...T...Z"); a raw string compare mismatches on the
+            // 'T' vs ' ' separator (space < 'T'), silently dropping in-window markers.
+            // Parse both sides so the window filter is timestamp-format-agnostic.
+            if from.is_some() { s.push_str(" AND parseDateTimeBestEffort(deployed_at) >= parseDateTimeBestEffort(?)"); }
+            if to.is_some() { s.push_str(" AND parseDateTimeBestEffort(deployed_at) <= parseDateTimeBestEffort(?)"); }
             s.push_str(" ORDER BY deployed_at DESC LIMIT 100");
             s
         };
@@ -2833,6 +2858,28 @@ impl ConfigDb {
             .bind(state).bind(error_budget_remaining).bind(error_count).bind(total_count)
             .bind(last_eval_at).bind(&lba)
             .bind(&existing.created_at).bind(&now).bind(ver)
+            .execute().await?;
+        Ok(())
+    }
+
+    /// Narrow eval flush for the SLO engine: re-inserts the SLO row the engine already
+    /// fetched this tick with the freshly computed budget/count values, avoiding the
+    /// SELECT…FINAL read-modify-write of `update_slo_state`. Only call when no state
+    /// transition occurred — transitions must go through `update_slo_state`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn persist_slo_eval(&self, slo: &crate::models::slo::Slo, state: &str, error_budget_remaining: f64, error_count: i64, total_count: i64, last_eval_at: &str) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_slos (id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&slo.id).bind(&slo.name).bind(&slo.description).bind(if slo.enabled { 1u8 } else { 0u8 })
+            .bind(&slo.slo_type).bind(&slo.indicator_type).bind(&slo.service_name).bind(&slo.metric_name)
+            .bind(&slo.window_type).bind(slo.target_percentage).bind(slo.threshold_ms).bind(slo.threshold_value)
+            .bind(slo.threshold_op.clone().unwrap_or_default()).bind(&slo.error_filters).bind(&slo.total_filters)
+            .bind(slo.eval_interval_secs).bind(&slo.notification_channel_ids)
+            .bind(state).bind(error_budget_remaining).bind(error_count).bind(total_count)
+            .bind(last_eval_at).bind(slo.last_breached_at.clone().unwrap_or_default())
+            .bind(&slo.created_at).bind(&now).bind(ver)
             .execute().await?;
         Ok(())
     }
@@ -3292,6 +3339,29 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Narrow `last_eval_at` flush for the monitor engine: re-inserts the monitor row
+    /// the engine already fetched this tick (state/group_states unchanged), avoiding
+    /// the SELECT…FINAL read-modify-write of `update_monitor_state`. Only call when no
+    /// state transition occurred — transitions must go through `update_monitor_state`.
+    pub async fn persist_monitor_eval(&self, monitor: &crate::models::monitor::Monitor, last_eval_at: &str) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&monitor.id).bind(&monitor.tenant_id).bind(&monitor.name).bind(&monitor.monitor_type).bind(&monitor.query_config)
+            .bind(monitor.critical).bind(monitor.critical_recovery).bind(monitor.warning).bind(monitor.warning_recovery)
+            .bind(&monitor.comparator).bind(monitor.eval_window_secs).bind(monitor.eval_interval_secs).bind(&monitor.group_by)
+            .bind(&monitor.state).bind(&monitor.group_states)
+            .bind(&monitor.no_data_action).bind(monitor.no_data_timeframe).bind(monitor.auto_resolve_hours)
+            .bind(&monitor.message).bind(&monitor.notification_channels).bind(monitor.renotify_interval)
+            .bind(&monitor.tags).bind(monitor.priority).bind(if monitor.enabled { 1u8 } else { 0u8 })
+            .bind(&monitor.composite_formula).bind(&monitor.composite_monitor_ids)
+            .bind(last_eval_at).bind(monitor.last_triggered_at.clone().unwrap_or_default())
+            .bind(&monitor.created_by).bind(&monitor.created_at).bind(&now).bind(ver)
+            .execute().await?;
+        Ok(())
+    }
+
     pub async fn update_monitor_triggered(&self, id: &str, last_triggered_at: &str) -> anyhow::Result<()> {
         let existing = match self.get_monitor_by_id(id).await? { Some(r) => r, None => return Ok(()) };
         let now = Self::now_str();
@@ -3546,6 +3616,31 @@ impl ConfigDb {
             .bind(if existing.enabled { 1u8 } else { 0u8 }).bind(&existing.channels)
             .bind(&existing.created_by).bind(last_eval_at).bind(triggered)
             .bind(&existing.created_at).bind(&now).bind(ver)
+            .execute().await?;
+        Ok(())
+    }
+
+    /// Narrow eval persist for the SIEM engine: re-inserts the detection rule row the
+    /// engine already fetched this tick, avoiding the SELECT…FINAL read-modify-write
+    /// of `update_detection_rule_eval`. Used both for the coarse `last_eval_at` flush
+    /// and on fire (with `last_triggered_at = Some(now)`).
+    pub async fn persist_detection_rule_eval(
+        &self,
+        rule: &crate::models::detection::DetectionRule,
+        last_eval_at: &str,
+        last_triggered_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        let ver = Self::next_version();
+        let triggered = last_triggered_at.unwrap_or_else(|| rule.last_triggered_at.as_deref().unwrap_or(""));
+        self.client
+            .query("INSERT INTO config_detection_rules (id, tenant_id, name, description, query_sql, interval_secs, threshold, severity, window_secs, enabled, channels, created_by, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&rule.id).bind(&rule.tenant_id).bind(&rule.name).bind(&rule.description)
+            .bind(&rule.query_sql).bind(rule.interval_secs).bind(rule.threshold)
+            .bind(&rule.severity).bind(rule.window_secs)
+            .bind(if rule.enabled { 1u8 } else { 0u8 }).bind(&rule.channels)
+            .bind(&rule.created_by).bind(last_eval_at).bind(triggered)
+            .bind(&rule.created_at).bind(&now).bind(ver)
             .execute().await?;
         Ok(())
     }

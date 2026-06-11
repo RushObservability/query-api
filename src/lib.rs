@@ -3,6 +3,7 @@ pub mod anomaly_engine;
 pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
+pub mod eval_state;
 pub mod handlers;
 pub mod metric_firewall;
 pub mod migrations;

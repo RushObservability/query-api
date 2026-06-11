@@ -114,6 +114,20 @@ struct UsageRow {
     bytes: u64,
 }
 
+/// Bucket a timestamp string to 15-second granularity for use in cache keys, so
+/// rolling explicit ranges ("last hour", recomputed from now() every refresh)
+/// map to the same key within the cache TTL. Unparsable strings pass through
+/// unchanged (the key just won't benefit from bucketing).
+fn bucket_ts_15s(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => {
+            let secs = dt.timestamp();
+            (secs - secs.rem_euclid(15)).to_string()
+        }
+        Err(_) => ts.to_string(),
+    }
+}
+
 pub async fn get_stats(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -124,9 +138,11 @@ pub async fn get_stats(
 
     // 15s response cache. The default (no explicit range) path uses a stable key so
     // consecutive dashboard refreshes hit the cache even though from/to are
-    // recomputed from `now()` on every call.
+    // recomputed from `now()` on every call. Explicit ranges are bucketed to 15s
+    // granularity in the key so rolling UI ranges (recomputed each refresh) can
+    // still hit within the TTL.
     let cache_key = match &req.time_range {
-        Some(tr) => format!("{tenant_id}|{}|{}", tr.from, tr.to),
+        Some(tr) => format!("{tenant_id}|{}|{}", bucket_ts_15s(&tr.from), bucket_ts_15s(&tr.to)),
         None => format!("{tenant_id}|default"),
     };
     if let Some(entry) = STATS_CACHE.get(&cache_key) {
@@ -339,8 +355,39 @@ pub async fn get_stats(
             (StatusCode::INTERNAL_SERVER_ERROR, "serialization failed".into())
         })?;
     if STATS_CACHE.len() > STATS_CACHE_MAX {
-        STATS_CACHE.clear(); // defensive: don't let unbounded distinct ranges grow the map
+        // Evict only expired entries first — clear() would also wipe hot entries.
+        STATS_CACHE.retain(|_, v| v.1.elapsed() < STATS_CACHE_TTL);
+        if STATS_CACHE.len() > STATS_CACHE_MAX {
+            STATS_CACHE.clear(); // backstop: still over cap after pruning
+        }
     }
     STATS_CACHE.insert(cache_key, (value.clone(), Instant::now()));
     Ok(Json(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_ts_15s_buckets_rolling_ranges_together() {
+        // Timestamps within the same 15s bucket map to the same key fragment.
+        let a = bucket_ts_15s("2026-06-10T12:00:01Z");
+        let b = bucket_ts_15s("2026-06-10T12:00:14Z");
+        assert_eq!(a, b);
+        // …and a different bucket maps elsewhere.
+        let c = bucket_ts_15s("2026-06-10T12:00:16Z");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn bucket_ts_15s_handles_offsets_and_garbage() {
+        // Same instant in a non-UTC offset buckets identically.
+        assert_eq!(
+            bucket_ts_15s("2026-06-10T12:00:05Z"),
+            bucket_ts_15s("2026-06-10T14:00:05+02:00"),
+        );
+        // Unparsable input passes through unchanged (key still tenant-scoped).
+        assert_eq!(bucket_ts_15s("not-a-date"), "not-a-date");
+    }
 }
