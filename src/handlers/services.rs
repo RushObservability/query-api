@@ -272,3 +272,105 @@ pub async fn service_latency_histogram(
         total: pct.total,
     }))
 }
+
+// ═══ Endpoint / Operation breakdown ═══
+// Per-service RED (Rate / Errors / Duration) broken down by endpoint or
+// operation, so a single bad route is visible instead of being averaged into
+// the service's overall numbers.
+//   mode=server (default): the service's own HTTP entry points — SPAN_KIND_SERVER
+//     spans grouped by (method, path); path is already templated (/articles/:id).
+//   mode=operation: downstream work this service does — non-server spans grouped
+//     by span_name (db.select, cache.set, …), excluding framework noise
+//     (middleware / request-handler internal spans).
+
+#[derive(Debug, Deserialize)]
+pub struct EndpointParams {
+    #[serde(default = "default_minutes")]
+    pub minutes: u64,
+    pub service: String,
+    #[serde(default = "default_endpoint_mode")]
+    pub mode: String,
+}
+
+fn default_endpoint_mode() -> String {
+    "server".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Row)]
+pub struct EndpointRow {
+    pub endpoint: String,
+    pub method: String,
+    pub path: String,
+    pub req: u64,
+    pub errors: u64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndpointsResponse {
+    pub endpoints: Vec<EndpointRow>,
+    pub mode: String,
+}
+
+pub async fn service_endpoints(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(params): Query<EndpointParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_service = crate::query_builder::escape_string_literal(&params.service);
+    let minutes = params.minutes.min(10080); // max 7d
+    let operation_mode = params.mode == "operation";
+
+    // Common RED aggregates; only the grouping key + filter differ by mode.
+    let err_expr = "countIf(http_status_code >= 500 OR status = 'ERROR') AS errors";
+    let pct = "quantile(0.5)(duration_ns)/1000000.0 AS p50_ms, \
+               quantile(0.95)(duration_ns)/1000000.0 AS p95_ms, \
+               quantile(0.99)(duration_ns)/1000000.0 AS p99_ms";
+
+    let sql = if operation_mode {
+        format!(
+            "SELECT span_name AS endpoint, '' AS method, '' AS path, \
+                count() AS req, {err_expr}, {pct} \
+             FROM spans \
+             PREWHERE tenant_id = '{escaped_tenant}' \
+                AND service_name = '{escaped_service}' \
+                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+             WHERE kind != 'SPAN_KIND_SERVER' \
+                AND span_name NOT LIKE 'middleware%' \
+                AND span_name NOT LIKE 'request handler%' \
+             GROUP BY span_name \
+             ORDER BY req DESC \
+             LIMIT 100"
+        )
+    } else {
+        format!(
+            "SELECT concat(http_method, ' ', http_path) AS endpoint, http_method AS method, http_path AS path, \
+                count() AS req, {err_expr}, {pct} \
+             FROM spans \
+             PREWHERE tenant_id = '{escaped_tenant}' \
+                AND service_name = '{escaped_service}' \
+                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+             WHERE kind = 'SPAN_KIND_SERVER' \
+             GROUP BY http_method, http_path \
+             ORDER BY req DESC \
+             LIMIT 100"
+        )
+    };
+
+    let endpoints = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<EndpointRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, handler = "service_endpoints", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
+
+    Ok(Json(EndpointsResponse {
+        endpoints,
+        mode: if operation_mode { "operation".into() } else { "server".into() },
+    }))
+}
