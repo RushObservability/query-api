@@ -374,3 +374,110 @@ pub async fn service_endpoints(
         mode: if operation_mode { "operation".into() } else { "server".into() },
     }))
 }
+
+// ═══ Top Errors (error grouping) ═══
+// What's actually failing for a service, grouped two ways:
+//   mode=endpoint (default): errored SERVER spans grouped by (status, method, path)
+//     — "503 POST /articles ×80". Always available from trace data.
+//   mode=message: ERROR/WARN/FATAL logs grouped by a normalized message template
+//     (UUIDs → UUID, digits → N) so "DB pool exhausted: 0/20" and "…2/20" collapse
+//     into one group — the classic error-grouping / issues view.
+
+#[derive(Debug, Deserialize)]
+pub struct ErrorsParams {
+    #[serde(default = "default_minutes")]
+    pub minutes: u64,
+    pub service: String,
+    #[serde(default = "default_errors_mode")]
+    pub mode: String,
+}
+
+fn default_errors_mode() -> String {
+    "endpoint".to_string()
+}
+
+// One row per error group. Column order/types are identical across both queries
+// so a single Row struct deserializes either mode (unused fields filled with
+// constants in SQL).
+#[derive(Debug, Serialize, Deserialize, Row)]
+pub struct ErrorGroup {
+    pub key: String,
+    pub status_code: u16,
+    pub method: String,
+    pub path: String,
+    pub severity: String,
+    pub example: String,
+    pub count: u64,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorsResponse {
+    pub groups: Vec<ErrorGroup>,
+    pub mode: String,
+}
+
+pub async fn service_errors(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(params): Query<ErrorsParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_service = crate::query_builder::escape_string_literal(&params.service);
+    let minutes = params.minutes.min(10080); // max 7d
+    let message_mode = params.mode == "message";
+
+    let sql = if message_mode {
+        // Normalize: collapse UUIDs then runs of digits so message variants group.
+        let template = "replaceRegexpAll(replaceRegexpAll(Body, \
+            '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', 'UUID'), \
+            '[0-9]+', 'N')";
+        format!(
+            "SELECT {template} AS key, \
+                toUInt16(0) AS status_code, '' AS method, '' AS path, \
+                argMax(SeverityText, SeverityNumber) AS severity, \
+                argMax(Body, Timestamp) AS example, \
+                count() AS count, \
+                toString(max(Timestamp)) AS last_seen \
+             FROM logs \
+             PREWHERE tenant_id = '{escaped_tenant}' \
+                AND ServiceName = '{escaped_service}' \
+                AND Timestamp >= now() - INTERVAL {minutes} MINUTE \
+             WHERE SeverityText IN ('ERROR', 'WARN', 'FATAL') \
+             GROUP BY key \
+             ORDER BY count DESC \
+             LIMIT 50"
+        )
+    } else {
+        format!(
+            "SELECT concat(toString(http_status_code), ' ', http_method, ' ', http_path) AS key, \
+                http_status_code AS status_code, http_method AS method, http_path AS path, \
+                '' AS severity, '' AS example, \
+                count() AS count, \
+                toString(max(timestamp)) AS last_seen \
+             FROM spans \
+             PREWHERE tenant_id = '{escaped_tenant}' \
+                AND service_name = '{escaped_service}' \
+                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+             WHERE kind = 'SPAN_KIND_SERVER' \
+                AND (status = 'ERROR' OR http_status_code >= 500) \
+             GROUP BY http_status_code, http_method, http_path \
+             ORDER BY count DESC \
+             LIMIT 50"
+        )
+    };
+
+    let groups = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<ErrorGroup>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, handler = "service_errors", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
+
+    Ok(Json(ErrorsResponse {
+        groups,
+        mode: if message_mode { "message".into() } else { "endpoint".into() },
+    }))
+}
