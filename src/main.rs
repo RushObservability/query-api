@@ -392,11 +392,10 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(true)
     };
     if !drain_only {
-    if engine_enabled("RUSH_RUN_ALERT_ENGINE") {
-        alert_engine::spawn_alert_engine(config_db.clone(), ch.clone(), smtp_config.clone());
-    } else {
-        tracing::info!("in-process alert engine disabled (RUSH_RUN_ALERT_ENGINE=false); expecting a dedicated alert-engine deployment");
-    }
+    // Legacy alert-rules engine retired — Monitors (monitor_engine) is the single
+    // alerting system. The alert_engine module is kept only for the shared
+    // notification infrastructure (SmtpConfig, send_channel_notification) that
+    // Monitors and the anomaly engine use; the rule-evaluation loop no longer runs.
     if engine_enabled("RUSH_RUN_SLO_ENGINE") {
         slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
     } else {
@@ -675,26 +674,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/notifications/log",
             get(handlers::alerts::list_notification_log),
         )
-        // Alert events (all rules)
-        .route(
-            "/api/v1/alert-events",
-            get(handlers::alerts::list_all_alert_events),
-        )
-        // Alert rules
-        .route(
-            "/api/v1/alerts",
-            get(handlers::alerts::list_alerts).post(handlers::alerts::create_alert),
-        )
-        .route(
-            "/api/v1/alerts/{id}",
-            get(handlers::alerts::get_alert)
-                .put(handlers::alerts::update_alert)
-                .delete(handlers::alerts::delete_alert),
-        )
-        .route(
-            "/api/v1/alerts/{id}/events",
-            get(handlers::alerts::list_alert_events),
-        )
+        // Legacy alert-rules endpoints removed (system retired in favor of Monitors).
         // Trace Funnels
         .route(
             "/api/v1/funnels",
