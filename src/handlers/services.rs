@@ -174,3 +174,101 @@ pub async fn service_graph(
 
     Ok(Json(ServiceGraph { nodes, edges }))
 }
+
+// ═══ Latency Histogram ═══
+// Full latency *distribution* for a single service, complementing the
+// percentile timeseries (which shows P50/P95/P99 over time but hides the shape
+// of the distribution — bimodality, long tails, fast-path/slow-path splits).
+// Durations are bucketed by log2(ms) so a single set of exponentially-growing
+// buckets covers microseconds to seconds without configuration. The frontend
+// maps each exponent `e` to the half-open range [2^e, 2^(e+1)) ms.
+
+#[derive(Debug, Deserialize)]
+pub struct LatencyHistParams {
+    #[serde(default = "default_minutes")]
+    pub minutes: u64,
+    pub service: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Row)]
+pub struct LatencyHistBucket {
+    /// log2(duration_ms) bucket exponent; range [2^exp, 2^(exp+1)) ms.
+    pub exp: i32,
+    pub count: u64,
+}
+
+#[derive(Debug, Deserialize, Row)]
+struct LatencyPercentilesRow {
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    total: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LatencyHistResponse {
+    pub buckets: Vec<LatencyHistBucket>,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub total: u64,
+}
+
+pub async fn service_latency_histogram(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(params): Query<LatencyHistParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_service = crate::query_builder::escape_string_literal(&params.service);
+    let minutes = params.minutes.min(10080); // max 7d
+
+    // Bucket by log2(ms). greatest(..., 0.001) floors at 1µs so log2 stays finite
+    // for zero/near-zero durations; those land in the smallest bucket.
+    let bucket_sql = format!(
+        "SELECT \
+            toInt32(floor(log2(greatest(duration_ns / 1000000.0, 0.001)))) AS exp, \
+            count() AS count \
+         FROM spans \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+            AND service_name = '{escaped_service}' \
+            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+         GROUP BY exp \
+         ORDER BY exp"
+    );
+
+    // Exact percentiles over the same window, drawn as markers on the histogram.
+    let pct_sql = format!(
+        "SELECT \
+            quantile(0.5)(duration_ns) / 1000000.0 AS p50_ms, \
+            quantile(0.95)(duration_ns) / 1000000.0 AS p95_ms, \
+            quantile(0.99)(duration_ns) / 1000000.0 AS p99_ms, \
+            count() AS total \
+         FROM spans \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+            AND service_name = '{escaped_service}' \
+            AND timestamp >= now() - INTERVAL {minutes} MINUTE"
+    );
+
+    let (buckets_res, pct_res) = tokio::join!(
+        crate::tenant_query(&state.ch, &bucket_sql, tenant_id).fetch_all::<LatencyHistBucket>(),
+        crate::tenant_query(&state.ch, &pct_sql, tenant_id).fetch_one::<LatencyPercentilesRow>(),
+    );
+
+    let buckets = buckets_res.map_err(|e| {
+        tracing::error!(error = %e, handler = "service_latency_histogram", "buckets query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
+
+    // No rows ⇒ no traffic in window; return an empty distribution rather than 500.
+    let pct = pct_res.unwrap_or(LatencyPercentilesRow { p50_ms: 0.0, p95_ms: 0.0, p99_ms: 0.0, total: 0 });
+
+    Ok(Json(LatencyHistResponse {
+        buckets,
+        p50_ms: pct.p50_ms,
+        p95_ms: pct.p95_ms,
+        p99_ms: pct.p99_ms,
+        total: pct.total,
+    }))
+}
