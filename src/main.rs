@@ -609,6 +609,7 @@ async fn main() -> anyhow::Result<()> {
         // Service catalog
         .route("/api/v1/services", get(handlers::services::list_services))
         .route("/api/v1/services/graph", get(handlers::services::service_graph))
+        .route("/api/v1/services/latency-histogram", get(handlers::services::service_latency_histogram))
         // Natural language query parsing (LLM-powered)
         .route("/api/v1/parse-query", post(handlers::parse_query::parse_query))
         .route("/api/v1/parse-promql", post(handlers::parse_promql::parse_promql))
