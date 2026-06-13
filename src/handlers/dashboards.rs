@@ -69,11 +69,13 @@ pub async fn create_dashboard(
 
     let tags_json = serde_json::to_string(&req.tags)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let vars_json = serde_json::to_string(&req.variables)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let id = uuid::Uuid::new_v4().to_string();
     state
         .config_db
-        .create_dashboard(&id, &req.name, &req.description, &tenant.tenant_id, &user_id, visibility, &tags_json).await
+        .create_dashboard(&id, &req.name, &req.description, &tenant.tenant_id, &user_id, visibility, &tags_json, &vars_json).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let dashboard = state
         .config_db
@@ -119,10 +121,12 @@ pub async fn update_dashboard(
 
     let tags_json = serde_json::to_string(&req.tags)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let vars_json = serde_json::to_string(&req.variables)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let updated = state
         .config_db
-        .update_dashboard(&id, &req.name, &req.description, &req.visibility, &tags_json, &tenant.tenant_id, &user_id, &role).await
+        .update_dashboard(&id, &req.name, &req.description, &req.visibility, &tags_json, &vars_json, &tenant.tenant_id, &user_id, &role).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "dashboard not found".to_string()));
@@ -332,13 +336,18 @@ pub async fn create_from_template(
         .filter_map(|v| serde_json::from_value(v).ok())
         .collect();
 
+    // Templates may pre-wire template variables (e.g. a $service dropdown).
+    let vars = template.template_json.get("variables")
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "[]".to_string());
+
     // Create dashboard
     let dash_id = uuid::Uuid::new_v4().to_string();
     let tags = serde_json::to_string(&template.tags)
         .unwrap_or_else(|_| "[]".to_string());
     state
         .config_db
-        .create_dashboard(&dash_id, &req.name, &template.description, &tenant.tenant_id, &user_id, "tenant", &tags).await
+        .create_dashboard(&dash_id, &req.name, &template.description, &tenant.tenant_id, &user_id, "tenant", &tags, &vars).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Create widgets from template

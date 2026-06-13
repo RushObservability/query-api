@@ -406,12 +406,16 @@ impl ConfigDb {
                 owner_id    String DEFAULT '',
                 visibility  String DEFAULT 'tenant',
                 tags        String DEFAULT '[]',
+                variables   String DEFAULT '[]',
                 created_at  String DEFAULT toString(now()),
                 updated_at  String DEFAULT toString(now()),
                 version     UInt64,
                 is_deleted  UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+
+            // Backfill `variables` on dashboards created before template-variable support.
+            "ALTER TABLE config_dashboards ADD COLUMN IF NOT EXISTS variables String DEFAULT '[]'",
 
             // ── Widgets ───────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_widgets (
@@ -2105,11 +2109,11 @@ impl ConfigDb {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String, name: String, description: String, tenant_id: String,
-            owner_id: String, visibility: String, tags: String,
+            owner_id: String, visibility: String, tags: String, variables: String,
             created_at: String, updated_at: String,
         }
         let rows = self.client
-            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, created_at, updated_at FROM config_dashboards FINAL WHERE is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) ORDER BY updated_at DESC")
+            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at FROM config_dashboards FINAL WHERE is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) ORDER BY updated_at DESC")
             .bind(user_id).bind(tenant_id)
             .fetch_all::<Row>()
             .await?;
@@ -2117,6 +2121,7 @@ impl ConfigDb {
             id: r.id, name: r.name, description: r.description,
             tenant_id: r.tenant_id, owner_id: r.owner_id, visibility: r.visibility,
             tags: serde_json::from_str(&r.tags).unwrap_or(serde_json::json!([])),
+            variables: serde_json::from_str(&r.variables).unwrap_or(serde_json::json!([])),
             created_at: r.created_at, updated_at: r.updated_at,
         }).collect())
     }
@@ -2125,11 +2130,11 @@ impl ConfigDb {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String, name: String, description: String, tenant_id: String,
-            owner_id: String, visibility: String, tags: String,
+            owner_id: String, visibility: String, tags: String, variables: String,
             created_at: String, updated_at: String,
         }
         let result = self.client
-            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) LIMIT 1")
+            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) LIMIT 1")
             .bind(id).bind(user_id).bind(tenant_id)
             .fetch_one::<Row>()
             .await;
@@ -2138,6 +2143,7 @@ impl ConfigDb {
                 id: r.id, name: r.name, description: r.description,
                 tenant_id: r.tenant_id, owner_id: r.owner_id, visibility: r.visibility,
                 tags: serde_json::from_str(&r.tags).unwrap_or(serde_json::json!([])),
+                variables: serde_json::from_str(&r.variables).unwrap_or(serde_json::json!([])),
                 created_at: r.created_at, updated_at: r.updated_at,
             })),
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
@@ -2149,11 +2155,11 @@ impl ConfigDb {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String, name: String, description: String, tenant_id: String,
-            owner_id: String, visibility: String, tags: String,
+            owner_id: String, visibility: String, tags: String, variables: String,
             created_at: String, updated_at: String,
         }
         let result = self.client
-            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
             .fetch_one::<Row>()
             .await;
@@ -2162,6 +2168,7 @@ impl ConfigDb {
                 id: r.id, name: r.name, description: r.description,
                 tenant_id: r.tenant_id, owner_id: r.owner_id, visibility: r.visibility,
                 tags: serde_json::from_str(&r.tags).unwrap_or(serde_json::json!([])),
+                variables: serde_json::from_str(&r.variables).unwrap_or(serde_json::json!([])),
                 created_at: r.created_at, updated_at: r.updated_at,
             })),
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
@@ -2169,20 +2176,20 @@ impl ConfigDb {
         }
     }
 
-    pub async fn create_dashboard(&self, id: &str, name: &str, description: &str, tenant_id: &str, owner_id: &str, visibility: &str, tags: &str) -> anyhow::Result<()> {
+    pub async fn create_dashboard(&self, id: &str, name: &str, description: &str, tenant_id: &str, owner_id: &str, visibility: &str, tags: &str, variables: &str) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(description).bind(tenant_id)
-            .bind(owner_id).bind(visibility).bind(tags)
+            .bind(owner_id).bind(visibility).bind(tags).bind(variables)
             .bind(&now).bind(&now).bind(ver)
             .execute()
             .await?;
         Ok(())
     }
 
-    pub async fn update_dashboard(&self, id: &str, name: &str, description: &str, visibility: &str, tags: &str, tenant_id: &str, user_id: &str, user_role: &str) -> anyhow::Result<bool> {
+    pub async fn update_dashboard(&self, id: &str, name: &str, description: &str, visibility: &str, tags: &str, variables: &str, tenant_id: &str, user_id: &str, user_role: &str) -> anyhow::Result<bool> {
         let dash = match self.get_dashboard(id, tenant_id, user_id).await? {
             Some(d) => d,
             None => return Ok(false),
@@ -2195,9 +2202,9 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(description).bind(&dash.tenant_id)
-            .bind(&dash.owner_id).bind(visibility).bind(tags)
+            .bind(&dash.owner_id).bind(visibility).bind(tags).bind(variables)
             .bind(&dash.created_at).bind(&now).bind(ver)
             .execute()
             .await?;
@@ -2214,10 +2221,11 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
             .bind(id).bind(&dash.name).bind(&dash.description).bind(&dash.tenant_id)
             .bind(&dash.owner_id).bind(&dash.visibility)
             .bind(serde_json::to_string(&dash.tags).unwrap_or_else(|_| "[]".to_string()))
+            .bind(serde_json::to_string(&dash.variables).unwrap_or_else(|_| "[]".to_string()))
             .bind(&dash.created_at).bind(&now).bind(ver)
             .execute()
             .await?;
@@ -2240,7 +2248,7 @@ impl ConfigDb {
         Ok(Some(serde_json::json!({
             "format_version": "v1",
             "exported_at": Self::now_str(),
-            "dashboard": {"name": dash.name, "description": dash.description, "visibility": dash.visibility, "tags": dash.tags},
+            "dashboard": {"name": dash.name, "description": dash.description, "visibility": dash.visibility, "tags": dash.tags, "variables": dash.variables},
             "widgets": widget_exports,
         })))
     }
@@ -2249,8 +2257,9 @@ impl ConfigDb {
         if import.format_version != "v1" { anyhow::bail!("unsupported format_version: {}", import.format_version); }
         let visibility = if import.dashboard.visibility == "global" && user_role != "admin" { "tenant" } else { &import.dashboard.visibility };
         let tags_str = serde_json::to_string(&import.dashboard.tags)?;
+        let vars_str = serde_json::to_string(&import.dashboard.variables).unwrap_or_else(|_| "[]".to_string());
         let dash_id = uuid::Uuid::new_v4().to_string();
-        self.create_dashboard(&dash_id, &import.dashboard.name, &import.dashboard.description, tenant_id, owner_id, visibility, &tags_str).await?;
+        self.create_dashboard(&dash_id, &import.dashboard.name, &import.dashboard.description, tenant_id, owner_id, visibility, &tags_str, &vars_str).await?;
         for w in &import.widgets {
             let wid = uuid::Uuid::new_v4().to_string();
             self.create_widget(&wid, &dash_id, &w.title, &w.widget_type, &serde_json::to_string(&w.query_config)?, &serde_json::to_string(&w.position)?, &serde_json::to_string(&w.display_config)?).await?;
@@ -2382,19 +2391,18 @@ impl ConfigDb {
     }
 
     pub async fn ensure_default_templates(&self) -> anyhow::Result<()> {
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Count { n: u64 }
-        let count = self.client
-            .query("SELECT count() AS n FROM config_dashboard_templates FINAL WHERE is_builtin = 1 AND is_deleted = 0")
-            .fetch_one::<Count>()
-            .await?.n;
-        if count > 0 { return Ok(()); }
+        // Upsert on every startup (ReplacingMergeTree dedupes by id + version), so
+        // corrected built-in templates roll out to existing installs — not just
+        // fresh ones. User-created templates have different ids and are untouched.
 
         fn w(title: &str, wt: &str, qc: serde_json::Value, pos: (i32,i32,i32,i32), dc: serde_json::Value) -> serde_json::Value {
-            serde_json::json!({"title":title,"widget_type":wt,"query_config":qc,"position":{"col":pos.0,"row":pos.1,"col_span":pos.2,"row_span":pos.3},"display_config":dc})
+            // Positions are authored 0-indexed; the grid (and the rest of the app) is
+            // 1-indexed, so shift col/row by 1. Without this, col/row 0 computes to CSS
+            // `auto` and widgets auto-pack into the wrong cells.
+            serde_json::json!({"title":title,"widget_type":wt,"query_config":qc,"position":{"col":pos.0+1,"row":pos.1+1,"col_span":pos.2,"row_span":pos.3},"display_config":dc})
         }
         fn qc_svc(agg: &str, interval: Option<&str>, extra: Vec<serde_json::Value>, group_by: Option<Vec<&str>>, limit: Option<i32>) -> serde_json::Value {
-            let mut filters = vec![serde_json::json!({"field":"ServiceName","op":"=","value":"{{service}}"})];
+            let mut filters = vec![serde_json::json!({"field":"service_name","op":"=","value":"$service"})];
             filters.extend(extra);
             let mut v = serde_json::json!({"time_range_minutes":60,"filters":filters,"aggregation":agg});
             if let Some(i) = interval { v["interval"] = serde_json::json!(i); }
@@ -2411,14 +2419,17 @@ impl ConfigDb {
         }
         fn color(c: &str) -> serde_json::Value { serde_json::json!({"color":c}) }
         fn empty() -> serde_json::Value { serde_json::json!({}) }
-        let ef = || vec![serde_json::json!({"field":"StatusCode","op":">=","value":"500"})];
+        let ef = || vec![serde_json::json!({"field":"http_status_code","op":">=","value":"500"})];
+        // A `$service` template variable, pre-wired so service-scoped templates load
+        // with a dropdown instead of an unsubstituted placeholder.
+        let svc_var = || serde_json::json!([{"name":"service","label":"service","type":"query","field":"service_name","include_all":false}]);
 
         let templates: Vec<(&str, &str, &str, &str, serde_json::Value)> = vec![
-            ("tpl-service-overview","Service Overview","Golden signals for a single service: request rate, error rate, and latency percentiles.","apm",serde_json::json!({"widgets":[w("Request Rate","timeseries",qc_svc("count",Some("1m"),vec![],None,None),(0,0,6,4),color("#3b82f6")),w("Error Rate","timeseries",qc_svc("count",Some("1m"),ef(),None,None),(6,0,6,4),color("#ef4444")),w("P50 Latency","timeseries",qc_svc("p50",Some("1m"),vec![],None,None),(0,4,4,4),color("#22c55e")),w("P99 Latency","timeseries",qc_svc("p99",Some("1m"),vec![],None,None),(4,4,4,4),color("#f59e0b")),w("Top Endpoints","table",qc_svc("count",None,vec![],Some(vec!["SpanName"]),Some(10)),(8,4,4,4),empty())]})),
-            ("tpl-error-analysis","Error Analysis","Error count by service, top error messages, and error rate timeline.","apm",serde_json::json!({"widgets":[w("Error Count","counter",qc("count",None,ef(),None,None),(0,0,3,3),color("#ef4444")),w("Error Rate Over Time","timeseries",qc("count",Some("5m"),ef(),None,None),(3,0,9,3),color("#ef4444")),w("Errors by Service","bar",qc("count",None,ef(),Some(vec!["ServiceName"]),Some(10)),(0,3,6,4),empty()),w("Top Error Messages","table",qc("count",None,ef(),Some(vec!["StatusMessage"]),Some(20)),(6,3,6,4),empty())]})),
-            ("tpl-latency-deep-dive","Latency Deep-Dive","P50/P99/P999 latency, latency by endpoint, and slow traces.","apm",serde_json::json!({"widgets":[w("P50 / P99 Latency","timeseries",qc_svc("p50",Some("1m"),vec![],None,None),(0,0,12,4),color("#8b5cf6")),w("Latency by Endpoint","bar",qc_svc("p99",None,vec![],Some(vec!["SpanName"]),Some(10)),(0,4,6,4),empty()),w("Slowest Traces","table",qc_svc("max",None,vec![],None,Some(20)),(6,4,6,4),empty())]})),
+            ("tpl-service-overview","Service Overview","Golden signals for a single service: request rate, error rate, and latency percentiles.","apm",serde_json::json!({"widgets":[w("Request Rate","timeseries",qc_svc("count",Some("1m"),vec![],None,None),(0,0,6,4),color("#3b82f6")),w("Error Rate","timeseries",qc_svc("count",Some("1m"),ef(),None,None),(6,0,6,4),color("#ef4444")),w("P50 Latency","timeseries",qc_svc("p50",Some("1m"),vec![],None,None),(0,4,4,4),color("#22c55e")),w("P99 Latency","timeseries",qc_svc("p99",Some("1m"),vec![],None,None),(4,4,4,4),color("#f59e0b")),w("Top Endpoints","table",qc_svc("count",None,vec![],Some(vec!["span_name"]),Some(10)),(8,4,4,4),empty())],"variables":svc_var()})),
+            ("tpl-error-analysis","Error Analysis","Error count by service, top error messages, and error rate timeline.","apm",serde_json::json!({"widgets":[w("Error Count","counter",qc("count",None,ef(),None,None),(0,0,3,3),color("#ef4444")),w("Error Rate Over Time","timeseries",qc("count",Some("5m"),ef(),None,None),(3,0,9,3),color("#ef4444")),w("Errors by Service","bar",qc("count",None,ef(),Some(vec!["service_name"]),Some(10)),(0,3,6,4),empty()),w("Top Error Messages","table",qc("count",None,ef(),Some(vec!["span_name"]),Some(20)),(6,3,6,4),empty())]})),
+            ("tpl-latency-deep-dive","Latency Deep-Dive","P50/P99/P999 latency, latency by endpoint, and slow traces.","apm",serde_json::json!({"widgets":[w("P50 / P99 Latency","timeseries",qc_svc("p50",Some("1m"),vec![],None,None),(0,0,12,4),color("#8b5cf6")),w("Latency by Endpoint","bar",qc_svc("p99",None,vec![],Some(vec!["span_name"]),Some(10)),(0,4,6,4),empty()),w("Slowest Traces","table",qc_svc("max",None,vec![],None,Some(20)),(6,4,6,4),empty())],"variables":svc_var()})),
             ("tpl-infra-overview","Infrastructure Overview","CPU, memory, pod count, and restart count for infrastructure monitoring.","infrastructure",serde_json::json!({"widgets":[w("Pod Count","counter",qc("count",None,vec![],None,None),(0,0,3,3),color("#06b6d4")),w("CPU Utilization","timeseries",qc("avg",Some("1m"),vec![],None,None),(3,0,9,3),color("#3b82f6")),w("Memory Usage","timeseries",qc("avg",Some("1m"),vec![],None,None),(0,3,6,4),color("#22c55e")),w("Disk I/O","timeseries",qc("avg",Some("1m"),vec![],None,None),(6,3,6,4),color("#f59e0b"))]})),
-            ("tpl-log-volume","Log Volume","Log count by severity, by service, and timeline for understanding ingestion patterns.","security",serde_json::json!({"widgets":[w("Error/Fatal Count","counter",qc("count",None,vec![serde_json::json!({"field":"SeverityText","op":"in","value":"ERROR,FATAL"})],None,None),(0,0,3,3),color("#ef4444")),w("Log Volume Over Time","timeseries",qc("count",Some("5m"),vec![],None,None),(3,0,9,3),color("#6366f1")),w("Logs by Severity","bar",qc("count",None,vec![],Some(vec!["SeverityText"]),Some(10)),(0,3,6,4),empty()),w("Top Services by Log Count","table",qc("count",None,vec![],Some(vec!["ServiceName"]),Some(20)),(6,3,6,4),empty())]})),
+            ("tpl-log-volume","Log Volume","Log count by severity, by service, and timeline for understanding ingestion patterns.","security",serde_json::json!({"widgets":[w("Error/Fatal Count","counter",qc("count",None,vec![serde_json::json!({"field":"SeverityText","op":"in","value":"ERROR,FATAL"})],None,None),(0,0,3,3),color("#ef4444")),w("Log Volume Over Time","timeseries",qc("count",Some("5m"),vec![],None,None),(3,0,9,3),color("#6366f1")),w("Logs by Severity","bar",qc("count",None,vec![],Some(vec!["SeverityText"]),Some(10)),(0,3,6,4),empty()),w("Top Services by Log Count","table",qc("count",None,vec![],Some(vec!["service_name"]),Some(20)),(6,3,6,4),empty())]})),
         ];
 
         for (id, name, desc, category, json_val) in &templates {
