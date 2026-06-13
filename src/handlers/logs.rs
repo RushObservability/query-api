@@ -374,3 +374,48 @@ pub async fn count_logs(
 
     Ok(Json(buckets))
 }
+
+/// Group logs by a single field (e.g. SeverityText) → top-N {field, count}.
+/// Mirrors the spans `group_query` response shape so the frontend reuses the
+/// same normalization. Backs the dashboard "logs" widget source for bar charts.
+pub async fn group_logs(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(req): Json<crate::models::query::QueryRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if req.group_by.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "group_by must have at least one field".to_string()));
+    }
+    let field = &req.group_by[0];
+    let col = resolve_log_field(field);
+    let tenant_id = &tenant.tenant_id;
+    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+
+    let sql = format!(
+        "SELECT toString({col}) as group_0, count() as count \
+         FROM logs {} \
+         GROUP BY group_0 \
+         ORDER BY count DESC \
+         LIMIT {}",
+        clauses.to_sql(),
+        req.limit.min(1000),
+    );
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize, clickhouse::Row)]
+    struct SingleGroupRow { group_0: String, count: u64 }
+
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<SingleGroupRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "logs", handler = "group_logs", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
+
+    let json_rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| serde_json::json!({ field.as_str(): r.group_0, "count": r.count }))
+        .collect();
+
+    Ok(Json(serde_json::json!({ "groups": json_rows })))
+}
