@@ -2417,6 +2417,12 @@ impl ConfigDb {
             if let Some(l) = limit { v["limit"] = serde_json::json!(l); }
             v
         }
+        // Like qc() but tagged source:"logs" so widgets query the logs table.
+        fn qc_logs(agg: &str, interval: Option<&str>, filters: Vec<serde_json::Value>, group_by: Option<Vec<&str>>, limit: Option<i32>) -> serde_json::Value {
+            let mut v = qc(agg, interval, filters, group_by, limit);
+            v["source"] = serde_json::json!("logs");
+            v
+        }
         fn color(c: &str) -> serde_json::Value { serde_json::json!({"color":c}) }
         fn empty() -> serde_json::Value { serde_json::json!({}) }
         let ef = || vec![serde_json::json!({"field":"http_status_code","op":">=","value":"500"})];
@@ -2429,7 +2435,7 @@ impl ConfigDb {
             ("tpl-error-analysis","Error Analysis","Error count by service, top error messages, and error rate timeline.","apm",serde_json::json!({"widgets":[w("Error Count","counter",qc("count",None,ef(),None,None),(0,0,3,3),color("#ef4444")),w("Error Rate Over Time","timeseries",qc("count",Some("5m"),ef(),None,None),(3,0,9,3),color("#ef4444")),w("Errors by Service","bar",qc("count",None,ef(),Some(vec!["service_name"]),Some(10)),(0,3,6,4),empty()),w("Top Error Messages","table",qc("count",None,ef(),Some(vec!["span_name"]),Some(20)),(6,3,6,4),empty())]})),
             ("tpl-latency-deep-dive","Latency Deep-Dive","P50/P99/P999 latency, latency by endpoint, and slow traces.","apm",serde_json::json!({"widgets":[w("P50 / P99 Latency","timeseries",qc_svc("p50",Some("1m"),vec![],None,None),(0,0,12,4),color("#8b5cf6")),w("Latency by Endpoint","bar",qc_svc("p99",None,vec![],Some(vec!["span_name"]),Some(10)),(0,4,6,4),empty()),w("Slowest Traces","table",qc_svc("max",None,vec![],None,Some(20)),(6,4,6,4),empty())],"variables":svc_var()})),
             ("tpl-infra-overview","Infrastructure Overview","CPU, memory, pod count, and restart count for infrastructure monitoring.","infrastructure",serde_json::json!({"widgets":[w("Pod Count","counter",qc("count",None,vec![],None,None),(0,0,3,3),color("#06b6d4")),w("CPU Utilization","timeseries",qc("avg",Some("1m"),vec![],None,None),(3,0,9,3),color("#3b82f6")),w("Memory Usage","timeseries",qc("avg",Some("1m"),vec![],None,None),(0,3,6,4),color("#22c55e")),w("Disk I/O","timeseries",qc("avg",Some("1m"),vec![],None,None),(6,3,6,4),color("#f59e0b"))]})),
-            ("tpl-log-volume","Log Volume","Log count by severity, by service, and timeline for understanding ingestion patterns.","security",serde_json::json!({"widgets":[w("Error/Fatal Count","counter",qc("count",None,vec![serde_json::json!({"field":"SeverityText","op":"in","value":"ERROR,FATAL"})],None,None),(0,0,3,3),color("#ef4444")),w("Log Volume Over Time","timeseries",qc("count",Some("5m"),vec![],None,None),(3,0,9,3),color("#6366f1")),w("Logs by Severity","bar",qc("count",None,vec![],Some(vec!["SeverityText"]),Some(10)),(0,3,6,4),empty()),w("Top Services by Log Count","table",qc("count",None,vec![],Some(vec!["service_name"]),Some(20)),(6,3,6,4),empty())]})),
+            ("tpl-log-volume","Log Volume","Log count by severity, by service, and timeline for understanding ingestion patterns.","security",serde_json::json!({"widgets":[w("Error/Fatal Count","counter",qc_logs("count",None,vec![serde_json::json!({"field":"severity_text","op":"IN","value":"ERROR,FATAL"})],None,None),(0,0,3,3),color("#ef4444")),w("Log Volume Over Time","timeseries",qc_logs("count",Some("5m"),vec![],None,None),(3,0,9,3),color("#6366f1")),w("Logs by Severity","bar",qc_logs("count",None,vec![],Some(vec!["severity_text"]),Some(10)),(0,3,6,4),empty()),w("Top Services by Log Count","table",qc_logs("count",None,vec![],Some(vec!["service_name"]),Some(20)),(6,3,6,4),empty())]})),
         ];
 
         for (id, name, desc, category, json_val) in &templates {

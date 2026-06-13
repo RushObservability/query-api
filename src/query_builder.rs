@@ -517,6 +517,16 @@ pub fn format_array_value(value: &serde_json::Value) -> String {
             let items: Vec<String> = arr.iter().map(format_value).collect();
             format!("({})", items.join(", "))
         }
+        // A comma-separated string (e.g. "ERROR,FATAL") is the common way the UI
+        // expresses an IN list — split into individual quoted literals instead of
+        // matching the literal string "ERROR,FATAL" (which matches nothing).
+        serde_json::Value::String(s) => {
+            let items: Vec<String> = s
+                .split(',')
+                .map(|p| format_value(&serde_json::Value::String(p.trim().to_string())))
+                .collect();
+            format!("({})", items.join(", "))
+        }
         _ => format!("({})", format_value(value)),
     }
 }
