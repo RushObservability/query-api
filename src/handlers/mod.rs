@@ -18,6 +18,7 @@ pub mod export;
 pub mod groups;
 pub mod health;
 pub mod funnels;
+pub mod license;
 pub mod logs;
 pub mod maintenance;
 pub mod metrics;

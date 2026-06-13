@@ -842,6 +842,7 @@ async fn main() -> anyhow::Result<()> {
         )
         // Feature flags (public — no auth)
         .route("/api/v1/features", get(handlers::settings::get_features))
+        .route("/api/v1/license", get(handlers::license::get_license))
         // Export row cap (admin-only setter; value also exposed via /features)
         .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
         .route(

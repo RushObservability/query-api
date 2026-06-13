@@ -43,7 +43,7 @@ sha2 = "0.10"
 hmac = "0.12"
 rand = "0.9"
 argon2 = { version = "0.5", features = ["password-hash", "std"] }
-jsonwebtoken = "10"
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 lettre = { version = "0.10", features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
 promql-parser = "0.7"
 regex = "1"

@@ -5,6 +5,7 @@ pub mod clickhouse_config;
 pub mod config;
 pub mod eval_state;
 pub mod handlers;
+pub mod license;
 pub mod metric_firewall;
 pub mod migrations;
 pub mod models;
