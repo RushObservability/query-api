@@ -9,6 +9,9 @@ pub struct Dashboard {
     pub owner_id: String,
     pub visibility: String,
     pub tags: serde_json::Value,
+    /// Template variables (Grafana-style) — array of variable definitions.
+    #[serde(default = "default_empty_array")]
+    pub variables: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -88,6 +91,8 @@ pub struct DashboardExportMeta {
     pub description: String,
     pub visibility: String,
     pub tags: serde_json::Value,
+    #[serde(default = "default_empty_array")]
+    pub variables: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,10 +113,16 @@ pub struct CreateDashboardRequest {
     pub visibility: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default = "default_empty_array")]
+    pub variables: serde_json::Value,
 }
 
 fn default_visibility() -> String {
     "tenant".to_string()
+}
+
+fn default_empty_array() -> serde_json::Value {
+    serde_json::Value::Array(Vec::new())
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +134,8 @@ pub struct UpdateDashboardRequest {
     pub visibility: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default = "default_empty_array")]
+    pub variables: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
