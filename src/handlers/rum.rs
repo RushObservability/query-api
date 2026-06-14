@@ -236,11 +236,26 @@ pub struct RumSessionRow {
 /// Takes the raw body so the payload size for usage metering is just
 /// `body.len()` — previously the deserialized struct was re-serialized with
 /// serde_json::to_string solely to count bytes.
+/// Whether RUM is enabled (admin toggle in Settings → General). Defaults ON;
+/// only an explicit "false" disables it. Gates both RUM ingest endpoints.
+async fn rum_enabled(state: &AppState) -> bool {
+    state
+        .config_db
+        .get_setting("rum_enabled").await
+        .ok()
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true)
+}
+
 pub async fn ingest(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !rum_enabled(&state).await {
+        return Err((StatusCode::FORBIDDEN, "RUM ingestion is disabled".into()));
+    }
     let payload: RumIngestPayload = serde_json::from_slice(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid RUM payload: {e}")))?;
     let tenant_id = &tenant.tenant_id;
@@ -674,6 +689,9 @@ pub async fn ingest_replay(
     Extension(tenant): Extension<TenantContext>,
     Json(payload): Json<ReplayIngestPayload>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !rum_enabled(&state).await {
+        return Err((StatusCode::FORBIDDEN, "RUM ingestion is disabled".into()));
+    }
     if payload.session_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
     }

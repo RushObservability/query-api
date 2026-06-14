@@ -145,12 +145,58 @@ pub async fn get_features(
         .map(|v| v != "false")
         .unwrap_or(true);
 
+    // Real User Monitoring — gates the RUM UI and ingest. Defaults ON
+    // (unset → true); only an explicit "false" disables it.
+    let rum_enabled = state
+        .config_db
+        .get_setting("rum_enabled").await
+        .ok()
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true);
+
     Json(serde_json::json!({
         "argocd": argocd_enabled,
         "sre_agent": sre_agent_enabled,
         "export_max_rows": export_max_rows,
         "deploy_markers": deploy_markers_enabled,
+        "rum": rum_enabled,
     }))
+}
+
+/// GET /api/v1/settings/rum — admin only. Returns { enabled }.
+pub async fn get_rum_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let enabled = state
+        .config_db
+        .get_setting("rum_enabled").await
+        .ok()
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    Ok(Json(serde_json::json!({ "enabled": enabled })))
+}
+
+/// PUT /api/v1/settings/rum — admin only. Body: { enabled: bool }.
+/// Toggles Real User Monitoring: when off, the RUM UI is hidden and RUM
+/// ingest endpoints reject data.
+pub async fn set_rum_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
+    })?;
+    state.config_db.set_setting("rum_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to save rum_enabled");
+        (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+    })?;
+    Ok(Json(serde_json::json!({ "enabled": enabled })))
 }
 
 /// GET /api/v1/settings/deploy-markers — admin only. Returns { enabled }.

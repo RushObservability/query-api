@@ -853,6 +853,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/settings/deploy-markers",
             get(handlers::settings::get_deploy_markers_setting).put(handlers::settings::set_deploy_markers_setting),
         )
+        .route(
+            "/api/v1/settings/rum",
+            get(handlers::settings::get_rum_setting).put(handlers::settings::set_rum_setting),
+        )
         // API Keys (settings)
         .route(
             "/api/v1/api-keys",
