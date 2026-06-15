@@ -49,6 +49,11 @@ pub struct AlertRuleRow {
 }
 
 #[derive(clickhouse::Row, serde::Deserialize)]
+struct ExplainClaimRow { id: String, query: String }
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct ExplainStatusRow { status: String, plan_json: String, error: String }
+
+#[derive(clickhouse::Row, serde::Deserialize)]
 pub struct SloRow {
     pub id: String, pub name: String, pub description: String, pub enabled: u8,
     pub slo_type: String, pub indicator_type: String, pub service_name: String,
@@ -635,6 +640,23 @@ impl ConfigDb {
                 updated_at               String DEFAULT toString(now()),
                 version                  UInt64,
                 is_deleted               UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (id)",
+
+            // ── Postgres EXPLAIN jobs (collector-run plan queue) ───────────────────
+            "CREATE TABLE IF NOT EXISTS config_pg_explain_jobs (
+                id           String,
+                tenant_id    String DEFAULT 'default',
+                server_name  String,
+                db           String DEFAULT '',
+                query        String,
+                status       String DEFAULT 'pending',
+                plan_json    String DEFAULT '',
+                error        String DEFAULT '',
+                created_at   String DEFAULT '',
+                updated_at   String DEFAULT '',
+                version      UInt64,
+                is_deleted   UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
 
@@ -2042,6 +2064,54 @@ impl ConfigDb {
         Ok(())
     }
 
+    // ── Postgres EXPLAIN job queue ─────────────────────────────────────────────
+    /// Create a pending EXPLAIN job; returns its id.
+    pub async fn create_explain_job(&self, tenant_id: &str, server: &str, query: &str) -> anyhow::Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Self::now_str();
+        self.client
+            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, plan_json, error, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, '', ?, 'pending', '', '', ?, ?, ?, 0)")
+            .bind(&id).bind(tenant_id).bind(server).bind(query).bind(&now).bind(&now).bind(Self::next_version())
+            .execute().await?;
+        Ok(id)
+    }
+
+    /// Claim the oldest pending job for a tenant+server, flipping it to `running`.
+    pub async fn claim_pending_explain_job(&self, tenant_id: &str, server: &str) -> anyhow::Result<Option<(String, String)>> {
+        let row = self.client
+            .query("SELECT id, query FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
+            .bind(tenant_id).bind(server)
+            .fetch_all::<ExplainClaimRow>().await?
+            .into_iter().next();
+        if let Some(r) = &row {
+            self.client
+                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, 'running', ?, ?, 0)")
+                .bind(&r.id).bind(tenant_id).bind(server).bind(&r.query).bind(Self::now_str()).bind(Self::next_version())
+                .execute().await?;
+        }
+        Ok(row.map(|r| (r.id, r.query)))
+    }
+
+    /// Complete a job with a plan or an error (sets status done/error).
+    pub async fn complete_explain_job(&self, id: &str, plan_json: &str, error: &str) -> anyhow::Result<()> {
+        let status = if error.is_empty() { "done" } else { "error" };
+        self.client
+            .query("INSERT INTO config_pg_explain_jobs (id, status, plan_json, error, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0)")
+            .bind(id).bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version())
+            .execute().await?;
+        Ok(())
+    }
+
+    /// Fetch a job's status/result for the UI.
+    pub async fn get_explain_job(&self, id: &str) -> anyhow::Result<Option<(String, String, String)>> {
+        Ok(self.client
+            .query("SELECT status, plan_json, error FROM config_pg_explain_jobs FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(id)
+            .fetch_all::<ExplainStatusRow>().await?
+            .into_iter().next()
+            .map(|r| (r.status, r.plan_json, r.error)))
+    }
+
     // ── Setup token operations ─────────────────────────────────────────────────
 
     pub async fn create_setup_token(&self, purpose: &str, created_by: &str, provider: &str, hostname: &str) -> anyhow::Result<String> {
@@ -2423,6 +2493,10 @@ impl ConfigDb {
             v["source"] = serde_json::json!("logs");
             v
         }
+        // Metrics widget: PromQL against the metrics tables (source:"metrics").
+        fn qc_metrics(promql: &str) -> serde_json::Value {
+            serde_json::json!({"time_range_minutes":60,"source":"metrics","promql":promql,"filters":[]})
+        }
         fn color(c: &str) -> serde_json::Value { serde_json::json!({"color":c}) }
         fn empty() -> serde_json::Value { serde_json::json!({}) }
         let ef = || vec![serde_json::json!({"field":"http_status_code","op":">=","value":"500"})];
@@ -2436,6 +2510,40 @@ impl ConfigDb {
             ("tpl-latency-deep-dive","Latency Deep-Dive","P50/P99/P999 latency, latency by endpoint, and slow traces.","apm",serde_json::json!({"widgets":[w("P50 / P99 Latency","timeseries",qc_svc("p50",Some("1m"),vec![],None,None),(0,0,12,4),color("#8b5cf6")),w("Latency by Endpoint","bar",qc_svc("p99",None,vec![],Some(vec!["span_name"]),Some(10)),(0,4,6,4),empty()),w("Slowest Traces","table",qc_svc("max",None,vec![],None,Some(20)),(6,4,6,4),empty())],"variables":svc_var()})),
             ("tpl-infra-overview","Infrastructure Overview","CPU, memory, pod count, and restart count for infrastructure monitoring.","infrastructure",serde_json::json!({"widgets":[w("Pod Count","counter",qc("count",None,vec![],None,None),(0,0,3,3),color("#06b6d4")),w("CPU Utilization","timeseries",qc("avg",Some("1m"),vec![],None,None),(3,0,9,3),color("#3b82f6")),w("Memory Usage","timeseries",qc("avg",Some("1m"),vec![],None,None),(0,3,6,4),color("#22c55e")),w("Disk I/O","timeseries",qc("avg",Some("1m"),vec![],None,None),(6,3,6,4),color("#f59e0b"))]})),
             ("tpl-log-volume","Log Volume","Log count by severity, by service, and timeline for understanding ingestion patterns.","security",serde_json::json!({"widgets":[w("Error/Fatal Count","counter",qc_logs("count",None,vec![serde_json::json!({"field":"severity_text","op":"IN","value":"ERROR,FATAL"})],None,None),(0,0,3,3),color("#ef4444")),w("Log Volume Over Time","timeseries",qc_logs("count",Some("5m"),vec![],None,None),(3,0,9,3),color("#6366f1")),w("Logs by Severity","bar",qc_logs("count",None,vec![],Some(vec!["severity_text"]),Some(10)),(0,3,6,4),empty()),w("Top Services by Log Count","table",qc_logs("count",None,vec![],Some(vec!["service_name"]),Some(20)),(6,3,6,4),empty())]})),
+            ("tpl-postgresql-overview","PostgreSQL","PostgreSQL health mirroring Datadog/Grafana: connections, throughput, cache/IO, locks & waits, storage, replication, scans, wraparound, query latency.","database",serde_json::json!({"widgets":[
+                // ── Connections & throughput ──
+                w("Connections by state","timeseries",qc_metrics("sum by (state) (postgresql_connection_count)"),(0,0,6,4),empty()),
+                w("Transactions / s","timeseries",qc_metrics("sum(rate(postgresql_commits[5m]))"),(6,0,6,4),color("#22c55e")),
+                w("Rollbacks / s","timeseries",qc_metrics("sum(rate(postgresql_rollbacks[5m]))"),(0,4,6,4),color("#ef4444")),
+                w("Rows / s by operation","timeseries",qc_metrics("sum by (operation) (rate(postgresql_rows[5m]))"),(6,4,6,4),empty()),
+                // ── Cache & I/O ──
+                w("Cache hit ratio %","timeseries",qc_metrics("100 * sum(rate(postgresql_blocks_read{source=\"hit\"}[5m])) / (sum(rate(postgresql_blocks_read{source=\"hit\"}[5m])) + sum(rate(postgresql_blocks_read{source=\"read\"}[5m])))"),(0,8,6,4),color("#f59e0b")),
+                w("Block reads / s (hit vs read)","timeseries",qc_metrics("sum by (source) (rate(postgresql_blocks_read[5m]))"),(6,8,6,4),empty()),
+                // ── Locks, deadlocks & waits ──
+                w("Locks by mode","timeseries",qc_metrics("sum by (mode) (postgresql_database_locks)"),(0,12,6,4),empty()),
+                w("Deadlocks / s","timeseries",qc_metrics("sum(rate(postgresql_deadlocks[5m]))"),(6,12,6,4),color("#ef4444")),
+                w("Wait events","timeseries",qc_metrics("sum by (wait_event_type) (postgresql_wait_events)"),(0,16,6,4),empty()),
+                w("Temp bytes / s","timeseries",qc_metrics("sum(rate(postgresql_temp_bytes[5m]))"),(6,16,6,4),color("#a855f7")),
+                // ── Storage & replication ──
+                w("Database size","timeseries",qc_metrics("sum by (db) (postgresql_db_size)"),(0,20,6,4),color("#8b5cf6")),
+                w("Replication delay (bytes)","timeseries",qc_metrics("max(postgresql_replication_data_delay)"),(6,20,6,4),color("#06b6d4")),
+                // ── Access patterns ──
+                w("Sequential scans / s","timeseries",qc_metrics("sum(rate(postgresql_table_seq_scans[5m]))"),(0,24,6,4),color("#f59e0b")),
+                w("Index scans / s","timeseries",qc_metrics("sum(rate(postgresql_table_idx_scans[5m]))"),(6,24,6,4),color("#22c55e")),
+                // ── Maintenance & queries ──
+                w("XID wraparound %","timeseries",qc_metrics("100 * max(postgresql_database_xid_age) / 2100000000"),(0,28,6,4),color("#ef4444")),
+                w("Slowest query mean latency (ms)","timeseries",qc_metrics("max(postgresql_query_mean_time)"),(6,28,6,4),color("#3b82f6")),
+                // ── WAL & checkpoints ──
+                w("WAL generated / s","timeseries",qc_metrics("rate(postgresql_wal_lsn[5m])"),(0,32,6,4),color("#06b6d4")),
+                w("Checkpoints / s by kind","timeseries",qc_metrics("sum by (kind) (rate(postgresql_checkpoints[5m]))"),(6,32,6,4),empty()),
+                w("Checkpoint write time / s (ms)","timeseries",qc_metrics("rate(postgresql_checkpoint_write_time[5m])"),(0,36,6,4),color("#f59e0b")),
+                w("Checkpoint buffers written / s","timeseries",qc_metrics("rate(postgresql_checkpoint_buffers_written[5m])"),(6,36,6,4),color("#a855f7")),
+                w("Buffers allocated / s","timeseries",qc_metrics("sum(rate(postgresql_bgwriter_buffers_alloc[5m]))"),(0,40,6,4),color("#8b5cf6")),
+                w("Replication slot lag (bytes)","timeseries",qc_metrics("max by (slot) (postgresql_replication_slot_lag)"),(6,40,6,4),color("#06b6d4")),
+                // ── Saturation & efficiency ──
+                w("Connections % of max","timeseries",qc_metrics("100 * sum(postgresql_backends) / max(postgresql_max_connections)"),(0,44,6,4),color("#3b82f6")),
+                w("Commit ratio %","timeseries",qc_metrics("100 * sum(rate(postgresql_commits[5m])) / (sum(rate(postgresql_commits[5m])) + sum(rate(postgresql_rollbacks[5m])))"),(6,44,6,4),color("#22c55e"))
+            ]})),
         ];
 
         for (id, name, desc, category, json_val) in &templates {

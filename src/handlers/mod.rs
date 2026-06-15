@@ -20,6 +20,7 @@ pub mod health;
 pub mod funnels;
 pub mod license;
 pub mod logs;
+pub mod pg_explain;
 pub mod maintenance;
 pub mod metrics;
 pub mod monitors;

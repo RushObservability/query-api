@@ -843,6 +843,11 @@ async fn main() -> anyhow::Result<()> {
         // Feature flags (public — no auth)
         .route("/api/v1/features", get(handlers::settings::get_features))
         .route("/api/v1/license", get(handlers::license::get_license))
+        // Postgres EXPLAIN job queue (UI submit/poll-result; collector poll/post)
+        .route("/api/v1/integrations/postgres/explain", post(handlers::pg_explain::submit))
+        .route("/api/v1/integrations/postgres/explain/poll", get(handlers::pg_explain::poll))
+        .route("/api/v1/integrations/postgres/explain/{id}", get(handlers::pg_explain::get_job))
+        .route("/api/v1/integrations/postgres/explain/{id}/result", post(handlers::pg_explain::post_result))
         // Export row cap (admin-only setter; value also exposed via /features)
         .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
         .route(
