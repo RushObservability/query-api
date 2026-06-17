@@ -3,6 +3,7 @@ pub mod anomalies;
 pub mod bubbleup;
 pub mod argocd;
 pub mod auth;
+pub mod fluxcd;
 pub mod custom_skills;
 pub mod dashboards;
 pub mod dd_common;

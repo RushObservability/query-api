@@ -985,6 +985,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/argocd/applications", get(handlers::argocd::list_applications))
         .route("/api/v1/argocd/applications/{name}", get(handlers::argocd::get_application))
         .route("/api/v1/argocd/applicationsets", get(handlers::argocd::list_applicationsets))
+        .route("/api/v1/fluxcd/resources", get(handlers::fluxcd::list_resources))
+        .route("/api/v1/fluxcd/sources", get(handlers::fluxcd::list_sources))
+        .route("/api/v1/fluxcd/resources/{kind}/{name}", get(handlers::fluxcd::get_resource))
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
         // Signal usage
