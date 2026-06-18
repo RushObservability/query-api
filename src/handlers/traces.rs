@@ -70,8 +70,13 @@ pub async fn get_trace(
     };
 
     let fetch_spans = |time_bound: String| {
+        // Single WHERE (no explicit PREWHERE): `trace_id` is served by the
+        // `idx_trace_id` bloom filter, which an explicit PREWHERE on tenant/time
+        // would defeat (CH would read the whole bloom instead of pruning) — most
+        // damaging on the MV-miss fallback where `time_bound` is empty.
+        // `optimize_move_to_prewhere` still promotes tenant/time to prewhere.
         let sql = format!(
-            "SELECT * FROM spans PREWHERE tenant_id = '{escaped_tenant}'{time_bound} WHERE trace_id = ? ORDER BY timestamp ASC"
+            "SELECT * FROM spans WHERE tenant_id = '{escaped_tenant}' AND trace_id = ?{time_bound} ORDER BY timestamp ASC"
         );
         let q = crate::tenant_query(&state.ch, &sql, tenant_id).bind(&trace_id);
         async move { q.fetch_all::<WideEvent>().await }

@@ -90,7 +90,13 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
     let q = ch
         .query(sql)
         .with_option("max_result_rows", "500000")
-        .with_option("result_overflow_mode", "break");
+        .with_option("result_overflow_mode", "break")
+        // ClickHouse 26.2 query condition cache: caches the per-granule match bitset
+        // for a WHERE predicate so repeated identical predicates (dashboard refreshes,
+        // the count+list+histogram+timeseries siblings of one Explore search, monitor/
+        // detection eval re-runs, service-map polls) skip re-evaluating skip indexes and
+        // re-reading granules. Safe on these MergeTree reads (no FINAL on the read path).
+        .with_option("use_query_condition_cache", "1");
     if ROW_POLICY_SUPPORTED.load(Ordering::Relaxed) == 1 {
         q.with_option("rush_tenant_id", tenant_id)
     } else {

@@ -54,8 +54,13 @@ fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
-    let prewhere = format!(
+    // Bound the partition column `TimestampDate` (PARTITION BY TimestampDate) in addition
+    // to the precise `Timestamp` filter: a predicate on raw `Timestamp` alone does not
+    // reliably drive partition pruning, so add the date range to prune partitions first.
+    let time_tenant = format!(
         "tenant_id = '{escaped_tenant}' \
+         AND TimestampDate >= toDate(parseDateTimeBestEffort('{from}')) \
+         AND TimestampDate <= toDate(parseDateTimeBestEffort('{to}')) \
          AND Timestamp >= parseDateTimeBestEffort('{from}') \
          AND Timestamp <= parseDateTimeBestEffort('{to}')"
     );
@@ -79,13 +84,30 @@ fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str
         conditions.push(condition);
     }
 
+    let mut has_search = false;
     if let Some(term) = search {
         if let Some(sql) = build_log_search_sql(term) {
             conditions.push(sql);
+            has_search = true;
         }
     }
 
-    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
+    // A free-text term compiles to a `lower(Body) LIKE …` (or TraceId/SpanId match)
+    // that relies on a skip index — for Body that's the `idx_body_text` full-text
+    // index. An *explicit* PREWHERE on tenant/time defeats that index: ClickHouse
+    // reads the entire index (tens of GiB) instead of using it to skip granules,
+    // turning a ~150 ms query into multi-second / tens-of-GiB scans. Emitting a
+    // single WHERE lets `optimize_move_to_prewhere` re-derive the prewhere while
+    // keeping the skip index effective. With no search term there's no Body index
+    // in play, so the explicit PREWHERE (efficient granule skipping) is kept.
+    if has_search {
+        let mut all = Vec::with_capacity(conditions.len() + 1);
+        all.push(time_tenant);
+        all.extend(conditions);
+        QueryClauses { prewhere: String::new(), where_clause: all.join(" AND ") }
+    } else {
+        QueryClauses { prewhere: time_tenant, where_clause: conditions.join(" AND ") }
+    }
 }
 
 /// Log query request.

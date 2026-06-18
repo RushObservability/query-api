@@ -55,7 +55,7 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) ->
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
-    let prewhere = format!(
+    let scope = format!(
         "tenant_id = '{escaped_tenant}' \
          AND TimestampTime >= toDateTime(parseDateTimeBestEffort('{from}')) \
          AND TimestampTime <= toDateTime(parseDateTimeBestEffort('{to}'))"
@@ -67,6 +67,11 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) ->
         format!("Timestamp <= parseDateTimeBestEffort('{to}')"),
     ];
 
+    // A LIKE/substring filter on `ErrorMessage` is backed by the `idx_error_message`
+    // tokenbf index, which an explicit PREWHERE on tenant/time would defeat. When such
+    // a filter is present, fold the scope into WHERE so the skip index stays usable
+    // (optimize_move_to_prewhere re-derives the prewhere). Else keep explicit PREWHERE.
+    let mut uses_index_predicate = false;
     for filter in filters {
         let field = resolve_rum_field(&filter.field);
         let condition = match &filter.op {
@@ -81,10 +86,20 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) ->
             FilterOp::In => format!("{field} IN {}", format_array_value(&filter.value)),
             FilterOp::NotIn => format!("{field} NOT IN {}", format_array_value(&filter.value)),
         };
+        if matches!(filter.op, FilterOp::Like | FilterOp::NotLike) {
+            uses_index_predicate = true;
+        }
         conditions.push(condition);
     }
 
-    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
+    if uses_index_predicate {
+        let mut all = Vec::with_capacity(conditions.len() + 1);
+        all.push(scope);
+        all.extend(conditions);
+        QueryClauses { prewhere: String::new(), where_clause: all.join(" AND ") }
+    } else {
+        QueryClauses { prewhere: scope, where_clause: conditions.join(" AND ") }
+    }
 }
 
 // ── Request / response types ──
@@ -622,7 +637,7 @@ pub async fn session_detail(
          ErrorMessage, ErrorStack, ErrorType, InteractionTarget, InteractionType, \
          DurationMs, TraceId, SpanId, Attributes \
          FROM rum \
-         PREWHERE tenant_id = '{escaped_tenant}' WHERE SessionId = '{escaped_id}' \
+         WHERE tenant_id = '{escaped_tenant}' AND SessionId = '{escaped_id}' \
          ORDER BY Timestamp ASC \
          LIMIT 1000"
     );

@@ -90,11 +90,7 @@ pub async fn login(
         "user authenticated"
     );
 
-    // __Host- prefix requires Secure, Path=/, and no Domain attribute.
-    // It prevents subdomain cookie injection attacks even if a subdomain is compromised.
-    let cookie = format!(
-        "__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
-    );
+    let cookie = session_cookie(&token, 86400);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -127,7 +123,7 @@ pub async fn logout(
         state.config_db.delete_session(&token).await;
     }
 
-    let clear_cookie = "__Host-rush_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+    let clear_cookie = session_cookie("", 0);
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
@@ -172,6 +168,25 @@ pub async fn me(
 }
 
 /// Parse the `rush_session` value out of the Cookie header.
+/// Build the `Set-Cookie` value for the session.
+///
+/// Default: a hardened `__Host-rush_session` with `Secure` (HTTPS-only) — the
+/// `__Host-` prefix blocks subdomain cookie injection. When `RUSH_INSECURE_COOKIES`
+/// is truthy, emit a plain `rush_session` without `__Host-`/`Secure` so the app
+/// works over plain HTTP (e.g. `kubectl port-forward`, non-TLS internal access),
+/// where browsers refuse to store `Secure`/`__Host-` cookies. `extract_session_cookie`
+/// reads both names.
+fn session_cookie(token: &str, max_age: i64) -> String {
+    let insecure = std::env::var("RUSH_INSECURE_COOKIES")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if insecure {
+        format!("rush_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
+    } else {
+        format!("__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}")
+    }
+}
+
 pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie_header.split(';') {

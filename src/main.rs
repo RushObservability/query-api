@@ -988,6 +988,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/fluxcd/resources", get(handlers::fluxcd::list_resources))
         .route("/api/v1/fluxcd/sources", get(handlers::fluxcd::list_sources))
         .route("/api/v1/fluxcd/resources/{kind}/{name}", get(handlers::fluxcd::get_resource))
+        .route("/api/v1/kubernetes/summary", get(handlers::kubernetes::summary))
+        .route("/api/v1/kubernetes/namespaces", get(handlers::kubernetes::list_namespaces))
+        .route("/api/v1/kubernetes/resources/{kind}", get(handlers::kubernetes::list_resources))
+        .route("/api/v1/kubernetes/resources/{kind}/{namespace}/{name}", get(handlers::kubernetes::get_resource))
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
         // Signal usage

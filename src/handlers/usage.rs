@@ -69,16 +69,19 @@ pub async fn get_usage(
         None => String::new(),
     };
 
-    // Get usage data (FINAL forces ReplacingMergeTree dedup)
-    // Use a subquery so toString alias doesn't shadow the column in WHERE
+    // signal_usage is ReplacingMergeTree(last_queried_at). Instead of FINAL (a full
+    // merge-on-read across all parts on every request — materially pricier in 26.x),
+    // collapse versions with GROUP BY + argMax on the version column: argMax keeps the
+    // query_count from the latest row, max() yields its timestamp. Equivalent result,
+    // no merge.
     let sql = format!(
         "SELECT signal_name, signal_type, source, \
-         toString(toUnixTimestamp64Milli(last_queried_at)) as last_queried_at, query_count \
-         FROM ( \
-             SELECT * FROM signal_usage FINAL \
-             WHERE tenant_id = '{escaped_tenant}' AND last_queried_at >= now() - INTERVAL {days} DAY {type_filter} \
-         ) \
-         ORDER BY last_queried_at DESC \
+         toString(toUnixTimestamp64Milli(max(last_queried_at))) as last_queried_at, \
+         argMax(query_count, last_queried_at) as query_count \
+         FROM signal_usage \
+         WHERE tenant_id = '{escaped_tenant}' AND last_queried_at >= now() - INTERVAL {days} DAY {type_filter} \
+         GROUP BY signal_name, signal_type, source \
+         ORDER BY max(last_queried_at) DESC \
          LIMIT {limit}"
     );
 
@@ -91,8 +94,9 @@ pub async fn get_usage(
         })?;
 
     // Count total tracked signals
+    // Distinct tracked signals in window — uniqExact over the dedup key avoids FINAL.
     let count_sql = format!(
-        "SELECT count() as count FROM signal_usage FINAL \
+        "SELECT uniqExact(signal_name, signal_type, source) as count FROM signal_usage \
          WHERE tenant_id = '{escaped_tenant}' AND last_queried_at >= now() - INTERVAL {days} DAY {type_filter}"
     );
 
@@ -118,7 +122,7 @@ pub async fn get_usage(
              WHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 DAY \
          ) AS all_metrics \
          LEFT JOIN ( \
-             SELECT signal_name FROM signal_usage FINAL \
+             SELECT DISTINCT signal_name FROM signal_usage \
              WHERE tenant_id = '{escaped_tenant}' AND signal_type = 'metric' AND last_queried_at >= now() - INTERVAL {days} DAY \
          ) AS used ON all_metrics.metric_name = used.signal_name \
          WHERE used.signal_name IS NULL OR used.signal_name = '' \

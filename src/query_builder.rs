@@ -75,14 +75,25 @@ impl QueryClauses {
         }
     }
 
-    /// Prepend a condition to PREWHERE (e.g. `tenant_id = 'x'`).
+    /// Prepend a condition (e.g. `tenant_id = 'x'`) to the granule-level scope.
+    ///
+    /// When a PREWHERE exists, the prefix joins it. When there is NO PREWHERE — the
+    /// case where the builder deliberately kept everything in WHERE so a skip index
+    /// (text/bloom) isn't defeated — the prefix is prepended to WHERE instead of
+    /// creating a fresh PREWHERE (which would re-defeat the index). `optimize_move_to_prewhere`
+    /// promotes the tenant/time predicates to prewhere as appropriate.
     pub fn with_prewhere_prefix(&self, prefix: &str) -> Self {
-        let prewhere = if self.prewhere.is_empty() {
-            prefix.to_string()
+        if self.prewhere.is_empty() {
+            let where_clause = if self.where_clause.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{prefix} AND {}", self.where_clause)
+            };
+            QueryClauses { prewhere: String::new(), where_clause }
         } else {
-            format!("{prefix} AND {}", self.prewhere)
-        };
-        QueryClauses { prewhere, where_clause: self.where_clause.clone() }
+            let prewhere = format!("{prefix} AND {}", self.prewhere);
+            QueryClauses { prewhere, where_clause: self.where_clause.clone() }
+        }
     }
 
     /// Append a condition to WHERE (e.g. `Duration > threshold`).
@@ -144,10 +155,19 @@ pub fn build_where_clause_with_search(
 ) -> QueryClauses {
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
-    let prewhere = format!(
+    let time_range = format!(
         "timestamp >= parseDateTimeBestEffort('{from}') AND timestamp <= parseDateTimeBestEffort('{to}')"
     );
 
+    // Whether the query carries a predicate backed by a skip index — a free-text
+    // search (spans `idx_search_text` text index, or a trace/span-id bloom) or a
+    // user LIKE on an indexed column. Such a predicate is DEFEATED by an explicit
+    // PREWHERE: ClickHouse reads the entire skip index instead of using it to skip
+    // granules (turning a ~150ms query into a multi-second/40GB scan). When present,
+    // fold the time range into WHERE and let `optimize_move_to_prewhere` re-derive
+    // the prewhere while keeping the index usable. Otherwise the explicit PREWHERE on
+    // `timestamp` (leading PK column) is the efficient path.
+    let mut uses_index_predicate = false;
     let mut conditions = Vec::new();
 
     for filter in filters {
@@ -164,6 +184,9 @@ pub fn build_where_clause_with_search(
             FilterOp::In => format!("{field} IN {}", format_array_value(&filter.value)),
             FilterOp::NotIn => format!("{field} NOT IN {}", format_array_value(&filter.value)),
         };
+        if matches!(filter.op, FilterOp::Like | FilterOp::NotLike) {
+            uses_index_predicate = true;
+        }
         conditions.push(condition);
     }
 
@@ -171,10 +194,18 @@ pub fn build_where_clause_with_search(
     if let Some(term) = search {
         if let Some(sql) = build_span_search_sql(term) {
             conditions.push(sql);
+            uses_index_predicate = true;
         }
     }
 
-    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
+    if uses_index_predicate {
+        let mut all = Vec::with_capacity(conditions.len() + 1);
+        all.push(time_range);
+        all.extend(conditions);
+        QueryClauses { prewhere: String::new(), where_clause: all.join(" AND ") }
+    } else {
+        QueryClauses { prewhere: time_range, where_clause: conditions.join(" AND ") }
+    }
 }
 
 /// A parsed search expression supporting AND/OR boolean logic.
@@ -556,8 +587,11 @@ fn resolve_metric_field(field: &str) -> String {
 pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
+    // Compare the raw `TimeUnix` PK column (not `toDateTime(TimeUnix)`): wrapping it in
+    // a function blocks primary-key granule pruning and partition pruning. CH promotes
+    // the DateTime literal to DateTime64 for the comparison.
     let prewhere = format!(
-        "toDateTime(TimeUnix) >= parseDateTimeBestEffort('{from}') AND toDateTime(TimeUnix) <= parseDateTimeBestEffort('{to}')"
+        "TimeUnix >= parseDateTimeBestEffort('{from}') AND TimeUnix <= parseDateTimeBestEffort('{to}')"
     );
 
     let mut conditions = Vec::new();

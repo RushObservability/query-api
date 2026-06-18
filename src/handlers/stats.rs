@@ -262,8 +262,10 @@ pub async fn get_stats(
     ), tenant_id).fetch_one::<TotalRateResult>();
 
     let log_today_fut = crate::tenant_query(&state.ch, &format!(
+        // logs PARTITION BY TimestampDate — query the partition column directly so the
+        // predicate prunes to one partition (toDate(Timestamp) wouldn't match the key).
         "SELECT count() as count FROM logs \
-         PREWHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
+         PREWHERE tenant_id = '{escaped_tenant}' AND TimestampDate = '{today_start}'"
     ), tenant_id).fetch_one::<CountResult>();
 
     // Combined total + rate per metrics table (was two scans of the same window each).

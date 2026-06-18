@@ -828,11 +828,14 @@ async fn query_log(
         ),
     ];
 
-    // Full-text search using hasToken on lowered Body
+    // Full-text search via `lower(Body) LIKE` — matches the `idx_body_text`
+    // text(ngrams(4)) index char-for-char. (hasToken uses token semantics the
+    // ngram index can't serve, forcing a full Body scan every eval interval.)
     if !cfg.search.is_empty() {
         for term in cfg.search.split_whitespace() {
             let escaped = escape_ch(&term.to_lowercase());
-            conditions.push(format!("hasToken(lower(Body), '{escaped}')"));
+            let inner = escaped.replace('%', "\\%").replace('_', "\\_");
+            conditions.push(format!("lower(Body) LIKE '%{inner}%'"));
         }
     }
 
@@ -1114,10 +1117,11 @@ async fn build_preview_timeseries(
             )];
             if !cfg.search.is_empty() {
                 for term in cfg.search.split_whitespace() {
-                    conds.push(format!(
-                        "hasToken(lower(Body), '{}')",
-                        escape_ch(&term.to_lowercase())
-                    ));
+                    // lower(Body) LIKE matches the idx_body_text ngrams(4) index;
+                    // hasToken would force a full Body scan in the preview path.
+                    let escaped = escape_ch(&term.to_lowercase());
+                    let inner = escaped.replace('%', "\\%").replace('_', "\\_");
+                    conds.push(format!("lower(Body) LIKE '%{inner}%'"));
                 }
             }
             for f in &cfg.filters {

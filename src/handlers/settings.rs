@@ -134,6 +134,17 @@ pub async fn get_features(
             .map(|v| v == "true")
             .unwrap_or(false);
 
+    let kubernetes_enabled = std::env::var("KUBERNETES_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+        || state
+            .config_db
+            .get_setting("kubernetes_enabled").await
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
     let sre_agent_enabled = state
         .config_db
         .get_setting("sre_agent_enabled").await
@@ -167,6 +178,7 @@ pub async fn get_features(
     Json(serde_json::json!({
         "argocd": argocd_enabled,
         "fluxcd": fluxcd_enabled,
+        "kubernetes": kubernetes_enabled,
         "sre_agent": sre_agent_enabled,
         "export_max_rows": export_max_rows,
         "deploy_markers": deploy_markers_enabled,

@@ -230,10 +230,28 @@ pub async fn bubbleup(
 
     let additional_filters = build_filter_conditions(&req.filters, &req.signal);
 
+    // A user `Body LIKE` filter (logs signal) is backed by the `idx_body_text` text
+    // index, which an explicit PREWHERE on tenant/time would defeat (CH reads the whole
+    // index instead of pruning granules). When such a filter is present, fold the scope
+    // into a single WHERE and let `optimize_move_to_prewhere` re-derive the prewhere.
+    // Pure-PK filters keep the explicit PREWHERE (the efficient granule-skipping path).
+    let has_like = req.filters.iter().any(|f| matches!(f.op, FilterOp::Like | FilterOp::NotLike));
+    let scan_clause = if has_like {
+        format!(
+            "WHERE tenant_id = '{escaped_tenant}' \
+               AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
+               AND {ts_col} <= parseDateTimeBestEffort('{latest}') {additional_filters}"
+        )
+    } else {
+        format!(
+            "PREWHERE tenant_id = '{escaped_tenant}' \
+               AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
+               AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
+             WHERE TRUE {additional_filters}"
+        )
+    };
+
     // ── Total counts query ──
-    // PREWHERE on tenant_id + time range: ClickHouse reads only those compact columns
-    // first, discards non-matching rows, then loads the remaining columns — reducing I/O
-    // significantly for multi-tenant tables.
     let totals_sql = format!(
         "SELECT \
             countIf({ts_col} >= parseDateTimeBestEffort('{sel_from}') \
@@ -241,10 +259,7 @@ pub async fn bubbleup(
             countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
                 AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS baseline_count \
          FROM {table} \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-           AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
-           AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
-         WHERE TRUE {additional_filters}"
+         {scan_clause}"
     );
 
     // ── Dimension query ──
@@ -290,10 +305,7 @@ pub async fn bubbleup(
             countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
                 AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS base_count \
          FROM {table} \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-           AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
-           AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
-         WHERE TRUE {additional_filters} \
+         {scan_clause} \
          GROUP BY GROUPING SETS ({grouping_sets}) \
          HAVING sel_count > 0 OR base_count > 0 \
          ORDER BY dim_idx ASC, sel_count DESC \
