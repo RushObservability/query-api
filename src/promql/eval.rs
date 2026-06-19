@@ -324,6 +324,12 @@ async fn evaluate_scalar_call(
 // ═══════════════════════════════════════════════════════════════════
 
 /// Query ClickHouse for a VectorSelector, returning TimeSeries.
+/// Prometheus lookback-delta (staleness): an instant value at step `t` is the latest
+/// sample in `(t - STALENESS_SECS, t]`. Default 5m — matches Prometheus and means a
+/// sparsely-scraped series still yields a value at every step (a connected line in
+/// Grafana rather than isolated points).
+const STALENESS_SECS: f64 = 300.0;
+
 /// When `align` is true, step-align samples to step_timestamps (for instant vectors).
 /// When false, return all raw samples (for range vectors used by rate/increase/etc).
 async fn query_clickhouse(
@@ -385,13 +391,19 @@ async fn query_clickhouse(
     let grid_step: f64 = if step_timestamps.len() >= 2 {
         step_timestamps[1] - step_timestamps[0]
     } else {
-        // Single step (instant query): step_align_series uses half_step = lookback, i.e.
-        // the whole [start,end] window collapses to one bucket. Model that as a single
-        // step of width 2*half_step so every in-window sample maps to k=0.
-        let hs = (end_secs - start_secs).max(5.0);
-        2.0 * hs
+        // Single step (instant query): the whole [start,end] lookback window collapses to
+        // one bucket. Model it as a single step wide enough that every in-window sample
+        // maps to k=0.
+        2.0 * (end_secs - start_secs).max(5.0)
     };
     let grid_start: f64 = step_timestamps.first().copied().unwrap_or(start_secs);
+    // Backward staleness window for the as-of lookup. Range queries use the 5m default;
+    // a single-step instant query uses its own [start,end] lookback span.
+    let staleness: f64 = if step_timestamps.len() >= 2 {
+        STALENESS_SECS
+    } else {
+        (end_secs - start_secs).max(5.0)
+    };
 
     // Raw-streaming SQL (align=false): all samples, ordered by series then time.
     let make_raw_sql = |table: &str| {
@@ -404,32 +416,28 @@ async fn query_clickhouse(
         )
     };
 
-    // Bucketed SQL (align=true): one argMax-by-time value per (series, step k).
+    // Bucketed SQL (align=true): one argMax-by-time value per (series, step k), matching
+    // Prometheus instant-vector semantics (latest sample in the backward window
+    // (t_k - staleness, t_k]).
     //
-    // step_align_series does a per-step *windowed lookup* (latest sample in the centered
-    // window [t_k - hs, t_k + hs], hs = grid_step/2), and the windows are inclusive at
-    // BOTH ends — so a sample sitting exactly on a shared boundary t_k + hs == t_{k+1} - hs
-    // populates BOTH step k and step k+1 (a carry-forward). A naive GROUP BY can't
-    // reproduce that because it partitions each sample into one bucket.
+    // Each sample at time st is the as-of value for every step t_k it can carry forward
+    // to, i.e. st <= t_k <= st + staleness. It emits that full set of step indices via
+    // arrayJoin(range(klo, khi+1)), where
+    //     klo = ceil ((st - grid_start) / grid_step)              [first step >= st]
+    //     khi = floor((st + staleness - grid_start) / grid_step)  [last step <= st+staleness]
+    // Then argMax(Value, TimeUnix) per (series, k) picks, for each step, the latest sample
+    // whose carry-forward window covers it — i.e. the most recent sample at or before t_k
+    // within staleness. Out-of-grid k are dropped in Rust.
     //
-    // We reproduce it exactly: each sample emits the FULL set of step indices whose
-    // window contains it, via arrayJoin(range(klo, khi+1)), where
-    //     klo = ceil ((st - hs - grid_start) / grid_step)
-    //     khi = floor((st + hs - grid_start) / grid_step)
-    // (almost always klo == khi; klo == khi-1 only at an exact shared boundary). Then
-    // argMax(Value, TimeUnix) per (series, k) picks the latest sample in each step's
-    // window — identical to step_align_series. Out-of-grid k are dropped in Rust.
-    //
-    // hs and grid_start/grid_step are f64s we control (never user SQL).
-    let hs = grid_step / 2.0;
+    // staleness and grid_start/grid_step are f64s we control (never user SQL).
     let make_bucketed_sql = |table: &str| {
         format!(
             "SELECT MetricName, ServiceName, Attributes, k AS ts_ms, \
              argMax(Value, TimeUnix) AS Value FROM ( \
                 SELECT MetricName, ServiceName, Attributes, Value, TimeUnix, \
                 arrayJoin(range( \
-                    toInt64(ceil ((toFloat64(toUnixTimestamp64Nano(TimeUnix)) / 1e9 - {hs} - {grid_start}) / {grid_step})), \
-                    toInt64(floor((toFloat64(toUnixTimestamp64Nano(TimeUnix)) / 1e9 + {hs} - {grid_start}) / {grid_step})) + 1 \
+                    toInt64(ceil ((toFloat64(toUnixTimestamp64Nano(TimeUnix)) / 1e9 - {grid_start}) / {grid_step})), \
+                    toInt64(floor((toFloat64(toUnixTimestamp64Nano(TimeUnix)) / 1e9 + {staleness} - {grid_start}) / {grid_step})) + 1 \
                 )) AS k \
                 FROM {table} WHERE {where_clause} \
              ) \
@@ -526,9 +534,9 @@ async fn query_clickhouse(
 
 /// Convert SQL-bucketed rows (one row per series per step bucket, `ts_ms` reused as the
 /// integer bucket index k, `value` = argMax-by-time within the bucket) into TimeSeries
-/// with samples placed at `step_timestamps[k]`. Bucket indices outside `[0, n)` (samples
-/// from the lookback skirt that fall before the first / after the last step's centered
-/// window) are dropped — exactly as step_align_series drops them.
+/// with samples placed at `step_timestamps[k]`. Bucket indices outside `[0, n)` (carry
+/// targets that fall before the first or after the last step) are dropped — exactly as
+/// step_align_series drops them.
 ///
 /// Mirrors `rows_to_series`: series sorted by label set, samples step-time-sorted,
 /// identical label sets merged (e.g. same labels in both tables, or distinct raw keys
@@ -639,39 +647,31 @@ fn rows_to_series(gauge_rows: &[MetricSample], sum_rows: &[MetricSample]) -> Vec
     merged
 }
 
-/// Snap raw series to step timestamps, picking the latest sample within tolerance.
+/// Snap raw series to step timestamps with Prometheus lookback-delta semantics: each
+/// step `t` takes the latest sample in `(t - staleness, t]`.
 ///
-/// Retained as the executable reference for the SQL-side bucketing rewrite: the new
-/// `align=true` path computes the same assignment server-side (see `query_clickhouse`),
-/// and tests pin the SQL bucket-index formula against this function.
+/// Executable reference for the SQL-side bucketing (see `query_clickhouse`); tests pin
+/// the SQL bucket-index formula against this function.
 #[cfg_attr(not(test), allow(dead_code))]
 fn step_align_series(
     series: Vec<TimeSeries>,
     step_timestamps: &[f64],
-    lookback: f64,
+    staleness: f64,
 ) -> Vec<TimeSeries> {
-    let half_step = if step_timestamps.len() >= 2 {
-        (step_timestamps[1] - step_timestamps[0]) / 2.0
-    } else {
-        // For instant queries (single timestamp), use the full lookback window
-        lookback.max(5.0)
-    };
-
-    // Two-pointer merge: samples are time-sorted and steps ascending, so a single
-    // forward pass replaces the old O(steps × samples) per-step reverse scan. For
-    // each step we want the latest sample with ts in [t - half_step, t + half_step].
+    // Two-pointer merge: samples are time-sorted and steps ascending, so one forward pass
+    // finds, for each step t, the latest sample with st <= t; keep it if st >= t - staleness.
     series
         .into_iter()
         .map(|ts| {
             let mut samples: Vec<(f64, f64)> = Vec::with_capacity(step_timestamps.len());
-            let mut i = 0usize; // first sample index not yet known to be <= t + half_step
+            let mut i = 0usize; // count of samples known to be <= the current step t
             for &t in step_timestamps {
-                while i < ts.samples.len() && ts.samples[i].0 <= t + half_step {
+                while i < ts.samples.len() && ts.samples[i].0 <= t {
                     i += 1;
                 }
                 if i > 0 {
                     let (st, v) = ts.samples[i - 1];
-                    if st >= t - half_step {
+                    if st >= t - staleness {
                         samples.push((t, v));
                     }
                 }
@@ -812,13 +812,9 @@ mod tests {
     fn step_align_reference(
         series: Vec<TimeSeries>,
         step_timestamps: &[f64],
-        lookback: f64,
+        staleness: f64,
     ) -> Vec<TimeSeries> {
-        let half_step = if step_timestamps.len() >= 2 {
-            (step_timestamps[1] - step_timestamps[0]) / 2.0
-        } else {
-            lookback.max(5.0)
-        };
+        // Naive O(steps × samples) backward as-of lookup: latest sample in (t - staleness, t].
         series
             .into_iter()
             .map(|ts| {
@@ -828,7 +824,7 @@ mod tests {
                         ts.samples
                             .iter()
                             .rev()
-                            .find(|(st, _)| *st <= t + half_step && *st >= t - half_step)
+                            .find(|(st, _)| *st <= t && *st >= t - staleness)
                             .map(|(_, v)| (t, *v))
                     })
                     .collect();
@@ -886,7 +882,7 @@ mod tests {
 
     #[test]
     fn step_align_matches_reference_at_window_boundaries() {
-        // Samples landing exactly on t ± half_step (half_step = 5 here).
+        // Samples landing exactly on step timestamps and on the staleness boundary.
         let samples = vec![(5.0, 1.0), (15.0, 2.0), (25.0, 3.0)];
         let steps = vec![0.0, 10.0, 20.0, 30.0];
         assert_align_matches_reference(samples, &steps, 10.0);
@@ -995,16 +991,16 @@ mod tests {
         raw: &[(f64, f64)],
         grid_start: f64,
         grid_step: f64,
+        staleness: f64,
     ) -> Vec<MetricSample> {
         use std::collections::BTreeMap;
-        let hs = grid_step / 2.0;
         // (bucket index) -> (best_time, value)
         let mut buckets: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
         for &(st, v) in raw {
-            // Each sample emits every step index whose centered window contains it —
-            // mirrors arrayJoin(range(klo, khi+1)) in make_bucketed_sql.
-            let klo = ((st - hs - grid_start) / grid_step).ceil() as i64;
-            let khi = ((st + hs - grid_start) / grid_step).floor() as i64;
+            // Each sample emits every step index in its forward carry window [st, st+staleness]
+            // — mirrors arrayJoin(range(klo, khi+1)) in make_bucketed_sql.
+            let klo = ((st - grid_start) / grid_step).ceil() as i64;
+            let khi = ((st + staleness - grid_start) / grid_step).floor() as i64;
             for k in klo..=khi {
                 buckets
                     .entry(k)
@@ -1034,13 +1030,12 @@ mod tests {
         assert!(steps.len() >= 2, "helper only covers multi-step grids");
         let grid_step = steps[1] - steps[0];
         let grid_start = steps[0];
-        let rows = bucketize_like_sql(&samples, grid_start, grid_step);
+        let staleness = STALENESS_SECS; // Prometheus default; exercises carry-forward
+        let rows = bucketize_like_sql(&samples, grid_start, grid_step, staleness);
         let got = bucketed_rows_to_series(&rows, &[], steps);
 
-        // Reference: step_align_series with the matching half_step (= grid_step/2 for
-        // multi-step grids).
-        let lookback = grid_step / 2.0;
-        let want = step_align_series(series_with(samples), steps, lookback);
+        // Reference: step_align_series with the same backward staleness window.
+        let want = step_align_series(series_with(samples), steps, staleness);
 
         let got_samples = got.first().map(|s| s.samples.clone()).unwrap_or_default();
         let want_samples = want.first().map(|s| s.samples.clone()).unwrap_or_default();
@@ -1071,9 +1066,8 @@ mod tests {
 
     #[test]
     fn sql_bucketing_matches_step_align_at_boundaries() {
-        // Samples landing exactly on t ± half_step (half_step = 5, step = 10). The tie
-        // must go to the LOWER step, matching step_align_series. This is the case where
-        // round() / floor(x+0.5) would diverge — ceil(x - 0.5) must be used.
+        // Samples landing exactly on step timestamps: the ceil(klo)/floor(khi) carry
+        // window must include the same steps step_align_series does.
         let samples = vec![(5.0, 1.0), (15.0, 2.0), (25.0, 3.0)];
         let steps = vec![0.0, 10.0, 20.0, 30.0];
         assert_sql_bucketing_matches_step_align(samples, &steps);

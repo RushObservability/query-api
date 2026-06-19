@@ -14,7 +14,14 @@ struct BytesRow {
 
 pub fn spawn_stats_engine(ch: Client, buffer: Arc<IngestBuffer>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // Emit cadence for rush_stats_* gauges. Default 15s (Prometheus-standard) so
+        // rate()/short windows have ≥2 samples; override with RUSH_STATS_INTERVAL_SECS.
+        let secs = std::env::var("RUSH_STATS_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&s| s >= 1)
+            .unwrap_or(15);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
         loop {
             interval.tick().await;
             if let Err(e) = collect_and_write(&ch, &buffer).await {
