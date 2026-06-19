@@ -49,23 +49,42 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
     resp
 }
 
-/// Middleware that resolves the tenant for every request. Four methods,
-/// checked in priority order:
+/// Middleware that resolves the tenant for every request. Methods checked in
+/// priority order:
 ///
 /// 1. `Authorization: Bearer <api_key>` — resolves the key to a tenant via
 ///    the config DB. Secure; the key is the trust boundary.
 /// 2. `rush_session` cookie — resolves a session to its user, then uses
 ///    the user's tenant_id.
-/// 3. `X-Rush-Tenant: <tenant_name_or_id>` — use the header value directly.
-///    No auth required. Intended for simple / dev / single-org deployments
-///    where teams trust each other and don't want to manage API keys.
-/// 4. Fall back to the `"default"` tenant (backward compatible, no headers
-///    needed at all).
+/// 3. `X-Rush-Tenant: <tenant_name_or_id>` header OR a `/t/{tenant}/…` URL
+///    prefix — selects the tenant by name/id. Subject to the same lock rules
+///    (a tenant with auth_required still needs a Bearer key or session). The
+///    URL form lets external tools (e.g. Grafana datasources) carry the tenant
+///    in the base URL; the header takes precedence when both are present.
+/// 4. Fall back to the `"default"` tenant (backward compatible).
 async fn tenant_middleware(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Response {
+    // ── URL-based tenant: /t/{tenant}/<rest> ──
+    // Strip the prefix so downstream routes match unchanged, and carry the
+    // extracted tenant through the same path as the X-Rush-Tenant header.
+    let mut url_tenant: Option<String> = None;
+    if let Some(rest) = req.uri().path().strip_prefix("/t/") {
+        if let Some(slash) = rest.find('/') {
+            let tenant = rest[..slash].to_string();
+            if !tenant.is_empty() {
+                let new_path = &rest[slash..]; // begins with '/'
+                let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+                if let Ok(uri) = format!("{new_path}{query}").parse() {
+                    *req.uri_mut() = uri;
+                    url_tenant = Some(tenant);
+                }
+            }
+        }
+    }
+
     // Extract all header values we need before any await point so the
     // &Request (whose Body is not Send) is not held across awaits.
     let auth_header: Option<String> = req
@@ -78,11 +97,13 @@ async fn tenant_middleware(
         .get("dd-api-key")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
+    // Header wins over the URL prefix when both are present.
     let rush_tenant: Option<String> = req
         .headers()
         .get("x-rush-tenant")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned());
+        .map(|s| s.to_owned())
+        .or(url_tenant);
     let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
 
     let tenant_id = resolve_tenant_from_headers(
@@ -590,9 +611,16 @@ async fn main() -> anyhow::Result<()> {
         api_key_cache,
     };
 
-    let app = Router::new()
+    let inner = Router::new()
         // Trace endpoints
         .route("/api/v1/traces/{trace_id}", get(handlers::traces::get_trace))
+        // Jaeger-compatible query API (for Grafana's built-in Jaeger data source).
+        // Mount behind /t/{tenant}/jaeger; auth via tenant-scoped API key.
+        .route("/jaeger/api/services", get(handlers::jaeger::services))
+        .route("/jaeger/api/services/{service}/operations", get(handlers::jaeger::operations))
+        .route("/jaeger/api/traces", get(handlers::jaeger::search))
+        .route("/jaeger/api/traces/{trace_id}", get(handlers::jaeger::get_trace))
+        .route("/jaeger/api/dependencies", get(handlers::jaeger::dependencies))
         // Query endpoints
         .route("/api/v1/query", post(handlers::query::execute_query))
         .route("/api/v1/query/count", post(handlers::query::count_query))
@@ -1138,10 +1166,17 @@ async fn main() -> anyhow::Result<()> {
         .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware))
         // Keep a writer handle for the graceful-shutdown flush before `state` is
         // consumed by `with_state`.
         .with_state(state.clone());
+
+    // Wrap the whole router so tenant resolution runs BEFORE routing. This matters
+    // for the `/t/{tenant}/…` URL prefix: the middleware strips it and rewrites the
+    // path, and routing must then run on the rewritten path. `Router::layer` runs
+    // *after* routing, so applying tenant_middleware there can't affect the match.
+    let app = Router::new()
+        .fallback_service(inner)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware));
     let shutdown_writer = state.writer.clone();
 
     let port: u16 = std::env::var("RUSH_PORT")

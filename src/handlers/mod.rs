@@ -20,6 +20,7 @@ pub mod export;
 pub mod groups;
 pub mod health;
 pub mod funnels;
+pub mod jaeger;
 pub mod license;
 pub mod logs;
 pub mod pg_explain;
