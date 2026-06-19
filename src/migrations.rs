@@ -9,50 +9,13 @@ const MIGRATIONS: &[&str] = &[
     // ── Database ──
     "CREATE DATABASE IF NOT EXISTS observability",
 
-    // ── OTel traces (v2: multi-tenant with materialized HTTP columns) ──
-    r"CREATE TABLE IF NOT EXISTS observability.spans_raw
-(
-    `tenant_id` LowCardinality(String) DEFAULT 'default',
-    `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(1)),
-    `TraceId` String CODEC(ZSTD(1)),
-    `SpanId` String CODEC(ZSTD(1)),
-    `ParentSpanId` String CODEC(ZSTD(1)),
-    `TraceState` String CODEC(ZSTD(1)),
-    `SpanName` LowCardinality(String) CODEC(ZSTD(1)),
-    `SpanKind` LowCardinality(String) CODEC(ZSTD(1)),
-    `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
-    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    `ScopeName` String CODEC(ZSTD(1)),
-    `ScopeVersion` String CODEC(ZSTD(1)),
-    `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    `SpanAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    `Duration` UInt64 CODEC(ZSTD(1)),
-    `StatusCode` LowCardinality(String) CODEC(ZSTD(1)),
-    `StatusMessage` String CODEC(ZSTD(1)),
-    `Events.Timestamp` Array(DateTime64(9)) CODEC(ZSTD(1)),
-    `Events.Name` Array(LowCardinality(String)) CODEC(ZSTD(1)),
-    `Events.Attributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
-    `Links.TraceId` Array(String) CODEC(ZSTD(1)),
-    `Links.SpanId` Array(String) CODEC(ZSTD(1)),
-    `Links.TraceState` Array(String) CODEC(ZSTD(1)),
-    `Links.Attributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
-    `mat_http_method` LowCardinality(String) MATERIALIZED SpanAttributes['http.request.method'],
-    `mat_http_path` String MATERIALIZED SpanAttributes['url.path'],
-    `mat_http_status` UInt16 MATERIALIZED toUInt16OrZero(SpanAttributes['http.response.status_code']),
-    INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
-    INDEX idx_span_id SpanId TYPE bloom_filter(0.001) GRANULARITY 1,
-    INDEX idx_status_code StatusCode TYPE set(4) GRANULARITY 4,
-    INDEX idx_http_status mat_http_status TYPE minmax GRANULARITY 1,
-    INDEX idx_duration Duration TYPE minmax GRANULARITY 1,
-    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_span_attr_key mapKeys(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_span_attr_value mapValues(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1
-)
-ENGINE = MergeTree
-PARTITION BY toDate(Timestamp)
-ORDER BY (tenant_id, ServiceName, SpanName, toDateTime(Timestamp))
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+    // ── OTel traces ──
+    // NOTE: `spans_raw` (the OTel-native landing table) and its `spans_mv` transform are
+    // GONE. query-api now reshapes OTel spans into the wide `spans` row in Rust at ingest
+    // (see `impl From<TraceInsertRow> for WideEvent`) and inserts directly into `spans` —
+    // one physical table for spans, no duplicate raw copy. The `spans_by_trace` and
+    // `services` MVs (below) read FROM `spans` and fire on the direct insert. Existing
+    // deployments drop the old objects via the DROP statements below.
 
     // ── Wide events (v2: multi-tenant flattened query-friendly schema) ──
     r"CREATE TABLE IF NOT EXISTS observability.spans
@@ -94,39 +57,13 @@ ORDER BY (tenant_id, timestamp, service_name, trace_id, span_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
 
-    // ── MV: OTel traces → wide events (v2: passes tenant_id through) ──
-    r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.spans_mv
-TO observability.spans
-AS SELECT
-    tenant_id,
-    Timestamp AS timestamp,
-    TraceId AS trace_id,
-    SpanId AS span_id,
-    ParentSpanId AS parent_span_id,
-    ServiceName AS service_name,
-    SpanName AS span_name,
-    SpanKind AS kind,
-    StatusCode AS status,
-    Duration AS duration_ns,
-    SpanAttributes['http.method'] AS http_method,
-    COALESCE(
-        nullIf(SpanAttributes['http.route'], ''),
-        nullIf(SpanAttributes['http.target'], ''),
-        nullIf(SpanAttributes['url.path'], ''),
-        SpanName
-    ) AS http_path,
-    toUInt16OrZero(COALESCE(
-        nullIf(SpanAttributes['http.status_code'], ''),
-        nullIf(SpanAttributes['http.response.status_code'], ''),
-        '0'
-    )) AS http_status_code,
-    toJSONString(SpanAttributes) AS attributes,
-    `Events.Name` AS event_names,
-    `Events.Timestamp` AS event_timestamps,
-    arrayMap(x -> toJSONString(x), `Events.Attributes`) AS event_attributes,
-    `Links.TraceId` AS link_trace_ids,
-    `Links.SpanId` AS link_span_ids
-FROM observability.spans_raw",
+    // ── Drop the legacy spans_raw landing table + its transform MV ──
+    // Spans are now ingested directly into `spans` (the transform moved to Rust). Drop the
+    // MV before the table (the MV depends on it). No-ops on a fresh install; on existing
+    // deployments they reclaim the duplicate raw copy. Order matters: these run after the
+    // `spans` CREATE above and before the `spans_by_trace`/`services` MVs below.
+    "DROP VIEW IF EXISTS observability.spans_mv",
+    "DROP TABLE IF EXISTS observability.spans_raw SYNC",
 
     // ── MV: trace index for fast trace-id lookups (v2: tenant-scoped) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.spans_by_trace
@@ -699,7 +636,6 @@ GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
 /// Call `apply_row_policies()` after `probe_row_policy_support()` confirms
 /// the custom setting is accepted.
 const ROW_POLICY_TABLES: &[&str] = &[
-    "spans_raw",
     "logs",
     "spans",
     "metrics_gauge",
@@ -943,22 +879,12 @@ async fn apply_skip_indexes(client: &Client) {
         drop_on_ngram: &'static [&'static str],
     }
     let plans = [
-        Plan {
-            table: "spans",
-            text_name: "idx_search_text",
-            text_ddl: "ALTER TABLE observability.spans ADD INDEX IF NOT EXISTS \
-                idx_search_text lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' '))) \
-                TYPE text(tokenizer = ngrams(4)) GRANULARITY 1",
-            ngram_name: "idx_search_blob",
-            ngram_ddl: "ALTER TABLE observability.spans ADD INDEX IF NOT EXISTS \
-                idx_search_blob lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' '))) \
-                TYPE ngrambf_v1(4, 65536, 3, 0) GRANULARITY 1",
-            // On text path, drop the ngram blob + the original per-column ngram indexes.
-            drop_on_text: &["idx_search_blob", "idx_attributes_ngram", "idx_event_attributes_ngram"],
-            // On ngram path, keep idx_search_blob (desired); drop only the superseded
-            // per-column ngram indexes and any stale text index.
-            drop_on_ngram: &["idx_attributes_ngram", "idx_event_attributes_ngram", "idx_search_text"],
-        },
+        // NOTE: spans have NO full-text search index. The attribute-blob text index cost
+        // ~66% of span storage for a path used ~2.5% of the time; spans free-text search
+        // now matches span_name/service_name (cheap LowCardinality columns) in
+        // query_builder, and trace/span-id lookups use bloom filters. Any pre-existing
+        // spans search index is dropped below so deployments converge. Only logs keep a
+        // full-text index (message search is a core logs feature).
         Plan {
             table: "logs",
             text_name: "idx_body_text",
@@ -1005,6 +931,19 @@ async fn apply_skip_indexes(client: &Client) {
                 if let Err(e) = client.query(&drop_ddl).execute().await {
                     tracing::warn!(table = p.table, index = name, error = %e, "failed to drop superseded index");
                 }
+            }
+        }
+    }
+
+    // Spans no longer carry a full-text search index. Drop any pre-existing spans search
+    // indexes so existing deployments reclaim the storage (the text index was ~66% of the
+    // spans table); fresh installs never create them.
+    for name in ["idx_search_text", "idx_search_blob", "idx_attributes_ngram", "idx_event_attributes_ngram"] {
+        if index_exists(client, "spans", name).await {
+            tracing::info!(index = name, "dropping obsolete spans full-text index");
+            let drop_ddl = format!("ALTER TABLE observability.spans DROP INDEX IF EXISTS {name}");
+            if let Err(e) = client.query(&drop_ddl).execute().await {
+                tracing::warn!(index = name, error = %e, "failed to drop obsolete spans search index");
             }
         }
     }
@@ -1083,7 +1022,6 @@ pub async fn apply_retention_ttls(
         ("metrics_sum_1m", "toDateTime(bucket)", rollup_1m_days),
         ("metrics_gauge_1h", "toDateTime(bucket)", rollup_1h_days),
         ("metrics_sum_1h", "toDateTime(bucket)", rollup_1h_days),
-        ("spans_raw", "toDateTime(Timestamp)", apm_days),
         ("spans", "toDateTime(timestamp)", apm_days),
         ("rum", "toDateTime(Timestamp)", apm_days),
         ("rum_replay", "toDateTime(chunk_ts)", apm_days),
@@ -1133,7 +1071,6 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
         ("metrics_exp_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
         ("metrics_summary", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
         // Traces / spans
-        ("spans_raw", "toDateTime(Timestamp)", tiering.traces_move_after_days),
         ("spans", "toDateTime(timestamp)", tiering.traces_move_after_days),
         // Logs
         ("logs", "toDateTime(Timestamp)", tiering.logs_move_after_days),
@@ -1159,7 +1096,7 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
         // include the existing DELETE TTL alongside the new MOVE TTL.
         let delete_days = match *table {
             t if t.starts_with("metrics_") => config.effective_metrics_ttl_days(),
-            "spans_raw" | "spans" => config.effective_traces_ttl_days(),
+            "spans" => config.effective_traces_ttl_days(),
             "logs" => config.effective_logs_ttl_days(),
             _ => 30,
         };

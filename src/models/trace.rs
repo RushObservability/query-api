@@ -27,6 +27,66 @@ pub struct WideEvent {
     pub link_span_ids: Vec<String>,
 }
 
+/// Look up an OTel attribute value by key in a `(key, value)` list.
+fn attr_lookup<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// Serialize an OTel attribute list to a JSON object string — matches ClickHouse's
+/// `toJSONString(Map(...))` so `JSONExtractString(attributes, key)` queries behave
+/// identically to the former `spans_mv` output.
+fn attrs_to_json(attrs: &[(String, String)]) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = attrs
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".into())
+}
+
+impl From<crate::models::ingest::TraceInsertRow> for WideEvent {
+    /// Reshape an OTel-native ingest row into the wide `spans` row. This is the Rust
+    /// port of the former `spans_mv` materialized view — applied at ingest so spans land
+    /// directly in the single `spans` table (no `spans_raw` copy + SQL MV).
+    fn from(r: crate::models::ingest::TraceInsertRow) -> Self {
+        let a = &r.span_attributes;
+        let http_method = attr_lookup(a, "http.method").unwrap_or("").to_string();
+        // COALESCE(http.route, http.target, url.path, SpanName) — first non-empty.
+        let http_path = attr_lookup(a, "http.route").filter(|s| !s.is_empty())
+            .or_else(|| attr_lookup(a, "http.target").filter(|s| !s.is_empty()))
+            .or_else(|| attr_lookup(a, "url.path").filter(|s| !s.is_empty()))
+            .map(str::to_string)
+            .unwrap_or_else(|| r.span_name.clone());
+        // toUInt16OrZero(COALESCE(http.status_code, http.response.status_code, '0')).
+        let http_status_code = attr_lookup(a, "http.status_code").filter(|s| !s.is_empty())
+            .or_else(|| attr_lookup(a, "http.response.status_code").filter(|s| !s.is_empty()))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        let attributes = attrs_to_json(a);
+        let event_attributes = r.events_attributes.iter().map(|e| attrs_to_json(e)).collect();
+        WideEvent {
+            tenant_id: r.tenant_id.to_string(),
+            timestamp: r.timestamp,
+            trace_id: r.trace_id,
+            span_id: r.span_id,
+            parent_span_id: r.parent_span_id,
+            service_name: r.service_name.to_string(),
+            span_name: r.span_name,
+            kind: r.span_kind,
+            status: r.status_code,
+            duration_ns: r.duration,
+            http_method,
+            http_path,
+            http_status_code,
+            attributes,
+            event_names: r.events_name,
+            event_timestamps: r.events_timestamp,
+            event_attributes,
+            link_trace_ids: r.links_trace_id,
+            link_span_ids: r.links_span_id,
+        }
+    }
+}
+
 /// A slim span row for the Explore list view — only the columns the table renders.
 /// Used when a query requests `columns: "list"`. Field names match `WideEvent` so a
 /// slim row is a forward-compatible subset on the wire (the wide-only fields are simply

@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn test_inject_tenant_filter_multiple_where() {
         let sql = "WITH sub AS (SELECT * FROM logs WHERE Timestamp > '2024-01-01') \
-                   SELECT * FROM spans_raw WHERE Timestamp > '2024-01-01'";
+                   SELECT * FROM spans WHERE timestamp > '2024-01-01'";
         let result = inject_tenant_filter(sql, "eng");
         // Both WHERE clauses should have tenant_id injected
         let count = result.matches("tenant_id = 'eng'").count();

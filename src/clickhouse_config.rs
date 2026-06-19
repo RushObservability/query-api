@@ -3810,26 +3810,26 @@ impl ConfigDb {
             (
                 "Error rate spike per service",
                 "Fires when any service has an error rate above 5% with at least 100 spans.",
-                "SELECT ServiceName, \
-                   countIf(StatusCode = 'ERROR') AS errors, \
+                "SELECT service_name, \
+                   countIf(status = 'ERROR') AS errors, \
                    count() AS total, \
                    errors / total AS error_rate \
-                 FROM spans_raw \
-                 WHERE Timestamp BETWEEN @window_start AND @window_end \
-                 GROUP BY ServiceName \
+                 FROM spans \
+                 WHERE timestamp BETWEEN @window_start AND @window_end \
+                 GROUP BY service_name \
                  HAVING error_rate > 0.05 AND total > 100",
                 "high", 300, 300,
             ),
             (
                 "P99 latency regression",
                 "Detects server spans where p99 latency exceeds 500ms with sufficient traffic.",
-                "SELECT ServiceName, SpanName, \
-                   quantile(0.99)(Duration) / 1000000 AS p99_ms, \
+                "SELECT service_name, span_name, \
+                   quantile(0.99)(duration_ns) / 1000000 AS p99_ms, \
                    count() AS total \
-                 FROM spans_raw \
-                 WHERE Timestamp BETWEEN @window_start AND @window_end \
-                   AND SpanKind = 'SPAN_KIND_SERVER' \
-                 GROUP BY ServiceName, SpanName \
+                 FROM spans \
+                 WHERE timestamp BETWEEN @window_start AND @window_end \
+                   AND kind = 'SPAN_KIND_SERVER' \
+                 GROUP BY service_name, span_name \
                  HAVING p99_ms > 500 AND total > 50",
                 "high", 300, 300,
             ),
@@ -3876,21 +3876,21 @@ impl ConfigDb {
                 "Detects services with both elevated error rates and high p99 latency.",
                 "WITH \
                    error_services AS ( \
-                     SELECT ServiceName FROM spans_raw \
-                     WHERE Timestamp BETWEEN @window_start AND @window_end \
-                     GROUP BY ServiceName \
-                     HAVING countIf(StatusCode = 'ERROR') / count() > 0.05 \
+                     SELECT service_name FROM spans \
+                     WHERE timestamp BETWEEN @window_start AND @window_end \
+                     GROUP BY service_name \
+                     HAVING countIf(status = 'ERROR') / count() > 0.05 \
                    ), \
                    slow_services AS ( \
-                     SELECT ServiceName FROM spans_raw \
-                     WHERE Timestamp BETWEEN @window_start AND @window_end \
-                       AND SpanKind = 'SPAN_KIND_SERVER' \
-                     GROUP BY ServiceName \
-                     HAVING quantile(0.99)(Duration) / 1000000 > 500 \
+                     SELECT service_name FROM spans \
+                     WHERE timestamp BETWEEN @window_start AND @window_end \
+                       AND kind = 'SPAN_KIND_SERVER' \
+                     GROUP BY service_name \
+                     HAVING quantile(0.99)(duration_ns) / 1000000 > 500 \
                    ) \
-                 SELECT es.ServiceName \
+                 SELECT es.service_name \
                  FROM error_services es \
-                 INNER JOIN slow_services ss ON es.ServiceName = ss.ServiceName",
+                 INNER JOIN slow_services ss ON es.service_name = ss.service_name",
                 "critical", 300, 300,
             ),
             (
@@ -3919,16 +3919,16 @@ impl ConfigDb {
                      HAVING log_errors >= 5 \
                    ), \
                    trace_errors AS ( \
-                     SELECT ServiceName, count() AS span_errors \
-                     FROM spans_raw \
-                     WHERE Timestamp BETWEEN @window_start AND @window_end \
-                       AND StatusCode = 'ERROR' \
-                     GROUP BY ServiceName \
+                     SELECT service_name, count() AS span_errors \
+                     FROM spans \
+                     WHERE timestamp BETWEEN @window_start AND @window_end \
+                       AND status = 'ERROR' \
+                     GROUP BY service_name \
                      HAVING span_errors >= 5 \
                    ) \
                  SELECT el.ServiceName, el.log_errors, te.span_errors \
                  FROM error_logs el \
-                 INNER JOIN trace_errors te ON el.ServiceName = te.ServiceName",
+                 INNER JOIN trace_errors te ON el.ServiceName = te.service_name",
                 "critical", 300, 300,
             ),
             (
@@ -3971,11 +3971,11 @@ impl ConfigDb {
                  deployments that caused regressions (>5% error rate with 20+ requests).",
                 "WITH \
                    recent_deploys AS ( \
-                     SELECT ServiceName, max(Timestamp) AS deploy_time \
-                     FROM spans_raw \
-                     WHERE Timestamp BETWEEN @window_start AND @window_end \
-                       AND SpanName LIKE '%deploy%' \
-                     GROUP BY ServiceName \
+                     SELECT service_name AS ServiceName, max(timestamp) AS deploy_time \
+                     FROM spans \
+                     WHERE timestamp BETWEEN @window_start AND @window_end \
+                       AND span_name LIKE '%deploy%' \
+                     GROUP BY service_name \
                    ), \
                    post_deploy_errors AS ( \
                      SELECT w.service_name AS ServiceName, \

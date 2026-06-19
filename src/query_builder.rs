@@ -358,57 +358,33 @@ fn id_lookup_sql(term: &str) -> Option<String> {
     }
 }
 
-/// The single combined free-text search expression, indexed by the native `text`
-/// (inverted) index `idx_search_text` with the `ngrams(4)` tokenizer. It MUST match the
-/// index DDL in migrations.rs character-for-character, or the planner can't use the
-/// index and falls back to a full scan.
-///
-/// Why a single concatenated expression instead of `lower(attributes) LIKE … OR
-/// lower(arrayStringConcat(event_attributes,' ')) LIKE …`:
-/// ClickHouse can only prune granules across an `OR` when every branch resolves to the
-/// SAME index. An OR of two *different* indexes prunes nothing (validated: 90/90
-/// granules read). Folding both columns into one indexed expression makes the search a
-/// single index probe that prunes (validated via EXPLAIN: ~17/135 granules for a needle)
-/// and keeps event-attribute content searchable.
-///
-/// The `text(ngrams(4))` index keeps substring `LIKE '%term%'` semantics (ClickHouse
-/// decomposes the pattern into 4-grams and intersects their posting lists) while
-/// avoiding the bloom-filter saturation of the old ngrambf_v1 (~97k distinct 4-grams
-/// per granule vs a 65536-bit filter).
-pub(crate) const SEARCH_BLOB_EXPR: &str =
-    "lower(concat(attributes, ' ', arrayStringConcat(event_attributes, ' ')))";
-
 /// Generate a ClickHouse predicate for a single free-text span search term.
 ///
-/// Index strategy — this is what makes a 7-day needle/haystack search prune granules
-/// instead of full-scanning:
-/// - Exact 32-hex / 16-hex terms route to `trace_id = …` / `span_id = …`, which use
-///   the bloom_filter skip indexes (Idea 1: separate ID lookup from free text).
-/// - Every other term searches the single `SEARCH_BLOB_EXPR`, backed by the
-///   `idx_search_blob` ngrambf_v1 index, so the planner can drop granules.
-///
-/// Trade-off: free text no longer substring-matches service_name / span_name /
-/// event_names. http/url fields are already inside `attributes` (serialized
-/// SpanAttributes), so they remain searchable. service_name/span_name should be
-/// queried via structured filters, which use their own bloom indexes.
+/// Spans deliberately have NO full-text index. The `text(ngrams(4))` index over the
+/// attribute blob cost ~66% of total span storage (8.4 GiB / 26M spans on delta) for a
+/// path exercised ~2.5% of the time — untenable at high span volume. Strategy now:
+/// - Exact 32-hex / 16-hex terms route to `trace_id = …` / `span_id = …`, using the
+///   `idx_trace_id` / `idx_span_id` bloom filters (the dominant trace-lookup path).
+/// - Every other term substring-matches the human-readable `span_name` / `service_name`
+///   columns. These are `LowCardinality(String)`, so `ILIKE` evaluates against the
+///   per-granule dictionary — cheap even with no skip index. Attribute *values* are
+///   queried via structured `key=value` filters, not free text.
 fn term_match_sql(term: &str) -> String {
-    // Idea 1: exact-ID fast path.
+    // Exact-ID fast path (trace_id is 32 hex, span_id is 16 hex).
     if let Some(id_pred) = id_lookup_sql(term) {
         return id_pred;
     }
 
-    // Free text → single index-backed LIKE pattern.
+    // Free text → substring match on the small name columns (no large index needed).
+    // `*` wildcards map to `%`; literal `%`/`_` are escaped.
     let escaped_lower = escape_string_literal(&term.to_lowercase());
-    // `*` wildcards map to `%`; literal `%`/`_` are escaped. Always wrapped in `%…%`
-    // for substring semantics. ngrambf_v1 still prunes using the literal n-grams
-    // between wildcards.
     let inner = escaped_lower
         .replace('%', "\\%")
         .replace('_', "\\_")
         .replace('*', "%");
     let pattern = format!("%{inner}%");
 
-    format!("{SEARCH_BLOB_EXPR} LIKE '{pattern}'")
+    format!("(span_name ILIKE '{pattern}' OR service_name ILIKE '{pattern}')")
 }
 
 /// Generate SQL for a `key=value` attribute lookup.
@@ -861,26 +837,23 @@ mod search_tests {
         assert_eq!(sql, "span_id = 'a1b2c3d4e5f60718'");
     }
 
-    // Free text uses the single combined SEARCH_BLOB_EXPR (one skip index), and never
-    // the non-indexed columns or an OR of two indexes that would defeat granule skipping.
+    // Free text matches the small name columns (no full-text index on spans), and
+    // never the big attribute blob or index-hostile ops that would force a wide scan.
     #[test]
-    fn free_text_uses_single_combined_index_expr() {
+    fn free_text_matches_name_columns() {
         let sql = build_span_search_sql("timeout").unwrap();
-        assert_eq!(sql, format!("{SEARCH_BLOB_EXPR} LIKE '%timeout%'"));
-        // No index-hostile predicates that would force a full scan.
+        assert_eq!(sql, "(span_name ILIKE '%timeout%' OR service_name ILIKE '%timeout%')");
         assert!(!sql.contains("positionCaseInsensitive"));
         assert!(!sql.contains("arrayExists"));
-        assert!(!sql.contains("service_name"));
-        assert!(!sql.contains("http_path"));
-        // Not an OR of two different indexes (which cannot prune in ClickHouse).
-        assert!(!sql.contains(" OR "));
+        // Must NOT scan the attributes blob (the dropped full-text path).
+        assert!(!sql.contains("concat(attributes"));
     }
 
-    // Wildcards still produce a LIKE pattern ngrambf can prune on, with no full-scan ops.
+    // Wildcards map to LIKE patterns on the name columns, no full-scan ops.
     #[test]
     fn wildcard_term_stays_index_friendly() {
         let sql = build_span_search_sql("slack*posted").unwrap();
-        assert_eq!(sql, format!("{SEARCH_BLOB_EXPR} LIKE '%slack%posted%'"));
+        assert_eq!(sql, "(span_name ILIKE '%slack%posted%' OR service_name ILIKE '%slack%posted%')");
         assert!(!sql.contains("positionCaseInsensitive"));
     }
 
@@ -897,7 +870,7 @@ mod search_tests {
     #[test]
     fn and_with_kv_preserves_indexed_branch() {
         let sql = build_span_search_sql("error db.system=postgresql").unwrap();
-        assert!(sql.contains(&format!("{SEARCH_BLOB_EXPR} LIKE '%error%'")));
+        assert!(sql.contains("span_name ILIKE '%error%'"));
         assert!(sql.contains("JSONExtractString(attributes, 'db.system') = 'postgresql'"));
     }
 

@@ -242,15 +242,15 @@ pub async fn get_stats(
     // Combined total + rate in one query per signal to halve span/log round-trips.
     let span_stats_fut = crate::tenant_query(&state.ch, &format!(
         "SELECT count() as total, count() / {range_secs} as rate \
-         FROM spans_raw \
+         FROM spans \
          PREWHERE tenant_id = '{escaped_tenant}' \
-           AND Timestamp >= parseDateTimeBestEffort('{from}') \
-           AND Timestamp <= parseDateTimeBestEffort('{to}')"
+           AND timestamp >= parseDateTimeBestEffort('{from}') \
+           AND timestamp <= parseDateTimeBestEffort('{to}')"
     ), tenant_id).fetch_one::<TotalRateResult>();
 
     let span_today_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as count FROM spans_raw \
-         PREWHERE tenant_id = '{escaped_tenant}' AND toDate(Timestamp) = '{today_start}'"
+        "SELECT count() as count FROM spans \
+         PREWHERE tenant_id = '{escaped_tenant}' AND toDate(timestamp) = '{today_start}'"
     ), tenant_id).fetch_one::<CountResult>();
 
     let log_stats_fut = crate::tenant_query(&state.ch, &format!(

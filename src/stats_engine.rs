@@ -35,7 +35,7 @@ async fn collect_and_write(ch: &Client, buffer: &IngestBuffer) -> anyhow::Result
     // All of these queries are independent — run them concurrently so the tick's
     // wall time is the slowest query, not the sum of all of them (~14 round trips).
     let q_spans = format!(
-        "SELECT count() as count FROM spans_raw WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
+        "SELECT count() as count FROM spans WHERE timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND timestamp <= parseDateTimeBestEffort('{now_str}')"
     );
     let q_logs = format!(
         "SELECT count() as count FROM logs WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
@@ -67,7 +67,7 @@ async fn collect_and_write(ch: &Client, buffer: &IngestBuffer) -> anyhow::Result
     ) = tokio::join!(
         query_count(ch, &q_spans),
         query_bytes(ch,
-            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans_raw' AND active"
+            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans' AND active"
         ),
         query_count(ch, &q_logs),
         query_count(ch, &q_gauge),

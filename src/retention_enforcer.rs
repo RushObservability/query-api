@@ -85,20 +85,7 @@ async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<(
     }
 
     // ── Trace rules ── (same combining, per span table)
-    let otel_preds: Vec<String> = config.retention.traces.iter()
-        .filter(|rule| rule.retain_days < table_traces_ttl)
-        .filter_map(|rule| build_trace_where_otel(rule).map(|clause| format!(
-            "(toDateTime(Timestamp) < now() - INTERVAL {} DAY AND {clause})", rule.retain_days
-        )))
-        .collect();
-    if !otel_preds.is_empty() {
-        let sql = format!(
-            "ALTER TABLE observability.spans_raw DELETE WHERE {}",
-            otel_preds.join(" OR ")
-        );
-        execute_or_log(ch, &sql, dry_run).await;
-    }
-
+    // spans_raw is gone — spans are stored only in the wide `spans` table below.
     let wide_preds: Vec<String> = config.retention.traces.iter()
         .filter(|rule| rule.retain_days < table_traces_ttl)
         .filter_map(|rule| build_trace_where_wide(rule).map(|clause| format!(
@@ -292,15 +279,7 @@ async fn enforce_tenant_retention(
                 }
             }
             "traces" => {
-                // spans_raw
-                let sql = format!(
-                    "ALTER TABLE observability.spans_raw DELETE \
-                     WHERE tenant_id = '{safe_tenant_id}' \
-                     AND toDate(Timestamp) < today() - {retain_days}"
-                );
-                execute_or_log(ch, &sql, dry_run).await;
-
-                // spans
+                // spans (single wide table — spans_raw was removed)
                 let sql = format!(
                     "ALTER TABLE observability.spans DELETE \
                      WHERE tenant_id = '{safe_tenant_id}' \
