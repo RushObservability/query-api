@@ -317,4 +317,176 @@ mod tests {
         assert!(values.contains(&100.0));
         assert!(values.contains(&200.0));
     }
+
+    // ── Grouped aggregation with label + value assertions ──
+    //
+    // Mirrors the structure of VictoriaMetrics' aggregate tests
+    // (app/vmselect/promql/exec_test.go, `sum(...) by (...)`/`without(...)` cases):
+    // build three labeled series sampled at the SAME timestamps as the step grid so the
+    // ±(step/2) window picks each value deterministically, then assert grouped output
+    // labels AND values.
+    //
+    // Series (steps = [0, 60]):
+    //   {job:api, inst:a} → (0,10),(60,1)
+    //   {job:api, inst:b} → (0,20),(60,2)
+    //   {job:db,  inst:c} → (0,40),(60,4)
+
+    fn labeled(job: &str, inst: &str, samples: Vec<(f64, f64)>) -> TimeSeries {
+        TimeSeries {
+            labels: [("job".into(), job.into()), ("inst".into(), inst.into())].into(),
+            samples,
+        }
+    }
+
+    fn three_series() -> Vec<TimeSeries> {
+        vec![
+            labeled("api", "a", vec![(0.0, 10.0), (60.0, 1.0)]),
+            labeled("api", "b", vec![(0.0, 20.0), (60.0, 2.0)]),
+            labeled("db", "c", vec![(0.0, 40.0), (60.0, 4.0)]),
+        ]
+    }
+
+    const STEPS: [f64; 2] = [0.0, 60.0];
+
+    /// Find the produced series whose group labels equal the given map.
+    fn group<'a>(result: &'a [TimeSeries], want: &[(&str, &str)]) -> &'a TimeSeries {
+        let want_map: BTreeMap<String, String> = want
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        result
+            .iter()
+            .find(|s| s.labels == want_map)
+            .unwrap_or_else(|| panic!("no group with labels {want_map:?} in {:?}",
+                result.iter().map(|s| &s.labels).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn test_sum_by_job() {
+        let by = vec!["job".to_string()];
+        let result = aggregate_series(three_series(), AggOp::Sum, &by, false, &STEPS, None);
+        assert_eq!(result.len(), 2);
+        let api = group(&result, &[("job", "api")]);
+        assert_approx(api.samples[0].1, 30.0, 0.001); // 10+20 at t=0
+        assert_approx(api.samples[1].1, 3.0, 0.001); // 1+2 at t=60
+        let db = group(&result, &[("job", "db")]);
+        assert_approx(db.samples[0].1, 40.0, 0.001);
+        assert_approx(db.samples[1].1, 4.0, 0.001);
+    }
+
+    #[test]
+    fn test_avg_by_job() {
+        let by = vec!["job".to_string()];
+        let result = aggregate_series(three_series(), AggOp::Avg, &by, false, &STEPS, None);
+        let api = group(&result, &[("job", "api")]);
+        assert_approx(api.samples[0].1, 15.0, 0.001); // (10+20)/2
+        let db = group(&result, &[("job", "db")]);
+        assert_approx(db.samples[0].1, 40.0, 0.001); // single member
+    }
+
+    #[test]
+    fn test_min_max_by_job() {
+        let by = vec!["job".to_string()];
+        let min = aggregate_series(three_series(), AggOp::Min, &by, false, &STEPS, None);
+        assert_approx(group(&min, &[("job", "api")]).samples[0].1, 10.0, 0.001);
+        let max = aggregate_series(three_series(), AggOp::Max, &by, false, &STEPS, None);
+        assert_approx(group(&max, &[("job", "api")]).samples[0].1, 20.0, 0.001);
+    }
+
+    #[test]
+    fn test_count_by_job() {
+        let by = vec!["job".to_string()];
+        let result = aggregate_series(three_series(), AggOp::Count, &by, false, &STEPS, None);
+        assert_approx(group(&result, &[("job", "api")]).samples[0].1, 2.0, 0.001);
+        assert_approx(group(&result, &[("job", "db")]).samples[0].1, 1.0, 0.001);
+    }
+
+    #[test]
+    fn test_stddev_stdvar_by_job() {
+        let by = vec!["job".to_string()];
+        // api group values at t=0: [10, 20]. mean=15, var=((25)+(25))/2=25, sd=5.
+        let var = aggregate_series(three_series(), AggOp::Stdvar, &by, false, &STEPS, None);
+        assert_approx(group(&var, &[("job", "api")]).samples[0].1, 25.0, 0.001);
+        let sd = aggregate_series(three_series(), AggOp::Stddev, &by, false, &STEPS, None);
+        assert_approx(group(&sd, &[("job", "api")]).samples[0].1, 5.0, 0.001);
+    }
+
+    #[test]
+    fn test_quantile_by_job() {
+        let by = vec!["job".to_string()];
+        // api values at t=0: [10,20]. median = linear interp at rank 0.5 → 15.
+        let result =
+            aggregate_series(three_series(), AggOp::Quantile, &by, false, &STEPS, Some(0.5));
+        assert_approx(group(&result, &[("job", "api")]).samples[0].1, 15.0, 0.001);
+    }
+
+    #[test]
+    fn test_group_by_job() {
+        let by = vec!["job".to_string()];
+        let result = aggregate_series(three_series(), AggOp::Group, &by, false, &STEPS, None);
+        assert_eq!(result.len(), 2);
+        assert_approx(group(&result, &[("job", "api")]).samples[0].1, 1.0, 0.001);
+        assert_approx(group(&result, &[("job", "db")]).samples[0].1, 1.0, 0.001);
+    }
+
+    #[test]
+    fn test_sum_without_inst() {
+        // without(inst) drops `inst`, keeps `job` → same grouping as by(job) here,
+        // but the group key now also retains any other (here none) labels.
+        let without = vec!["inst".to_string()];
+        let result = aggregate_series(three_series(), AggOp::Sum, &without, true, &STEPS, None);
+        assert_eq!(result.len(), 2);
+        let api = group(&result, &[("job", "api")]);
+        assert_approx(api.samples[0].1, 30.0, 0.001);
+        let db = group(&result, &[("job", "db")]);
+        assert_approx(db.samples[0].1, 40.0, 0.001);
+    }
+
+    #[test]
+    fn test_sum_no_grouping_all_in_one() {
+        // No by/without labels → all three series collapse into one empty-labeled group.
+        let result = aggregate_series(three_series(), AggOp::Sum, &[], false, &STEPS, None);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].labels.is_empty());
+        assert_approx(result[0].samples[0].1, 70.0, 0.001); // 10+20+40
+        assert_approx(result[0].samples[1].1, 7.0, 0.001); // 1+2+4
+    }
+
+    #[test]
+    fn test_topk_bottomk_by_job() {
+        // topk(1) by (job): within each job group keep the single highest-valued series.
+        let by = vec!["job".to_string()];
+        let top = aggregate_series(three_series(), AggOp::Topk, &by, false, &STEPS, Some(1.0));
+        // api group: inst b (last value 2) > inst a (last value 1) → keep b.
+        let top_api: Vec<_> = top
+            .iter()
+            .filter(|s| s.labels.get("job").map(|j| j == "api").unwrap_or(false))
+            .collect();
+        assert_eq!(top_api.len(), 1);
+        assert_eq!(top_api[0].labels.get("inst").unwrap(), "b");
+
+        let bottom =
+            aggregate_series(three_series(), AggOp::Bottomk, &by, false, &STEPS, Some(1.0));
+        let bot_api: Vec<_> = bottom
+            .iter()
+            .filter(|s| s.labels.get("job").map(|j| j == "api").unwrap_or(false))
+            .collect();
+        assert_eq!(bot_api.len(), 1);
+        assert_eq!(bot_api[0].labels.get("inst").unwrap(), "a");
+    }
+
+    #[test]
+    fn test_build_group_key_modes() {
+        let labels: BTreeMap<String, String> =
+            [("job".into(), "api".into()), ("inst".into(), "a".into())].into();
+        // by(job)
+        let k = build_group_key(&labels, &["job".to_string()], false);
+        assert_eq!(k, [("job".to_string(), "api".to_string())].into());
+        // without(inst)
+        let k = build_group_key(&labels, &["inst".to_string()], true);
+        assert_eq!(k, [("job".to_string(), "api".to_string())].into());
+        // no grouping → empty key
+        let k = build_group_key(&labels, &[], false);
+        assert!(k.is_empty());
+    }
 }

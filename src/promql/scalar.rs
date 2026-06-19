@@ -274,4 +274,108 @@ mod tests {
         assert_approx(result[0].samples[1].1, 3.0, 0.001);
         assert_approx(result[0].samples[2].1, 0.0, 0.001);
     }
+
+    // ── Additional VictoriaMetrics-style scalar identities ──
+
+    #[test]
+    fn test_scalar_pi_exp0_ln1() {
+        assert_approx(apply_scalar_op(ScalarFunc::Pi, 0.0, &[]), std::f64::consts::PI, 1e-12);
+        assert_approx(apply_scalar_op(ScalarFunc::Exp, 0.0, &[]), 1.0, 1e-12);
+        assert_approx(apply_scalar_op(ScalarFunc::Ln, 1.0, &[]), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn test_scalar_ceil_floor_vm_cases() {
+        // VM TestExecSuccess: ceil(1.2)=2, floor(1.8)=1.
+        assert_approx(apply_scalar_op(ScalarFunc::Ceil, 1.2, &[]), 2.0, 1e-12);
+        assert_approx(apply_scalar_op(ScalarFunc::Floor, 1.8, &[]), 1.0, 1e-12);
+    }
+
+    #[test]
+    fn test_scalar_round_to_tenth() {
+        // round(2.34, 0.1) ≈ 2.3
+        assert_approx(apply_scalar_op(ScalarFunc::Round, 2.34, &[0.1]), 2.3, 1e-9);
+    }
+
+    #[test]
+    fn test_scalar_deg_rad_roundtrip() {
+        // rad(deg(x)) == x for an arbitrary angle.
+        let x = 1.234_f64;
+        let deg = apply_scalar_op(ScalarFunc::Deg, x, &[]);
+        let back = apply_scalar_op(ScalarFunc::Rad, deg, &[]);
+        assert_approx(back, x, 1e-12);
+    }
+
+    #[test]
+    fn test_apply_scalar_func_abs_over_two_sample_series() {
+        // Abs over [(0,-1),(60,-2)] → [(0,1),(60,2)]
+        let series = vec![TimeSeries {
+            labels: BTreeMap::new(),
+            samples: vec![(0.0, -1.0), (60.0, -2.0)],
+        }];
+        let result = apply_scalar_func(series, ScalarFunc::Abs, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].samples[0], (0.0, 1.0));
+        assert_eq!(result[0].samples[1], (60.0, 2.0));
+    }
+
+    // ── histogram_quantile ──
+    //
+    // Classic cumulative buckets (same non-le labels), one sample each — the impl reads
+    // samples.last(). Counts: le 0.1→1, 0.5→2, 1→5, +Inf→10 (total 10).
+    //
+    // Interpolation (mirroring compute_histogram_quantile): target = phi*total; find the
+    // first bucket whose cumulative count >= target, then linearly interpolate within it:
+    //   result = prev_le + (le - prev_le) * (target - prev_count) / (count - prev_count)
+
+    fn bucket(le: &str, count: f64) -> TimeSeries {
+        TimeSeries {
+            labels: [
+                ("__name__".into(), "http_request_duration_seconds_bucket".into()),
+                ("le".into(), le.into()),
+            ]
+            .into(),
+            samples: vec![(100.0, count)],
+        }
+    }
+
+    fn classic_buckets() -> Vec<TimeSeries> {
+        vec![
+            bucket("0.1", 1.0),
+            bucket("0.5", 2.0),
+            bucket("1", 5.0),
+            bucket("+Inf", 10.0),
+        ]
+    }
+
+    #[test]
+    fn test_histogram_quantile_p50() {
+        // phi=0.5 → target=5. First cumulative count >= 5 is le=1 (count 5).
+        // prev=(le 0.5, count 2). bucket_count=5-2=3. fraction=(5-2)/3=1.0.
+        // result = 0.5 + (1 - 0.5)*1.0 = 1.0.
+        let result = apply_scalar_func(classic_buckets(), ScalarFunc::HistogramQuantile, &[0.5]);
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].labels.contains_key("le"), "le label must be dropped");
+        assert_approx(result[0].samples[0].1, 1.0, 1e-9);
+    }
+
+    #[test]
+    fn test_histogram_quantile_finite_interpolation() {
+        // phi=0.3 → target=3. First cumulative count >= 3 is le=1 (count 5).
+        // prev=(le 0.5, count 2). bucket_count=3. fraction=(3-2)/3=1/3.
+        // result = 0.5 + (1 - 0.5)*(1/3) = 0.5 + 0.16666... = 0.66666...
+        let result = apply_scalar_func(classic_buckets(), ScalarFunc::HistogramQuantile, &[0.3]);
+        assert_approx(result[0].samples[0].1, 0.5 + 0.5 / 3.0, 1e-9);
+        // p30 falls between the 0.5 and 1 bucket boundaries.
+        assert!(result[0].samples[0].1 > 0.5 && result[0].samples[0].1 < 1.0);
+    }
+
+    #[test]
+    fn test_histogram_quantile_p90_in_inf_bucket() {
+        // phi=0.9 → target=9. First cumulative count >= 9 is +Inf (count 10).
+        // prev=(le 1, count 5). bucket_count=5. fraction=(9-5)/5=0.8.
+        // result = 1 + (+Inf - 1)*0.8 = +Inf (target lands in the unbounded top bucket).
+        let result = apply_scalar_func(classic_buckets(), ScalarFunc::HistogramQuantile, &[0.9]);
+        assert!(result[0].samples[0].1.is_infinite() && result[0].samples[0].1 > 0.0);
+    }
 }

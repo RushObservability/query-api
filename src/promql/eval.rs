@@ -330,6 +330,23 @@ async fn evaluate_scalar_call(
 /// Grafana rather than isolated points).
 const STALENESS_SECS: f64 = 300.0;
 
+/// Effective lookback/staleness window. Defaults to STALENESS_SECS (5m, the Prometheus
+/// default); override with RUSH_PROM_LOOKBACK_SECS. Lowering it makes a stopped series'
+/// flat carry-forward tail end sooner (closer to its last real sample) — at the cost of
+/// gaps for any live series scraped slower than this value. Used for BOTH the bucketing
+/// carry window and the selector fetch skirt so they stay consistent.
+fn prom_lookback_secs() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSH_PROM_LOOKBACK_SECS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&v| v >= 1.0)
+            .unwrap_or(STALENESS_SECS)
+    })
+}
+
 /// When `align` is true, step-align samples to step_timestamps (for instant vectors).
 /// When false, return all raw samples (for range vectors used by rate/increase/etc).
 async fn query_clickhouse(
@@ -400,7 +417,7 @@ async fn query_clickhouse(
     // Backward staleness window for the as-of lookup. Range queries use the 5m default;
     // a single-step instant query uses its own [start,end] lookback span.
     let staleness: f64 = if step_timestamps.len() >= 2 {
-        STALENESS_SECS
+        prom_lookback_secs()
     } else {
         (end_secs - start_secs).max(5.0)
     };
@@ -743,7 +760,7 @@ pub fn extract_lookback(expr: &Expr) -> f64 {
         }
         Expr::Unary(u) => extract_lookback(&u.expr),
         Expr::Paren(p) => extract_lookback(&p.expr),
-        _ => 300.0, // default 5m
+        _ => prom_lookback_secs(), // default 5m staleness (RUSH_PROM_LOOKBACK_SECS)
     }
 }
 

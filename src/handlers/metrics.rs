@@ -569,3 +569,121 @@ fn format_value(v: f64) -> String {
         format!("{v}")
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Tests — Tier 3: API param helpers + Prometheus response shape
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    // `use super::*;` re-exports the parent module's `use crate::models::metrics::*;`,
+    // so PromResponse/VectorData/MatrixData/etc. are already in scope here.
+    use super::*;
+
+    // ── parse_step ──
+
+    #[test]
+    fn test_parse_step_plain_seconds() {
+        assert_eq!(parse_step("15").unwrap(), 15.0);
+    }
+
+    #[test]
+    fn test_parse_step_durations() {
+        assert_eq!(parse_step("1m").unwrap(), 60.0);
+        assert_eq!(parse_step("5m").unwrap(), 300.0);
+        assert_eq!(parse_step("1h").unwrap(), 3600.0);
+        assert_eq!(parse_step("1h30m").unwrap(), 5400.0);
+    }
+
+    #[test]
+    fn test_parse_step_errors() {
+        assert!(parse_step("").is_err());
+        assert!(parse_step("abc").is_err());
+    }
+
+    // ── parse_timestamp ──
+
+    #[test]
+    fn test_parse_timestamp_unix_int() {
+        assert_eq!(parse_timestamp("1577836800").unwrap(), 1577836800.0);
+    }
+
+    #[test]
+    fn test_parse_timestamp_unix_float() {
+        assert_eq!(parse_timestamp("1234.5").unwrap(), 1234.5);
+    }
+
+    #[test]
+    fn test_parse_timestamp_rfc3339() {
+        // 2020-01-01T00:00:00Z == 1577836800 unix seconds.
+        assert_eq!(parse_timestamp("2020-01-01T00:00:00Z").unwrap(), 1577836800.0);
+    }
+
+    #[test]
+    fn test_parse_timestamp_error() {
+        assert!(parse_timestamp("garbage").is_err());
+    }
+
+    // ── format_value ──
+
+    #[test]
+    fn test_format_value() {
+        assert_eq!(format_value(f64::NAN), "NaN");
+        assert_eq!(format_value(f64::INFINITY), "+Inf");
+        assert_eq!(format_value(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(format_value(1.5), "1.5");
+        assert_eq!(format_value(166.0), "166");
+    }
+
+    // ── Prometheus response shapes ──
+
+    #[test]
+    fn test_vector_response_shape() {
+        let metric: BTreeMap<String, String> =
+            [("__name__".to_string(), "up".to_string())].into();
+        let resp = PromResponse {
+            status: "success",
+            data: VectorData {
+                result_type: "vector",
+                result: vec![VectorResult {
+                    metric,
+                    value: (1000.0, "1.5".into()),
+                }],
+            },
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["data"]["resultType"], "vector");
+        let value = &v["data"]["result"][0]["value"];
+        assert!(value.is_array());
+        assert_eq!(value[0], 1000.0);
+        assert_eq!(value[1], "1.5");
+        assert_eq!(v["data"]["result"][0]["metric"]["__name__"], "up");
+    }
+
+    #[test]
+    fn test_matrix_response_shape() {
+        let metric: BTreeMap<String, String> =
+            [("__name__".to_string(), "up".to_string())].into();
+        let resp = PromResponse {
+            status: "success",
+            data: MatrixData {
+                result_type: "matrix",
+                result: vec![MatrixResult {
+                    metric,
+                    values: vec![(1000.0, "1.5".into()), (1200.0, "2".into())],
+                }],
+            },
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["data"]["resultType"], "matrix");
+        let values = &v["data"]["result"][0]["values"];
+        assert!(values.is_array());
+        assert_eq!(values[0][0], 1000.0);
+        assert_eq!(values[0][1], "1.5");
+        assert_eq!(values[1][0], 1200.0);
+        assert_eq!(values[1][1], "2");
+        assert_eq!(v["data"]["result"][0]["metric"]["__name__"], "up");
+    }
+}

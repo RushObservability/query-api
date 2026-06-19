@@ -458,6 +458,35 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_predict_linear_zero_offset() {
+        // predict_linear(samples, 0) evaluates the regression line AT the last
+        // timestamp: slope*last_t + intercept. Hand-derived on the VM dataset:
+        // slope ≈ -0.2669 (test_compute_deriv), and the regression line at t=130
+        // is the predicted value with no future offset.
+        let samples = test_samples();
+        let slope = linear_regression_slope(&samples).unwrap();
+        let n = samples.len() as f64;
+        let mean_x = samples.iter().map(|(t, _)| t).sum::<f64>() / n;
+        let mean_y = samples.iter().map(|(_, v)| v).sum::<f64>() / n;
+        let intercept = mean_y - slope * mean_x;
+        let last_t = samples.last().unwrap().0;
+        let expected = slope * last_t + intercept;
+        let predicted = compute_predict_linear(&samples, 0.0).unwrap();
+        assert_approx(predicted, expected, 0.001);
+    }
+
+    #[test]
+    fn test_compute_deriv_via_linear_regression_slope() {
+        // deriv() is defined as the least-squares slope; cross-check the dispatch.
+        let samples = test_samples();
+        assert_approx(
+            compute_deriv(&samples).unwrap(),
+            linear_regression_slope(&samples).unwrap(),
+            1e-9,
+        );
+    }
+
+    #[test]
     fn test_compute_absent_over_time() {
         let samples = test_samples();
         assert_eq!(compute_absent_over_time(&samples), None);
