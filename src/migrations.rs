@@ -690,6 +690,13 @@ pub async fn run(url: &str, user: &str, password: &str, _config: &RushConfig) ->
         })?;
     }
 
+    // Audit log table. Built separately from the static MIGRATIONS list because
+    // its TTL is env-driven (RUSH_AUDIT_RETENTION_DAYS) and must be format!ed in.
+    if let Err(e) = create_audit_table(&client).await {
+        tracing::error!("audit_events migration failed: {e}");
+        return Err(e);
+    }
+
     tracing::info!("clickhouse migrations complete");
 
     // One-time backfill of the metric rollups from pre-existing raw data. The MVs only
@@ -702,6 +709,47 @@ pub async fn run(url: &str, user: &str, password: &str, _config: &RushConfig) ->
         tracing::warn!("metric rollup backfill failed (non-fatal): {e}");
     }
 
+    Ok(())
+}
+
+/// Create the append-only, hash-chained audit log table.
+///
+/// `observability.audit_events` is an **immutable** `MergeTree` (NOT
+/// ReplacingMergeTree) — rows are never updated or merged-away by key, so the
+/// hash chain stays intact. It is ORDER BY `seq` (the monotonic chain index)
+/// and partitioned monthly. Retention is its OWN long TTL (default 730 days,
+/// overridable via `RUSH_AUDIT_RETENTION_DAYS`) and is deliberately exempt from
+/// the per-tenant retention enforcer (see `retention_enforcer.rs`).
+async fn create_audit_table(client: &Client) -> anyhow::Result<()> {
+    let retention_days: u64 = std::env::var("RUSH_AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(730);
+
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS observability.audit_events (
+  id String,
+  seq UInt64,
+  timestamp DateTime64(9),
+  tenant_id String DEFAULT '_audit',
+  actor_id String, actor_name String, actor_type String,
+  action String,
+  resource_type String, resource_id String,
+  outcome String,
+  ip_address String, user_agent String, request_id String,
+  changes String DEFAULT '',
+  description String DEFAULT '',
+  metadata String DEFAULT '',
+  prev_hash String DEFAULT '', hash String DEFAULT ''
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY seq
+TTL toDateTime(timestamp) + INTERVAL {retention_days} DAY
+SETTINGS index_granularity = 8192"
+    );
+
+    tracing::info!(retention_days, "creating audit_events table");
+    client.query(&ddl).execute().await?;
     Ok(())
 }
 

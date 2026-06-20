@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension,
 };
@@ -175,6 +175,7 @@ pub struct SpanExportRequest {
 pub async fn export_query(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Json(req): Json<SpanExportRequest>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use crate::handlers::export;
@@ -188,6 +189,31 @@ pub async fn export_query(
 
     let cap = export::read_export_max_rows(&state).await;
     let limit = export::effective_limit(req.limit, cap);
+
+    // AUDIT: data export. Do NOT log the full search/query text — only a
+    // has_search boolean and the row cap.
+    {
+        let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
+            Some(tok) => state.config_db.get_session_user(&tok).await
+                .map(|c| (c.0, c.1))
+                .unwrap_or_default(),
+            None => (String::new(), String::new()),
+        };
+        state.audit.log(
+            crate::audit::AuditEvent::new("data.export", if actor_id.is_empty() { "anonymous" } else { "user" })
+                .actor(actor_id, actor_name)
+                .tenant(tenant.tenant_id.clone())
+                .resource("spans", tenant.tenant_id.clone())
+                .changes(serde_json::json!({
+                    "signal": "spans",
+                    "format": match req.format { export::ExportFormat::Csv => "csv", export::ExportFormat::Json => "json" },
+                    "limit": limit,
+                    "has_search": req.search.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+                }).to_string())
+                .description("spans exported")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        ).await;
+    }
 
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())

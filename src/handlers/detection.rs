@@ -144,6 +144,17 @@ pub async fn create_detection_rule(
             )
         })?;
 
+    // AUDIT: detection rule created.
+    state.audit.log(
+        crate::audit::AuditEvent::new("detection_rule.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("detection_rule", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "severity": req.severity, "enabled": req.enabled }).to_string())
+            .description("detection rule created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(DetectionRuleResponse::from(rule))))
 }
 
@@ -179,7 +190,7 @@ pub async fn update_detection_rule(
     Path(id): Path<String>,
     Json(req): Json<UpdateDetectionRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
@@ -248,6 +259,17 @@ pub async fn update_detection_rule(
             )
         })?;
 
+    // AUDIT: detection rule updated.
+    state.audit.log(
+        crate::audit::AuditEvent::new("detection_rule.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("detection_rule", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "severity": req.severity, "enabled": req.enabled }).to_string())
+            .description("detection rule updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(DetectionRuleResponse::from(rule)))
 }
 
@@ -259,7 +281,7 @@ pub async fn delete_detection_rule(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     // Verify ownership
     let existing = state
         .config_db
@@ -277,6 +299,18 @@ pub async fn delete_detection_rule(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
     }
+
+    // AUDIT: detection rule deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("detection_rule.delete", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("detection_rule", id.clone())
+            .changes(serde_json::json!({ "name": existing.name }).to_string())
+            .description("detection rule deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

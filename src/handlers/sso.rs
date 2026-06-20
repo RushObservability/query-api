@@ -556,6 +556,37 @@ pub async fn save_sso_provider(
         "SSO provider saved"
     );
 
+    // AUDIT: SSO provider config update. NEVER log client_secret or SAML cert —
+    // only non-sensitive config (name/protocol/issuer/enabled).
+    state.audit.log(
+        crate::audit::AuditEvent::new("sso.config_update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("sso_provider", id.clone())
+            .changes(serde_json::json!({
+                "name": req.name,
+                "protocol": req.protocol.as_deref().unwrap_or("oidc"),
+                "enabled": req.enabled.unwrap_or(false),
+                "issuer_url": req.issuer_url.as_deref().unwrap_or(""),
+                "client_id": req.client_id.as_deref().unwrap_or(""),
+                "client_secret_set": req.client_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+            }).to_string())
+            .description("sso provider config updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+    // Also emit an explicit enable/disable event reflecting the new state.
+    if let Some(enabled) = req.enabled {
+        state.audit.log(
+            crate::audit::AuditEvent::new(if enabled { "sso.enable" } else { "sso.disable" }, "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("sso_provider", id.clone())
+                .changes(serde_json::json!({ "enabled": enabled }).to_string())
+                .description("sso provider enabled state set")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        ).await;
+    }
+
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
 }
 
@@ -578,6 +609,16 @@ pub async fn delete_sso_provider(
             admin = %caller.1,
             "SSO provider deleted"
         );
+        // AUDIT: SSO provider deleted.
+        state.audit.log(
+            crate::audit::AuditEvent::new("sso.config_update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("sso_provider", id.clone())
+                .changes(serde_json::json!({ "deleted": true }).to_string())
+                .description("sso provider deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        ).await;
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((StatusCode::NOT_FOUND, "provider not found".to_string()))
@@ -617,13 +658,29 @@ pub async fn create_idp_group_mapping(
     headers: HeaderMap,
     Json(req): Json<CreateMappingRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let provider_id = req.provider_id.as_deref().unwrap_or("default");
 
     let id = state
         .config_db
         .create_idp_group_mapping(&req.idp_group, &req.rush_group_id, provider_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+
+    // AUDIT: IdP→group mapping created.
+    state.audit.log(
+        crate::audit::AuditEvent::new("sso.group_mapping_change", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("idp_group_mapping", id.clone())
+            .changes(serde_json::json!({
+                "action": "create",
+                "idp_group": req.idp_group,
+                "rush_group_id": req.rush_group_id,
+                "provider_id": provider_id
+            }).to_string())
+            .description("idp group mapping created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
 }
@@ -634,13 +691,23 @@ pub async fn delete_idp_group_mapping(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_idp_group_mapping(&id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if deleted {
+        // AUDIT: IdP→group mapping deleted.
+        state.audit.log(
+            crate::audit::AuditEvent::new("sso.group_mapping_change", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("idp_group_mapping", id.clone())
+                .changes(serde_json::json!({ "action": "delete" }).to_string())
+                .description("idp group mapping deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        ).await;
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((StatusCode::NOT_FOUND, "mapping not found".to_string()))

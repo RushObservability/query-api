@@ -56,25 +56,46 @@ pub async fn login(
         };
         state.login_limiter.insert(rate_key, (new_count, new_window));
         if new_count > 10 {
+            // AUDIT: rate-limit lockout. Awaited (low volume) — the audit logger
+            // swallows its own errors so this never affects the response.
+            state.audit.log(
+                crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
+                    .actor_name(req.username.clone())
+                    .outcome("failure")
+                    .description("login rate limit exceeded")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            ).await;
             return Err((StatusCode::TOO_MANY_REQUESTS, "too many login attempts, try again later".to_string()));
         }
     }
 
-    let (user_id, username, display_name, tenant_id, role) = state
+    let (user_id, username, display_name, tenant_id, role) = match state
         .config_db
         .authenticate(&req.username, &req.password).await
-        .ok_or_else(|| {
+    {
+        Some(u) => u,
+        None => {
             tracing::warn!(
                 event = "login_failed",
                 username = %req.username,
                 reason = "invalid_credentials",
                 "authentication failed"
             );
-            (
+            // AUDIT: failed login. Actor is anonymous (unauthenticated); record
+            // the attempted username so the trail shows who was targeted.
+            state.audit.log(
+                crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                    .actor_name(req.username.clone())
+                    .outcome("failure")
+                    .description("invalid username or password")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            ).await;
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 "invalid username or password".to_string(),
-            )
-        })?;
+            ));
+        }
+    };
 
     let token = state
         .config_db
@@ -89,6 +110,17 @@ pub async fn login(
         method = "local",
         "user authenticated"
     );
+
+    // AUDIT: successful login. `tenant_id` is the user's actual (affected)
+    // tenant — the row itself still lives in observability.audit_events.
+    state.audit.log(
+        crate::audit::AuditEvent::new("auth.login.success", "user")
+            .actor(user_id.clone(), username.clone())
+            .tenant(tenant_id.clone())
+            .outcome("success")
+            .description("user authenticated (local)")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     let cookie = session_cookie(&token, 86400);
 

@@ -151,7 +151,7 @@ pub async fn create_custom_skill(
     headers: HeaderMap,
     Json(req): Json<CreateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     validate_skill_fields(
         &req.name,
         &req.title,
@@ -178,6 +178,17 @@ pub async fn create_custom_skill(
         .create_custom_skill(&req, "").await
         .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
+    // AUDIT: custom skill created. Skill content is not logged (only name/title).
+    state.audit.log(
+        crate::audit::AuditEvent::new("skill.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("custom_skill", created.id.clone())
+            .changes(serde_json::json!({ "name": req.name, "title": req.title, "allowed_tools": req.allowed_tools }).to_string())
+            .description("custom skill created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json::<CustomSkill>(created)))
 }
 
@@ -187,7 +198,7 @@ pub async fn update_custom_skill(
     Path(id): Path<String>,
     Json(req): Json<UpdateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     // Fetch the existing skill so we can validate against its immutable name.
     let existing = state
         .config_db
@@ -210,6 +221,17 @@ pub async fn update_custom_skill(
         .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
 
+    // AUDIT: custom skill updated. Skill content is not logged.
+    state.audit.log(
+        crate::audit::AuditEvent::new("skill.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("custom_skill", id.clone())
+            .changes(serde_json::json!({ "name": existing.name, "title": req.title, "allowed_tools": req.allowed_tools }).to_string())
+            .description("custom skill updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(updated))
 }
 
@@ -218,7 +240,7 @@ pub async fn delete_custom_skill(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_custom_skill(&id).await
@@ -226,5 +248,16 @@ pub async fn delete_custom_skill(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "custom skill not found".to_string()));
     }
+
+    // AUDIT: custom skill deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("skill.delete", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("custom_skill", id.clone())
+            .description("custom skill deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }

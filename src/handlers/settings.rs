@@ -103,6 +103,18 @@ pub async fn create_api_key(
         "API key created"
     );
 
+    // AUDIT: API key created. NEVER log the key value or its hash — only the
+    // name, the public prefix, and the tenant.
+    state.audit.log(
+        crate::audit::AuditEvent::new("apikey.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("api_key", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "prefix": prefix, "tenant": caller.3 }).to_string())
+            .description("api key created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     // Return the full key ONLY on creation
     Ok(Json(ApiKeyCreated {
         id,
@@ -224,7 +236,7 @@ pub async fn set_rum_setting(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
     })?;
@@ -232,6 +244,18 @@ pub async fn set_rum_setting(
         tracing::error!(error = %e, "failed to save rum_enabled");
         (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
     })?;
+
+    // AUDIT: RUM setting change.
+    state.audit.log(
+        crate::audit::AuditEvent::new("settings.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("setting", "rum_enabled")
+            .changes(serde_json::json!({ "key": "rum_enabled", "value": enabled }).to_string())
+            .description("rum setting updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(serde_json::json!({ "enabled": enabled })))
 }
 
@@ -271,7 +295,7 @@ pub async fn set_cloudwatch_setting(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
     })?;
@@ -279,6 +303,17 @@ pub async fn set_cloudwatch_setting(
         tracing::error!(error = %e, "failed to save cloudwatch_enabled");
         (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
     })?;
+
+    // AUDIT: CloudWatch integration toggle.
+    state.audit.log(
+        crate::audit::AuditEvent::new("integration.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("integration", "cloudwatch")
+            .changes(serde_json::json!({ "key": "cloudwatch_enabled", "enabled": enabled }).to_string())
+            .description("cloudwatch integration toggled")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
     // Optional default_tenant (UI hint only). Present → persist (empty clears it).
     if let Some(dt_val) = body.get("default_tenant") {
         let dt = dt_val.as_str().unwrap_or("").trim();
@@ -322,7 +357,7 @@ pub async fn set_deploy_markers_setting(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
     })?;
@@ -330,6 +365,18 @@ pub async fn set_deploy_markers_setting(
         tracing::error!(error = %e, "failed to save deploy_markers_enabled");
         (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
     })?;
+
+    // AUDIT: deploy-markers setting change.
+    state.audit.log(
+        crate::audit::AuditEvent::new("settings.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("setting", "deploy_markers_enabled")
+            .changes(serde_json::json!({ "key": "deploy_markers_enabled", "value": enabled }).to_string())
+            .description("deploy markers setting updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(serde_json::json!({ "enabled": enabled })))
 }
 
@@ -340,7 +387,7 @@ pub async fn set_export_max_rows(
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
-    crate::handlers::users::require_admin(&state, &headers).await?;
+    let caller = crate::handlers::users::require_admin(&state, &headers).await?;
 
     let value = body.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
         (axum::http::StatusCode::BAD_REQUEST, "missing or invalid 'value' (expected a positive integer)".to_string())
@@ -351,6 +398,17 @@ pub async fn set_export_max_rows(
         tracing::error!(error = %e, "failed to set export_max_rows");
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
     })?;
+
+    // AUDIT: export-max-rows setting change.
+    state.audit.log(
+        crate::audit::AuditEvent::new("settings.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("setting", "export_max_rows")
+            .changes(serde_json::json!({ "key": "export_max_rows", "value": value }).to_string())
+            .description("export max rows setting updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(Json(serde_json::json!({ "export_max_rows": value })))
 }
@@ -489,7 +547,26 @@ pub async fn set_sre_agent_settings(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
+
+    // Helper to emit a settings.update audit event for an sre-agent setting.
+    // No secrets are involved here, but we still log only key + value.
+    let audit_setting = |key: &'static str, value: serde_json::Value| {
+        let state = state.clone();
+        let caller = caller.clone();
+        let ctx = crate::audit::actor_context_from_headers(&headers);
+        async move {
+            state.audit.log(
+                crate::audit::AuditEvent::new("settings.update", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("setting", key)
+                    .changes(serde_json::json!({ "key": key, "value": value }).to_string())
+                    .description("sre-agent setting updated")
+                    .context(ctx),
+            ).await;
+        }
+    };
 
     // Optional `model` (free text; empty clears it → agent falls back to its LLM_MODEL env).
     // Saved first so it persists even on a toggle-only update.
@@ -502,6 +579,7 @@ pub async fn set_sre_agent_settings(
             tracing::error!(error = %e, "failed to save sre_agent_model");
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
         })?;
+        audit_setting("sre_agent_model", serde_json::json!(model)).await;
     }
 
     // Optional `reasoning_effort` (minimal/low/medium/high, or empty to clear).
@@ -515,6 +593,7 @@ pub async fn set_sre_agent_settings(
             tracing::error!(error = %e, "failed to save sre_agent_reasoning_effort");
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
         })?;
+        audit_setting("sre_agent_reasoning_effort", serde_json::json!(re)).await;
     }
 
     // Optional `allowed_models` policy: which models users may pick + per-model
@@ -562,6 +641,8 @@ pub async fn set_sre_agent_settings(
             tracing::error!(error = %e, "failed to save sre_agent_allowed_models");
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
         })?;
+        let model_ids: Vec<&str> = normalized.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str())).collect();
+        audit_setting("sre_agent_allowed_models", serde_json::json!(model_ids)).await;
     }
 
     // model/reasoning/policy-only update (no toggle, no budget) — done.
@@ -584,6 +665,7 @@ pub async fn set_sre_agent_settings(
             tracing::error!(error = %e, "failed to save sre_agent_enabled");
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
         })?;
+        audit_setting("sre_agent_enabled", serde_json::json!(enabled)).await;
         // Toggle-only update: budget fields are optional in this case.
         if body.get("max_tool_steps").is_none() && body.get("max_llm_calls").is_none() {
             return Ok(Json(serde_json::json!({ "enabled": enabled })));
@@ -610,6 +692,17 @@ pub async fn set_sre_agent_settings(
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
         })?;
     }
+
+    // AUDIT: sre-agent budget update.
+    state.audit.log(
+        crate::audit::AuditEvent::new("settings.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("setting", "sre_agent_budget")
+            .changes(serde_json::json!({ "key": "sre_agent_budget", "max_tool_steps": steps, "max_llm_calls": calls }).to_string())
+            .description("sre-agent budget updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(Json(serde_json::json!({ "max_tool_steps": steps, "max_llm_calls": calls })))
 }
@@ -719,5 +812,16 @@ pub async fn delete_api_key(
         admin = %caller.1,
         "API key deleted"
     );
+
+    // AUDIT: API key revoked/deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("apikey.revoke", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("api_key", id.clone())
+            .description("api key revoked")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }

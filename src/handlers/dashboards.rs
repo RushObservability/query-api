@@ -49,7 +49,7 @@ pub async fn create_dashboard(
     Json(req): Json<CreateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
@@ -82,6 +82,18 @@ pub async fn create_dashboard(
         .get_dashboard(&id, &tenant.tenant_id, &user_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created dashboard".to_string()))?;
+
+    // AUDIT: dashboard created.
+    state.audit.log(
+        crate::audit::AuditEvent::new("dashboard.create", "user")
+            .actor(user_id.clone(), username.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("dashboard", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "visibility": visibility }).to_string())
+            .description("dashboard created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(dashboard)))
 }
 
@@ -117,7 +129,7 @@ pub async fn update_dashboard(
     Json(req): Json<UpdateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let (user_id, _, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
+    let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
 
     let tags_json = serde_json::to_string(&req.tags)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -136,6 +148,18 @@ pub async fn update_dashboard(
         .get_dashboard(&id, &tenant.tenant_id, &user_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read dashboard".to_string()))?;
+
+    // AUDIT: dashboard updated.
+    state.audit.log(
+        crate::audit::AuditEvent::new("dashboard.update", "user")
+            .actor(user_id.clone(), username.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("dashboard", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "visibility": req.visibility }).to_string())
+            .description("dashboard updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(dashboard))
 }
 
@@ -146,7 +170,7 @@ pub async fn delete_dashboard(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let (user_id, _, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
+    let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
     let deleted = state
         .config_db
         .delete_dashboard(&id, &tenant.tenant_id, &user_id, &role).await
@@ -154,6 +178,17 @@ pub async fn delete_dashboard(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "dashboard not found".to_string()));
     }
+
+    // AUDIT: dashboard deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("dashboard.delete", "user")
+            .actor(user_id.clone(), username.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("dashboard", id.clone())
+            .description("dashboard deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

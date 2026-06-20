@@ -136,7 +136,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(input): Json<FirewallRuleInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let rule = validate(&input, id, created_at)?;
@@ -147,6 +147,18 @@ pub async fn create(
     state.config_db.upsert_metric_firewall(&rule).await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     reload(&state).await;
+
+    // AUDIT: metric firewall rule created.
+    state.audit.log(
+        crate::audit::AuditEvent::new("firewall.rule_create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("metric_firewall_rule", rule.id.clone())
+            .changes(serde_json::json!({ "name": rule.name, "action": rule.action, "enabled": rule.enabled == 1 }).to_string())
+            .description("metric firewall rule created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(rule)))
 }
 
@@ -157,7 +169,7 @@ pub async fn update(
     Path(id): Path<String>,
     Json(input): Json<FirewallRuleInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let existing = state.config_db.list_metric_firewall().await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     // Preserve the original created_at if the rule exists.
@@ -173,6 +185,18 @@ pub async fn update(
     state.config_db.upsert_metric_firewall(&rule).await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     reload(&state).await;
+
+    // AUDIT: metric firewall rule updated.
+    state.audit.log(
+        crate::audit::AuditEvent::new("firewall.rule_update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("metric_firewall_rule", rule.id.clone())
+            .changes(serde_json::json!({ "name": rule.name, "action": rule.action, "enabled": rule.enabled == 1 }).to_string())
+            .description("metric firewall rule updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::OK, Json(rule)))
 }
 
@@ -182,7 +206,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     // Deleting the last allow rule while a catch-all block exists would leave
     // the firewall blocking everything — reject it (delete the block first).
     let after: Vec<MetricFirewallRule> = state.config_db.list_metric_firewall().await
@@ -195,5 +219,16 @@ pub async fn delete(
         return Err((StatusCode::NOT_FOUND, "rule not found".into()));
     }
     reload(&state).await;
+
+    // AUDIT: metric firewall rule deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("firewall.rule_delete", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("metric_firewall_rule", id.clone())
+            .description("metric firewall rule deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }

@@ -69,7 +69,7 @@ pub async fn set_global_retention(
     headers: HeaderMap,
     Json(req): Json<SetGlobalRetentionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     if req.default_days < 1 {
         return Err((StatusCode::BAD_REQUEST, "default_days must be >= 1".to_string()));
     }
@@ -82,6 +82,24 @@ pub async fn set_global_retention(
         .config_db
         .set_global_retention(req.default_days, req.logs_days, req.metrics_days, req.apm_days).await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
+
+    // AUDIT: global retention update.
+    state.audit.log(
+        crate::audit::AuditEvent::new("retention.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("retention", "global")
+            .changes(serde_json::json!({
+                "scope": "global",
+                "default_days": req.default_days,
+                "logs_days": req.logs_days,
+                "metrics_days": req.metrics_days,
+                "apm_days": req.apm_days
+            }).to_string())
+            .description("global retention updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     get_global_retention(State(state), headers).await
 }
 
@@ -143,7 +161,7 @@ pub async fn set_tenant_retention(
     Path(id): Path<String>,
     Json(req): Json<SetRetentionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     // Verify tenant exists
     state
         .config_db
@@ -213,6 +231,21 @@ pub async fn set_tenant_retention(
         }
     }
 
+    // AUDIT: per-tenant retention update (one event per provided signal).
+    for (signal, maybe_days) in signals {
+        if let Some(days) = maybe_days {
+            state.audit.log(
+                crate::audit::AuditEvent::new("retention.update", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(id.clone())
+                    .resource("retention", &id)
+                    .changes(serde_json::json!({ "signal": signal, "days": days }).to_string())
+                    .description("tenant retention updated")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            ).await;
+        }
+    }
+
     // Return current state (auth already verified above)
     get_tenant_retention(State(state), headers, Path(id)).await
 }
@@ -223,7 +256,7 @@ pub async fn delete_tenant_retention(
     headers: HeaderMap,
     Path((id, signal)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     // Validate signal name
     if !["metrics", "traces", "logs"].contains(&signal.as_str()) {
         return Err((
@@ -250,6 +283,17 @@ pub async fn delete_tenant_retention(
             "no retention override found for this signal".to_string(),
         ));
     }
+
+    // AUDIT: per-tenant retention override removed (revert to global).
+    state.audit.log(
+        crate::audit::AuditEvent::new("retention.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(id.clone())
+            .resource("retention", &id)
+            .changes(serde_json::json!({ "signal": signal, "days": null }).to_string())
+            .description("tenant retention override removed")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

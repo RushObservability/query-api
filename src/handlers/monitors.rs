@@ -44,7 +44,7 @@ pub async fn create_monitor(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -147,6 +147,17 @@ pub async fn create_monitor(
             )
         })?;
 
+    // AUDIT: monitor created.
+    state.audit.log(
+        crate::audit::AuditEvent::new("monitor.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("monitor", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "monitor_type": req.monitor_type, "enabled": req.enabled }).to_string())
+            .description("monitor created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(MonitorResponse::from(monitor))))
 }
 
@@ -183,7 +194,7 @@ pub async fn update_monitor(
     Path(id): Path<String>,
     Json(req): Json<UpdateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -283,6 +294,17 @@ pub async fn update_monitor(
             )
         })?;
 
+    // AUDIT: monitor updated.
+    state.audit.log(
+        crate::audit::AuditEvent::new("monitor.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("monitor", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "monitor_type": req.monitor_type, "enabled": req.enabled }).to_string())
+            .description("monitor updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(MonitorResponse::from(monitor)))
 }
 
@@ -293,7 +315,7 @@ pub async fn delete_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_monitor(&id, &tenant.tenant_id).await
@@ -301,6 +323,17 @@ pub async fn delete_monitor(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
     }
+
+    // AUDIT: monitor deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("monitor.delete", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("monitor", id.clone())
+            .description("monitor deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

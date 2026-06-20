@@ -126,6 +126,27 @@ async fn resolve_tenant_from_headers(
     rush_tenant: Option<String>,
     session_token: Option<String>,
 ) -> String {
+    let resolved =
+        resolve_tenant_inner(state, auth_header, dd_key, rush_tenant, session_token).await;
+    // FINAL LOCKDOWN SAFETY NET: under no circumstances may the public request
+    // path resolve to the reserved `_audit` tenant. Even though every individual
+    // resolution branch already excludes it (header branch rejects it; API keys
+    // are bound to `default`; sessions resolve to a real user tenant), collapse
+    // any `_audit` here to `default` so audit data can never be read or written
+    // via the normal telemetry tenant scoping.
+    if resolved.eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT) {
+        return "default".to_string();
+    }
+    resolved
+}
+
+async fn resolve_tenant_inner(
+    state: &AppState,
+    auth_header: Option<String>,
+    dd_key: Option<String>,
+    rush_tenant: Option<String>,
+    session_token: Option<String>,
+) -> String {
     // ── Priority 1: Bearer token → fixed to the key's tenant ──
     // API keys are scoped to one tenant (for collectors, CI, Grafana).
     if let Some(val) = auth_header {
@@ -198,7 +219,19 @@ async fn resolve_tenant_from_headers(
     // This prevents unauthenticated ingest into locked tenants.
     if let Some(tenant_header) = rush_tenant {
         let tenant = tenant_header.trim().to_string();
-        if !tenant.is_empty() {
+        // LOCKDOWN: `_audit` is the reserved tamper-evident-audit tenant. It must
+        // NEVER be selectable via the public API (X-Rush-Tenant header or
+        // /t/{tenant} URL prefix), for ingest OR query. Treat any attempt to
+        // select it as "not allowed" and fall through to the normal resolution
+        // chain (which ends at "default"). Case-insensitive. (The tenant is also
+        // seeded disabled, so is_tenant_enabled would reject it anyway — this is
+        // an explicit belt-and-suspenders guard with a clear audit trail.)
+        if tenant.eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT) {
+            tracing::warn!(
+                method = "header",
+                "attempt to select reserved '_audit' tenant via public API — rejected"
+            );
+        } else if !tenant.is_empty() {
             if state.config_db.is_tenant_enabled(&tenant).await {
                 // If the request carries a session cookie, validate the user has
                 // group-based access to the requested tenant.
@@ -375,6 +408,8 @@ async fn main() -> anyhow::Result<()> {
         ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?
     );
     config_db.ensure_default_tenant().await?;
+    // Reserve the `_audit` tenant (seeded disabled) so it's never an ingest target.
+    config_db.ensure_audit_tenant().await?;
     config_db.ensure_global_retention().await?;
     config_db.ensure_default_admin().await?;
     config_db.ensure_default_groups().await?;
@@ -606,6 +641,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Tamper-evident audit logger. Built after migrations (the audit_events
+    // table exists) and after the `ch` client is constructed; loads the current
+    // hash-chain tail so a restart continues the same chain.
+    let audit = std::sync::Arc::new(rush_api::audit::AuditLogger::new(ch.clone()).await);
+
     let state = AppState {
         ch,
         writer,
@@ -615,6 +655,7 @@ async fn main() -> anyhow::Result<()> {
         config: wide_config,
         login_limiter,
         api_key_cache,
+        audit,
     };
 
     let inner = Router::new()
@@ -1130,6 +1171,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route("/api/v1/auth/logout", post(handlers::auth::logout))
         .route("/api/v1/auth/me", get(handlers::auth::me))
+        // Tamper-evident audit log (admin only)
+        .route("/api/v1/audit", get(handlers::audit::list_audit))
+        .route("/api/v1/audit/verify", get(handlers::audit::verify_audit))
         // Health
         .route("/healthz", get(handlers::health::healthz))
         // Catch-all for unmatched DD agent paths (debug logging)

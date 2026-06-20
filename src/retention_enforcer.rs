@@ -182,6 +182,13 @@ async fn apply_global_retention_ttls(ch: &Client, config_db: &ConfigDb) -> anyho
     .await
 }
 
+/// AUDIT EXEMPTION: this enforcer only ever touches the telemetry tables
+/// (logs/spans/metrics*/rum*) listed explicitly in `enforce_retention` and
+/// below, driven by per-tenant override rows from `list_all_tenant_retention()`.
+/// `observability.audit_events` is never in any of those lists and the reserved
+/// `_audit` tenant has no retention overrides, so audit data is governed solely
+/// by the table's own long TTL (RUSH_AUDIT_RETENTION_DAYS, default 730d) and is
+/// never deleted by tenant retention.
 async fn enforce_tenant_retention(
     ch: &Client,
     config: &RushConfig,

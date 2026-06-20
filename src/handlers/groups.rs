@@ -98,7 +98,7 @@ pub async fn create_group(
     headers: HeaderMap,
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     let name = req.name.trim().to_string();
     if name.is_empty() {
@@ -130,6 +130,17 @@ pub async fn create_group(
             )
         })?;
 
+    // AUDIT: group creation.
+    state.audit.log(
+        crate::audit::AuditEvent::new("group.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("group", id.clone())
+            .changes(serde_json::json!({ "name": name, "scopes": scopes, "permissions": permissions }).to_string())
+            .description("group created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(group_response(row))))
 }
 
@@ -147,7 +158,8 @@ pub async fn update_group(
     Path(id): Path<String>,
     Json(req): Json<UpdateGroupRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
+    let permissions_changed = req.permissions.is_some();
 
     // Get current group to use as defaults
     let current = state
@@ -181,6 +193,28 @@ pub async fn update_group(
         .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
+    // AUDIT: group update (scopes/permissions/description).
+    state.audit.log(
+        crate::audit::AuditEvent::new("group.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("group", id.clone())
+            .changes(serde_json::json!({ "description": description, "scopes": scopes, "permissions": permissions }).to_string())
+            .description("group updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+    if permissions_changed {
+        state.audit.log(
+            crate::audit::AuditEvent::new("group.permissions_change", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("group", id.clone())
+                .changes(serde_json::json!({ "scopes": scopes, "permissions": permissions }).to_string())
+                .description("group permissions changed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        ).await;
+    }
+
     Ok(Json(group_response(row)))
 }
 
@@ -190,14 +224,25 @@ pub async fn delete_group(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     match state
         .config_db
         .delete_group(&id).await
         .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
     {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(true) => {
+            // AUDIT: group deletion.
+            state.audit.log(
+                crate::audit::AuditEvent::new("group.delete", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("group", id.clone())
+                    .description("group deleted")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            ).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
         Ok(false) => Err((StatusCode::NOT_FOUND, "group not found".to_string())),
         Err(msg) => Err((StatusCode::BAD_REQUEST, msg)),
     }
@@ -215,7 +260,7 @@ pub async fn set_group_tenants(
     Path(id): Path<String>,
     Json(req): Json<SetGroupTenantsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     // Verify group exists
     state
@@ -234,6 +279,17 @@ pub async fn set_group_tenants(
         .get_group(&id).await
         .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+
+    // AUDIT: group-to-tenant binding change.
+    state.audit.log(
+        crate::audit::AuditEvent::new("group.tenant_binding_change", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("group", id.clone())
+            .changes(serde_json::json!({ "tenant_ids": req.tenant_ids }).to_string())
+            .description("group tenant bindings changed")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(Json(group_response(row)))
 }
@@ -266,7 +322,7 @@ pub async fn set_user_groups(
     Path(user_id): Path<String>,
     Json(req): Json<SetUserGroupsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     state
         .config_db
@@ -277,6 +333,17 @@ pub async fn set_user_groups(
         .config_db
         .get_user_groups(&user_id).await
         .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+
+    // AUDIT: user group membership change (effective role/permission change).
+    state.audit.log(
+        crate::audit::AuditEvent::new("user.role_change", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("user", user_id.clone())
+            .changes(serde_json::json!({ "group_ids": req.group_ids }).to_string())
+            .description("user group membership changed")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(Json(serde_json::json!({ "group_ids": group_ids })))
 }

@@ -164,6 +164,17 @@ pub async fn create_user(
         "user created"
     );
 
+    // AUDIT: user creation. Never log the password — only username/display_name/id.
+    state.audit.log(
+        crate::audit::AuditEvent::new("user.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("user", id.clone())
+            .changes(serde_json::json!({ "username": username, "display_name": display_name }).to_string())
+            .description("user created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(user_response(row))))
 }
 
@@ -204,6 +215,17 @@ pub async fn delete_user(
         admin = %caller.1,
         "user deleted"
     );
+
+    // AUDIT: user deletion.
+    state.audit.log(
+        crate::audit::AuditEvent::new("user.delete", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("user", id.clone())
+            .changes(serde_json::json!({ "username": username }).to_string())
+            .description("user deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -249,6 +271,20 @@ pub async fn change_password(
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
     }
 
+    // AUDIT: password change. NEVER log the password value.
+    state.audit.log(
+        crate::audit::AuditEvent::new("user.password_change", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("user", id.clone())
+            .description(if caller.4 == "admin" && caller.0 != id {
+                "password reset by admin"
+            } else {
+                "password changed"
+            })
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -259,7 +295,7 @@ pub async fn toggle_user(
     Path(id): Path<String>,
     Json(req): Json<ToggleUserRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     let updated = state
         .config_db
@@ -275,6 +311,17 @@ pub async fn toggle_user(
         .get_user(&id).await
         .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
+
+    // AUDIT: user enable/disable.
+    state.audit.log(
+        crate::audit::AuditEvent::new("user.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("user", id.clone())
+            .changes(serde_json::json!({ "enabled": req.enabled }).to_string())
+            .description("user enabled state changed")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     Ok(Json(user_response(row)))
 }

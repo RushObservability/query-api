@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension,
 };
@@ -286,6 +286,7 @@ pub struct LogExportRequest {
 pub async fn export_logs(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Json(req): Json<LogExportRequest>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use crate::handlers::export;
@@ -299,6 +300,31 @@ pub async fn export_logs(
 
     let cap = export::read_export_max_rows(&state).await;
     let limit = export::effective_limit(req.limit, cap);
+
+    // AUDIT: data export. Do NOT log the full search/query text (it may contain
+    // sensitive values) — only a has_search boolean and the row cap.
+    {
+        let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
+            Some(tok) => state.config_db.get_session_user(&tok).await
+                .map(|c| (c.0, c.1))
+                .unwrap_or_default(),
+            None => (String::new(), String::new()),
+        };
+        state.audit.log(
+            crate::audit::AuditEvent::new("data.export", if actor_id.is_empty() { "anonymous" } else { "user" })
+                .actor(actor_id, actor_name)
+                .tenant(tenant.tenant_id.clone())
+                .resource("logs", tenant.tenant_id.clone())
+                .changes(serde_json::json!({
+                    "signal": "logs",
+                    "format": match req.format { export::ExportFormat::Csv => "csv", export::ExportFormat::Json => "json" },
+                    "limit": limit,
+                    "has_search": req.search.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+                }).to_string())
+                .description("logs exported")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        ).await;
+    }
 
     let select_cols = "Timestamp, TraceId, SpanId, SeverityText, SeverityNumber, \
          ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";

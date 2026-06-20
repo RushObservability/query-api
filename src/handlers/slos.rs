@@ -35,7 +35,7 @@ pub async fn create_slo(
     headers: HeaderMap,
     Json(req): Json<CreateSloRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid slo_type: {}", req.slo_type)));
     }
@@ -119,6 +119,17 @@ pub async fn create_slo(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created slo".to_string()))?;
 
+    // AUDIT: SLO created.
+    state.audit.log(
+        crate::audit::AuditEvent::new("slo.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("slo", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "slo_type": req.slo_type, "indicator_type": req.indicator_type, "enabled": req.enabled }).to_string())
+            .description("slo created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(SloResponse::from(slo))))
 }
 
@@ -152,7 +163,7 @@ pub async fn update_slo(
     Path(id): Path<String>,
     Json(req): Json<UpdateSloRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid slo_type: {}", req.slo_type)));
     }
@@ -233,6 +244,17 @@ pub async fn update_slo(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read slo".to_string()))?;
 
+    // AUDIT: SLO updated.
+    state.audit.log(
+        crate::audit::AuditEvent::new("slo.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("slo", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "slo_type": req.slo_type, "indicator_type": req.indicator_type, "enabled": req.enabled }).to_string())
+            .description("slo updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(SloResponse::from(slo)))
 }
 
@@ -242,7 +264,7 @@ pub async fn delete_slo(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_slo(&id, &tenant.tenant_id).await
@@ -250,6 +272,17 @@ pub async fn delete_slo(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "slo not found".to_string()));
     }
+
+    // AUDIT: SLO deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("slo.delete", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("slo", id.clone())
+            .description("slo deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

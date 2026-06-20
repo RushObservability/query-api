@@ -242,7 +242,7 @@ pub async fn create_anomaly_rule(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid source: {}", req.source)));
@@ -282,6 +282,17 @@ pub async fn create_anomaly_rule(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created rule".to_string()))?;
 
+    // AUDIT: anomaly rule created.
+    state.audit.log(
+        crate::audit::AuditEvent::new("anomaly_rule.create", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("anomaly_rule", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "source": req.source, "enabled": req.enabled }).to_string())
+            .description("anomaly rule created")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(AnomalyRuleResponse::from(rule))))
 }
 
@@ -315,7 +326,7 @@ pub async fn update_anomaly_rule(
     Path(id): Path<String>,
     Json(req): Json<UpdateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid source: {}", req.source)));
@@ -357,6 +368,17 @@ pub async fn update_anomaly_rule(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read rule".to_string()))?;
 
+    // AUDIT: anomaly rule updated.
+    state.audit.log(
+        crate::audit::AuditEvent::new("anomaly_rule.update", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("anomaly_rule", id.clone())
+            .changes(serde_json::json!({ "name": req.name, "source": req.source, "enabled": req.enabled }).to_string())
+            .description("anomaly rule updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(AnomalyRuleResponse::from(rule)))
 }
 
@@ -366,7 +388,7 @@ pub async fn delete_anomaly_rule(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_anomaly_rule(&id, &tenant.tenant_id).await
@@ -374,6 +396,17 @@ pub async fn delete_anomaly_rule(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "anomaly rule not found".to_string()));
     }
+
+    // AUDIT: anomaly rule deleted.
+    state.audit.log(
+        crate::audit::AuditEvent::new("anomaly_rule.delete", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("anomaly_rule", id.clone())
+            .description("anomaly rule deleted")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

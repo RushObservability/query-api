@@ -871,6 +871,31 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Seed the reserved `_audit` tenant row, DISABLED (enabled=0).
+    ///
+    /// This makes `_audit` a known/reserved tenant id+name so it can never be
+    /// accidentally created as a normal tenant, while `enabled=0` guarantees
+    /// `is_tenant_enabled("_audit")` is false — so the tenant middleware will
+    /// never resolve `_audit` as an ingest/query target. Belt-and-suspenders
+    /// with the explicit reject in `resolve_tenant_from_headers`. `auth_required=1`
+    /// for good measure. Mirrors `ensure_default_tenant`.
+    pub async fn ensure_audit_tenant(&self) -> anyhow::Result<()> {
+        let existing = self.get_tenant(crate::audit::AUDIT_TENANT).await?;
+        if existing.is_none() {
+            let ver = Self::next_version();
+            let now = Self::now_str();
+            self.client
+                .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 0, 1, ?, ?, 0)")
+                .bind(crate::audit::AUDIT_TENANT)
+                .bind(crate::audit::AUDIT_TENANT)
+                .bind(&now)
+                .bind(ver)
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn resolve_tenant_for_api_key(&self, key_hash: &str) -> anyhow::Result<Option<String>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row { tenant_id: String }

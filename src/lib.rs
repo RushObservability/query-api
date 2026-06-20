@@ -1,5 +1,6 @@
 pub mod alert_engine;
 pub mod anomaly_engine;
+pub mod audit;
 pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
@@ -176,4 +177,6 @@ pub struct AppState {
     pub login_limiter: Arc<DashMap<String, (u32, Instant)>>,
     /// API key resolution cache: key_hash → (tenant_id, cached_at). TTL 60s.
     pub api_key_cache: Arc<DashMap<String, (String, Instant)>>,
+    /// Tamper-evident audit log writer (hash-chained, serialized). Shared.
+    pub audit: Arc<audit::AuditLogger>,
 }
