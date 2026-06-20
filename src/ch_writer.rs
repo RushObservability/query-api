@@ -3,8 +3,9 @@
 /// Normal path:  caller builds a `SpoolBatch`, calls `ChWriter::write`.
 ///               `write` calls `try_insert` directly → zero extra latency.
 ///
-/// Failure path: if `try_insert` returns an error the batch is serialised to
-///               JSON and handed to `Spool::append`.  If the spool is full a
+/// Failure path: if `try_insert` returns an error the batch is serialised (see
+///               `encode_spool`: zstd-compressed MessagePack) and handed to
+///               `Spool::append`.  If the spool is full a
 ///               `WriteError::Backpressure` is returned (→ HTTP 429).
 ///
 /// Replay:       `spawn_replayer` consumes the oldest segment every ~5 s,
@@ -151,6 +152,53 @@ impl SpoolBatch {
             // Variant mismatch is a programming error (slots keep them apart).
             _ => debug_assert!(false, "extend_from called with mismatched SpoolBatch variants"),
         }
+    }
+}
+
+// ─── Spool payload codec ───────────────────────────────────────────────────────
+//
+// Spooled batches are stored as `[1-byte format tag][body]`. New writes use
+// zstd-compressed MessagePack — far cheaper in CPU and bytes than the JSON this
+// path used previously, which matters because a CH outage can spool large
+// batches while the process is already under pressure. Reads accept every
+// historical format so a rolling deploy (or a restart with already-spooled
+// segments) drains cleanly:
+//
+//   0x01  MessagePack, uncompressed
+//   0x02  MessagePack, zstd-compressed   ← current write format
+//   else  legacy JSON — serde_json output for the externally-tagged SpoolBatch
+//         enum always begins with '{' (0x7B), so it can never collide with a tag.
+
+const SPOOL_FMT_MSGPACK: u8 = 0x01;
+const SPOOL_FMT_MSGPACK_ZSTD: u8 = 0x02;
+/// zstd level for spool payloads: low (fast). The spool is a failure-path buffer,
+/// so cheap CPU matters more than squeezing out the last few percent of ratio.
+const SPOOL_ZSTD_LEVEL: i32 = 3;
+
+/// Encode a batch for the spool: zstd-compressed MessagePack behind a format tag.
+fn encode_spool(batch: &SpoolBatch) -> Result<Vec<u8>, WriteError> {
+    let mp = rmp_serde::to_vec(batch)
+        .map_err(|e| WriteError::Fatal(format!("spool msgpack encode: {e}")))?;
+    let compressed = zstd::encode_all(mp.as_slice(), SPOOL_ZSTD_LEVEL)
+        .map_err(|e| WriteError::Fatal(format!("spool zstd encode: {e}")))?;
+    let mut out = Vec::with_capacity(compressed.len() + 1);
+    out.push(SPOOL_FMT_MSGPACK_ZSTD);
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+/// Decode a spool payload written by `encode_spool` OR any earlier format
+/// (uncompressed MessagePack, or legacy JSON). The replayer logs and skips the
+/// record on error, so any decode failure surfaces as an `Err` here.
+fn decode_spool(payload: &[u8]) -> anyhow::Result<SpoolBatch> {
+    match payload.first() {
+        Some(&SPOOL_FMT_MSGPACK_ZSTD) => {
+            let mp = zstd::decode_all(&payload[1..])?;
+            Ok(rmp_serde::from_slice(&mp)?)
+        }
+        Some(&SPOOL_FMT_MSGPACK) => Ok(rmp_serde::from_slice(&payload[1..])?),
+        // Legacy JSON (or empty/unknown) — fall back to serde_json.
+        _ => Ok(serde_json::from_slice(payload)?),
     }
 }
 
@@ -412,9 +460,8 @@ impl ChWriter {
                     "ch insert failed — spooling batch"
                 );
 
-                // Serialise to JSON for the spool.
-                let payload = serde_json::to_vec(&batch)
-                    .map_err(|e| WriteError::Fatal(format!("serde_json serialise: {e}")))?;
+                // Serialise for the spool (zstd-compressed MessagePack).
+                let payload = encode_spool(&batch)?;
 
                 match self.buffer.append(table, payload).await {
                     Ok(()) => Ok(()),
@@ -499,7 +546,7 @@ impl ChWriter {
 
                     let mut all_ok = true;
                     for (table, payload) in &drain.records {
-                        let batch: SpoolBatch = match serde_json::from_slice(payload) {
+                        let batch: SpoolBatch = match decode_spool(payload) {
                             Ok(b) => b,
                             Err(e) => {
                                 tracing::warn!(
@@ -718,6 +765,53 @@ mod batch_tests {
         assert_eq!(total, 5, "all buffered rows drained exactly once");
         // Second drain is empty.
         assert!(acc.drain_all().await.is_empty());
+    }
+
+    // ── Spool payload codec ──
+    //
+    // SpoolBatch's field tree doesn't derive PartialEq, so equality is checked
+    // via canonical JSON (serde_json::to_value), which is enough to confirm the
+    // decoded batch is structurally identical to the original.
+    fn same_batch(a: &SpoolBatch, b: &SpoolBatch) -> bool {
+        serde_json::to_value(a).unwrap() == serde_json::to_value(b).unwrap()
+    }
+
+    #[test]
+    fn spool_roundtrips_through_zstd_msgpack() {
+        let batch = gauge(3);
+        let encoded = encode_spool(&batch).expect("encode");
+        assert_eq!(encoded[0], SPOOL_FMT_MSGPACK_ZSTD, "new writes use the zstd-msgpack tag");
+        let decoded = decode_spool(&encoded).expect("decode");
+        assert!(same_batch(&batch, &decoded));
+        assert_eq!(decoded.len(), 3);
+    }
+
+    #[test]
+    fn spool_decode_accepts_legacy_json() {
+        // A payload written by the pre-change binary: raw serde_json, no tag byte.
+        let batch = gauge(2);
+        let legacy = serde_json::to_vec(&batch).unwrap();
+        assert_eq!(legacy[0], b'{', "legacy JSON starts with '{{', never a tag byte");
+        let decoded = decode_spool(&legacy).expect("legacy json still decodes");
+        assert!(same_batch(&batch, &decoded));
+    }
+
+    #[test]
+    fn spool_decode_accepts_uncompressed_msgpack() {
+        // The 0x01 (uncompressed MessagePack) format is also accepted on read.
+        let batch = gauge(4);
+        let mut payload = vec![SPOOL_FMT_MSGPACK];
+        payload.extend_from_slice(&rmp_serde::to_vec(&batch).unwrap());
+        let decoded = decode_spool(&payload).expect("uncompressed msgpack decodes");
+        assert!(same_batch(&batch, &decoded));
+    }
+
+    #[test]
+    fn spool_encoded_payload_is_not_json() {
+        // Guards the tag/JSON disambiguation: a new encoded payload must not be
+        // mistakable for legacy JSON.
+        let encoded = encode_spool(&gauge(1)).expect("encode");
+        assert!(serde_json::from_slice::<serde_json::Value>(&encoded).is_err());
     }
 }
 
