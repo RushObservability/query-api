@@ -151,39 +151,59 @@ pub async fn query_logs(
     // just the last hour first is nearly instant and usually returns enough rows.
     let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
 
-    let (rows, total) = if req.search.is_none() && req.offset == 0 {
-        // Fast path: try a narrow (last 1h) window first and ONLY run the full-range
-        // query when the narrow one doesn't fill the limit. The previous version
-        // join!'ed both queries, so the full-range scan always ran to completion even
-        // when the narrow result won — pure wasted I/O (up to range/1h × the work)
-        // for the common "browsing recent logs" case. The full query is now built and
-        // executed lazily, so the fast path never touches the full window. Trade-off:
-        // when data is sparse the two queries run sequentially instead of in parallel.
+    let (rows, total) = if req.offset == 0 {
+        // Progressive fast path (applies to browse AND free-text search): try a narrow
+        // recent window first and ONLY scan the full range when the narrow one doesn't
+        // fill the page.
+        //
+        // Browsing (no search term) already terminates early over wide ranges via
+        // read-in-order on the time-first primary key. A free-text term compiles to a
+        // `lower(Body) LIKE …` that defeats that early-termination, so a wide search
+        // would otherwise scan the entire range (measured ~31s over 48h on a hot,
+        // high-volume service). Starting with the last hour returns the newest matches
+        // in well under a second in the common "what's happening now" case; the search
+        // term is included in the narrow query so it benefits too (previously the narrow
+        // probe ran only for browse and passed `None`). When the narrow window doesn't
+        // fill the page we fall through to the full requested range, so results are
+        // never missed — the miss case just pays one cheap probe before the full scan.
         let narrow_to = &req.time_range.to;
-        let narrow_from = {
-            let to_dt = chrono::DateTime::parse_from_rfc3339(narrow_to)
-                .or_else(|_| chrono::DateTime::parse_from_rfc3339(&format!("{narrow_to}Z")))
-                .unwrap_or_else(|_| chrono::Utc::now().into());
-            (to_dt - chrono::Duration::hours(1)).to_rfc3339()
+        let to_dt = chrono::DateTime::parse_from_rfc3339(narrow_to)
+            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&format!("{narrow_to}Z")))
+            .unwrap_or_else(|_| chrono::Utc::now().into());
+        let from_dt = chrono::DateTime::parse_from_rfc3339(&req.time_range.from)
+            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&format!("{}Z", req.time_range.from)))
+            .ok();
+        // Only probe when the requested range is wider than the probe window — for an
+        // already-narrow range (e.g. a 5-minute zoom) the probe == full range, so skip
+        // straight to the single query and avoid a redundant round-trip.
+        let probe_from_dt = to_dt - chrono::Duration::hours(1);
+        let worth_probing = from_dt.map(|f| f < probe_from_dt).unwrap_or(true);
+
+        let narrow_rows = if worth_probing {
+            let narrow_from = probe_from_dt.to_rfc3339();
+            let narrow_clauses = build_log_where(&req.filters, &narrow_from, narrow_to, req.search.as_deref(), tenant_id);
+            let narrow_sql = format!(
+                "SELECT {select_cols} FROM logs {} \
+                 ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+                narrow_clauses.to_sql(),
+            );
+            crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
+                .fetch_all::<LogRecord>()
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+                })?
+        } else {
+            Vec::new()
         };
-        let narrow_clauses = build_log_where(&req.filters, &narrow_from, narrow_to, None, tenant_id);
-        let narrow_sql = format!(
-            "SELECT {select_cols} FROM logs {} \
-             ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
-            narrow_clauses.to_sql(),
-        );
-        let narrow_rows = crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
-            .fetch_all::<LogRecord>()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-            })?;
-        if (narrow_rows.len() as u64) >= limit {
+
+        if worth_probing && (narrow_rows.len() as u64) >= limit {
             let total = narrow_rows.len() as u64;
             (narrow_rows, total)
         } else {
-            // Sparse case: the recent window didn't fill the page — scan the full range.
+            // Narrow window didn't fill the page (or the range was already narrow):
+            // scan the full requested range.
             let full_sql = format!(
                 "SELECT {select_cols} FROM logs {} \
                  ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
@@ -395,6 +415,90 @@ pub async fn count_logs(
         })?;
 
     Ok(Json(buckets))
+}
+
+/// Adaptive time-bucketed "match histogram" request — same shape as a log
+/// query but only the time range, optional filters, and optional free-text
+/// search matter.
+#[derive(Debug, serde::Deserialize)]
+pub struct LogHistogramRequest {
+    pub time_range: TimeRange,
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+/// "Nice" bucket sizes (seconds). The histogram picks the smallest value that
+/// is >= the computed bucket so adjacent ranges snap to readable intervals
+/// (1s, 5s, 15s, … 6h, 1d) rather than arbitrary widths.
+const NICE_BUCKET_SECS: [u64; 11] = [1, 5, 15, 30, 60, 300, 900, 1800, 3600, 21600, 86400];
+
+/// Time-bucketed histogram of matching log lines across the selected range.
+/// Buckets adapt to the span (~120 buckets, snapped to a "nice" interval) so
+/// the UI can render a compact sparkline and let users zoom into a spike.
+pub async fn log_histogram(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(req): Json<LogHistogramRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+
+    if let Some(ref s) = req.search {
+        if s.len() > 512 {
+            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+        }
+    }
+
+    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+
+    // Parse from/to (RFC3339, tolerating a missing 'Z' like query_logs does) to
+    // size the bucket. Fall back to a 1s bucket if the range can't be parsed.
+    let parse_ts = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&format!("{s}Z")))
+    };
+    let from_dt = parse_ts(&req.time_range.from);
+    let to_dt = parse_ts(&req.time_range.to);
+    let span_secs = match (&from_dt, &to_dt) {
+        (Ok(f), Ok(t)) => (t.timestamp() - f.timestamp()).max(1) as u64,
+        _ => 1,
+    };
+    // Aim for ~120 buckets, then snap up to the smallest "nice" interval.
+    let computed = (span_secs / 120).max(1);
+    let bucket_secs = NICE_BUCKET_SECS
+        .iter()
+        .copied()
+        .find(|&n| n >= computed)
+        .unwrap_or(computed);
+
+    let sql = format!(
+        "SELECT toUnixTimestamp(toStartOfInterval(Timestamp, INTERVAL {bucket_secs} SECOND)) AS bucket, \
+         count() AS c \
+         FROM logs {} \
+         GROUP BY bucket \
+         ORDER BY bucket",
+        clauses.to_sql(),
+    );
+
+    #[derive(Debug, clickhouse::Row, serde::Deserialize)]
+    struct HistoRow { bucket: i64, c: u64 }
+
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<HistoRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "logs", handler = "log_histogram", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
+
+    #[derive(serde::Serialize)]
+    struct Bucket { ts: i64, count: u64 }
+    #[derive(serde::Serialize)]
+    struct Resp { interval_secs: u64, buckets: Vec<Bucket> }
+
+    let buckets = rows.into_iter().map(|r| Bucket { ts: r.bucket, count: r.c }).collect();
+    Ok(Json(Resp { interval_secs: bucket_secs, buckets }))
 }
 
 /// Group logs by a single field (e.g. SeverityText) → top-N {field, count}.

@@ -633,6 +633,7 @@ async fn main() -> anyhow::Result<()> {
         // Log endpoints
         .route("/api/v1/logs", post(handlers::logs::query_logs))
         .route("/api/v1/logs/count", post(handlers::logs::count_logs))
+        .route("/api/v1/logs/histogram", post(handlers::logs::log_histogram))
         .route("/api/v1/logs/group", post(handlers::logs::group_logs))
         .route("/api/v1/logs/export", post(handlers::logs::export_logs))
         // Service catalog

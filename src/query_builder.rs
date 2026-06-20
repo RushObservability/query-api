@@ -469,19 +469,22 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
 
 /// Generate a ClickHouse predicate for a single free-text log search term.
 ///
-/// Mirrors the span search strategy so a multi-day haystack scan prunes granules:
-/// - Exact 32-hex / 16-hex terms route to `TraceId = …` / `SpanId = …`, using the
-///   `idx_trace_id` bloom filter (Idea 1: separate ID lookup from free text).
-/// - Every other term searches the single `lower(Body)` expression, backed by the
-///   native `text` index `idx_body_text` (ngrams(4)) via `LIKE`. Previously this OR'd
-///   in `positionCaseInsensitive(TraceId/SpanId/ServiceName/SeverityText, …)`, which are
-///   non-indexed — and a granule can only be skipped when EVERY OR branch is provably
-///   false, so those branches silently defeated the Body index and forced a full scan.
+/// Backed by the native `text` index `idx_body_text` on `lower(Body)`, which uses a
+/// word tokenizer (`splitByNonAlpha`). Strategy:
+/// - Exact 32-hex / 16-hex terms route to `TraceId = …` / `SpanId = …` (idx_trace_id
+///   bloom filter) — separate ID lookup from free text.
+/// - A `*` wildcard term falls back to a substring `lower(Body) LIKE` (no index
+///   acceleration, but correct) — the token index can't serve arbitrary substrings.
+/// - Every other term is split into word tokens the same way the index tokenizes
+///   (`splitByNonAlpha`: maximal alphanumeric runs), and matched with `hasToken(...)`
+///   AND-ed together. A multi-word/quoted phrase therefore matches rows containing all
+///   of its words (not necessarily adjacent).
 ///
-/// Trade-off: free text no longer substring-matches ServiceName / SeverityText; those
-/// are queried via structured filters (which use their own bloom/set indexes).
+/// Trade-offs vs the previous `ngrams(4)` + `LIKE '%term%'` approach: the index is ~6×
+/// smaller and common-term scans are faster, but free text no longer substring-matches
+/// inside a token (`proxy` won't match `g3proxy`) and phrases lose exact adjacency.
 fn log_term_match_sql(term: &str) -> String {
-    // Idea 1: exact-ID fast path (TraceId is 32 hex, SpanId is 16 hex).
+    // Exact-ID fast path (TraceId is 32 hex, SpanId is 16 hex).
     let t = term.trim();
     if !t.is_empty() && !t.contains('*') && t.chars().all(|c| c.is_ascii_hexdigit()) {
         match t.len() {
@@ -491,13 +494,39 @@ fn log_term_match_sql(term: &str) -> String {
         }
     }
 
-    // Free text → single index-backed LIKE on lower(Body) (matches idx_body_text).
-    let escaped_lower = escape_string_literal(&term.to_lowercase());
-    let inner = escaped_lower
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-        .replace('*', "%");
-    format!("lower(Body) LIKE '%{inner}%'")
+    let lower = t.to_lowercase();
+
+    // Wildcard terms need substring semantics the token index can't provide → LIKE.
+    if lower.contains('*') {
+        let inner = escape_string_literal(&lower)
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('*', "%");
+        return format!("lower(Body) LIKE '%{inner}%'");
+    }
+
+    // Tokenize like the index (`splitByNonAlpha`): maximal alphanumeric runs.
+    let tokens: Vec<String> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    if tokens.is_empty() {
+        // Nothing tokenizable (e.g. pure punctuation) → substring LIKE fallback.
+        let inner = escape_string_literal(&lower).replace('%', "\\%").replace('_', "\\_");
+        return format!("lower(Body) LIKE '%{inner}%'");
+    }
+
+    let parts: Vec<String> = tokens
+        .iter()
+        .map(|tok| format!("hasToken(lower(Body), '{}')", escape_string_literal(tok)))
+        .collect();
+    if parts.len() == 1 {
+        parts.into_iter().next().unwrap()
+    } else {
+        format!("({})", parts.join(" AND "))
+    }
 }
 
 pub fn format_value(value: &serde_json::Value) -> String {
@@ -874,14 +903,26 @@ mod search_tests {
         assert!(sql.contains("JSONExtractString(attributes, 'db.system') = 'postgresql'"));
     }
 
-    // Log free text uses the single indexed lower(Body) LIKE, never the non-indexed
-    // positionCaseInsensitive columns that previously defeated the Body text index.
+    // Log free text uses the indexed token search on lower(Body), never the
+    // non-indexed positionCaseInsensitive columns that previously defeated the index.
     #[test]
-    fn log_free_text_uses_only_body_index() {
+    fn log_free_text_uses_token_index() {
+        // Single word → one hasToken.
         let sql = build_log_search_sql("timeout").unwrap();
-        assert_eq!(sql, "lower(Body) LIKE '%timeout%'");
+        assert_eq!(sql, "hasToken(lower(Body), 'timeout')");
         assert!(!sql.contains("positionCaseInsensitive"));
         assert!(!sql.contains("ServiceName"));
+
+        // Multi-word phrase → AND of per-word hasToken (matches all words).
+        let sql = build_log_search_sql("\"Using passed request\"").unwrap();
+        assert_eq!(
+            sql,
+            "(hasToken(lower(Body), 'using') AND hasToken(lower(Body), 'passed') AND hasToken(lower(Body), 'request'))"
+        );
+
+        // Wildcards fall back to a substring LIKE (token index can't serve them).
+        let sql = build_log_search_sql("time*").unwrap();
+        assert_eq!(sql, "lower(Body) LIKE '%time%%'");
         assert!(!sql.contains("hasToken"));
     }
 

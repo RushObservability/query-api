@@ -855,6 +855,16 @@ async fn apply_skip_indexes(client: &Client) {
         client.query(&sql).fetch_one::<IndexRow>().await.map(|r| r.count > 0).unwrap_or(false)
     }
 
+    // Full type string of an existing skip index (e.g. `text(tokenizer = ngrams(4))`),
+    // used to detect a stale definition that needs rebuilding.
+    async fn index_type_full(client: &Client, table: &str, name: &str) -> Option<String> {
+        let sql = format!(
+            "SELECT type_full AS v FROM system.data_skipping_indices \
+             WHERE database = 'observability' AND table = '{table}' AND name = '{name}' LIMIT 1"
+        );
+        client.query(&sql).fetch_one::<VerRow>().await.ok().map(|r| r.v)
+    }
+
     // Native `text` indexes are GA in 26.2+. Be conservative on parse failure.
     let text_supported = match client.query("SELECT version() AS v").fetch_one::<VerRow>().await {
         Ok(r) => {
@@ -889,7 +899,7 @@ async fn apply_skip_indexes(client: &Client) {
             table: "logs",
             text_name: "idx_body_text",
             text_ddl: "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
-                idx_body_text lower(Body) TYPE text(tokenizer = ngrams(4)) GRANULARITY 1",
+                idx_body_text lower(Body) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1",
             ngram_name: "idx_body_ngram",
             ngram_ddl: "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
                 idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
@@ -907,6 +917,29 @@ async fn apply_skip_indexes(client: &Client) {
         } else {
             (p.ngram_name, p.ngram_ddl, p.drop_on_ngram)
         };
+
+        // 0. Self-heal a stale text index. If idx_body_text exists but with an outdated
+        // definition (the old `ngrams(4)` tokenizer — ~9× the data in storage and
+        // net-negative for common terms — or a coarse granularity that only pruned at
+        // part level), drop it so the create step below rebuilds it with the current
+        // `splitByNonAlpha` DDL. This briefly leaves lower(Body) without a text index,
+        // which is unavoidable (a column may carry only ONE text index, so we cannot
+        // create-before-drop) and acceptable during a migration: free-text queries stay
+        // correct, just unaccelerated, until MATERIALIZE finishes in the background.
+        if text_supported && index_exists(client, p.table, want_name).await {
+            if let Some(tf) = index_type_full(client, p.table, want_name).await {
+                if !tf.contains("splitByNonAlpha") {
+                    tracing::info!(table = p.table, index = want_name, current = %tf,
+                        "rebuilding stale search index with current tokenizer");
+                    let drop_ddl = format!(
+                        "ALTER TABLE observability.{} DROP INDEX IF EXISTS {}", p.table, want_name);
+                    if let Err(e) = client.query(&drop_ddl).execute().await {
+                        tracing::warn!(table = p.table, index = want_name, error = %e,
+                            "failed to drop stale search index — leaving it in place");
+                    }
+                }
+            }
+        }
 
         // 1. Ensure the desired index exists (create + materialize) BEFORE dropping anything.
         if !index_exists(client, p.table, want_name).await {
