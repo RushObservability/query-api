@@ -15,6 +15,7 @@ pub mod dd_traces;
 pub mod otlp;
 pub mod metric_firewall;
 pub mod ingest_buffer;
+pub mod ingest_gate;
 pub mod deploys;
 pub mod detection;
 pub mod export;

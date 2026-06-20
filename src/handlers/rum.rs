@@ -315,7 +315,7 @@ pub async fn ingest(
         }
     }).collect();
 
-    state.writer.write(SpoolBatch::Rum(rum_rows)).await.map_err(|e| match e {
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Rum(rum_rows)).await.map_err(|e| match e {
         WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
@@ -373,7 +373,7 @@ pub async fn ingest(
             }
         }).collect();
 
-        if let Err(e) = state.writer.write(SpoolBatch::Spans(span_rows)).await {
+        if let Err(e) = crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(span_rows)).await {
             tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span write failed");
         } else {
             tracing::debug!(signal = "rum", synthetic_spans = trace_events.len(), "synthetic spans committed");
@@ -725,7 +725,7 @@ pub async fn ingest_replay(
         events_json,
     };
 
-    state.writer.write(SpoolBatch::RumReplay(vec![row])).await.map_err(|e| match e {
+    crate::handlers::ingest_gate::write_gated(&state, &tenant.tenant_id, SpoolBatch::RumReplay(vec![row])).await.map_err(|e| match e {
         WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;

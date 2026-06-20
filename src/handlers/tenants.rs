@@ -9,9 +9,44 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::handlers::users::{require_admin, require_auth};
 
+/// Per-signal on/off flags. Each field defaults to `true` (enabled) when
+/// omitted, so a tenant with no explicit config ingests every signal.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+pub struct SignalFlags {
+    #[serde(default = "default_true")]
+    pub logs: bool,
+    #[serde(default = "default_true")]
+    pub apm: bool,
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+    #[serde(default = "default_true")]
+    pub rum: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for SignalFlags {
+    fn default() -> Self {
+        SignalFlags { logs: true, apm: true, metrics: true, rum: true }
+    }
+}
+
+/// Resolve the effective signal flags for a tenant id (defaulting each to true).
+async fn resolve_signal_flags(state: &AppState, tenant_id: &str) -> SignalFlags {
+    SignalFlags {
+        logs: state.config_db.tenant_signal_enabled(tenant_id, "logs").await,
+        apm: state.config_db.tenant_signal_enabled(tenant_id, "apm").await,
+        metrics: state.config_db.tenant_signal_enabled(tenant_id, "metrics").await,
+        rum: state.config_db.tenant_signal_enabled(tenant_id, "rum").await,
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct CreateTenantRequest {
     pub name: String,
+    /// Optional per-signal enable flags; each defaults to enabled when omitted.
+    #[serde(default)]
+    pub signals: Option<SignalFlags>,
 }
 
 #[derive(serde::Deserialize)]
@@ -31,6 +66,26 @@ pub struct TenantResponse {
     pub enabled: bool,
     pub auth_required: bool,
     pub created_at: String,
+    /// Per-signal ingest enable flags (each defaults true when no row exists).
+    pub signals: SignalFlags,
+}
+
+impl TenantResponse {
+    /// Build a response, resolving the tenant's signal flags from config.
+    async fn build(
+        state: &AppState,
+        row: (String, String, bool, bool, String),
+    ) -> TenantResponse {
+        let signals = resolve_signal_flags(state, &row.0).await;
+        TenantResponse {
+            id: row.0,
+            name: row.1,
+            enabled: row.2,
+            auth_required: row.3,
+            created_at: row.4,
+            signals,
+        }
+    }
 }
 
 pub async fn list_tenants(
@@ -44,17 +99,9 @@ pub async fn list_tenants(
         .list_tenants().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
-    let tenants: Vec<TenantResponse> = if caller.4 == "admin" {
+    let visible: Vec<(String, String, bool, bool, String)> = if caller.4 == "admin" {
         // Admins see all tenants
-        rows.into_iter()
-            .map(|(id, name, enabled, auth_required, created_at)| TenantResponse {
-                id,
-                name,
-                enabled,
-                auth_required,
-                created_at,
-            })
-            .collect()
+        rows
     } else {
         // Non-admins see only tenants accessible via their groups
         let (_, _, accessible_ids) = state
@@ -66,15 +113,13 @@ pub async fn list_tenants(
 
         rows.into_iter()
             .filter(|(id, _, enabled, _, _)| *enabled && accessible_ids.contains(id))
-            .map(|(id, name, enabled, auth_required, created_at)| TenantResponse {
-                id,
-                name,
-                enabled,
-                auth_required,
-                created_at,
-            })
             .collect()
     };
+
+    let mut tenants: Vec<TenantResponse> = Vec::with_capacity(visible.len());
+    for row in visible {
+        tenants.push(TenantResponse::build(&state, row).await);
+    }
 
     Ok(Json(serde_json::json!({ "tenants": tenants })))
 }
@@ -110,6 +155,24 @@ pub async fn create_tenant(
         .create_tenant(&id, &name).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
 
+    // Persist any explicitly-disabled signals. Default is enabled, so we only
+    // need to write the ones turned off (writing enabled rows is harmless too).
+    if let Some(flags) = req.signals {
+        for (signal, enabled) in [
+            ("logs", flags.logs),
+            ("apm", flags.apm),
+            ("metrics", flags.metrics),
+            ("rum", flags.rum),
+        ] {
+            if !enabled {
+                state
+                    .config_db
+                    .set_tenant_signal(&id, signal, false).await
+                    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
+            }
+        }
+    }
+
     let tenant = state
         .config_db
         .get_tenant(&id).await
@@ -123,12 +186,7 @@ pub async fn create_tenant(
 
     Ok((
         StatusCode::CREATED,
-        Json(TenantResponse {
-            id: tenant.0,
-            name: tenant.1,
-            enabled: tenant.2,
-            auth_required: tenant.3, created_at: tenant.4,
-        }),
+        Json(TenantResponse::build(&state, tenant).await),
     ))
 }
 
@@ -154,12 +212,7 @@ pub async fn toggle_tenant(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
-    Ok(Json(TenantResponse {
-        id: tenant.0,
-        name: tenant.1,
-        enabled: tenant.2,
-        auth_required: tenant.3, created_at: tenant.4,
-    }))
+    Ok(Json(TenantResponse::build(&state, tenant).await))
 }
 
 pub async fn delete_tenant(
@@ -209,11 +262,120 @@ pub async fn set_auth_required(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
-    Ok(Json(TenantResponse {
-        id: tenant.0,
-        name: tenant.1,
-        enabled: tenant.2,
-        auth_required: tenant.3,
-        created_at: tenant.4,
-    }))
+    Ok(Json(TenantResponse::build(&state, tenant).await))
+}
+
+// ── Per-tenant ingest signal enable/disable ────────────────────────────────
+
+/// Dropped-event counts per signal (blocked ingest volume).
+#[derive(serde::Serialize, Default)]
+pub struct DroppedCounts {
+    pub logs: u64,
+    pub apm: u64,
+    pub metrics: u64,
+    pub rum: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct TenantSignalsResponse {
+    pub signals: SignalFlags,
+    /// Events dropped per signal over the last 24h because the signal is
+    /// disabled for this tenant.
+    pub dropped: DroppedCounts,
+}
+
+/// PUT body for signal flags — any omitted field is left unchanged.
+#[derive(serde::Deserialize)]
+pub struct SetSignalsRequest {
+    pub logs: Option<bool>,
+    pub apm: Option<bool>,
+    pub metrics: Option<bool>,
+    pub rum: Option<bool>,
+}
+
+/// Best-effort dropped-event counts (last 24h) from the usage store. Returns
+/// zeros if the query fails — visibility is non-critical.
+async fn dropped_counts(state: &AppState, tenant_id: &str) -> DroppedCounts {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct Row { signal: String, events: u64 }
+    let escaped = crate::query_builder::escape_string_literal(tenant_id);
+    let sql = format!(
+        "SELECT signal, sum(events_count) AS events \
+         FROM observability.tenant_usage \
+         WHERE tenant_id = '{escaped}' \
+           AND signal IN ('logs_dropped','apm_dropped','metrics_dropped','rum_dropped') \
+           AND bucket >= now() - INTERVAL 24 HOUR \
+         GROUP BY signal"
+    );
+    let mut out = DroppedCounts::default();
+    match state.ch.query(&sql).fetch_all::<Row>().await {
+        Ok(rows) => {
+            for r in rows {
+                match r.signal.as_str() {
+                    "logs_dropped" => out.logs = r.events,
+                    "apm_dropped" => out.apm = r.events,
+                    "metrics_dropped" => out.metrics = r.events,
+                    "rum_dropped" => out.rum = r.events,
+                    _ => {}
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, tenant_id = %tenant_id, "dropped_counts query failed");
+        }
+    }
+    out
+}
+
+/// GET /api/v1/tenants/{id}/signals
+pub async fn get_tenant_signals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    // Verify tenant exists.
+    state
+        .config_db
+        .get_tenant(&id).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
+
+    let signals = resolve_signal_flags(&state, &id).await;
+    let dropped = dropped_counts(&state, &id).await;
+    Ok(Json(TenantSignalsResponse { signals, dropped }))
+}
+
+/// PUT /api/v1/tenants/{id}/signals
+pub async fn set_tenant_signals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetSignalsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    // Verify tenant exists.
+    state
+        .config_db
+        .get_tenant(&id).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
+
+    for (signal, maybe_enabled) in [
+        ("logs", req.logs),
+        ("apm", req.apm),
+        ("metrics", req.metrics),
+        ("rum", req.rum),
+    ] {
+        if let Some(enabled) = maybe_enabled {
+            state
+                .config_db
+                .set_tenant_signal(&id, signal, enabled).await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
+        }
+    }
+
+    let signals = resolve_signal_flags(&state, &id).await;
+    let dropped = dropped_counts(&state, &id).await;
+    Ok(Json(TenantSignalsResponse { signals, dropped }))
 }

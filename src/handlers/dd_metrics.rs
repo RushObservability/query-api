@@ -227,13 +227,13 @@ pub async fn ingest_v1(
     };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            state.writer.write(SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            state.writer.write(SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
@@ -348,13 +348,13 @@ pub async fn ingest_v2(
     };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            state.writer.write(SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            state.writer.write(SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
@@ -428,7 +428,7 @@ pub async fn check_run(
         row
     }).collect();
 
-    state.writer.write(SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
         WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;

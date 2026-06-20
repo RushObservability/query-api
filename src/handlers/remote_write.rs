@@ -230,7 +230,7 @@ pub async fn prom_remote_write(
         }
     }
 
-    state.writer.write(SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
         WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;

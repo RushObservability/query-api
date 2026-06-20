@@ -103,6 +103,10 @@ pub struct ConfigDb {
     tenant_cache: DashMap<String, (TenantFlags, Instant)>,
     /// user_id → (scopes, permissions, tenant_ids).
     perms_cache: DashMap<String, ((Vec<String>, Vec<String>, Vec<String>), Instant)>,
+    /// (tenant_id_or_name, signal) → (enabled, cached_at). Hit on every ingest
+    /// request to decide drop-vs-write, so it mirrors the tenant_flags TTL cache.
+    /// Defaults (no stored row) are cached too so all-enabled tenants stay cheap.
+    signal_cache: DashMap<(String, String), (bool, Instant)>,
 }
 
 /// A metric firewall rule (storage + API shape). `enabled`/`*_regex` are 0/1.
@@ -168,6 +172,7 @@ impl ConfigDb {
             session_cache: DashMap::new(),
             tenant_cache: DashMap::new(),
             perms_cache: DashMap::new(),
+            signal_cache: DashMap::new(),
         };
         db.run_migrations().await?;
         Ok(db)
@@ -180,6 +185,7 @@ impl ConfigDb {
         self.session_cache.clear();
         self.tenant_cache.clear();
         self.perms_cache.clear();
+        self.signal_cache.clear();
     }
 
     fn cache_fresh(at: Instant) -> bool {
@@ -731,6 +737,19 @@ impl ConfigDb {
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (tenant_id, signal)",
 
+            // ── Tenant ingest signal enable/disable ───────────────────────────────
+            // Per (tenant, signal) on/off switch for ingest. Missing row = enabled,
+            // so tenants without explicit config keep ingesting every signal.
+            // signal ∈ {logs, apm, metrics, rum}.
+            "CREATE TABLE IF NOT EXISTS config_tenant_signals (
+                tenant_id  String,
+                signal     String,
+                enabled    UInt8,
+                version    UInt64,
+                is_deleted UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, signal)",
+
             // ── Global retention (singleton, id='global') ─────────────────────────
             // default_days applies to any signal whose per-signal value is 0 (inherit).
             // These are the MAXIMUM retention per signal — tenant overrides are clamped
@@ -1048,6 +1067,71 @@ impl ConfigDb {
             .fetch_all::<Row>()
             .await?;
         Ok(rows.into_iter().map(|r| (r.tenant_id, r.signal, r.retain_days)).collect())
+    }
+
+    // ── Tenant ingest-signal operations ────────────────────────────────────────
+
+    /// Whether `signal` ingest is enabled for `tenant_id_or_name`. Accepts a
+    /// tenant id OR name (cloudwatch/dd URL paths pass a name), resolving the id
+    /// the same way `tenant_flags` does. Defaults to TRUE when no explicit row
+    /// exists, so existing tenants keep ingesting everything. Cached per
+    /// (tenant, signal) with CONFIG_CACHE_TTL since this is hit on every ingest.
+    pub async fn tenant_signal_enabled(&self, tenant_id_or_name: &str, signal: &str) -> bool {
+        let key = (tenant_id_or_name.to_string(), signal.to_string());
+        if let Some(entry) = self.signal_cache.get(&key) {
+            let (enabled, at) = entry.value();
+            if Self::cache_fresh(*at) {
+                return *enabled;
+            }
+        }
+        // Resolve to a canonical id (name-or-id → id). Unknown tenant → keep the
+        // passed value as the key; default-enabled still applies.
+        let resolved = self.tenant_flags(tenant_id_or_name).await
+            .map(|(id, ..)| id)
+            .unwrap_or_else(|| tenant_id_or_name.to_string());
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row { enabled: u8 }
+        let result = self.client
+            .query("SELECT enabled FROM config_tenant_signals FINAL WHERE tenant_id = ? AND signal = ? AND is_deleted = 0 LIMIT 1")
+            .bind(&resolved)
+            .bind(signal)
+            .fetch_one::<Row>()
+            .await;
+        let enabled = match result {
+            Ok(r) => r.enabled != 0,
+            // No row (or any read error) → default enabled (backward compatible).
+            Err(_) => true,
+        };
+        self.signal_cache.insert(key, (enabled, Instant::now()));
+        enabled
+    }
+
+    /// Explicitly stored signal flags for a tenant (no defaults filled in).
+    pub async fn get_tenant_signals(&self, tenant_id: &str) -> anyhow::Result<Vec<(String, bool)>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row { signal: String, enabled: u8 }
+        let rows = self.client
+            .query("SELECT signal, enabled FROM config_tenant_signals FINAL WHERE tenant_id = ? AND is_deleted = 0")
+            .bind(tenant_id)
+            .fetch_all::<Row>()
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.signal, r.enabled != 0)).collect())
+    }
+
+    /// Upsert a tenant signal flag. Versioned (microseconds) like retention.
+    pub async fn set_tenant_signal(&self, tenant_id: &str, signal: &str, enabled: bool) -> anyhow::Result<()> {
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_tenant_signals (tenant_id, signal, enabled, version, is_deleted) VALUES (?, ?, ?, ?, 0)")
+            .bind(tenant_id)
+            .bind(signal)
+            .bind(if enabled { 1u8 } else { 0u8 })
+            .bind(ver)
+            .execute()
+            .await?;
+        self.invalidate_config_caches();
+        Ok(())
     }
 
     // ── Global retention operations ────────────────────────────────────────────

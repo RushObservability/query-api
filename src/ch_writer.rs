@@ -92,6 +92,27 @@ impl SpoolBatch {
         }
     }
 
+    /// Whether the batch has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Canonical ingest-signal category for this batch variant. One of
+    /// "logs", "apm", "metrics", "rum" — used by the per-tenant signal gate.
+    /// `apm` covers traces (spans), `metrics` covers all metric types.
+    pub fn signal_category(&self) -> &'static str {
+        match self {
+            SpoolBatch::Logs(_) => "logs",
+            SpoolBatch::Spans(_) | SpoolBatch::SpansRaw(_) => "apm",
+            SpoolBatch::Gauge(_)
+            | SpoolBatch::Sum(_)
+            | SpoolBatch::Histogram(_)
+            | SpoolBatch::ExpHistogram(_)
+            | SpoolBatch::Summary(_) => "metrics",
+            SpoolBatch::Rum(_) | SpoolBatch::RumReplay(_) => "rum",
+        }
+    }
+
     /// Stable index for this variant's per-table buffer slot (one slot per
     /// ClickHouse table). Used by the cross-request batcher to coalesce rows of
     /// the same variant from independent requests into one larger insert.

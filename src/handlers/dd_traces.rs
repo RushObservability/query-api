@@ -249,7 +249,7 @@ pub async fn ingest_v04(
         })
     }).collect();
 
-    state.writer.write(SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
         WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
@@ -386,7 +386,7 @@ pub async fn ingest_agent(
             convert_span(span, &span_env, &span_host, &tenant_arc)
         }).collect();
 
-        state.writer.write(SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
+        crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
             WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
             WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
         })?;
@@ -423,7 +423,7 @@ pub async fn ingest_agent(
                 })
             }).collect();
 
-            state.writer.write(SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
                 WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
                 WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
             })?;

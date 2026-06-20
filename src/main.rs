@@ -944,6 +944,12 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/tenants/{id}/auth",
             put(handlers::tenants::set_auth_required),
         )
+        // Per-tenant ingest signal enable/disable (logs / apm / metrics / rum)
+        .route(
+            "/api/v1/tenants/{id}/signals",
+            get(handlers::tenants::get_tenant_signals)
+                .put(handlers::tenants::set_tenant_signals),
+        )
         // Global retention caps (default + per-signal maximums)
         .route(
             "/api/v1/retention/global",

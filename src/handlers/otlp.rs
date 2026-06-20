@@ -382,9 +382,7 @@ pub async fn ingest_otlp_traces(
     // transform) and write directly to the single `spans` table — no spans_raw copy.
     let wide: Vec<crate::models::trace::WideEvent> =
         rows.into_iter().map(crate::models::trace::WideEvent::from).collect();
-    state
-        .writer
-        .write(SpoolBatch::Spans(wide))
+    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Spans(wide))
         .await
         .map_err(map_write_err)?;
 
@@ -493,9 +491,7 @@ pub async fn ingest_otlp_logs(
     }
 
     let count = rows.len();
-    state
-        .writer
-        .write(SpoolBatch::Logs(rows))
+    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows))
         .await
         .map_err(map_write_err)?;
 
@@ -783,31 +779,31 @@ pub async fn ingest_otlp_metrics(
     // Write each non-empty type batch concurrently.
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            state.writer.write(SpoolBatch::Gauge(gauge_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Gauge(gauge_rows)).await.map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            state.writer.write(SpoolBatch::Sum(sum_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Sum(sum_rows)).await.map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let histogram_fut = async {
         if !histogram_rows.is_empty() {
-            state.writer.write(SpoolBatch::Histogram(histogram_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Histogram(histogram_rows)).await.map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let exp_histogram_fut = async {
         if !exp_histogram_rows.is_empty() {
-            state.writer.write(SpoolBatch::ExpHistogram(exp_histogram_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::ExpHistogram(exp_histogram_rows)).await.map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let summary_fut = async {
         if !summary_rows.is_empty() {
-            state.writer.write(SpoolBatch::Summary(summary_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Summary(summary_rows)).await.map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
@@ -970,9 +966,7 @@ pub async fn ingest_vector_logs(
         .collect();
 
     let count = rows.len();
-    state
-        .writer
-        .write(SpoolBatch::Logs(rows))
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Logs(rows))
         .await
         .map_err(map_write_err)?;
 

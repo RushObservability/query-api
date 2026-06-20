@@ -28,6 +28,14 @@ impl UsageAccumulator {
             .or_insert((events, bytes));
     }
 
+    /// Record an ingest batch that was dropped because the signal is disabled
+    /// for the tenant. Lands in the same per-tenant usage store under the signal
+    /// name suffixed `_dropped` (e.g. "logs_dropped") so admins can see blocked
+    /// volume alongside accepted volume.
+    pub fn record_dropped(&self, tenant_id: &str, signal: &str, events: u64, bytes: u64) {
+        self.record(tenant_id, &format!("{signal}_dropped"), events, bytes);
+    }
+
     /// Spawn the background flush loop.
     pub fn spawn_flusher(&self, ch: Client) {
         let counters = self.counters.clone();

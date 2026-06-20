@@ -394,7 +394,7 @@ async fn ingest_firehose_inner(
     }
 
     let count = rows.len() as u64;
-    if let Err(e) = state.writer.write(SpoolBatch::Logs(rows)).await {
+    if let Err(e) = crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows)).await {
         let (status, msg) = match e {
             WriteError::Backpressure => (
                 StatusCode::TOO_MANY_REQUESTS,
