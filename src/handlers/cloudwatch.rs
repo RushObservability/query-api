@@ -161,9 +161,10 @@ fn firehose_response(request_id: &str, error: Option<&str>) -> Json<serde_json::
 
 /// POST /cloudwatch/firehose/t/{tenant} — AWS CloudWatch Logs via Kinesis Data
 /// Firehose HTTP-endpoint delivery. The tenant is taken from the URL path. An
-/// access key (X-Amz-Firehose-Access-Key) is optional: the customer may set one
-/// on the Firehose stream for defense-in-depth, but it is neither required nor
-/// used for tenant routing — the URL alone determines the tenant. Mirrors
+/// The tenant always comes from the URL path. If that tenant is NOT auth-required,
+/// no key is needed. If it IS auth-required, the caller must present a tenant-scoped
+/// API key as the Firehose access key (`X-Amz-Firehose-Access-Key`, or an
+/// `Authorization: Bearer` header) and it must resolve to this same tenant. Mirrors
 /// dd_logs::ingest_logs_with_tenant.
 pub async fn ingest_firehose_with_tenant(
     State(state): State<AppState>,
@@ -171,19 +172,75 @@ pub async fn ingest_firehose_with_tenant(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // No request_id parsed yet; echo whatever the Firehose header carries.
+    let request_id = headers
+        .get("x-amz-firehose-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     if !state.config_db.is_tenant_enabled(&tenant_override).await {
-        // No request_id parsed yet; echo whatever the Firehose header carries.
-        let request_id = headers
-            .get("x-amz-firehose-request-id")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
         return (
             StatusCode::BAD_REQUEST,
             firehose_response(&request_id, Some(&format!("tenant '{}' not found or disabled", tenant_override))),
         );
     }
+
+    // Enforce the tenant's auth policy. For an auth-required tenant, require a valid
+    // API key (resolving to this tenant) in the Firehose access-key or Bearer header.
+    if state.config_db.is_tenant_auth_required(&tenant_override).await {
+        if let Err(msg) = authorize_protected_tenant(&state, &tenant_override, &headers).await {
+            return (StatusCode::FORBIDDEN, firehose_response(&request_id, Some(&msg)));
+        }
+    }
+
     ingest_firehose_inner(state, tenant_override, headers, body).await
+}
+
+/// Verify the request carries a tenant-scoped API key (via X-Amz-Firehose-Access-Key
+/// or Authorization: Bearer) that resolves to `tenant`. Returns Err(message) otherwise.
+async fn authorize_protected_tenant(
+    state: &AppState,
+    tenant: &str,
+    headers: &HeaderMap,
+) -> Result<(), String> {
+    // Firehose's configured access key; fall back to a Bearer token for manual setups.
+    let key = headers
+        .get("x-amz-firehose-access-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer "))
+                .map(|v| v[7..].trim().to_string())
+        })
+        .filter(|k| !k.is_empty());
+
+    let Some(key) = key else {
+        return Err(format!(
+            "tenant '{tenant}' requires an API key — send a tenant-scoped key in the X-Amz-Firehose-Access-Key header"
+        ));
+    };
+
+    let key_hash = crate::handlers::settings::hash_api_key(&key);
+    let key_tenant = match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
+        Ok(Some(tid)) => tid,
+        _ => return Err("invalid API key".to_string()),
+    };
+
+    // The key resolves to a tenant id; the URL tenant may be a name or id. Resolve
+    // the URL tenant to its canonical id and compare.
+    let tenant_id = match state.config_db.get_tenant_id_by_name(tenant).await {
+        Ok(Some(id)) => id,
+        _ => tenant.to_string(),
+    };
+    if key_tenant == tenant_id || key_tenant == tenant {
+        Ok(())
+    } else {
+        Err("API key does not belong to this tenant".to_string())
+    }
 }
 
 async fn ingest_firehose_inner(
