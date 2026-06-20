@@ -98,6 +98,28 @@ impl SpoolBatch {
         self.len() == 0
     }
 
+    /// Approximate in-memory size of the batch in bytes: row count × the fixed in-memory
+    /// size of the row struct. This is a cheap, real, bounded figure (no serialization on
+    /// the hot path) used for the `rush_ingest_bytes_total` self-metric. It reflects
+    /// in-memory row footprint, not compressed wire/on-disk bytes — good enough for
+    /// relative ingest-volume trends without adding hot-path cost.
+    pub fn approx_bytes(&self) -> u64 {
+        use std::mem::size_of;
+        let per_row = match self {
+            SpoolBatch::SpansRaw(_) => size_of::<TraceInsertRow>(),
+            SpoolBatch::Spans(_) => size_of::<WideEvent>(),
+            SpoolBatch::Logs(_) => size_of::<LogInsertRow>(),
+            SpoolBatch::Gauge(_) => size_of::<GaugeRow>(),
+            SpoolBatch::Sum(_) => size_of::<SumRow>(),
+            SpoolBatch::Rum(_) => size_of::<RumRecord>(),
+            SpoolBatch::RumReplay(_) => size_of::<RumReplayChunk>(),
+            SpoolBatch::Histogram(_) => size_of::<HistogramRow>(),
+            SpoolBatch::ExpHistogram(_) => size_of::<ExpHistogramRow>(),
+            SpoolBatch::Summary(_) => size_of::<SummaryRow>(),
+        };
+        (self.len() as u64).saturating_mul(per_row as u64)
+    }
+
     /// Canonical ingest-signal category for this batch variant. One of
     /// "logs", "apm", "metrics", "rum" — used by the per-tenant signal gate.
     /// `apm` covers traces (spans), `metrics` covers all metric types.

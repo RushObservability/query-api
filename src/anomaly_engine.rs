@@ -101,8 +101,9 @@ pub fn spawn_anomaly_engine(
     ch: Client,
     smtp_config: SmtpConfig,
     prom_base_url: String,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) {
-    tokio::spawn(run_anomaly_engine(config_db, ch, smtp_config, prom_base_url));
+    tokio::spawn(run_anomaly_engine(config_db, ch, smtp_config, prom_base_url, self_metrics));
 }
 
 /// Run the anomaly engine loop forever. Call this directly from the standalone binary.
@@ -111,6 +112,7 @@ pub async fn run_anomaly_engine(
     ch: Client,
     smtp_config: SmtpConfig,
     prom_base_url: String,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) {
     let http_client = reqwest::Client::new();
     let smtp_transport = build_smtp_transport(&smtp_config);
@@ -122,9 +124,15 @@ pub async fn run_anomaly_engine(
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
-        if let Err(e) = eval_anomaly_rules(&config_db, &ch, &http_client, &smtp_config, &smtp_transport, &prom_base_url).await {
-            tracing::error!(error = %e, engine = "anomaly", "anomaly engine error");
-        }
+        let start = std::time::Instant::now();
+        let ok = match eval_anomaly_rules(&config_db, &ch, &http_client, &smtp_config, &smtp_transport, &prom_base_url).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, engine = "anomaly", "anomaly engine error");
+                false
+            }
+        };
+        self_metrics.record_engine("anomaly_engine", start.elapsed().as_millis() as u64, ok);
     }
 }
 

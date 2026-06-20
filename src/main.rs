@@ -6,6 +6,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{extract::Request, middleware::Next, response::Response};
+use axum::response::IntoResponse;
 use axum::http::{HeaderValue, header};
 use clickhouse::Client;
 use std::net::SocketAddr;
@@ -53,6 +54,76 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
         ),
     );
     resp
+}
+
+/// Middleware that records API RED self-metrics (`rush_http_*`) for every request.
+///
+/// Labels are bounded: `route` is the templated `MatchedPath` (a finite set of route
+/// patterns, NOT the raw URI), `method` is the HTTP method, and `status_class` is the
+/// 2xx/3xx/4xx/5xx family. The raw path and tenant_id are deliberately NOT used as labels.
+///
+/// `/metrics` and `/healthz` are skipped so scraping doesn't inflate the request counters.
+/// Cost on the hot path: one `MatchedPath` clone, atomic counter increments, one histogram
+/// observe (bounded linear scan), and a gauge inc/dec — no locks held across `.await`.
+async fn http_metrics_middleware(
+    State(state): State<AppState>,
+    matched: Option<axum::extract::MatchedPath>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Resolve the templated route up-front (finite cardinality). Fall back to "unmatched".
+    let route: String = matched
+        .as_ref()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    // Skip self-instrumentation for the scrape + health endpoints.
+    if route == "/metrics" || route == "/healthz" {
+        return next.run(req).await;
+    }
+
+    let method = req.method().as_str().to_string();
+    let sm = state.self_metrics.clone();
+
+    // In-flight gauge: inc on entry, dec on exit (even on panic-free early returns).
+    sm.add_gauge("rush_http_requests_in_flight", &[], 1.0);
+    let start = std::time::Instant::now();
+
+    let resp = next.run(req).await;
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    sm.add_gauge("rush_http_requests_in_flight", &[], -1.0);
+
+    let status = resp.status().as_u16();
+    let status_class = match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    };
+    sm.inc_counter(
+        "rush_http_requests_total",
+        &[("route", route.as_str()), ("method", method.as_str()), ("status_class", status_class)],
+        1,
+    );
+    sm.observe_histogram(
+        "rush_http_request_duration_ms",
+        &[("route", route.as_str()), ("method", method.as_str())],
+        elapsed_ms,
+    );
+
+    resp
+}
+
+/// Open `GET /metrics` handler: renders the self-metrics registry as Prometheus text
+/// exposition (version 0.0.4). No auth — same posture as `/healthz`.
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let body = state.self_metrics.render_prometheus();
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 /// Middleware that resolves the tenant for every request. Methods checked in
@@ -440,6 +511,13 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
         .unwrap_or(true);
 
+    // System-health self-metrics registry. Single in-process source of truth for the
+    // open `/metrics` Prometheus endpoint AND the self-ingested series the stats engine
+    // writes into our own metrics tables. Constructed before engine spawns + middleware
+    // so the same Arc is shared everywhere.
+    let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
+        std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
+
     // Spawn background engines (skipped in drain-worker-only mode)
     //
     // Each rule-evaluation engine runs in-process by default (single-binary /
@@ -459,7 +537,7 @@ async fn main() -> anyhow::Result<()> {
     // notification infrastructure (SmtpConfig, send_channel_notification) that
     // Monitors and the anomaly engine use; the rule-evaluation loop no longer runs.
     if engine_enabled("RUSH_RUN_SLO_ENGINE") {
-        slo_engine::spawn_slo_engine(config_db.clone(), ch.clone());
+        slo_engine::spawn_slo_engine(config_db.clone(), ch.clone(), self_metrics.clone());
     } else {
         tracing::info!("in-process slo engine disabled (RUSH_RUN_SLO_ENGINE=false); expecting a dedicated slo-engine deployment");
     }
@@ -478,16 +556,16 @@ async fn main() -> anyhow::Result<()> {
     if run_anomaly_in_process {
         let prom_base_url = std::env::var("RUSH_PROM_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:8080".to_string());
-        anomaly_engine::spawn_anomaly_engine(config_db.clone(), ch.clone(), smtp_config.clone(), prom_base_url);
+        anomaly_engine::spawn_anomaly_engine(config_db.clone(), ch.clone(), smtp_config.clone(), prom_base_url, self_metrics.clone());
     } else {
         tracing::info!("in-process anomaly engine disabled (RUSH_RUN_ANOMALY_ENGINE=false); expecting a dedicated anomaly-engine deployment");
     }
-    retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone(), config_db.clone());
+    retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone(), config_db.clone(), self_metrics.clone());
     // stats_engine is spawned after the ingest buffer is built (it emits buffer metrics).
 
     // Spawn the Datadog-style monitor engine (v2 alerting)
     if engine_enabled("RUSH_RUN_MONITOR_ENGINE") {
-        monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config);
+        monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config, self_metrics.clone());
     } else {
         tracing::info!("in-process monitor engine disabled (RUSH_RUN_MONITOR_ENGINE=false); expecting a dedicated monitor-engine deployment");
     }
@@ -495,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
     // Seed built-in SIEM detection rules and spawn the SIEM detection engine
     config_db.ensure_default_detection_rules().await?;
     if engine_enabled("RUSH_RUN_SIEM_ENGINE") {
-        siem_engine::spawn(ch.clone(), config_db.clone());
+        siem_engine::spawn(ch.clone(), config_db.clone(), self_metrics.clone());
     } else {
         tracing::info!("in-process siem engine disabled (RUSH_RUN_SIEM_ENGINE=false); expecting a dedicated siem-engine deployment");
     }
@@ -547,7 +625,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // Stats engine (emits ingest-buffer depth/age/drain metrics). API process only.
     if !drain_only {
-        stats_engine::spawn_stats_engine(ch.clone(), writer.buffer.clone());
+        stats_engine::spawn_stats_engine(ch.clone(), writer.buffer.clone(), self_metrics.clone());
     }
 
     // Drain-worker-only: this process exists solely to drain the ingest buffer
@@ -656,6 +734,7 @@ async fn main() -> anyhow::Result<()> {
         login_limiter,
         api_key_cache,
         audit,
+        self_metrics,
     };
 
     let inner = Router::new()
@@ -1176,6 +1255,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/audit/verify", get(handlers::audit::verify_audit))
         // Health
         .route("/healthz", get(handlers::health::healthz))
+        // System-health self-metrics (Prometheus exposition). OPEN — no auth, like /healthz.
+        .route("/metrics", get(metrics_handler))
         // Catch-all for unmatched DD agent paths (debug logging)
         .fallback(|req: axum::http::Request<axum::body::Body>| async move {
             tracing::warn!(
@@ -1241,6 +1322,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(security_headers_middleware))
+        // API RED self-metrics (rush_http_*). Applied as a router layer so the
+        // MatchedPath (templated route) is populated by routing before it runs.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
         .layer(TraceLayer::new_for_http())
         // Keep a writer handle for the graceful-shutdown flush before `state` is
         // consumed by `with_state`.

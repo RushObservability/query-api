@@ -17,6 +17,7 @@ pub mod query_builder;
 pub mod retention_enforcer;
 pub mod rollup;
 pub mod saml;
+pub mod self_metrics;
 pub mod siem_engine;
 pub mod slo_engine;
 pub mod spool;
@@ -179,4 +180,8 @@ pub struct AppState {
     pub api_key_cache: Arc<DashMap<String, (String, Instant)>>,
     /// Tamper-evident audit log writer (hash-chained, serialized). Shared.
     pub audit: Arc<audit::AuditLogger>,
+    /// In-process system-health self-metrics registry. Updated on the HTTP hot path,
+    /// the ingest path, and engine loops; rendered at the open `GET /metrics` endpoint
+    /// and self-ingested into our own metrics tables by the stats engine each tick.
+    pub self_metrics: Arc<self_metrics::SelfMetrics>,
 }

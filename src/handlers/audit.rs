@@ -97,11 +97,16 @@ pub async fn list_audit(
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0);
 
+    // Convert the DateTime64 `timestamp` to Int64 nanos for the driver, via a
+    // subquery so the alias never collides with the source column of the same
+    // name (ClickHouse 26.1 rejects `toUnixTimestamp64Nano(timestamp) AS timestamp`
+    // with an AMBIGUOUS_COLUMN_NAME / block-structure-mismatch error).
     let sql = format!(
-        "SELECT id, seq, toUnixTimestamp64Nano(timestamp) AS timestamp, tenant_id, \
+        "SELECT id, seq, ts AS timestamp, tenant_id, \
          actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
          ip_address, user_agent, request_id, changes, description, metadata, prev_hash, hash \
-         FROM audit_events {where_clause} ORDER BY seq DESC LIMIT {limit} OFFSET {offset}"
+         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events {where_clause}) \
+         ORDER BY seq DESC LIMIT {limit} OFFSET {offset}"
     );
 
     let rows = state
@@ -136,10 +141,10 @@ pub async fn verify_audit(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    let sql = "SELECT id, seq, toUnixTimestamp64Nano(timestamp) AS timestamp, tenant_id, \
+    let sql = "SELECT id, seq, ts AS timestamp, tenant_id, \
          actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
          ip_address, user_agent, request_id, changes, description, metadata, prev_hash, hash \
-         FROM audit_events ORDER BY seq ASC";
+         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY seq ASC";
 
     let rows = state
         .ch

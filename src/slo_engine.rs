@@ -258,16 +258,22 @@ async fn write_slo_metrics(
     }
 }
 
-pub fn spawn_slo_engine(config_db: Arc<ConfigDb>, ch: Client) {
+pub fn spawn_slo_engine(config_db: Arc<ConfigDb>, ch: Client, self_metrics: Arc<crate::self_metrics::SelfMetrics>) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
         let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
-            if let Err(e) = eval_slos(&config_db, &ch, &http_client, &mut eval_state).await {
-                tracing::error!("slo engine error: {e}");
-            }
+            let start = std::time::Instant::now();
+            let ok = match eval_slos(&config_db, &ch, &http_client, &mut eval_state).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!("slo engine error: {e}");
+                    false
+                }
+            };
+            self_metrics.record_engine("slo_engine", start.elapsed().as_millis() as u64, ok);
         }
     });
 }

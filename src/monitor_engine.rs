@@ -32,6 +32,7 @@ pub fn spawn(
     ch: Client,
     config_db: Arc<ConfigDb>,
     smtp_config: alert_engine::SmtpConfig,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
@@ -40,6 +41,7 @@ pub fn spawn(
 
         loop {
             let start = Instant::now();
+            let mut ok = true;
             let (evaluated, state_changes) =
                 match run_evaluation_cycle(&ch, &config_db, &http_client, &smtp_config, &smtp_transport, &mut eval_state)
                     .await
@@ -47,10 +49,12 @@ pub fn spawn(
                     Ok(stats) => stats,
                     Err(e) => {
                         tracing::error!(engine = "monitors", error = %e, "evaluation cycle failed");
+                        ok = false;
                         (0, 0)
                     }
                 };
             let elapsed_ms = start.elapsed().as_millis() as u64;
+            self_metrics.record_engine("monitor_engine", elapsed_ms, ok);
 
             if evaluated > 0 {
                 tracing::info!(

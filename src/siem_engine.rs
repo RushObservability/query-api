@@ -16,7 +16,7 @@ const EVAL_FLUSH_EVERY: u32 = 10;
 
 /// Spawn the SIEM detection engine as a background task.
 /// Runs every 60 seconds, evaluating all enabled detection rules that are due.
-pub fn spawn(ch: Client, config_db: Arc<ConfigDb>) {
+pub fn spawn(ch: Client, config_db: Arc<ConfigDb>, self_metrics: Arc<crate::self_metrics::SelfMetrics>) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
         tracing::info!(engine = "siem", interval_secs = 60, "detection engine started");
@@ -25,9 +25,15 @@ pub fn spawn(ch: Client, config_db: Arc<ConfigDb>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            if let Err(e) = run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state).await {
-                tracing::error!(error = %e, engine = "siem", "detection cycle failed");
-            }
+            let start = std::time::Instant::now();
+            let ok = match run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(error = %e, engine = "siem", "detection cycle failed");
+                    false
+                }
+            };
+            self_metrics.record_engine("siem_engine", start.elapsed().as_millis() as u64, ok);
         }
     });
 }

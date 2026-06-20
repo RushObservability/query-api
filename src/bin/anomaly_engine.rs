@@ -62,7 +62,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "http://localhost:8080".to_string());
 
     tracing::info!("wide-anomaly-engine starting");
-    anomaly_engine::run_anomaly_engine(config_db, ch, smtp_config, prom_base_url).await;
+    // The standalone engine has no /metrics endpoint; give it a private registry so the
+    // engine-loop instrumentation still works (record_engine just updates in-memory atomics).
+    let self_metrics = Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    anomaly_engine::run_anomaly_engine(config_db, ch, smtp_config, prom_base_url, self_metrics).await;
 
     Ok(())
 }
