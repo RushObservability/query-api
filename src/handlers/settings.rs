@@ -145,6 +145,17 @@ pub async fn get_features(
             .map(|v| v == "true")
             .unwrap_or(false);
 
+    let cloudwatch_enabled = std::env::var("CLOUDWATCH_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+        || state
+            .config_db
+            .get_setting("cloudwatch_enabled").await
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
     let sre_agent_enabled = state
         .config_db
         .get_setting("sre_agent_enabled").await
@@ -179,6 +190,7 @@ pub async fn get_features(
         "argocd": argocd_enabled,
         "fluxcd": fluxcd_enabled,
         "kubernetes": kubernetes_enabled,
+        "cloudwatch": cloudwatch_enabled,
         "sre_agent": sre_agent_enabled,
         "export_max_rows": export_max_rows,
         "deploy_markers": deploy_markers_enabled,
@@ -219,6 +231,70 @@ pub async fn set_rum_setting(
         (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
     })?;
     Ok(Json(serde_json::json!({ "enabled": enabled })))
+}
+
+/// GET /api/v1/settings/cloudwatch — admin only. Returns { enabled, default_tenant }.
+/// `enabled` reflects the env override OR the stored `cloudwatch_enabled` setting.
+/// `default_tenant` is purely a UI hint (the tenant shown in setup instructions);
+/// it does NOT gate ingest.
+pub async fn get_cloudwatch_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let enabled = std::env::var("CLOUDWATCH_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+        || state
+            .config_db
+            .get_setting("cloudwatch_enabled").await
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+    let default_tenant = state
+        .config_db
+        .get_setting("cloudwatch_default_tenant").await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({ "enabled": enabled, "default_tenant": default_tenant })))
+}
+
+/// PUT /api/v1/settings/cloudwatch — admin only. Body: { enabled: bool, default_tenant?: string }.
+/// Toggles CloudWatch Logs ingest (Kinesis Data Firehose). `default_tenant` is an
+/// optional UI hint for the setup instructions and does NOT gate ingest.
+pub async fn set_cloudwatch_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
+    })?;
+    state.config_db.set_setting("cloudwatch_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to save cloudwatch_enabled");
+        (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+    })?;
+    // Optional default_tenant (UI hint only). Present → persist (empty clears it).
+    if let Some(dt_val) = body.get("default_tenant") {
+        let dt = dt_val.as_str().unwrap_or("").trim();
+        if dt.len() > 128 {
+            return Err((StatusCode::BAD_REQUEST, "default_tenant too long".to_string()));
+        }
+        state.config_db.set_setting("cloudwatch_default_tenant", dt).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to save cloudwatch_default_tenant");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+        })?;
+    }
+    let default_tenant = state
+        .config_db
+        .get_setting("cloudwatch_default_tenant").await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({ "enabled": enabled, "default_tenant": default_tenant })))
 }
 
 /// GET /api/v1/settings/deploy-markers — admin only. Returns { enabled }.

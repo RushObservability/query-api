@@ -3,6 +3,7 @@ pub mod anomalies;
 pub mod bubbleup;
 pub mod argocd;
 pub mod auth;
+pub mod cloudwatch;
 pub mod fluxcd;
 pub mod kubernetes;
 pub mod custom_skills;

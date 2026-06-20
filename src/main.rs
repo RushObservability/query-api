@@ -901,6 +901,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/settings/rum",
             get(handlers::settings::get_rum_setting).put(handlers::settings::set_rum_setting),
         )
+        .route(
+            "/api/v1/settings/cloudwatch",
+            get(handlers::settings::get_cloudwatch_setting).put(handlers::settings::set_cloudwatch_setting),
+        )
         // API Keys (settings)
         .route(
             "/api/v1/api-keys",
@@ -1059,6 +1063,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/metrics", post(handlers::otlp::ingest_otlp_metrics))
         // Vector JSON logs
         .route("/api/v1/ingest/logs", post(handlers::otlp::ingest_vector_logs))
+        // ═══ AWS CloudWatch Logs Ingestion (Kinesis Data Firehose HTTP endpoint) ═══
+        // Tenant comes from the URL path; an access key is optional (the customer
+        // may set one on the Firehose stream for defense-in-depth, but it is not
+        // required and is not used for tenant routing).
+        .route("/cloudwatch/firehose/t/{tenant}", post(handlers::cloudwatch::ingest_firehose_with_tenant))
         // Trace stats from agent trace writer
         .route("/datadog/api/v0.6/stats", any(handlers::dd_common::stub_ok))
         .route("/datadog/api/v0.2/stats", any(handlers::dd_common::stub_ok))
