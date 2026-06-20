@@ -68,7 +68,7 @@ pub struct SloRow {
 
 #[derive(clickhouse::Row, serde::Deserialize)]
 pub struct AnomalyRuleRow {
-    pub id: String, pub name: String, pub description: String, pub enabled: u8,
+    pub id: String, pub tenant_id: String, pub name: String, pub description: String, pub enabled: u8,
     pub source: String, pub pattern: String, pub query: String,
     pub service_name: String, pub apm_metric: String, pub sensitivity: f64,
     pub alpha: f64, pub eval_interval_secs: i64, pub window_secs: i64,
@@ -525,6 +525,7 @@ impl ConfigDb {
             // ── Anomaly rules ─────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_anomaly_rules (
                 id                       String,
+                tenant_id                String DEFAULT 'default',
                 name                     String,
                 description              String DEFAULT '',
                 enabled                  UInt8 DEFAULT 1,
@@ -553,6 +554,7 @@ impl ConfigDb {
             "CREATE TABLE IF NOT EXISTS config_anomaly_events (
                 id         String,
                 rule_id    String,
+                tenant_id  String DEFAULT 'default',
                 state      String,
                 metric     String DEFAULT '',
                 value      Float64,
@@ -562,6 +564,12 @@ impl ConfigDb {
                 created_at String DEFAULT toString(now())
             ) ENGINE = MergeTree()
             ORDER BY (rule_id, created_at)",
+
+            // Tenant-scope existing anomaly tables (deployments created before
+            // anomaly rules/events carried a tenant). Idempotent; existing rows
+            // backfill to 'default' via the column DEFAULT.
+            "ALTER TABLE config_anomaly_rules ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+            "ALTER TABLE config_anomaly_events ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
 
             // ── Monitors ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_monitors (
@@ -3119,7 +3127,7 @@ impl ConfigDb {
 
     fn map_anomaly_rule(r: AnomalyRuleRow) -> crate::models::anomaly::AnomalyRule {
         crate::models::anomaly::AnomalyRule {
-            id: r.id, name: r.name, description: r.description, enabled: r.enabled != 0,
+            id: r.id, tenant_id: r.tenant_id, name: r.name, description: r.description, enabled: r.enabled != 0,
             source: r.source, pattern: r.pattern, query: r.query,
             service_name: r.service_name, apm_metric: r.apm_metric,
             sensitivity: r.sensitivity, alpha: r.alpha,
@@ -3132,18 +3140,20 @@ impl ConfigDb {
         }
     }
 
-    pub async fn list_anomaly_rules(&self) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyRule>> {
+    pub async fn list_anomaly_rules(&self, tenant_id: &str) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyRule>> {
         let rows = self.client
-            .query("SELECT id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_anomaly_rules FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
+            .query("SELECT id, tenant_id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_anomaly_rules FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY created_at DESC")
+            .bind(tenant_id)
             .fetch_all::<AnomalyRuleRow>()
             .await?;
         Ok(rows.into_iter().map(Self::map_anomaly_rule).collect())
     }
 
-    pub async fn get_anomaly_rule(&self, id: &str) -> anyhow::Result<Option<crate::models::anomaly::AnomalyRule>> {
+    pub async fn get_anomaly_rule(&self, id: &str, tenant_id: &str) -> anyhow::Result<Option<crate::models::anomaly::AnomalyRule>> {
         let result = self.client
-            .query("SELECT id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_anomaly_rules FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, tenant_id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_anomaly_rules FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
+            .bind(tenant_id)
             .fetch_one::<AnomalyRuleRow>()
             .await;
         match result {
@@ -3154,12 +3164,12 @@ impl ConfigDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_anomaly_rule(&self, id: &str, name: &str, description: &str, enabled: bool, source: &str, pattern: &str, query: &str, service_name: &str, apm_metric: &str, sensitivity: f64, alpha: f64, eval_interval_secs: i64, window_secs: i64, split_labels: &str, notification_channel_ids: &str) -> anyhow::Result<()> {
+    pub async fn create_anomaly_rule(&self, id: &str, tenant_id: &str, name: &str, description: &str, enabled: bool, source: &str, pattern: &str, query: &str, service_name: &str, apm_metric: &str, sensitivity: f64, alpha: f64, eval_interval_secs: i64, window_secs: i64, split_labels: &str, notification_channel_ids: &str) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_anomaly_rules (id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', '', '', ?, ?, ?, 0)")
-            .bind(id).bind(name).bind(description).bind(if enabled { 1u8 } else { 0u8 })
+            .query("INSERT INTO config_anomaly_rules (id, tenant_id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', '', '', ?, ?, ?, 0)")
+            .bind(id).bind(tenant_id).bind(name).bind(description).bind(if enabled { 1u8 } else { 0u8 })
             .bind(source).bind(pattern).bind(query).bind(service_name).bind(apm_metric)
             .bind(sensitivity).bind(alpha).bind(eval_interval_secs).bind(window_secs)
             .bind(split_labels).bind(notification_channel_ids)
@@ -3169,13 +3179,13 @@ impl ConfigDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn update_anomaly_rule(&self, id: &str, name: &str, description: &str, enabled: bool, source: &str, pattern: &str, query: &str, service_name: &str, apm_metric: &str, sensitivity: f64, alpha: f64, eval_interval_secs: i64, window_secs: i64, split_labels: &str, notification_channel_ids: &str) -> anyhow::Result<bool> {
-        let existing = match self.get_anomaly_rule(id).await? { Some(r) => r, None => return Ok(false) };
+    pub async fn update_anomaly_rule(&self, id: &str, tenant_id: &str, name: &str, description: &str, enabled: bool, source: &str, pattern: &str, query: &str, service_name: &str, apm_metric: &str, sensitivity: f64, alpha: f64, eval_interval_secs: i64, window_secs: i64, split_labels: &str, notification_channel_ids: &str) -> anyhow::Result<bool> {
+        let existing = match self.get_anomaly_rule(id, tenant_id).await? { Some(r) => r, None => return Ok(false) };
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_anomaly_rules (id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(name).bind(description).bind(if enabled { 1u8 } else { 0u8 })
+            .query("INSERT INTO config_anomaly_rules (id, tenant_id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(id).bind(&existing.tenant_id).bind(name).bind(description).bind(if enabled { 1u8 } else { 0u8 })
             .bind(source).bind(pattern).bind(query).bind(service_name).bind(apm_metric)
             .bind(sensitivity).bind(alpha).bind(eval_interval_secs).bind(window_secs)
             .bind(split_labels).bind(notification_channel_ids).bind(&existing.state)
@@ -3185,13 +3195,13 @@ impl ConfigDb {
         Ok(true)
     }
 
-    pub async fn delete_anomaly_rule(&self, id: &str) -> anyhow::Result<bool> {
-        let existing = match self.get_anomaly_rule(id).await? { Some(r) => r, None => return Ok(false) };
+    pub async fn delete_anomaly_rule(&self, id: &str, tenant_id: &str) -> anyhow::Result<bool> {
+        let existing = match self.get_anomaly_rule(id, tenant_id).await? { Some(r) => r, None => return Ok(false) };
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_anomaly_rules (id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
-            .bind(id).bind(&existing.name).bind(&existing.description).bind(if existing.enabled { 1u8 } else { 0u8 })
+            .query("INSERT INTO config_anomaly_rules (id, tenant_id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(id).bind(&existing.tenant_id).bind(&existing.name).bind(&existing.description).bind(if existing.enabled { 1u8 } else { 0u8 })
             .bind(&existing.source).bind(&existing.pattern).bind(&existing.query)
             .bind(&existing.service_name).bind(&existing.apm_metric)
             .bind(existing.sensitivity).bind(existing.alpha)
@@ -3205,22 +3215,25 @@ impl ConfigDb {
     }
 
     pub async fn get_due_anomaly_rules(&self, now: &str) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyRule>> {
+        // Engine lister: returns due rules across ALL tenants (deliberately NOT
+        // tenant-filtered). Each rule carries its own tenant_id so the engine can
+        // scope the telemetry queries and stamp anomaly events per tenant.
         let rows = self.client
-            .query("SELECT id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_anomaly_rules FINAL WHERE enabled = 1 AND is_deleted = 0 AND (last_eval_at = '' OR toUnixTimestamp(parseDateTimeBestEffort(?)) - toUnixTimestamp(parseDateTimeBestEffort(last_eval_at)) >= eval_interval_secs)")
+            .query("SELECT id, tenant_id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at FROM config_anomaly_rules FINAL WHERE enabled = 1 AND is_deleted = 0 AND (last_eval_at = '' OR toUnixTimestamp(parseDateTimeBestEffort(?)) - toUnixTimestamp(parseDateTimeBestEffort(last_eval_at)) >= eval_interval_secs)")
             .bind(now)
             .fetch_all::<AnomalyRuleRow>()
             .await?;
         Ok(rows.into_iter().map(Self::map_anomaly_rule).collect())
     }
 
-    pub async fn update_anomaly_state(&self, id: &str, state: &str, last_eval_at: &str, last_triggered_at: Option<&str>) -> anyhow::Result<()> {
-        let existing = match self.get_anomaly_rule(id).await? { Some(r) => r, None => return Ok(()) };
+    pub async fn update_anomaly_state(&self, id: &str, tenant_id: &str, state: &str, last_eval_at: &str, last_triggered_at: Option<&str>) -> anyhow::Result<()> {
+        let existing = match self.get_anomaly_rule(id, tenant_id).await? { Some(r) => r, None => return Ok(()) };
         let now = Self::now_str();
         let ver = Self::next_version();
         let lta = last_triggered_at.map(|s| s.to_string()).unwrap_or_else(|| existing.last_triggered_at.clone().unwrap_or_default());
         self.client
-            .query("INSERT INTO config_anomaly_rules (id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(&existing.name).bind(&existing.description).bind(if existing.enabled { 1u8 } else { 0u8 })
+            .query("INSERT INTO config_anomaly_rules (id, tenant_id, name, description, enabled, source, pattern, query, service_name, apm_metric, sensitivity, alpha, eval_interval_secs, window_secs, split_labels, notification_channel_ids, state, last_eval_at, last_triggered_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(id).bind(&existing.tenant_id).bind(&existing.name).bind(&existing.description).bind(if existing.enabled { 1u8 } else { 0u8 })
             .bind(&existing.source).bind(&existing.pattern).bind(&existing.query)
             .bind(&existing.service_name).bind(&existing.apm_metric)
             .bind(existing.sensitivity).bind(existing.alpha)
@@ -3234,50 +3247,51 @@ impl ConfigDb {
 
     // ── Anomaly event operations ───────────────────────────────────────────────
 
-    pub async fn get_anomaly_event(&self, id: &str) -> anyhow::Result<Option<crate::models::anomaly::AnomalyEvent>> {
+    pub async fn get_anomaly_event(&self, id: &str, tenant_id: &str) -> anyhow::Result<Option<crate::models::anomaly::AnomalyEvent>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row { id: String, rule_id: String, state: String, metric: String, value: f64, expected: f64, deviation: f64, message: String, created_at: String }
+        struct Row { id: String, rule_id: String, tenant_id: String, state: String, metric: String, value: f64, expected: f64, deviation: f64, message: String, created_at: String }
         let result = self.client
-            .query("SELECT id, rule_id, state, metric, value, expected, deviation, message, created_at FROM config_anomaly_events WHERE id = ? LIMIT 1")
+            .query("SELECT id, rule_id, tenant_id, state, metric, value, expected, deviation, message, created_at FROM config_anomaly_events WHERE id = ? AND tenant_id = ? LIMIT 1")
             .bind(id)
+            .bind(tenant_id)
             .fetch_one::<Row>()
             .await;
         match result {
-            Ok(r) => Ok(Some(crate::models::anomaly::AnomalyEvent { id: r.id, rule_id: r.rule_id, state: r.state, metric: r.metric, value: r.value, expected: r.expected, deviation: r.deviation, message: r.message, created_at: r.created_at })),
+            Ok(r) => Ok(Some(crate::models::anomaly::AnomalyEvent { id: r.id, rule_id: r.rule_id, tenant_id: r.tenant_id, state: r.state, metric: r.metric, value: r.value, expected: r.expected, deviation: r.deviation, message: r.message, created_at: r.created_at })),
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub async fn create_anomaly_event(&self, id: &str, rule_id: &str, state: &str, metric: &str, value: f64, expected: f64, deviation: f64, message: &str) -> anyhow::Result<()> {
+    pub async fn create_anomaly_event(&self, id: &str, rule_id: &str, tenant_id: &str, state: &str, metric: &str, value: f64, expected: f64, deviation: f64, message: &str) -> anyhow::Result<()> {
         let now = Self::now_str();
         self.client
-            .query("INSERT INTO config_anomaly_events (id, rule_id, state, metric, value, expected, deviation, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(id).bind(rule_id).bind(state).bind(metric).bind(value).bind(expected).bind(deviation).bind(message).bind(&now)
+            .query("INSERT INTO config_anomaly_events (id, rule_id, tenant_id, state, metric, value, expected, deviation, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(id).bind(rule_id).bind(tenant_id).bind(state).bind(metric).bind(value).bind(expected).bind(deviation).bind(message).bind(&now)
             .execute().await?;
         Ok(())
     }
 
-    pub async fn list_anomaly_events(&self, rule_id: &str, limit: i64) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyEvent>> {
+    pub async fn list_anomaly_events(&self, rule_id: &str, tenant_id: &str, limit: i64) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyEvent>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row { id: String, rule_id: String, state: String, metric: String, value: f64, expected: f64, deviation: f64, message: String, created_at: String }
+        struct Row { id: String, rule_id: String, tenant_id: String, state: String, metric: String, value: f64, expected: f64, deviation: f64, message: String, created_at: String }
         let rows = self.client
-            .query("SELECT id, rule_id, state, metric, value, expected, deviation, message, created_at FROM config_anomaly_events WHERE rule_id = ? ORDER BY created_at DESC LIMIT ?")
-            .bind(rule_id).bind(limit as u64)
+            .query("SELECT id, rule_id, tenant_id, state, metric, value, expected, deviation, message, created_at FROM config_anomaly_events WHERE rule_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT ?")
+            .bind(rule_id).bind(tenant_id).bind(limit as u64)
             .fetch_all::<Row>()
             .await?;
-        Ok(rows.into_iter().map(|r| crate::models::anomaly::AnomalyEvent { id: r.id, rule_id: r.rule_id, state: r.state, metric: r.metric, value: r.value, expected: r.expected, deviation: r.deviation, message: r.message, created_at: r.created_at }).collect())
+        Ok(rows.into_iter().map(|r| crate::models::anomaly::AnomalyEvent { id: r.id, rule_id: r.rule_id, tenant_id: r.tenant_id, state: r.state, metric: r.metric, value: r.value, expected: r.expected, deviation: r.deviation, message: r.message, created_at: r.created_at }).collect())
     }
 
-    pub async fn list_all_anomaly_events(&self, limit: i64) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyEventWithRule>> {
+    pub async fn list_all_anomaly_events(&self, tenant_id: &str, limit: i64) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyEventWithRule>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row { id: String, rule_id: String, rule_name: String, state: String, metric: String, value: f64, expected: f64, deviation: f64, message: String, created_at: String }
+        struct Row { id: String, rule_id: String, tenant_id: String, rule_name: String, state: String, metric: String, value: f64, expected: f64, deviation: f64, message: String, created_at: String }
         let rows = self.client
-            .query("SELECT e.id, e.rule_id, coalesce(r.name, 'deleted rule') AS rule_name, e.state, e.metric, e.value, e.expected, e.deviation, e.message, e.created_at FROM config_anomaly_events e LEFT JOIN (SELECT id, name FROM config_anomaly_rules FINAL WHERE is_deleted = 0) r ON e.rule_id = r.id ORDER BY e.created_at DESC LIMIT ?")
-            .bind(limit as u64)
+            .query("SELECT e.id, e.rule_id, e.tenant_id, coalesce(r.name, 'deleted rule') AS rule_name, e.state, e.metric, e.value, e.expected, e.deviation, e.message, e.created_at FROM config_anomaly_events e LEFT JOIN (SELECT id, name FROM config_anomaly_rules FINAL WHERE is_deleted = 0) r ON e.rule_id = r.id WHERE e.tenant_id = ? ORDER BY e.created_at DESC LIMIT ?")
+            .bind(tenant_id).bind(limit as u64)
             .fetch_all::<Row>()
             .await?;
-        Ok(rows.into_iter().map(|r| crate::models::anomaly::AnomalyEventWithRule { id: r.id, rule_id: r.rule_id, rule_name: r.rule_name, state: r.state, metric: r.metric, value: r.value, expected: r.expected, deviation: r.deviation, message: r.message, created_at: r.created_at }).collect())
+        Ok(rows.into_iter().map(|r| crate::models::anomaly::AnomalyEventWithRule { id: r.id, rule_id: r.rule_id, tenant_id: r.tenant_id, rule_name: r.rule_name, state: r.state, metric: r.metric, value: r.value, expected: r.expected, deviation: r.deviation, message: r.message, created_at: r.created_at }).collect())
     }
 
     // ── Custom skills operations ───────────────────────────────────────────────

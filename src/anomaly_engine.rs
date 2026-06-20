@@ -182,12 +182,12 @@ async fn eval_anomaly_rules(
             Ok(s) if !s.is_empty() => s,
             Ok(_) => {
                 tracing::debug!(engine = "anomaly", rule_name = %rule.name, "no data points returned");
-                config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None).await?;
+                config_db.update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None).await?;
                 continue;
             }
             Err(e) => {
                 tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "data fetch failed");
-                config_db.update_anomaly_state(&rule.id, "no_data", &now_str, None).await?;
+                config_db.update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None).await?;
                 continue;
             }
         };
@@ -257,6 +257,7 @@ async fn eval_anomaly_rules(
             config_db.create_anomaly_event(
                 &event_id,
                 &rule.id,
+                &rule.tenant_id,
                 new_state,
                 &worst_metric,
                 worst_val,
@@ -266,7 +267,7 @@ async fn eval_anomaly_rules(
             ).await?;
 
             let triggered_at = if any_anomalous { Some(now_str.as_str()) } else { None };
-            config_db.update_anomaly_state(&rule.id, new_state, &now_str, triggered_at).await?;
+            config_db.update_anomaly_state(&rule.id, &rule.tenant_id, new_state, &now_str, triggered_at).await?;
 
             // Send notifications
             send_notifications(config_db, http_client, smtp_config, smtp_transport, &rule, &message, any_anomalous).await;
@@ -281,7 +282,7 @@ async fn eval_anomaly_rules(
                 "anomaly state changed"
             );
         } else {
-            config_db.update_anomaly_state(&rule.id, new_state, &now_str, None).await?;
+            config_db.update_anomaly_state(&rule.id, &rule.tenant_id, new_state, &now_str, None).await?;
         }
     }
 
@@ -309,6 +310,7 @@ async fn fetch_apm_data(
         .to_string();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
+    let escaped_tenant = crate::query_builder::escape_string_literal(&rule.tenant_id);
     let sql = format!(
         "SELECT toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL '1' MINUTE)) as bucket, \
          count() as count, \
@@ -317,8 +319,9 @@ async fn fetch_apm_data(
          quantile(0.95)(duration_ns) as p95, \
          quantile(0.99)(duration_ns) as p99 \
          FROM spans \
-         WHERE service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp <= parseDateTimeBestEffort('{}') \
+         WHERE tenant_id = '{}' AND service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp <= parseDateTimeBestEffort('{}') \
          GROUP BY bucket ORDER BY bucket",
+        escaped_tenant,
         rule.service_name.replace('\'', "''"),
         from,
         now_str,
@@ -383,7 +386,17 @@ async fn fetch_prom_data(
         step,
     );
 
-    let resp: PromResponse = http_client.get(&url).send().await?.json().await?;
+    // Scope the upstream PromQL evaluation to this rule's tenant. The /prom
+    // endpoint resolves the tenant from the X-Rush-Tenant header and pushes it
+    // into the PromQL→ClickHouse query, so without this an anomaly rule would
+    // evaluate against the default tenant's metrics.
+    let resp: PromResponse = http_client
+        .get(&url)
+        .header("X-Rush-Tenant", &rule.tenant_id)
+        .send()
+        .await?
+        .json()
+        .await?;
 
     let all_series = resp.data
         .map(|d| d.result)

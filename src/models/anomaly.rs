@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnomalyRule {
     pub id: String,
+    pub tenant_id: String,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -81,6 +82,7 @@ impl From<AnomalyRule> for AnomalyRuleResponse {
 pub struct AnomalyEvent {
     pub id: String,
     pub rule_id: String,
+    pub tenant_id: String,
     pub state: String,
     pub metric: String,
     pub value: f64,
@@ -94,6 +96,7 @@ pub struct AnomalyEvent {
 pub struct AnomalyEventWithRule {
     pub id: String,
     pub rule_id: String,
+    pub tenant_id: String,
     pub rule_name: String,
     pub state: String,
     pub metric: String,
