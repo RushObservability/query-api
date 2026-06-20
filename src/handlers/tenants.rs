@@ -97,7 +97,7 @@ pub async fn list_tenants(
     let rows = state
         .config_db
         .list_tenants().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
     let visible: Vec<(String, String, bool, bool, String)> = if caller.4 == "admin" {
         // Admins see all tenants
@@ -107,7 +107,7 @@ pub async fn list_tenants(
         let (_, _, accessible_ids) = state
             .config_db
             .resolve_user_permissions(&caller.0).await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+            .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
         tracing::info!(user_id = %caller.0, username = %caller.1, accessible_tenant_ids = ?accessible_ids, "list_tenants: non-admin user");
 
@@ -153,7 +153,7 @@ pub async fn create_tenant(
     state
         .config_db
         .create_tenant(&id, &name).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
     // Persist any explicitly-disabled signals. Default is enabled, so we only
     // need to write the ones turned off (writing enabled rows is harmless too).
@@ -176,7 +176,7 @@ pub async fn create_tenant(
     let tenant = state
         .config_db
         .get_tenant(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -200,7 +200,7 @@ pub async fn toggle_tenant(
     let updated = state
         .config_db
         .set_tenant_enabled(&id, req.enabled).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
@@ -209,7 +209,7 @@ pub async fn toggle_tenant(
     let tenant = state
         .config_db
         .get_tenant(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     Ok(Json(TenantResponse::build(&state, tenant).await))
@@ -231,7 +231,7 @@ pub async fn delete_tenant(
     let deleted = state
         .config_db
         .delete_tenant(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
@@ -250,7 +250,7 @@ pub async fn set_auth_required(
     let updated = state
         .config_db
         .set_tenant_auth_required(&id, req.auth_required).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
@@ -259,7 +259,7 @@ pub async fn set_auth_required(
     let tenant = state
         .config_db
         .get_tenant(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     Ok(Json(TenantResponse::build(&state, tenant).await))

@@ -22,6 +22,7 @@ struct V1SeriesPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct V1Series {
     metric: String,
     /// [[timestamp, value], ...]
@@ -44,6 +45,7 @@ struct V2SeriesPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct V2Series {
     metric: String,
     #[serde(default)]
@@ -76,6 +78,7 @@ struct V2Resource {
 // ═══ Service check payload ═══
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ServiceCheck {
     check: String,
     #[serde(default)]

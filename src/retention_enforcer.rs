@@ -121,26 +121,6 @@ fn build_metric_where(rule: &MetricRetentionRule) -> String {
     parts.join(" AND ")
 }
 
-fn build_trace_where_otel(rule: &TraceRetentionRule) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-
-    if let Some(ref svc) = rule.service_name {
-        parts.push(format!("ServiceName = '{svc}'"));
-    }
-    if let Some(ref attr) = rule.attribute {
-        parts.push(format!(
-            "ResourceAttributes['{}'] = '{}'",
-            attr.key, attr.value
-        ));
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" AND "))
-    }
-}
-
 fn build_trace_where_wide(rule: &TraceRetentionRule) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 

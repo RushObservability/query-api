@@ -1356,6 +1356,7 @@ impl ConfigDb {
             }
         }
         #[derive(clickhouse::Row, serde::Deserialize)]
+        #[allow(dead_code)]
         struct Row { id: String, username: String, display_name: String, tenant_id: String, expires_at: String, user_id: String }
         let now = Self::now_str();
         let result = self.client
@@ -2053,6 +2054,7 @@ impl ConfigDb {
 
     pub async fn validate_sso_state(&self, state: &str) -> anyhow::Result<bool> {
         #[derive(clickhouse::Row, serde::Deserialize)]
+        #[allow(dead_code)]
         struct Row { state: String }
         // ClickHouse TTL handles expiry; just check existence and delete
         let result = self.client
@@ -3446,7 +3448,7 @@ impl ConfigDb {
     }
 
     pub async fn get_monitor(&self, id: &str, tenant_id: &str) -> anyhow::Result<Option<crate::models::monitor::Monitor>> {
-        let mut q = self.client.query(&format!("{} AND id = ? AND tenant_id = ? LIMIT 1", Self::MONITOR_SELECT)).bind(id).bind(tenant_id);
+        let q = self.client.query(&format!("{} AND id = ? AND tenant_id = ? LIMIT 1", Self::MONITOR_SELECT)).bind(id).bind(tenant_id);
         let result = q.fetch_one::<MonitorRow>().await;
         match result {
             Ok(r) => Ok(Some(Self::map_monitor_row(r))),

@@ -14,6 +14,7 @@ use crate::models::ingest::LogInsertRow;
 
 /// Outer Kinesis Data Firehose HTTP-endpoint envelope.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct FirehoseRequest {
     #[serde(default, rename = "requestId")]
     request_id: String,

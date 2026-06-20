@@ -69,6 +69,7 @@ pub async fn list_api_keys(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
     let rows = state.config_db.list_api_keys().await.map_err(|e| {
+        tracing::error!(error = %e, "internal error");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
     let keys: Vec<ApiKeyListEntry> = rows
@@ -90,6 +91,7 @@ pub async fn create_api_key(
     let prefix = key[..8].to_string();
 
     state.config_db.create_api_key(&id, &req.name, &key_hash, &prefix).await.map_err(|e| {
+        tracing::error!(error = %e, "internal error");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
 
@@ -705,6 +707,7 @@ pub async fn delete_api_key(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
     let deleted = state.config_db.delete_api_key(&id).await.map_err(|e| {
+        tracing::error!(error = %e, "internal error");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
     if !deleted {

@@ -98,6 +98,7 @@ fn query_guards() -> &'static QueryGuards {
 /// If not, we skip injecting the per-query setting (row policies stay permissive).
 pub async fn probe_row_policy_support(ch: &Client) {
     #[derive(clickhouse::Row, serde::Deserialize)]
+    #[allow(dead_code)]
     struct Probe { n: u8 }
     let result = ch
         .query("SELECT 1 AS n")

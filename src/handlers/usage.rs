@@ -243,6 +243,7 @@ pub async fn get_label_breakdown(
     );
 
     #[derive(serde::Deserialize, clickhouse::Row)]
+    #[allow(dead_code)]
     struct TotalRow {
         label_key: String,
         unique_values: u64,

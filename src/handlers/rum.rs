@@ -688,7 +688,7 @@ pub async fn list_replay_sessions(
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<ReplaySessionRow>()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into()))?;
+        .map_err(|e| { tracing::error!(error = %e, "query failed"); (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into()) })?;
     let ids: Vec<String> = rows.into_iter().map(|r| r.session_id).collect();
     Ok(Json(serde_json::json!({ "session_ids": ids })))
 }

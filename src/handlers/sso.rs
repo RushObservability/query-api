@@ -108,7 +108,7 @@ pub async fn sso_login(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -201,7 +201,7 @@ pub async fn sso_callback(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -212,7 +212,7 @@ pub async fn sso_callback(
     let (
         provider_id, _name, _protocol, _enabled,
         client_id, client_secret, issuer_url, _oidc_scopes,
-        groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, _created_at,
+        groups_claim, _email_claim, _first_name_claim, _last_name_claim, jit_provisioning, default_group_id, _created_at,
         _f13, _f14, _f15, _f16,
     ) = provider;
 
@@ -682,7 +682,7 @@ pub async fn sso_acs(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
         .ok_or_else(|| {
             (StatusCode::BAD_REQUEST, "no SSO provider configured".to_string())
         })?;
@@ -690,7 +690,7 @@ pub async fn sso_acs(
     let (
         provider_id, _name, _protocol, _enabled,
         _client_id, _client_secret, _issuer_url, _oidc_scopes,
-        groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, _created_at,
+        groups_claim, _email_claim, _first_name_claim, _last_name_claim, jit_provisioning, default_group_id, _created_at,
         _saml_meta, _saml_sso, saml_cert, _saml_entity,
     ) = provider;
 
@@ -762,7 +762,7 @@ pub async fn sso_acs(
     let user_id = match state
         .config_db
         .find_user_by_external_id(external_id, auth_provider).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
     {
         Some(uid) => uid,
         None => {
@@ -813,7 +813,7 @@ pub async fn sso_metadata(
     let provider = state
         .config_db
         .get_enabled_sso_provider().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
 
     let base_url = resolve_base_url(&headers);
     let acs_url = format!("{base_url}/auth/sso/acs");

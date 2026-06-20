@@ -8,6 +8,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 #[derive(clickhouse::Row, serde::Deserialize)]
+#[allow(dead_code)]
 struct ApmBucket {
     bucket: u32,
     count: u64,
