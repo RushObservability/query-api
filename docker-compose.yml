@@ -28,6 +28,13 @@ services:
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
       - RUST_LOG=rush_api=info,tower_http=info
+      # jemalloc tuning: run a background thread that returns freed pages to the
+      # OS within a few seconds (dirty/muzzy decay), keeping steady-state RSS low.
+      - MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000
+      # Optional ClickHouse read-path memory guardrails (defaults applied if unset):
+      # - RUSH_CH_MAX_MEMORY_USAGE=4000000000   # per-query byte ceiling (4 GiB)
+      # - RUSH_CH_MAX_BYTES_EXTERNAL=2000000000  # spill-to-disk threshold (default: half of above)
+      # - RUSH_CH_MAX_THREADS=                   # cap per-query CPU fan-out (default: CH default)
     depends_on:
       clickhouse:
         condition: service_healthy

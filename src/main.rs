@@ -1,3 +1,9 @@
+// Use jemalloc as the global allocator: lower, flatter RSS than glibc malloc
+// under tokio's multi-thread allocation churn (see Cargo.toml note). Declared per
+// binary crate root — the anomaly-engine binary has its own identical decl.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{extract::Request, middleware::Next, response::Response};
 use axum::http::{HeaderValue, header};
