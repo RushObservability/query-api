@@ -336,7 +336,7 @@ async fn persist_no_data(
     should_flush: bool,
 ) -> anyhow::Result<bool> {
     if slo.state != "no_data" {
-        config_db.update_slo_state(&slo.id, "no_data", 0.0, 0, 0, now_str, None).await?;
+        config_db.update_slo_state(&slo.id, &slo.tenant_id, "no_data", 0.0, 0, 0, now_str, None).await?;
         return Ok(true);
     }
     if should_flush {
@@ -378,10 +378,24 @@ async fn eval_one_slo(
         }
     };
 
+    // tenant_id scopes EVERY evaluation query: telemetry tables (spans / metrics_*)
+    // all carry a tenant_id column, and an SLO must only ever see its own tenant's
+    // signals. Injected first into every filter list so it lands in both the pruning
+    // base scan and each countIf/sumIf predicate. `tenant_id` is a safe column name
+    // and the String value is escaped by format_value (build_where_clause), yielding
+    // `tenant_id = '<escaped>'` — no unscoped query can run.
+    let tenant_filter = Filter {
+        field: "tenant_id".to_string(),
+        op: FilterOp::Eq,
+        value: serde_json::Value::String(slo.tenant_id.clone()),
+    };
+    let mut common_filters: Vec<Filter> = vec![tenant_filter.clone()];
+    error_filters.insert(0, tenant_filter.clone());
+    total_filters.insert(0, tenant_filter);
+
     // service_name scopes every evaluation query. The availability evaluators take
     // it separately (it prunes the single combined scan); the single-filter-set
     // evaluators get it injected into their filter list as before.
-    let mut common_filters: Vec<Filter> = Vec::new();
     if !slo.service_name.is_empty() {
         let sn_filter = Filter {
             field: "service_name".to_string(),
@@ -469,6 +483,7 @@ async fn eval_one_slo(
         config_db.create_slo_event(
             &event_id,
             &slo.id,
+            &slo.tenant_id,
             new_state,
             error_count,
             total_count,
@@ -478,7 +493,7 @@ async fn eval_one_slo(
 
         let breached_at = if new_state == "breaching" { Some(now_str) } else { None };
         config_db.update_slo_state(
-            &slo.id, new_state, error_budget_remaining,
+            &slo.id, &slo.tenant_id, new_state, error_budget_remaining,
             error_count, total_count, now_str, breached_at,
         ).await?;
 

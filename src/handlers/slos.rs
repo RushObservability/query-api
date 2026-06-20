@@ -1,11 +1,12 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 
 use crate::AppState;
+use crate::TenantContext;
 use crate::handlers::users::{require_auth, require_write};
 use crate::models::slo::*;
 
@@ -16,12 +17,13 @@ const VALID_THRESHOLD_OPS: [&str; 4] = ["lt", "lte", "gt", "gte"];
 
 pub async fn list_slos(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let slos = state
         .config_db
-        .list_slos().await
+        .list_slos(&tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<SloResponse> = slos.into_iter().map(SloResponse::from).collect();
     Ok(Json(serde_json::json!({ "slos": responses })))
@@ -29,6 +31,7 @@ pub async fn list_slos(
 
 pub async fn create_slo(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Json(req): Json<CreateSloRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -90,6 +93,7 @@ pub async fn create_slo(
         .config_db
         .create_slo(
             &id,
+            &tenant.tenant_id,
             &req.name,
             &req.description,
             req.enabled,
@@ -111,7 +115,7 @@ pub async fn create_slo(
 
     let slo = state
         .config_db
-        .get_slo(&id).await
+        .get_slo(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created slo".to_string()))?;
 
@@ -120,18 +124,19 @@ pub async fn create_slo(
 
 pub async fn get_slo(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let slo = state
         .config_db
-        .get_slo(&id).await
+        .get_slo(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "slo not found".to_string()))?;
     let events = state
         .config_db
-        .list_slo_events(&id, 20).await
+        .list_slo_events(&id, &tenant.tenant_id, 20).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -142,6 +147,7 @@ pub async fn get_slo(
 
 pub async fn update_slo(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateSloRequest>,
@@ -198,6 +204,7 @@ pub async fn update_slo(
         .config_db
         .update_slo(
             &id,
+            &tenant.tenant_id,
             &req.name,
             &req.description,
             req.enabled,
@@ -222,7 +229,7 @@ pub async fn update_slo(
 
     let slo = state
         .config_db
-        .get_slo(&id).await
+        .get_slo(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read slo".to_string()))?;
 
@@ -231,13 +238,14 @@ pub async fn update_slo(
 
 pub async fn delete_slo(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_slo(&id).await
+        .delete_slo(&id, &tenant.tenant_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "slo not found".to_string()));
@@ -247,13 +255,14 @@ pub async fn delete_slo(
 
 pub async fn list_slo_events(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     let events = state
         .config_db
-        .list_slo_events(&id, 100).await
+        .list_slo_events(&id, &tenant.tenant_id, 100).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }

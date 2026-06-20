@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Slo {
     pub id: String,
+    pub tenant_id: String,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -94,6 +95,7 @@ impl From<Slo> for SloResponse {
 pub struct SloEvent {
     pub id: String,
     pub slo_id: String,
+    pub tenant_id: String,
     pub state: String,
     pub error_count: i64,
     pub total_count: i64,
