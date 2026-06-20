@@ -69,6 +69,12 @@ dashmap = "6"
 bincode = "1"
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
 hex = "0.4"
+# Drop-in global allocator. glibc malloc fragments badly under tokio's
+# multi-thread churn (many short-lived per-request Vec/String allocations in the
+# ingest + query paths) and rarely returns freed pages to the OS, so steady-state
+# RSS drifts up. jemalloc keeps RSS lower and flatter; pair with a deploy-time
+# MALLOC_CONF=...,dirty_decay_ms/muzzy_decay_ms to release pages promptly.
+tikv-jemallocator = "0.6"
 
 [profile.release]
 lto = true

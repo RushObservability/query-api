@@ -1,3 +1,8 @@
+// Use jemalloc as the global allocator (see src/main.rs / Cargo.toml). Declared
+// per binary crate root, so this mirrors the decl in the main rush-api binary.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 

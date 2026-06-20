@@ -1,6 +1,8 @@
 FROM rust:1.87-slim AS builder
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# build-essential (gcc + make) is required to compile jemalloc-sys, which runs
+# jemalloc's own configure + make during the build of the tikv-jemallocator dep.
+RUN apt-get update && apt-get install -y pkg-config libssl-dev build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./

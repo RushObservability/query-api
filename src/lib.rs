@@ -27,6 +27,7 @@ use clickhouse::Client;
 use clickhouse::query::Query;
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
@@ -46,6 +47,52 @@ pub struct TenantContext {
 /// Tri-state flag for whether ClickHouse accepts the `rush_tenant_id` custom setting.
 /// 0 = untested, 1 = supported, 2 = not supported (graceful fallback).
 static ROW_POLICY_SUPPORTED: AtomicU8 = AtomicU8::new(0);
+
+/// Per-query ClickHouse memory guardrails, read once from the environment. These
+/// are ClickHouse *server* settings attached to every read via [`tenant_query`]:
+/// they bound how much memory a single query can consume server-side and let
+/// large aggregations/sorts spill to disk instead of failing. `max_result_rows`
+/// (set separately in `tenant_query`) bounds rows streamed back to this process;
+/// these bound CH-side working memory, a different failure mode.
+struct QueryGuards {
+    /// `max_memory_usage` — per-query byte ceiling.
+    max_memory_usage: String,
+    /// Threshold (bytes) applied to both `max_bytes_before_external_group_by`
+    /// and `max_bytes_before_external_sort`, so heavy GROUP BY / ORDER BY spill
+    /// to disk rather than erroring (graceful degradation).
+    max_bytes_external: String,
+    /// `max_threads` — optional per-query CPU fan-out cap; only emitted when
+    /// `RUSH_CH_MAX_THREADS` is set (None → ClickHouse default).
+    max_threads: Option<String>,
+}
+
+static QUERY_GUARDS: OnceLock<QueryGuards> = OnceLock::new();
+
+/// Read the read-path memory guardrails from the environment once and cache them.
+/// Mirrors the env-parse idiom in `ch_writer::BatchConfig::from_env`.
+fn query_guards() -> &'static QueryGuards {
+    QUERY_GUARDS.get_or_init(|| {
+        // 4 GiB default per-query ceiling.
+        let max_memory: u64 = std::env::var("RUSH_CH_MAX_MEMORY_USAGE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4_000_000_000u64);
+        // Spill threshold defaults to half the memory ceiling so a query starts
+        // spilling well before it hits the hard cap.
+        let max_external: u64 = std::env::var("RUSH_CH_MAX_BYTES_EXTERNAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(max_memory / 2);
+        let max_threads = std::env::var("RUSH_CH_MAX_THREADS")
+            .ok()
+            .filter(|s| s.parse::<u64>().is_ok());
+        QueryGuards {
+            max_memory_usage: max_memory.to_string(),
+            max_bytes_external: max_external.to_string(),
+            max_threads,
+        }
+    })
+}
 
 /// Probe ClickHouse once at startup to see if custom_settings_prefixes includes 'rush_'.
 /// If not, we skip injecting the per-query setting (row policies stay permissive).
@@ -87,16 +134,27 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
     // this process. `break` truncates silently at the cap instead of erroring, which
     // is acceptable for the read path. Note: deliberately NOT setting readonly=2 here
     // because this client is shared with paths that set their own settings.
+    // Memory guardrails: cap CH-side working memory for a single query and let
+    // heavy GROUP BY / ORDER BY spill to disk instead of OOMing the server. These
+    // complement the row cap below (which bounds rows streamed back to us).
+    let guards = query_guards();
     let q = ch
         .query(sql)
         .with_option("max_result_rows", "500000")
         .with_option("result_overflow_mode", "break")
+        .with_option("max_memory_usage", guards.max_memory_usage.as_str())
+        .with_option("max_bytes_before_external_group_by", guards.max_bytes_external.as_str())
+        .with_option("max_bytes_before_external_sort", guards.max_bytes_external.as_str())
         // ClickHouse 26.2 query condition cache: caches the per-granule match bitset
         // for a WHERE predicate so repeated identical predicates (dashboard refreshes,
         // the count+list+histogram+timeseries siblings of one Explore search, monitor/
         // detection eval re-runs, service-map polls) skip re-evaluating skip indexes and
         // re-reading granules. Safe on these MergeTree reads (no FINAL on the read path).
         .with_option("use_query_condition_cache", "1");
+    let q = match &guards.max_threads {
+        Some(n) => q.with_option("max_threads", n.as_str()),
+        None => q,
+    };
     if ROW_POLICY_SUPPORTED.load(Ordering::Relaxed) == 1 {
         q.with_option("rush_tenant_id", tenant_id)
     } else {
