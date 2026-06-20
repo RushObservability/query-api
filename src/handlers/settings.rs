@@ -5,7 +5,7 @@ use sha2::Sha256;
 use rand::Rng;
 
 use crate::AppState;
-use crate::handlers::users::require_admin;
+use crate::handlers::users::{require_admin, require_auth};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -281,6 +281,80 @@ pub async fn set_export_max_rows(
 /// stay in sync with sre-agent's LoopBudget (which re-clamps defensively).
 const SRE_AGENT_DEFAULT_MAX_TOOL_STEPS: u64 = 40;
 const SRE_AGENT_DEFAULT_MAX_LLM_CALLS: u64 = 55;
+/// Common OpenAI models offered as a combo-box suggestion list in the UI. The field is
+/// free-text, so any model name (incl. non-OpenAI when LLM_BASE_URL is changed) still works.
+const SRE_AGENT_MODEL_SUGGESTIONS: &[&str] =
+    &["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o4-mini"];
+/// Reasoning-effort levels for thinking models (OpenAI gpt-5 / o-series).
+const SRE_AGENT_REASONING_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
+
+/// True for models that accept `reasoning_effort` (gpt-5 / o-series). Mirrors the agent's
+/// `is_reasoning_model` so the UI can decide whether to show the reasoning control.
+fn is_reasoning_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+}
+
+/// One admin-allowed model: its id and the reasoning ("thinking") levels a user
+/// may pick for it. `reasoning` is empty for non-reasoning models.
+#[derive(Debug, Clone, Serialize)]
+struct AllowedModel {
+    id: String,
+    reasoning: Vec<String>,
+}
+
+/// Parse the `sre_agent_allowed_models` JSON setting into a validated list.
+/// Tolerant: bad JSON / missing setting → empty list. Reasoning levels are
+/// filtered against SRE_AGENT_REASONING_LEVELS and dropped for non-reasoning ids.
+fn parse_allowed_models(raw: &str) -> Vec<AllowedModel> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let arr: Vec<serde_json::Value> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    arr.into_iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if id.is_empty() {
+                return None;
+            }
+            let reasoning = if is_reasoning_model(id) {
+                item.get("reasoning")
+                    .and_then(|v| v.as_array())
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|l| l.as_str())
+                            .map(|s| s.trim())
+                            .filter(|s| SRE_AGENT_REASONING_LEVELS.contains(s))
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            Some(AllowedModel { id: id.to_string(), reasoning })
+        })
+        .collect()
+}
+
+/// Resolve the default model from the stored `sre_agent_model` default + the
+/// allowed list: the default if it's allowed, else the allowed list's first
+/// entry, else the stored default verbatim (which may be empty → agent env).
+fn resolve_default_model(default: &str, allowed: &[AllowedModel]) -> String {
+    let default = default.trim();
+    if !default.is_empty() && allowed.iter().any(|m| m.id == default) {
+        return default.to_string();
+    }
+    if let Some(first) = allowed.first() {
+        return first.id.clone();
+    }
+    default.to_string()
+}
 
 /// GET /api/v1/settings/sre-agent — admin only.
 /// Current investigation budget (defaults when unset).
@@ -302,8 +376,23 @@ pub async fn get_sre_agent_settings(
     // Same key /api/v1/features exposes as `sre_agent` — this is the UI switch.
     let enabled = state.config_db.get_setting("sre_agent_enabled").await
         .ok().flatten().map(|v| v == "true").unwrap_or(false);
+    // Operator-chosen model (empty = use the agent's LLM_MODEL env default).
+    let model = state.config_db.get_setting("sre_agent_model").await
+        .ok().flatten().unwrap_or_default();
+    let reasoning_effort = state.config_db.get_setting("sre_agent_reasoning_effort").await
+        .ok().flatten().unwrap_or_default();
+    // Admin-defined policy: which models users may pick + per-model thinking levels.
+    let allowed_raw = state.config_db.get_setting("sre_agent_allowed_models").await
+        .ok().flatten().unwrap_or_default();
+    let allowed_models = parse_allowed_models(&allowed_raw);
     Ok(Json(serde_json::json!({
         "enabled": enabled,
+        "model": model,
+        "allowed_models": allowed_models,
+        "model_suggestions": SRE_AGENT_MODEL_SUGGESTIONS,
+        "reasoning_effort": reasoning_effort,
+        "reasoning_levels": SRE_AGENT_REASONING_LEVELS,
+        "model_is_reasoning": is_reasoning_model(&model),
         "max_tool_steps": max_tool_steps,
         "max_llm_calls": max_llm_calls,
         "defaults": {
@@ -323,6 +412,90 @@ pub async fn set_sre_agent_settings(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
+
+    // Optional `model` (free text; empty clears it → agent falls back to its LLM_MODEL env).
+    // Saved first so it persists even on a toggle-only update.
+    if let Some(model_val) = body.get("model") {
+        let model = model_val.as_str().unwrap_or("").trim();
+        if model.len() > 100 {
+            return Err((StatusCode::BAD_REQUEST, "model name too long".to_string()));
+        }
+        state.config_db.set_setting("sre_agent_model", model).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to save sre_agent_model");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+        })?;
+    }
+
+    // Optional `reasoning_effort` (minimal/low/medium/high, or empty to clear).
+    if let Some(re_val) = body.get("reasoning_effort") {
+        let re = re_val.as_str().unwrap_or("").trim();
+        if !re.is_empty() && !SRE_AGENT_REASONING_LEVELS.contains(&re) {
+            return Err((StatusCode::BAD_REQUEST,
+                "invalid 'reasoning_effort' (expected minimal|low|medium|high)".to_string()));
+        }
+        state.config_db.set_setting("sre_agent_reasoning_effort", re).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to save sre_agent_reasoning_effort");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+        })?;
+    }
+
+    // Optional `allowed_models` policy: which models users may pick + per-model
+    // thinking levels. Each item is {id: string, reasoning: string[]}. Validate
+    // server-side (non-empty id ≤100 chars; levels ∈ reasoning_levels; reasoning
+    // dropped for non-reasoning ids) before re-serializing to the JSON setting.
+    if let Some(am_val) = body.get("allowed_models") {
+        let arr = am_val.as_array().ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, "invalid 'allowed_models' (expected an array)".to_string())
+        })?;
+        let mut normalized: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
+        for item in arr {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if id.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "allowed_models: each model needs a non-empty 'id'".to_string()));
+            }
+            if id.len() > 100 {
+                return Err((StatusCode::BAD_REQUEST, "allowed_models: model id too long".to_string()));
+            }
+            let reasoning: Vec<String> = if is_reasoning_model(id) {
+                let mut levels = Vec::new();
+                if let Some(arr) = item.get("reasoning").and_then(|v| v.as_array()) {
+                    for l in arr {
+                        let lvl = l.as_str().unwrap_or("").trim();
+                        if lvl.is_empty() {
+                            continue;
+                        }
+                        if !SRE_AGENT_REASONING_LEVELS.contains(&lvl) {
+                            return Err((StatusCode::BAD_REQUEST,
+                                "allowed_models: invalid reasoning level (expected minimal|low|medium|high)".to_string()));
+                        }
+                        if !levels.iter().any(|x: &String| x == lvl) {
+                            levels.push(lvl.to_string());
+                        }
+                    }
+                }
+                levels
+            } else {
+                Vec::new()
+            };
+            normalized.push(serde_json::json!({ "id": id, "reasoning": reasoning }));
+        }
+        let serialized = serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string());
+        state.config_db.set_setting("sre_agent_allowed_models", &serialized).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to save sre_agent_allowed_models");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
+        })?;
+    }
+
+    // model/reasoning/policy-only update (no toggle, no budget) — done.
+    if (body.get("model").is_some()
+        || body.get("reasoning_effort").is_some()
+        || body.get("allowed_models").is_some())
+        && body.get("enabled").is_none()
+        && body.get("max_tool_steps").is_none()
+        && body.get("max_llm_calls").is_none()
+    {
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
 
     // Optional `enabled` toggle: strictly a JSON bool when present.
     if let Some(enabled_val) = body.get("enabled") {
@@ -361,6 +534,92 @@ pub async fn set_sre_agent_settings(
     }
 
     Ok(Json(serde_json::json!({ "max_tool_steps": steps, "max_llm_calls": calls })))
+}
+
+/// GET /api/v1/sre-agent/options — any authenticated user (NOT admin-only).
+/// Surfaces the admin-defined model/thinking policy to the investigation page so
+/// a user can pick a model + thinking level from the allowed menu without admin
+/// rights. Returns `{ models: [{id, reasoning}], default_model }`.
+pub async fn get_sre_agent_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers).await?;
+    let allowed_raw = state.config_db.get_setting("sre_agent_allowed_models").await
+        .ok().flatten().unwrap_or_default();
+    let allowed_models = parse_allowed_models(&allowed_raw);
+    let default = state.config_db.get_setting("sre_agent_model").await
+        .ok().flatten().unwrap_or_default();
+    let default_model = resolve_default_model(&default, &allowed_models);
+    Ok(Json(serde_json::json!({
+        "models": allowed_models,
+        "default_model": default_model,
+    })))
+}
+
+/// GET /api/v1/settings/sre-agent/models — admin. Pulls the live model list from the
+/// LLM provider (OpenAI-compatible `/v1/models`) using the configured key, filtered to
+/// chat-capable models. Falls back to the static suggestion list when no key is set or
+/// the provider call fails.
+pub async fn list_sre_agent_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let fallback = || {
+        Json(serde_json::json!({ "models": SRE_AGENT_MODEL_SUGGESTIONS, "source": "suggestions" }))
+    };
+    let api_key = ["OPENAI_API_KEY", "OPENAI_KEY", "LLM_API_KEY"]
+        .into_iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()));
+    let api_key = match api_key {
+        Some(k) => k,
+        None => return Ok(fallback()),
+    };
+    let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await;
+    let v: serde_json::Value = match resp {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(_) => return Ok(fallback()),
+        },
+        _ => return Ok(fallback()),
+    };
+    let mut models: Vec<String> = v["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["id"].as_str())
+                .filter(|id| is_chat_model(id))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Ok(fallback());
+    }
+    Ok(Json(serde_json::json!({ "models": models, "source": "provider" })))
+}
+
+/// Filter `/v1/models` ids down to chat-completions-capable models.
+fn is_chat_model(id: &str) -> bool {
+    let m = id.to_ascii_lowercase();
+    let chatty = m.starts_with("gpt-")
+        || m.starts_with("chatgpt")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4");
+    let excluded = ["embedding", "audio", "realtime", "transcribe", "tts", "whisper", "image", "moderation", "instruct", "search"]
+        .iter()
+        .any(|x| m.contains(x));
+    chatty && !excluded
 }
 
 pub async fn delete_api_key(

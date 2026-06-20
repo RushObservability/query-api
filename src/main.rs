@@ -883,6 +883,16 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::settings::get_sre_agent_settings).put(handlers::settings::set_sre_agent_settings),
         )
         .route(
+            "/api/v1/settings/sre-agent/models",
+            get(handlers::settings::list_sre_agent_models),
+        )
+        // User-facing model/thinking menu (the admin-defined policy). Any
+        // authenticated user can read it to populate the investigation pickers.
+        .route(
+            "/api/v1/sre-agent/options",
+            get(handlers::settings::get_sre_agent_options),
+        )
+        .route(
             "/api/v1/settings/deploy-markers",
             get(handlers::settings::get_deploy_markers_setting).put(handlers::settings::set_deploy_markers_setting),
         )
