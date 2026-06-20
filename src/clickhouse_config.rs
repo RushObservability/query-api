@@ -3864,15 +3864,18 @@ impl ConfigDb {
         Ok(row.n as i64)
     }
 
-    async fn default_detection_rule_exists(&self, name: &str, tenant_id: &str) -> anyhow::Result<bool> {
+    /// Fetch a built-in (`system`) default detection rule by name: its id and
+    /// current query_sql. Returns None when the rule isn't present. Used by the
+    /// seeder to decide whether to create, refresh, or skip a built-in rule.
+    async fn get_default_detection_rule(&self, name: &str, tenant_id: &str) -> anyhow::Result<Option<(String, String)>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Count { n: u64 }
-        let row = self.client
-            .query("SELECT count() AS n FROM config_detection_rules FINAL WHERE name = ? AND tenant_id = ? AND created_by = 'system' AND is_deleted = 0")
+        struct Row { id: String, query_sql: String }
+        let rows = self.client
+            .query("SELECT id, query_sql FROM config_detection_rules FINAL WHERE name = ? AND tenant_id = ? AND created_by = 'system' AND is_deleted = 0 LIMIT 1")
             .bind(name).bind(tenant_id)
-            .fetch_one::<Count>()
+            .fetch_all::<Row>()
             .await?;
-        Ok(row.n > 0)
+        Ok(rows.into_iter().next().map(|r| (r.id, r.query_sql)))
     }
 
     pub async fn ensure_default_detection_rules(&self) -> anyhow::Result<()> {
@@ -4022,11 +4025,11 @@ impl ConfigDb {
                  likely root cause of slow responses.",
                 "WITH \
                    slow_services AS ( \
-                     SELECT ServiceName \
+                     SELECT service_name AS ServiceName \
                      FROM spans \
                      WHERE timestamp BETWEEN @window_start AND @window_end \
                        AND http_status_code > 0 \
-                     GROUP BY ServiceName \
+                     GROUP BY service_name \
                      HAVING quantile(0.99)(duration_ns) / 1000000 > 500 AND count() > 50 \
                    ), \
                    mem_pressure AS ( \
@@ -4037,10 +4040,9 @@ impl ConfigDb {
                                           'container.memory.usage', \
                                           'process.memory.usage') \
                      GROUP BY ServiceName \
-                     HAVING max(Value) > 0.85 * any( \
-                       SELECT Value FROM metrics_gauge \
+                     HAVING max(Value) > 0.85 * ( \
+                       SELECT max(Value) FROM metrics_gauge \
                        WHERE MetricName LIKE '%memory.limit%' AND TimeUnix >= @window_start \
-                       LIMIT 1 \
                      ) \
                    ) \
                  SELECT ss.ServiceName \
@@ -4125,22 +4127,40 @@ impl ConfigDb {
         ];
 
         let mut seeded = 0u32;
+        let mut refreshed = 0u32;
         for (name, description, query_sql, severity, interval, window) in &defaults {
-            if self.default_detection_rule_exists(name, "default").await? {
-                continue;
+            match self.get_default_detection_rule(name, "default").await? {
+                Some((id, existing_sql)) => {
+                    // Built-in rule already present. Refresh it in place if its
+                    // definition drifted from the current canonical SQL — older
+                    // seeds referenced since-renamed tables (otel_traces → spans,
+                    // otel_logs → logs, otel_metrics_gauge → metrics_gauge,
+                    // wide_events → spans) and a malformed any(subquery), which
+                    // made every eval fail. This makes the built-ins self-heal on
+                    // upgrade without clobbering user-edited rules (created_by != system).
+                    if existing_sql.trim() != query_sql.trim() {
+                        self.update_detection_rule(
+                            &id, name, description, query_sql,
+                            *interval, 1, severity, *window, true, "[]",
+                        ).await?;
+                        refreshed += 1;
+                    }
+                }
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    self.create_detection_rule(
+                        &id, "default", name, description, query_sql,
+                        *interval, 1, severity, *window, true, "[]", "system",
+                    ).await?;
+                    seeded += 1;
+                }
             }
-            let id = uuid::Uuid::new_v4().to_string();
-            self.create_detection_rule(
-                &id, "default", name, description, query_sql,
-                *interval, 1, severity, *window, true, "[]", "system",
-            ).await?;
-            seeded += 1;
         }
 
-        if seeded > 0 {
-            tracing::info!("SIEM: seeded {seeded} new default detection rules ({} total built-in)", defaults.len());
+        if seeded > 0 || refreshed > 0 {
+            tracing::info!("SIEM: seeded {seeded} new + refreshed {refreshed} stale built-in detection rules ({} total built-in)", defaults.len());
         } else {
-            tracing::debug!("SIEM: all {} default detection rules already present", defaults.len());
+            tracing::debug!("SIEM: all {} default detection rules already up to date", defaults.len());
         }
         Ok(())
     }
