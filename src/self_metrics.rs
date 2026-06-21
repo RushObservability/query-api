@@ -695,4 +695,37 @@ mod tests {
         assert!(!text.contains("tenant"), "tenant label leaked:\n{text}");
         assert!(!text.contains("route="), "route label leaked:\n{text}");
     }
+
+    #[test]
+    fn record_search_metrics_signal_emits_bounded_series() {
+        let m = SelfMetrics::new();
+        // PromQL instant query: 8-char expr returning 2 series in 30ms.
+        m.record_search("metrics", Some(8), 2, 30, true);
+        // PromQL range query that returned 0 series (empty) in 12ms.
+        m.record_search("metrics", Some(15), 0, 12, true);
+        // A failed PromQL query (parse/eval error) → counted as error, empty.
+        m.record_search("metrics", Some(5), 0, 7, false);
+
+        let text = m.render_prometheus();
+
+        // signal="metrics" appears on the counter with the same outcome dimension as logs/spans.
+        assert!(text.contains("rush_search_queries_total{outcome=\"ok\",signal=\"metrics\"} 2"), "metrics ok wrong:\n{text}");
+        assert!(text.contains("rush_search_queries_total{outcome=\"error\",signal=\"metrics\"} 1"), "metrics err wrong:\n{text}");
+        // Empty counter: the 0-series range query + the failed query.
+        assert!(text.contains("rush_search_empty_total{signal=\"metrics\"} 2"), "metrics empty wrong:\n{text}");
+        // Duration histogram: three observations (30+12+7) → _count 3, _sum 49.
+        assert!(text.contains("rush_search_duration_ms_count{signal=\"metrics\"} 3"), "metrics dur count wrong:\n{text}");
+        assert!(text.contains("rush_search_duration_ms_sum{signal=\"metrics\"} 49"), "metrics dur sum wrong:\n{text}");
+        // Result-rows histogram: series counts 2,0,0 → _count 3, _sum 2.
+        assert!(text.contains("rush_search_result_rows_count{signal=\"metrics\"} 3"), "metrics rows count wrong:\n{text}");
+        assert!(text.contains("rush_search_result_rows_sum{signal=\"metrics\"} 2"), "metrics rows sum wrong:\n{text}");
+        // Query-length histogram: all three had a query_len → _count 3, _sum 28 (8+15+5).
+        assert!(text.contains("rush_search_query_length_chars_count{signal=\"metrics\"} 3"), "metrics qlen count wrong:\n{text}");
+        assert!(text.contains("rush_search_query_length_chars_sum{signal=\"metrics\"} 28"), "metrics qlen sum wrong:\n{text}");
+
+        // Cardinality stays bounded: signal is the only added dimension; no tenant/route/query labels.
+        assert!(!text.contains("tenant"), "tenant label leaked:\n{text}");
+        assert!(!text.contains("route="), "route label leaked:\n{text}");
+        assert!(!text.contains("promql"), "query text leaked:\n{text}");
+    }
 }

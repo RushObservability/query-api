@@ -2674,12 +2674,13 @@ impl ConfigDb {
             ]})),
             // Rush platform self-usage: how operators exercise the system. All series come
             // from the API's self-ingested `rush_*` metrics (source:"metrics" / PromQL).
-            // Search query rate/timing split by `signal` (logs vs spans/apm); metrics-query
-            // rate from the /prom HTTP route (the PromQL path has no per-search metric).
+            // Search query rate/timing split by `signal` (logs, spans/apm, metrics/PromQL);
+            // all three signals share the same rush_search_* self-metrics, so latency /
+            // result-size / empty / error widgets are apples-to-apples across them.
             ("tpl-rush-usage","Rush Usage & Performance","How operators use Rush: query rate by signal (APM/logs/metrics), search latency p50/p95/p99, result sizes, empty/error rates, and API request load. Sourced from the platform's own self-metrics.","platform",serde_json::json!({"widgets":[
                 // ── Query rate by signal ──
                 w("Search queries / s by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_search_queries_total[5m]))"),(0,0,6,4),empty()),
-                w("Metrics (PromQL) queries / s","timeseries",qc_metrics("sum(rate(rush_http_requests_total{route=~\"/prom/api/v1/query(_range)?\"}[5m]))"),(6,0,6,4),color("#a855f7")),
+                w("Metrics (PromQL) queries / s","timeseries",qc_metrics("sum(rate(rush_search_queries_total{signal=\"metrics\"}[5m]))"),(6,0,6,4),color("#a855f7")),
                 // ── Search latency percentiles (ms) ──
                 w("Search p95 latency by signal (ms)","timeseries",qc_metrics("rush_search_duration_ms_p95"),(0,4,6,4),color("#f59e0b")),
                 w("Search p99 latency by signal (ms)","timeseries",qc_metrics("rush_search_duration_ms_p99"),(6,4,6,4),color("#ef4444")),

@@ -85,9 +85,20 @@ async fn prom_query_inner(
         .and_then(|t| t.parse::<f64>().ok())
         .unwrap_or(now);
 
+    let query_len = params.query.chars().count();
     let series = promql::evaluate_instant_query(&state.ch, &params.query, eval_time, 300.0, tenant_id)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("PromQL error: {e}")))?;
+        .map_err(|e| {
+            // Additive self-metric; never fails the request.
+            state.self_metrics.record_search(
+                "metrics",
+                Some(query_len),
+                0,
+                start.elapsed().as_millis() as u64,
+                false,
+            );
+            (StatusCode::BAD_REQUEST, format!("PromQL error: {e}"))
+        })?;
 
     // Return the latest value from each series
     let result: Vec<VectorResult> = series
@@ -120,6 +131,15 @@ async fn prom_query_inner(
         series_count = result.len(),
         duration_ms = start.elapsed().as_millis() as u64,
         "promql instant query completed"
+    );
+
+    // Self-metric: count of result series (one VectorResult per time series), not datapoints.
+    state.self_metrics.record_search(
+        "metrics",
+        Some(query_len),
+        result.len() as u64,
+        start.elapsed().as_millis() as u64,
+        true,
     );
 
     Ok(Json(PromResponse {
@@ -171,9 +191,20 @@ async fn prom_query_range_inner(
         .and_then(|s| parse_step(s).ok())
         .unwrap_or(15.0);
 
+    let query_len = params.query.chars().count();
     let series = promql::evaluate_range_query(&state.ch, &params.query, start, end, step, tenant_id)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("PromQL error: {e}")))?;
+        .map_err(|e| {
+            // Additive self-metric; never fails the request.
+            state.self_metrics.record_search(
+                "metrics",
+                Some(query_len),
+                0,
+                query_start.elapsed().as_millis() as u64,
+                false,
+            );
+            (StatusCode::BAD_REQUEST, format!("PromQL error: {e}"))
+        })?;
 
     let result: Vec<MatrixResult> = series
         .into_iter()
@@ -203,6 +234,15 @@ async fn prom_query_range_inner(
         series_count = result.len(),
         duration_ms = query_start.elapsed().as_millis() as u64,
         "promql range query completed"
+    );
+
+    // Self-metric: count of result series (one MatrixResult per time series), not datapoints.
+    state.self_metrics.record_search(
+        "metrics",
+        Some(query_len),
+        result.len() as u64,
+        query_start.elapsed().as_millis() as u64,
+        true,
     );
 
     Ok(Json(PromResponse {
