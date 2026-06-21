@@ -192,6 +192,7 @@ pub async fn query_logs(
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
+                    state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
                 })?
         } else {
@@ -214,6 +215,7 @@ pub async fn query_logs(
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
+                    state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
                 })?;
             let total = rows.len() as u64;
@@ -234,6 +236,7 @@ pub async fn query_logs(
             .fetch_all::<LogRecord>().await
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "logs", handler = "query_logs", "search query failed");
+                state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                 (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
         let total = rows.len() as u64;
@@ -248,6 +251,18 @@ pub async fn query_logs(
         total = total,
         duration_ms = start.elapsed().as_millis() as u64,
         "log search completed"
+    );
+
+    // Self-metric: search-quality signals (latency, result count, query length). Low
+    // cardinality — labeled only by the fixed `signal`. `query_len` is None for pure
+    // browse (no term) so the length histogram only reflects real searches; char count
+    // (not bytes) matches the 512-char validation above.
+    state.self_metrics.record_search(
+        "logs",
+        req.search.as_ref().map(|s| s.chars().count()),
+        rows.len() as u64,
+        start.elapsed().as_millis() as u64,
+        true,
     );
 
     // Only track usage if the query returned results

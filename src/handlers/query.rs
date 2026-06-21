@@ -91,6 +91,7 @@ pub async fn execute_query(
         );
         let rows = rows_result.map_err(|e| {
             tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
+            state.self_metrics.record_search("spans", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
@@ -107,6 +108,7 @@ pub async fn execute_query(
         );
         let rows = rows_result.map_err(|e| {
             tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
+            state.self_metrics.record_search("spans", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
@@ -150,6 +152,18 @@ fn emit_usage_and_log(
         duration_ms = start.elapsed().as_millis() as u64,
         filters = req.filters.len(),
         "query completed"
+    );
+
+    // Self-metric: span search-quality signals (latency, result count, query length).
+    // Low cardinality — labeled only by the fixed `signal="spans"`. `query_len` is None
+    // for browse (no free-text term) so the length histogram only reflects real searches;
+    // char count (not bytes) matches the handler's 512-char validation.
+    state.self_metrics.record_search(
+        "spans",
+        req.search.as_ref().map(|s| s.chars().count()),
+        row_count as u64,
+        start.elapsed().as_millis() as u64,
+        true,
     );
 }
 

@@ -28,8 +28,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Fixed latency histogram bucket upper bounds, in milliseconds. Chosen to cover sub-ms
 /// (effectively the first bucket) through 10s. `+Inf` is implicit (the `_count`).
+/// This is the default bucket set used by [`SelfMetrics::observe_histogram`].
 pub const LATENCY_BUCKETS_MS: [f64; 11] =
     [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0];
+
+/// Latency bucket bounds (ms) sized for *search* — which can be much slower than the
+/// HTTP/engine paths — covering 10ms through 60s.
+pub const SEARCH_LATENCY_BUCKETS_MS: [f64; 11] =
+    [10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0];
+
+/// Result-row-count bucket bounds (unitless counts), for `rush_search_result_rows`.
+pub const RESULT_COUNT_BUCKETS: [f64; 10] =
+    [0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0];
+
+/// Free-text query-length bucket bounds (characters), for `rush_search_query_length_chars`.
+pub const QUERY_LEN_BUCKETS: [f64; 10] =
+    [0.0, 1.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0];
 
 /// A label set, stored already-sorted by key so identical sets map to one series.
 type Labels = Vec<(&'static str, String)>;
@@ -77,54 +91,57 @@ impl AtomicF64 {
     }
 }
 
-/// A fixed-bucket histogram. `buckets[i]` counts observations `<= LATENCY_BUCKETS_MS[i]`
+/// A fixed-bucket histogram. `buckets[i]` counts observations `<= bounds[i]`
 /// (cumulative is computed at render time). `count` is the total (= `+Inf` bucket),
-/// `sum` is the running sum of observed values.
+/// `sum` is the running sum of observed values. Each histogram carries its own
+/// `&'static` bucket bounds, chosen on first registration — so latency (ms),
+/// result-count, and query-length histograms can use different scales.
 struct Histogram {
-    buckets: [AtomicU64; LATENCY_BUCKETS_MS.len()],
+    /// Bucket upper bounds for this histogram (e.g. [`LATENCY_BUCKETS_MS`]).
+    bounds: &'static [f64],
+    /// One counter per bound; `buckets.len() == bounds.len()`.
+    buckets: Vec<AtomicU64>,
     count: AtomicU64,
     sum: AtomicF64,
 }
 
-impl Default for Histogram {
-    fn default() -> Self {
+impl Histogram {
+    fn new(bounds: &'static [f64]) -> Self {
         Histogram {
-            buckets: Default::default(),
+            bounds,
+            buckets: (0..bounds.len()).map(|_| AtomicU64::new(0)).collect(),
             count: AtomicU64::new(0),
             sum: AtomicF64::default(),
         }
     }
-}
 
-impl Histogram {
-    fn observe(&self, value_ms: f64) {
+    fn observe(&self, value: f64) {
         // Record into the first bucket whose upper bound the value falls under.
-        // Bounded linear scan over 11 entries — cheap and branch-predictable.
-        for (i, &ub) in LATENCY_BUCKETS_MS.iter().enumerate() {
-            if value_ms <= ub {
+        // Bounded linear scan over the (small, fixed) bound list — cheap and
+        // branch-predictable. Values above the last finite bound only bump `count`
+        // (the implicit `+Inf` bucket).
+        for (i, &ub) in self.bounds.iter().enumerate() {
+            if value <= ub {
                 self.buckets[i].fetch_add(1, Ordering::Relaxed);
                 break;
             }
         }
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum.add(value_ms);
+        self.sum.add(value);
     }
 
     /// Snapshot the per-bucket (non-cumulative) counts, the total count, and the sum.
-    fn snapshot(&self) -> ([u64; LATENCY_BUCKETS_MS.len()], u64, f64) {
-        let mut b = [0u64; LATENCY_BUCKETS_MS.len()];
-        for (i, slot) in self.buckets.iter().enumerate() {
-            b[i] = slot.load(Ordering::Relaxed);
-        }
+    fn snapshot(&self) -> (Vec<u64>, u64, f64) {
+        let b: Vec<u64> = self.buckets.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         (b, self.count.load(Ordering::Relaxed), self.sum.get())
     }
 }
 
 /// Compute an approximate quantile (0.0..=1.0) from cumulative bucket counts, using the
 /// standard Prometheus `histogram_quantile` linear-interpolation-within-bucket method.
-/// `per_bucket` holds the **non-cumulative** counts aligned to [`LATENCY_BUCKETS_MS`].
-/// Returns the estimated value in ms, or 0.0 when there are no observations.
-pub fn quantile_from_buckets(per_bucket: &[u64], total: u64, q: f64) -> f64 {
+/// `per_bucket` holds the **non-cumulative** counts aligned to `bounds`.
+/// Returns the estimated value, or 0.0 when there are no observations.
+pub fn quantile_from_buckets(per_bucket: &[u64], bounds: &[f64], total: u64, q: f64) -> f64 {
     if total == 0 {
         return 0.0;
     }
@@ -132,7 +149,7 @@ pub fn quantile_from_buckets(per_bucket: &[u64], total: u64, q: f64) -> f64 {
     let mut cumulative = 0u64;
     let mut prev_bound = 0.0f64;
     for (i, &c) in per_bucket.iter().enumerate() {
-        let upper = LATENCY_BUCKETS_MS[i];
+        let upper = bounds[i];
         let next_cumulative = cumulative + c;
         if (next_cumulative as f64) >= rank {
             // Linear interpolation within this bucket between prev_bound and upper.
@@ -148,7 +165,7 @@ pub fn quantile_from_buckets(per_bucket: &[u64], total: u64, q: f64) -> f64 {
     }
     // Everything above the last finite bucket falls in the implicit +Inf bucket; the best
     // bounded estimate we can report is the top finite bound.
-    *LATENCY_BUCKETS_MS.last().unwrap()
+    bounds.last().copied().unwrap_or(0.0)
 }
 
 /// The registry. Cheap to clone the `Arc` of; cheap to update.
@@ -202,13 +219,30 @@ impl SelfMetrics {
         }
     }
 
-    /// Observe a value into a fixed-bucket histogram.
+    /// Observe a value (milliseconds) into a histogram using the default
+    /// [`LATENCY_BUCKETS_MS`] bucket set. The bucket set is bound to the series on first
+    /// use; later calls reuse the existing histogram (and its bounds).
     pub fn observe_histogram(&self, name: &'static str, labels: &[(&'static str, &str)], value_ms: f64) {
+        self.observe_histogram_with(name, labels, value_ms, &LATENCY_BUCKETS_MS);
+    }
+
+    /// Observe a value into a histogram with an explicit `&'static` bucket set. The first
+    /// observation for a (name, labels) series registers the histogram with these `bounds`;
+    /// subsequent observations reuse the existing histogram and ignore `bounds` (the bound
+    /// set is fixed per series). Use this for non-millisecond histograms (result counts,
+    /// query lengths) — see [`RESULT_COUNT_BUCKETS`], [`QUERY_LEN_BUCKETS`].
+    pub fn observe_histogram_with(
+        &self,
+        name: &'static str,
+        labels: &[(&'static str, &str)],
+        value: f64,
+        bounds: &'static [f64],
+    ) {
         let key = (name, Self::norm(labels));
         if let Some(h) = self.histograms.get(&key) {
-            h.observe(value_ms);
+            h.observe(value);
         } else {
-            self.histograms.entry(key).or_default().observe(value_ms);
+            self.histograms.entry(key).or_insert_with(|| Histogram::new(bounds)).observe(value);
         }
     }
 
@@ -229,6 +263,57 @@ impl SelfMetrics {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.set_gauge("rush_engine_last_run_timestamp", &labels, now as f64);
+    }
+
+    /// Convenience: record one log/span SEARCH and update all search self-metrics.
+    ///
+    /// Emits, all labeled only by the fixed `signal` (and `outcome` on the counter):
+    ///   - `rush_search_queries_total{signal,outcome}` — always (+1).
+    ///   - `rush_search_duration_ms{signal}` — end-to-end latency histogram
+    ///     ([`SEARCH_LATENCY_BUCKETS_MS`]); `_sum`/`_count` give the average.
+    ///   - `rush_search_result_rows{signal}` — returned-row-count histogram
+    ///     ([`RESULT_COUNT_BUCKETS`]); `_sum`/`_count` give the average.
+    ///   - `rush_search_query_length_chars{signal}` — free-text length histogram
+    ///     ([`QUERY_LEN_BUCKETS`]), **only** when `query_len` is `Some` (a search term was
+    ///     present); pure browse (`None`) is still counted as a query but skips this.
+    ///   - `rush_search_empty_total{signal}` — +1 when `result_rows == 0` (no-results signal).
+    ///
+    /// `signal` is a fixed, finite label (e.g. "logs" or "spans"). Never pass tenant,
+    /// query text, route, or user as a label here — cardinality must stay tiny.
+    pub fn record_search(
+        &self,
+        signal: &'static str,
+        query_len: Option<usize>,
+        result_rows: u64,
+        duration_ms: u64,
+        ok: bool,
+    ) {
+        let signal_label = [("signal", signal)];
+        let outcome = if ok { "ok" } else { "error" };
+        self.inc_counter("rush_search_queries_total", &[("signal", signal), ("outcome", outcome)], 1);
+        self.observe_histogram_with(
+            "rush_search_duration_ms",
+            &signal_label,
+            duration_ms as f64,
+            &SEARCH_LATENCY_BUCKETS_MS,
+        );
+        self.observe_histogram_with(
+            "rush_search_result_rows",
+            &signal_label,
+            result_rows as f64,
+            &RESULT_COUNT_BUCKETS,
+        );
+        if let Some(len) = query_len {
+            self.observe_histogram_with(
+                "rush_search_query_length_chars",
+                &signal_label,
+                len as f64,
+                &QUERY_LEN_BUCKETS,
+            );
+        }
+        if result_rows == 0 {
+            self.inc_counter("rush_search_empty_total", &signal_label, 1);
+        }
     }
 
     // ── Output 1: Prometheus text exposition (0.0.4) ──────────────────────────────
@@ -284,16 +369,18 @@ impl SelfMetrics {
         hist_names.dedup();
         for name in hist_names {
             out.push_str(&format!("# TYPE {name} histogram\n"));
-            let mut rows: Vec<(Labels, ([u64; LATENCY_BUCKETS_MS.len()], u64, f64))> = self
+            // Each series carries its own bucket bounds, so snapshot the bounds alongside
+            // the per-bucket counts rather than assuming a single global bucket set.
+            let mut rows: Vec<(Labels, &'static [f64], (Vec<u64>, u64, f64))> = self
                 .histograms
                 .iter()
                 .filter(|e| e.key().0 == name)
-                .map(|e| (e.key().1.clone(), e.value().snapshot()))
+                .map(|e| (e.key().1.clone(), e.value().bounds, e.value().snapshot()))
                 .collect();
             rows.sort_by(|a, b| a.0.cmp(&b.0));
-            for (labels, (per_bucket, count, sum)) in rows {
+            for (labels, bounds, (per_bucket, count, sum)) in rows {
                 let mut cumulative = 0u64;
-                for (i, &ub) in LATENCY_BUCKETS_MS.iter().enumerate() {
+                for (i, &ub) in bounds.iter().enumerate() {
                     cumulative += per_bucket[i];
                     out.push_str(name);
                     out.push_str("_bucket");
@@ -350,6 +437,7 @@ impl SelfMetrics {
         for e in self.histograms.iter() {
             let name = e.key().0;
             let labels = e.key().1.clone();
+            let bounds = e.value().bounds;
             let (per_bucket, count, sum) = e.value().snapshot();
             points.push(MetricPoint {
                 name: format!("{name}_count"),
@@ -367,7 +455,7 @@ impl SelfMetrics {
                 points.push(MetricPoint {
                     name: format!("{name}_{suffix}"),
                     labels: labels.clone(),
-                    value: quantile_from_buckets(&per_bucket, count, q),
+                    value: quantile_from_buckets(&per_bucket, bounds, count, q),
                     kind: MetricKind::Gauge,
                 });
             }
@@ -486,9 +574,9 @@ mod tests {
         let mut per_bucket = [0u64; LATENCY_BUCKETS_MS.len()];
         per_bucket[0] = 10;
         let total = 10u64;
-        let p50 = quantile_from_buckets(&per_bucket, total, 0.50);
-        let p95 = quantile_from_buckets(&per_bucket, total, 0.95);
-        let p99 = quantile_from_buckets(&per_bucket, total, 0.99);
+        let p50 = quantile_from_buckets(&per_bucket, &LATENCY_BUCKETS_MS, total, 0.50);
+        let p95 = quantile_from_buckets(&per_bucket, &LATENCY_BUCKETS_MS, total, 0.95);
+        let p99 = quantile_from_buckets(&per_bucket, &LATENCY_BUCKETS_MS, total, 0.99);
         // rank for p50 = 5 → interpolated 5*(5/10)=2.5; p95 rank=9.5 → 5*(9.5/10)=4.75.
         assert!((p50 - 2.5).abs() < 1e-9, "p50={p50}");
         assert!((p95 - 4.75).abs() < 1e-9, "p95={p95}");
@@ -496,15 +584,15 @@ mod tests {
 
         // Empty histogram → all quantiles 0.
         let empty = [0u64; LATENCY_BUCKETS_MS.len()];
-        assert_eq!(quantile_from_buckets(&empty, 0, 0.99), 0.0);
+        assert_eq!(quantile_from_buckets(&empty, &LATENCY_BUCKETS_MS, 0, 0.99), 0.0);
 
         // Spread across buckets: 5 in [0,5], 5 in (5,10]. p50 rank=5 lands at boundary of
         // first bucket → 5.0; p95 rank=9.5 → in second bucket: 5 + (10-5)*((9.5-5)/5)=9.5.
         let mut spread = [0u64; LATENCY_BUCKETS_MS.len()];
         spread[0] = 5;
         spread[1] = 5;
-        let p50b = quantile_from_buckets(&spread, 10, 0.50);
-        let p95b = quantile_from_buckets(&spread, 10, 0.95);
+        let p50b = quantile_from_buckets(&spread, &LATENCY_BUCKETS_MS, 10, 0.50);
+        let p95b = quantile_from_buckets(&spread, &LATENCY_BUCKETS_MS, 10, 0.95);
         assert!((p50b - 5.0).abs() < 1e-9, "p50b={p50b}");
         assert!((p95b - 9.5).abs() < 1e-9, "p95b={p95b}");
     }
@@ -530,5 +618,81 @@ mod tests {
         assert!(points.iter().any(|p| p.name == "rush_engine_run_duration_ms_sum" && p.kind == MetricKind::Sum));
         assert!(points.iter().any(|p| p.name == "rush_engine_run_duration_ms_p99" && p.kind == MetricKind::Gauge));
         assert!(!points.iter().any(|p| p.name.contains("_bucket")));
+    }
+
+    #[test]
+    fn custom_bucket_histogram_renders_with_its_own_bounds() {
+        let m = SelfMetrics::new();
+        let labels = [("signal", "logs")];
+        // RESULT_COUNT_BUCKETS = [0,1,5,10,50,100,500,1000,5000,10000].
+        m.observe_histogram_with("rush_search_result_rows", &labels, 0.0, &RESULT_COUNT_BUCKETS); // <=0
+        m.observe_histogram_with("rush_search_result_rows", &labels, 3.0, &RESULT_COUNT_BUCKETS); // <=5
+        m.observe_histogram_with("rush_search_result_rows", &labels, 7.0, &RESULT_COUNT_BUCKETS); // <=10
+        m.observe_histogram_with("rush_search_result_rows", &labels, 99999.0, &RESULT_COUNT_BUCKETS); // +Inf
+
+        let text = m.render_prometheus();
+        assert!(text.contains("# TYPE rush_search_result_rows histogram"));
+        // Bounds come from RESULT_COUNT_BUCKETS, NOT the default ms set: le="0",le="5",le="10".
+        assert!(text.contains("le=\"0\"} 1"), "le=0 wrong:\n{text}");
+        assert!(text.contains("le=\"5\"} 2"), "le=5 wrong:\n{text}");
+        assert!(text.contains("le=\"10\"} 3"), "le=10 wrong:\n{text}");
+        // +Inf and _count = 4 total; _sum = 0+3+7+99999 = 100009.
+        assert!(text.contains("le=\"+Inf\"} 4"), "+Inf wrong:\n{text}");
+        assert!(text.contains("rush_search_result_rows_count{signal=\"logs\"} 4"), "count wrong:\n{text}");
+        assert!(text.contains("rush_search_result_rows_sum{signal=\"logs\"} 100009"), "sum wrong:\n{text}");
+        // The default ms bucket bound (5000) is NOT emitted as a separate le from this set;
+        // confirm the highest finite bound is the custom one (10000), not 10000-from-latency.
+        assert!(text.contains("le=\"10000\"} 3"), "le=10000 wrong:\n{text}");
+
+        // Snapshot uses the same custom bounds for quantiles (no panic / no wrong scale).
+        let points = m.snapshot_series();
+        assert!(points.iter().any(|p| p.name == "rush_search_result_rows_count" && (p.value - 4.0).abs() < 1e-9));
+        let p99 = points.iter().find(|p| p.name == "rush_search_result_rows_p99").unwrap();
+        // p99 of {0,3,7,large} should land within the bucket bounds (max finite bound 10000).
+        assert!(p99.value <= 10000.0 && p99.value >= 0.0, "p99={}", p99.value);
+    }
+
+    #[test]
+    fn record_search_emits_all_series_with_bounded_labels() {
+        let m = SelfMetrics::new();
+        // A successful logs search with a 4-char term returning 3 rows in 120ms.
+        m.record_search("logs", Some(4), 3, 120, true);
+        // A successful logs browse (no term) returning 0 rows in 50ms → empty + no length hist.
+        m.record_search("logs", None, 0, 50, true);
+        // A failed spans search.
+        m.record_search("spans", Some(10), 0, 999, false);
+
+        let text = m.render_prometheus();
+
+        // Counter with signal+outcome, low cardinality.
+        assert!(text.contains("rush_search_queries_total{outcome=\"ok\",signal=\"logs\"} 2"), "queries ok wrong:\n{text}");
+        assert!(text.contains("rush_search_queries_total{outcome=\"error\",signal=\"spans\"} 1"), "queries err wrong:\n{text}");
+
+        // Empty counter: the 0-row browse (logs) and the 0-row failed spans search.
+        assert!(text.contains("rush_search_empty_total{signal=\"logs\"} 1"), "empty logs wrong:\n{text}");
+        assert!(text.contains("rush_search_empty_total{signal=\"spans\"} 1"), "empty spans wrong:\n{text}");
+
+        // Duration histogram uses SEARCH_LATENCY_BUCKETS_MS (le="100" exists, not the ms set's 250-cap).
+        assert!(text.contains("# TYPE rush_search_duration_ms histogram"));
+        // logs: two observations (120ms, 50ms) → _count 2, _sum 170.
+        assert!(text.contains("rush_search_duration_ms_count{signal=\"logs\"} 2"), "dur count wrong:\n{text}");
+        assert!(text.contains("rush_search_duration_ms_sum{signal=\"logs\"} 170"), "dur sum wrong:\n{text}");
+        // SEARCH_LATENCY_BUCKETS_MS starts at 10 — confirm that bound exists.
+        assert!(text.contains("rush_search_duration_ms_bucket{signal=\"logs\",le=\"10\"}"), "search latency bounds wrong:\n{text}");
+
+        // Result-rows histogram: logs got 3 and 0 → _count 2, _sum 3.
+        assert!(text.contains("rush_search_result_rows_count{signal=\"logs\"} 2"), "rows count wrong:\n{text}");
+        assert!(text.contains("rush_search_result_rows_sum{signal=\"logs\"} 3"), "rows sum wrong:\n{text}");
+
+        // Query-length histogram: ONLY the two searches with a term (logs len=4) recorded
+        // for logs → _count 1; the browse (None) was skipped.
+        assert!(text.contains("rush_search_query_length_chars_count{signal=\"logs\"} 1"), "qlen count wrong:\n{text}");
+        assert!(text.contains("rush_search_query_length_chars_sum{signal=\"logs\"} 4"), "qlen sum wrong:\n{text}");
+        // spans length histogram recorded once (len=10).
+        assert!(text.contains("rush_search_query_length_chars_count{signal=\"spans\"} 1"), "qlen spans count wrong:\n{text}");
+
+        // No high-cardinality labels leaked (no tenant/route/query labels).
+        assert!(!text.contains("tenant"), "tenant label leaked:\n{text}");
+        assert!(!text.contains("route="), "route label leaked:\n{text}");
     }
 }

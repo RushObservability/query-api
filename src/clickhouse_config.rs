@@ -2672,6 +2672,31 @@ impl ConfigDb {
                 w("Connections % of max","timeseries",qc_metrics("100 * sum(postgresql_backends) / max(postgresql_max_connections)"),(0,44,6,4),color("#3b82f6")),
                 w("Commit ratio %","timeseries",qc_metrics("100 * sum(rate(postgresql_commits[5m])) / (sum(rate(postgresql_commits[5m])) + sum(rate(postgresql_rollbacks[5m])))"),(6,44,6,4),color("#22c55e"))
             ]})),
+            // Rush platform self-usage: how operators exercise the system. All series come
+            // from the API's self-ingested `rush_*` metrics (source:"metrics" / PromQL).
+            // Search query rate/timing split by `signal` (logs vs spans/apm); metrics-query
+            // rate from the /prom HTTP route (the PromQL path has no per-search metric).
+            ("tpl-rush-usage","Rush Usage & Performance","How operators use Rush: query rate by signal (APM/logs/metrics), search latency p50/p95/p99, result sizes, empty/error rates, and API request load. Sourced from the platform's own self-metrics.","platform",serde_json::json!({"widgets":[
+                // ── Query rate by signal ──
+                w("Search queries / s by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_search_queries_total[5m]))"),(0,0,6,4),empty()),
+                w("Metrics (PromQL) queries / s","timeseries",qc_metrics("sum(rate(rush_http_requests_total{route=~\"/prom/api/v1/query(_range)?\"}[5m]))"),(6,0,6,4),color("#a855f7")),
+                // ── Search latency percentiles (ms) ──
+                w("Search p95 latency by signal (ms)","timeseries",qc_metrics("rush_search_duration_ms_p95"),(0,4,6,4),color("#f59e0b")),
+                w("Search p99 latency by signal (ms)","timeseries",qc_metrics("rush_search_duration_ms_p99"),(6,4,6,4),color("#ef4444")),
+                w("Search avg latency by signal (ms)","timeseries",qc_metrics("sum by (signal) (rate(rush_search_duration_ms_sum[5m])) / sum by (signal) (rate(rush_search_duration_ms_count[5m]))"),(0,8,6,4),color("#22c55e")),
+                w("Search p50 latency by signal (ms)","timeseries",qc_metrics("rush_search_duration_ms_p50"),(6,8,6,4),color("#3b82f6")),
+                // ── Result sizes & query shape ──
+                w("Avg result rows by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_search_result_rows_sum[5m])) / sum by (signal) (rate(rush_search_result_rows_count[5m]))"),(0,12,6,4),color("#06b6d4")),
+                w("Avg search query length (chars)","timeseries",qc_metrics("sum by (signal) (rate(rush_search_query_length_chars_sum[5m])) / sum by (signal) (rate(rush_search_query_length_chars_count[5m]))"),(6,12,6,4),color("#8b5cf6")),
+                // ── Quality signals: empty & error rate ──
+                w("Empty-result searches / s by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_search_empty_total[5m]))"),(0,16,6,4),color("#f59e0b")),
+                w("Search error rate % by signal","timeseries",qc_metrics("100 * sum by (signal) (rate(rush_search_queries_total{outcome=\"error\"}[5m])) / sum by (signal) (rate(rush_search_queries_total[5m]))"),(6,16,6,4),color("#ef4444")),
+                // ── API request load (system-usage context) ──
+                w("API requests / s by route","timeseries",qc_metrics("sum by (route) (rate(rush_http_requests_total[5m]))"),(0,20,6,4),empty()),
+                w("API request p95 latency (ms)","timeseries",qc_metrics("rush_http_request_duration_ms_p95"),(6,20,6,4),color("#f59e0b")),
+                w("In-flight API requests","timeseries",qc_metrics("rush_http_requests_in_flight"),(0,24,6,4),color("#3b82f6")),
+                w("API 5xx / s by route","timeseries",qc_metrics("sum by (route) (rate(rush_http_requests_total{status_class=\"5xx\"}[5m]))"),(6,24,6,4),color("#ef4444"))
+            ]})),
         ];
 
         for (id, name, desc, category, json_val) in &templates {
