@@ -2677,7 +2677,7 @@ impl ConfigDb {
             // Search query rate/timing split by `signal` (logs, spans/apm, metrics/PromQL);
             // all three signals share the same rush_search_* self-metrics, so latency /
             // result-size / empty / error widgets are apples-to-apples across them.
-            ("tpl-rush-usage","Rush Usage & Performance","How operators use Rush: query rate by signal (APM/logs/metrics), search latency p50/p95/p99, result sizes, empty/error rates, and API request load. Sourced from the platform's own self-metrics.","platform",serde_json::json!({"widgets":[
+            ("tpl-rush-usage","Rush Usage & Performance","Full self-observability for the Rush platform: query rate by signal (APM/logs/metrics), search latency p50/p95/p99, result sizes, empty/error rates, API request load & latency, ingest throughput/spool backpressure, background-engine health, and ClickHouse storage health. Sourced entirely from the platform's own self-metrics.","platform",serde_json::json!({"widgets":[
                 // ── Query rate by signal ──
                 w("Search queries / s by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_search_queries_total[5m]))"),(0,0,6,4),empty()),
                 w("Metrics (PromQL) queries / s","timeseries",qc_metrics("sum(rate(rush_search_queries_total{signal=\"metrics\"}[5m]))"),(6,0,6,4),color("#a855f7")),
@@ -2696,7 +2696,32 @@ impl ConfigDb {
                 w("API requests / s by route","timeseries",qc_metrics("sum by (route) (rate(rush_http_requests_total[5m]))"),(0,20,6,4),empty()),
                 w("API request p95 latency (ms)","timeseries",qc_metrics("rush_http_request_duration_ms_p95"),(6,20,6,4),color("#f59e0b")),
                 w("In-flight API requests","timeseries",qc_metrics("rush_http_requests_in_flight"),(0,24,6,4),color("#3b82f6")),
-                w("API 5xx / s by route","timeseries",qc_metrics("sum by (route) (rate(rush_http_requests_total{status_class=\"5xx\"}[5m]))"),(6,24,6,4),color("#ef4444"))
+                w("API 5xx / s by route","timeseries",qc_metrics("sum by (route) (rate(rush_http_requests_total{status_class=\"5xx\"}[5m]))"),(6,24,6,4),color("#ef4444")),
+                w("API request p99 latency (ms)","timeseries",qc_metrics("rush_http_request_duration_ms_p99"),(0,28,6,4),color("#ef4444")),
+                w("API request avg latency (ms)","timeseries",qc_metrics("sum(rate(rush_http_request_duration_ms_sum[5m])) / sum(rate(rush_http_request_duration_ms_count[5m]))"),(6,28,6,4),color("#22c55e")),
+                // ── Ingest throughput (self-ingested rush_ingest_* counters, split by signal) ──
+                w("Ingested events / s by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_ingest_events_total[5m]))"),(0,32,6,4),empty()),
+                w("Ingested bytes / s by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_ingest_bytes_total[5m]))"),(6,32,6,4),color("#06b6d4")),
+                w("Rejected events / s by signal","timeseries",qc_metrics("sum by (signal) (rate(rush_ingest_events_total{outcome=\"rejected\"}[5m]))"),(0,36,6,4),color("#ef4444")),
+                w("Avg ingested event size (bytes)","timeseries",qc_metrics("sum(rate(rush_ingest_bytes_total[5m])) / sum(rate(rush_ingest_events_total[5m]))"),(6,36,6,4),color("#8b5cf6")),
+                // ── Ingest spool (disk-backed buffer; rising = backpressure / downstream stalls) ──
+                w("Spool buffered (bytes)","timeseries",qc_metrics("rush_ingest_spool_bytes"),(0,40,6,4),color("#f59e0b")),
+                w("Spool segments on disk","timeseries",qc_metrics("rush_ingest_spool_segments"),(6,40,6,4),color("#a855f7")),
+                w("Oldest spooled segment age (s)","timeseries",qc_metrics("rush_ingest_spool_oldest_age_secs"),(0,44,6,4),color("#ef4444")),
+                // ── Background engines (anomaly / monitor / siem / slo / stats) ──
+                w("Engine runs / s by engine","timeseries",qc_metrics("sum by (engine) (rate(rush_engine_runs_total[5m]))"),(6,44,6,4),empty()),
+                w("Engine run p95 duration (ms)","timeseries",qc_metrics("rush_engine_run_duration_ms_p95"),(0,48,6,4),color("#f59e0b")),
+                w("Engine run avg duration (ms)","timeseries",qc_metrics("sum by (engine) (rate(rush_engine_run_duration_ms_sum[5m])) / sum by (engine) (rate(rush_engine_run_duration_ms_count[5m]))"),(6,48,6,4),color("#22c55e")),
+                w("Seconds since last engine run","timeseries",qc_metrics("time() - max by (engine) (rush_engine_last_run_timestamp)"),(0,52,6,4),color("#ef4444")),
+                // ── ClickHouse storage backend health (rush_ch_* gauges) ──
+                w("CH resident memory (bytes)","timeseries",qc_metrics("rush_ch_memory_resident_bytes"),(6,52,6,4),color("#3b82f6")),
+                w("CH active merges","timeseries",qc_metrics("rush_ch_active_merges"),(0,56,6,4),color("#06b6d4")),
+                w("CH active mutations","timeseries",qc_metrics("rush_ch_active_mutations"),(6,56,6,4),color("#a855f7")),
+                w("CH longest running merge (s)","timeseries",qc_metrics("rush_ch_longest_running_merge_secs"),(0,60,6,4),color("#f59e0b")),
+                w("CH max parts per partition","timeseries",qc_metrics("rush_ch_max_part_count_for_partition"),(6,60,6,4),color("#ef4444")),
+                w("CH delayed inserts","timeseries",qc_metrics("rush_ch_delayed_inserts"),(0,64,6,4),color("#ef4444")),
+                w("CH background pool tasks","timeseries",qc_metrics("rush_ch_background_pool_task"),(6,64,6,4),color("#8b5cf6")),
+                w("CH failed queries (cumulative)","timeseries",qc_metrics("rush_ch_failed_query_total"),(0,68,6,4),color("#ef4444"))
             ]})),
         ];
 
