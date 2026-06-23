@@ -1114,8 +1114,14 @@ pub async fn apply_retention_ttls(
             tracing::debug!("TTL on {table} already {days}d, skipping");
             continue;
         }
+        // materialize_ttl_after_modify=0: change only the table's TTL metadata, do
+        // NOT rewrite existing parts. Re-materializing TTL on large parts spawns a
+        // mutation that needs ~the whole part in memory (hits max_server_memory_usage,
+        // fails, and locks the part against MOVE). The background TTL task still
+        // moves/drops parts lazily on merges using the new rule.
         let sql = format!(
-            "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {days} DAY DELETE"
+            "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {days} DAY DELETE \
+             SETTINGS materialize_ttl_after_modify = 0"
         );
         if let Err(e) = client.query(&sql).execute().await {
             tracing::warn!("failed to set TTL on {table}: {e}");
@@ -1181,10 +1187,15 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
             "logs" => config.effective_logs_ttl_days(),
             _ => 30,
         };
+        // materialize_ttl_after_modify=0: set the move/delete TTL as metadata only.
+        // Re-materializing on large existing parts spawns a per-part mutation that
+        // exceeds max_server_memory_usage and locks the part against MOVE; the
+        // background mover relocates parts to the cold volume lazily instead.
         let sql = format!(
             "ALTER TABLE observability.{table} MODIFY TTL \
              {ts_expr} + INTERVAL {move_days} DAY TO VOLUME 'cold', \
-             {ts_expr} + INTERVAL {delete_days} DAY DELETE"
+             {ts_expr} + INTERVAL {delete_days} DAY DELETE \
+             SETTINGS materialize_ttl_after_modify = 0"
         );
         if let Err(e) = client.query(&sql).execute().await {
             tracing::warn!("could not set TTL MOVE on {table} (non-fatal): {e}");

@@ -1180,9 +1180,14 @@ impl ConfigDb {
 
     /// Seed the singleton global-retention row if absent: 365d default, all
     /// signals inheriting it (per-signal value 0 = inherit default).
-    pub async fn ensure_global_retention(&self) -> anyhow::Result<()> {
+    /// Seed the UI-editable global-retention store ONCE (when empty) from the
+    /// caller-supplied defaults — normally `rushConfig.retention.defaults`, so a
+    /// fresh install's tenant/UI retention matches Helm instead of a hardcoded 365.
+    /// Existing clusters keep whatever's already stored (edit via the UI/API).
+    /// Per-signal 0 = inherit `default_days`.
+    pub async fn ensure_global_retention(&self, default_days: i32, logs_days: i32, metrics_days: i32, apm_days: i32) -> anyhow::Result<()> {
         if self.get_global_retention().await?.is_none() {
-            self.set_global_retention(365, 0, 0, 0).await?;
+            self.set_global_retention(default_days, logs_days, metrics_days, apm_days).await?;
         }
         Ok(())
     }

@@ -481,7 +481,16 @@ async fn main() -> anyhow::Result<()> {
     config_db.ensure_default_tenant().await?;
     // Reserve the `_audit` tenant (seeded disabled) so it's never an ingest target.
     config_db.ensure_audit_tenant().await?;
-    config_db.ensure_global_retention().await?;
+    // Seed the UI/tenant global-retention store from rushConfig.retention.defaults
+    // (only on a fresh, unseeded cluster) so new tenants inherit the Helm-configured
+    // retention instead of a hardcoded 365. traces → apm_days.
+    {
+        let rd = &wide_config.retention.defaults;
+        let default_days = rd.metrics_days.max(rd.traces_days).max(rd.logs_days) as i32;
+        config_db
+            .ensure_global_retention(default_days, rd.logs_days as i32, rd.metrics_days as i32, rd.traces_days as i32)
+            .await?;
+    }
     config_db.ensure_default_admin().await?;
     config_db.ensure_default_groups().await?;
     config_db.ensure_default_templates().await?;
@@ -1169,6 +1178,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/kubernetes/resources/{kind}/{namespace}/{name}", get(handlers::kubernetes::get_resource))
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
+        .route("/api/v1/stats/partitions", axum::routing::get(handlers::stats::get_storage_partitions))
         // Signal usage
         .route("/api/v1/usage", get(handlers::usage::get_usage))
         .route("/api/v1/usage/cardinality/{metric}", get(handlers::usage::get_label_breakdown))

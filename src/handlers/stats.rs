@@ -439,6 +439,143 @@ pub async fn get_stats(
     Ok(Json(value))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-partition tiered-storage view: for each data table + partition, how many
+// bytes are on local disk vs object store, when the partition is expected to move
+// to cold (S3), and when it will be deleted. Powers the Settings → Storage tiers UI.
+// Admin-only (exposes cluster-wide partition metadata across all tenants).
+
+#[derive(Debug, Clone, Deserialize, Row)]
+struct PartitionRow {
+    table: String,
+    partition: String,
+    rows: u64,
+    bytes_total: u64,
+    bytes_local: u64,
+    bytes_object_store: u64,
+    // toUnixTimestamp(max(delete_ttl_info_max)); 0 when the partition has no DELETE TTL.
+    delete_due_ts: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartitionStorage {
+    pub table: String,
+    pub signal: String,
+    pub partition: String,
+    pub rows: u64,
+    pub bytes_total: u64,
+    pub bytes_local: u64,
+    pub bytes_object_store: u64,
+    /// "local" (all hot), "cold" (all on S3), or "mixed".
+    pub tier: String,
+    pub move_after_days: u32,
+    pub retention_days: u32,
+    /// Epoch seconds when ClickHouse will DELETE the partition (ground truth from
+    /// delete_ttl_info_max). None if no DELETE TTL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_at: Option<i64>,
+    /// Epoch seconds when the still-local data is expected to move to S3, ESTIMATED
+    /// as partition_date + move_after_days (ClickHouse's per-part move_ttl_info is
+    /// unreliable for pre-policy/already-moved parts). None when fully cold or
+    /// tiering is disabled for the signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_at_estimate: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartitionStorageResponse {
+    pub object_store_enabled: bool,
+    /// Server time (epoch seconds) so the UI computes countdowns against the same clock.
+    pub now: i64,
+    pub partitions: Vec<PartitionStorage>,
+}
+
+/// GET /api/v1/stats/partitions — admin-only per-partition tiered-storage view.
+pub async fn get_storage_partitions(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::handlers::users::require_admin(&state, &headers).await?;
+
+    let rows = state.ch.query(
+        "SELECT \
+             p.table AS table, \
+             p.partition AS partition, \
+             sum(p.rows) AS rows, \
+             sum(p.bytes_on_disk) AS bytes_total, \
+             sumIf(p.bytes_on_disk, d.type = 'Local') AS bytes_local, \
+             sumIf(p.bytes_on_disk, d.type != 'Local') AS bytes_object_store, \
+             toUInt32(max(toUnixTimestamp(p.delete_ttl_info_max))) AS delete_due_ts \
+         FROM system.parts AS p \
+         LEFT JOIN system.disks AS d ON p.disk_name = d.name \
+         WHERE p.database = 'observability' AND p.active \
+           AND p.table IN ('logs','spans','metrics_gauge','metrics_sum','metrics_histogram', \
+                           'metrics_exp_histogram','metrics_summary','rum','rum_replay') \
+         GROUP BY table, partition \
+         ORDER BY table, partition DESC"
+    ).fetch_all::<PartitionRow>().await.map_err(|e| {
+        tracing::error!(error = %e, handler = "get_storage_partitions", "query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".to_string())
+    })?;
+
+    let tiering = &state.config.storage.tiering;
+    let ret = &state.config.retention.defaults;
+    let now = chrono::Utc::now().timestamp();
+
+    let partitions = rows.into_iter().map(|r| {
+        let (signal, move_days, retention_days) = match r.table.as_str() {
+            "logs" => ("logs", tiering.logs_move_after_days, ret.logs_days),
+            "spans" => ("traces", tiering.traces_move_after_days, ret.traces_days),
+            "rum" | "rum_replay" => ("traces", tiering.traces_move_after_days, ret.traces_days),
+            t if t.starts_with("metrics_") => ("metrics", tiering.metrics_move_after_days, ret.metrics_days),
+            _ => ("other", 0, 0),
+        };
+        let tier = if r.bytes_local > 0 && r.bytes_object_store > 0 {
+            "mixed"
+        } else if r.bytes_local == 0 && r.bytes_object_store > 0 {
+            "cold"
+        } else {
+            "local"
+        };
+        let delete_at = if r.delete_due_ts > 0 { Some(r.delete_due_ts as i64) } else { None };
+        // Estimate the move only while there's still hot data and tiering is on.
+        let move_at_estimate = if r.bytes_local > 0 && move_days > 0 {
+            chrono::NaiveDate::parse_from_str(&r.partition, "%Y-%m-%d").ok()
+                .and_then(|d| d.checked_add_days(chrono::Days::new(move_days as u64)))
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc().timestamp())
+        } else {
+            None
+        };
+        PartitionStorage {
+            table: r.table,
+            signal: signal.to_string(),
+            partition: r.partition,
+            rows: r.rows,
+            bytes_total: r.bytes_total,
+            bytes_local: r.bytes_local,
+            bytes_object_store: r.bytes_object_store,
+            tier: tier.to_string(),
+            move_after_days: move_days,
+            retention_days,
+            delete_at,
+            move_at_estimate,
+        }
+    }).collect();
+
+    let object_store_enabled = match OBJECT_STORE_ENABLED.get() {
+        Some(v) => *v,
+        None => {
+            let probed = state.ch.query(
+                "SELECT count() AS count FROM system.disks WHERE type != 'Local'"
+            ).fetch_one::<CountResult>().await.map(|r| r.count > 0).unwrap_or(false);
+            *OBJECT_STORE_ENABLED.get_or_init(|| probed)
+        }
+    };
+
+    Ok(Json(PartitionStorageResponse { object_store_enabled, now, partitions }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
