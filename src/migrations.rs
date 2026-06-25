@@ -951,8 +951,12 @@ async fn apply_skip_indexes(client: &Client) {
             ngram_name: "idx_body_ngram",
             ngram_ddl: "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
                 idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
-            // On text path, the text index supersedes both tokenbf + ngrambf on Body.
-            drop_on_text: &["idx_body", "idx_body_ngram"],
+            // On the text path we keep BOTH indexes on lower(Body): the `text` token
+            // index for whole-word search AND the ngrambf_v1 substring index for
+            // partial-word wildcards (LIKE '%...%'), which the token index cannot serve.
+            // The bloom substring index is tiny (~3.7 GiB full-table at our volume), so it
+            // covers the whole retained table. Drop only the legacy `idx_body` tokenbf.
+            drop_on_text: &["idx_body"],
             // On ngram path, keep the existing bloom indexes (idx_body tokenbf is a useful
             // word index; idx_body_ngram is the desired substring index). Drop only a stale text index.
             drop_on_ngram: &["idx_body_text"],
@@ -1011,6 +1015,24 @@ async fn apply_skip_indexes(client: &Client) {
                 let drop_ddl = format!("ALTER TABLE observability.{} DROP INDEX IF EXISTS {}", p.table, name);
                 if let Err(e) = client.query(&drop_ddl).execute().await {
                     tracing::warn!(table = p.table, index = name, error = %e, "failed to drop superseded index");
+                }
+            }
+        }
+
+        // 3. On the text path, ALSO ensure the ngrambf_v1 substring index exists alongside
+        //    the `text` token index. Partial-word wildcards (LIKE '%foo%') can't use the
+        //    token index and otherwise force a full Body scan; the bloom n-gram index prunes
+        //    granules for substrings >= 4 chars. It's a compact fixed-size bloom filter
+        //    (~3.7 GiB across the whole table), so it covers all retained data — no windowing.
+        //    On the non-text path the loop above already created idx_body_ngram as `want`.
+        if text_supported && !index_exists(client, p.table, p.ngram_name).await {
+            tracing::info!(table = p.table, index = p.ngram_name, "creating substring (ngrambf_v1) index");
+            if let Err(e) = client.query(p.ngram_ddl).execute().await {
+                tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "failed to create substring index");
+            } else {
+                let materialize = format!("ALTER TABLE observability.{} MATERIALIZE INDEX {}", p.table, p.ngram_name);
+                if let Err(e) = client.query(&materialize).execute().await {
+                    tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "failed to materialize substring index");
                 }
             }
         }
