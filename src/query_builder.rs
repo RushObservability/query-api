@@ -461,10 +461,48 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
             format!("({})", parts.join(" AND "))
         }
         SearchExpr::Or(exprs) => {
-            let parts: Vec<String> = exprs.iter().map(log_search_expr_to_sql).collect();
-            format!("({})", parts.join(" OR "))
+            // When every branch is a plain substring wildcard on Body (e.g. `*foo* OR *bar*`),
+            // collapse the OR-of-LIKEs into a single multiSearchAny: one hyperscan-vectorized
+            // pass over lower(Body) (computed once) instead of N separate LIKE evaluations.
+            // Same substring semantics, and it still prunes via the idx_body_ngram skip index
+            // for selective needles. Token/ID/key=value/internal-wildcard branches fall back to OR.
+            let needles: Option<Vec<String>> = exprs.iter().map(body_substring_needle).collect();
+            match needles {
+                Some(ns) if ns.len() >= 2 => {
+                    let arr = ns
+                        .iter()
+                        .map(|n| format!("'{}'", escape_string_literal(n)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("multiSearchAny(lower(Body), [{arr}])")
+                }
+                _ => {
+                    let parts: Vec<String> = exprs.iter().map(log_search_expr_to_sql).collect();
+                    format!("({})", parts.join(" OR "))
+                }
+            }
         }
     }
+}
+
+/// If `expr` is a plain substring-wildcard term on the log body (e.g. `*foo*`, `foo*`,
+/// `*foo`), return its literal needle, lowercased. Such terms compile to
+/// `lower(Body) LIKE '%needle%'`, so an OR of them is equivalent to a single
+/// `multiSearchAny(lower(Body), [needles])` — one vectorized pass instead of N LIKEs.
+/// Returns None for bare token terms (which use hasToken), ID terms, key=value, empty
+/// cores, or patterns with an internal wildcard (`a*b`) that aren't one literal substring.
+fn body_substring_needle(expr: &SearchExpr) -> Option<String> {
+    let SearchExpr::Term(term) = expr else { return None };
+    let t = term.trim();
+    if !t.contains('*') {
+        return None; // bare term → hasToken (whole-word), not a substring match
+    }
+    let lower = t.to_lowercase();
+    let core = lower.trim_matches('*');
+    if core.is_empty() || core.contains('*') {
+        return None; // empty, or an internal-wildcard pattern (not a single literal substring)
+    }
+    Some(core.to_string())
 }
 
 /// Generate a ClickHouse predicate for a single free-text log search term.
@@ -924,6 +962,39 @@ mod search_tests {
         let sql = build_log_search_sql("time*").unwrap();
         assert_eq!(sql, "lower(Body) LIKE '%time%%'");
         assert!(!sql.contains("hasToken"));
+    }
+
+    // An OR of substring wildcards collapses to ONE vectorized multiSearchAny
+    // (single hyperscan pass over lower(Body)) instead of N separate LIKE scans.
+    #[test]
+    fn log_or_of_wildcards_collapses_to_multisearchany() {
+        let sql = build_log_search_sql("*reset* OR *closed* OR *refused*").unwrap();
+        assert_eq!(sql, "multiSearchAny(lower(Body), ['reset', 'closed', 'refused'])");
+    }
+
+    // OR of bare tokens stays token-precise (hasToken) — NOT collapsed to substring
+    // multiSearchAny (whole-word 'error' vs the substring 'error' are different).
+    #[test]
+    fn log_or_of_tokens_stays_hastoken() {
+        let sql = build_log_search_sql("error OR warn").unwrap();
+        assert_eq!(sql, "(hasToken(lower(Body), 'error') OR hasToken(lower(Body), 'warn'))");
+        assert!(!sql.contains("multiSearchAny"));
+    }
+
+    // A mixed OR (wildcard + bare token) does not collapse; falls back to OR.
+    #[test]
+    fn log_mixed_or_does_not_collapse() {
+        let sql = build_log_search_sql("*reset* OR error").unwrap();
+        assert!(!sql.contains("multiSearchAny"));
+        assert!(sql.contains("reset") && sql.contains("LIKE"));
+        assert!(sql.contains("hasToken(lower(Body), 'error')"));
+    }
+
+    // An internal-wildcard pattern (`re*set`) is not a single literal substring → no collapse.
+    #[test]
+    fn log_internal_wildcard_or_does_not_collapse() {
+        let sql = build_log_search_sql("re*set OR *closed*").unwrap();
+        assert!(!sql.contains("multiSearchAny"));
     }
 
     // Log search routes exact trace/span IDs to indexed equality.
