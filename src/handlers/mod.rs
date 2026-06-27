@@ -39,6 +39,7 @@ pub mod rum;
 pub mod service_links;
 pub mod services;
 pub mod settings;
+pub mod sre_proxy;
 pub mod slos;
 pub mod stats;
 pub mod suggest;

@@ -777,6 +777,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/services/latency-histogram", get(handlers::services::service_latency_histogram))
         .route("/api/v1/services/endpoints", get(handlers::services::service_endpoints))
         .route("/api/v1/services/errors", get(handlers::services::service_errors))
+        // SRE-agent gateway: query-api fronts the agent (auth + tenant injection),
+        // so the browser only talks to query-api. Forwards to SRE_AGENT_URL.
+        .route("/api/v1/investigate", post(handlers::sre_proxy::investigate))
+        .route("/api/v1/sessions", get(handlers::sre_proxy::list_sessions))
+        .route(
+            "/api/v1/sessions/{id}",
+            get(handlers::sre_proxy::get_session).delete(handlers::sre_proxy::delete_session),
+        )
+        .route("/api/v1/investigation-templates", get(handlers::sre_proxy::list_investigation_templates))
         // Natural language query parsing (LLM-powered)
         .route("/api/v1/parse-query", post(handlers::parse_query::parse_query))
         .route("/api/v1/parse-promql", post(handlers::parse_promql::parse_promql))
