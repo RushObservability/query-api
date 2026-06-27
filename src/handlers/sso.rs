@@ -720,6 +720,7 @@ pub async fn delete_idp_group_mapping(
 /// The IdP posts the SAMLResponse here after user authenticates.
 pub async fn sso_acs(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: String,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let params: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
@@ -856,6 +857,30 @@ pub async fn sso_acs(
     let token = state.config_db.create_session(&user_id).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}"))
     })?;
+
+    // AUDIT: successful SSO login (mirrors the local auth.login.success event).
+    // Logs identity + provider/groups only — never the assertion, cert, or token.
+    let actor_name = assertion
+        .email
+        .clone()
+        .unwrap_or_else(|| assertion.name_id.clone());
+    state.audit.log(
+        crate::audit::AuditEvent::new("auth.login.success", "user")
+            .actor(user_id.clone(), actor_name)
+            .tenant("default".to_string())
+            .outcome("success")
+            .description("user authenticated (SSO/SAML)")
+            .changes(
+                serde_json::json!({
+                    "method": "saml",
+                    "provider_id": provider_id,
+                    "name_id": assertion.name_id,
+                    "groups": mapped_group_ids,
+                })
+                .to_string(),
+            )
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
 
     let cookie = format!("__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400");
 
