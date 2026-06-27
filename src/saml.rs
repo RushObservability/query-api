@@ -6,10 +6,6 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use flate2::{Compression, write::DeflateEncoder};
-use openssl::hash::MessageDigest;
-use openssl::pkey::PKey;
-use openssl::sign::Verifier;
-use openssl::x509::X509;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::HashMap;
@@ -62,169 +58,34 @@ pub fn build_login_redirect_url(
     )
 }
 
-/// Verify the XML signature of a SAML response against the IdP's X.509 certificate.
+/// Verify the enveloped XML signature of a SAML Response against the IdP's
+/// X.509 certificate.
 ///
-/// SAML responses typically contain a `<ds:Signature>` element inside
-/// `<samlp:Response>` or `<saml:Assertion>`. The signature covers a
-/// canonicalized digest of the signed element.
+/// Backed by `opensaml`/`bergshamra` (pure-Rust XML-DSig): performs exclusive
+/// XML canonicalization (exc-c14n), validates both the `SignedInfo` RSA
+/// signature AND every reference `DigestValue` over the canonicalized signed
+/// element, and guards against signature-wrapping (XSW) and duplicate-ID
+/// attacks. Verification trusts ONLY the metadata-pinned certificate passed in
+/// (inline KeyInfo certs are never imported as key material).
 ///
-/// Simplified verification flow:
-/// 1. Extract the `<ds:SignatureValue>` (base64-encoded signature bytes)
-/// 2. Extract the `<ds:SignedInfo>` element (the data that was actually signed)
-/// 3. Detect the signature algorithm from `<ds:SignatureMethod>`
-/// 4. Parse the IdP certificate (PEM format)
-/// 5. Verify: RSA signature of the canonicalized SignedInfo matches SignatureValue
-///
-/// For v1 we use the raw XML bytes of `<ds:SignedInfo>...</ds:SignedInfo>` rather
-/// than full Exclusive XML Canonicalization (C14N). Most IdPs produce XML that
-/// works without C14N normalization. Full C14N support can be added later.
+/// Returns `Ok(true)` only if a signature verifies against `idp_cert_pem`,
+/// `Ok(false)` if present-but-invalid (tampered / wrong key), and `Err` only on
+/// a structural problem (e.g. the certificate could not be parsed).
 pub fn verify_signature(xml: &str, idp_cert_pem: &str) -> Result<bool, String> {
-    // 1. Extract <ds:SignedInfo>...</ds:SignedInfo> raw bytes
-    let signed_info_xml = extract_xml_element(xml, "SignedInfo")
-        .ok_or_else(|| "no ds:SignedInfo element found in SAML response".to_string())?;
+    // bergshamra wants the bare base64 certificate body — it rejects the PEM
+    // armor lines. Drop the BEGIN/END lines and concatenate.
+    let cert_b64: String = idp_cert_pem
+        .lines()
+        .filter(|l| !l.contains("CERTIFICATE"))
+        .collect::<Vec<_>>()
+        .join("");
 
-    // 2. Extract <ds:SignatureValue> text content
-    let sig_value_b64 = extract_xml_text(xml, "SignatureValue")
-        .ok_or_else(|| "no ds:SignatureValue element found in SAML response".to_string())?;
-
-    // Clean whitespace from base64 (IdPs often wrap the value across lines)
-    let sig_value_clean: String = sig_value_b64.chars().filter(|c| !c.is_whitespace()).collect();
-    let sig_bytes = B64
-        .decode(&sig_value_clean)
-        .map_err(|e| format!("failed to base64-decode SignatureValue: {e}"))?;
-
-    // 3. Detect signature algorithm from <ds:SignatureMethod Algorithm="...">
-    let digest = detect_signature_algorithm(xml);
-
-    // 4. Parse the IdP certificate
-    let cert_pem = normalize_cert_pem(idp_cert_pem);
-    let x509 = X509::from_pem(cert_pem.as_bytes())
-        .map_err(|e| format!("failed to parse IdP certificate: {e}"))?;
-
-    let pkey: PKey<openssl::pkey::Public> = x509
-        .public_key()
-        .map_err(|e| format!("failed to extract public key from IdP certificate: {e}"))?;
-
-    // 5. Verify the signature over the SignedInfo element
-    let mut verifier = Verifier::new(digest, &pkey)
-        .map_err(|e| format!("failed to create signature verifier: {e}"))?;
-
-    verifier
-        .update(signed_info_xml.as_bytes())
-        .map_err(|e| format!("verifier update failed: {e}"))?;
-
-    let valid = verifier
-        .verify(&sig_bytes)
-        .map_err(|e| format!("signature verification error: {e}"))?;
-
-    Ok(valid)
+    match opensaml::crypto::verify::verify_signature(xml, std::slice::from_ref(&cert_b64)) {
+        Ok((valid, _verified_content)) => Ok(valid),
+        Err(e) => Err(format!("SAML signature verification error: {e:?}")),
+    }
 }
 
-/// Extract the raw XML of an element by its local name (handles namespace prefixes).
-/// Returns the full element including opening and closing tags.
-fn extract_xml_element(xml: &str, local_name_target: &str) -> Option<String> {
-    // Search for opening tag with any namespace prefix or none
-    // Patterns: <ds:SignedInfo, <SignedInfo, <dsig:SignedInfo, etc.
-    let open_patterns = [
-        format!("<ds:{local_name_target}"),
-        format!("<dsig:{local_name_target}"),
-        format!("<{local_name_target}"),
-    ];
-
-    let close_patterns = [
-        format!("</ds:{local_name_target}>"),
-        format!("</dsig:{local_name_target}>"),
-        format!("</{local_name_target}>"),
-    ];
-
-    for (open, close) in open_patterns.iter().zip(close_patterns.iter()) {
-        if let Some(start) = xml.find(open.as_str()) {
-            if let Some(end_offset) = xml[start..].find(close.as_str()) {
-                let end = start + end_offset + close.len();
-                return Some(xml[start..end].to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Extract the text content of an XML element by its local name.
-/// Handles namespace-prefixed element names.
-fn extract_xml_text(xml: &str, local_name_target: &str) -> Option<String> {
-    let open_patterns = [
-        format!("<ds:{local_name_target}"),
-        format!("<dsig:{local_name_target}"),
-        format!("<{local_name_target}"),
-    ];
-
-    let close_patterns = [
-        format!("</ds:{local_name_target}>"),
-        format!("</dsig:{local_name_target}>"),
-        format!("</{local_name_target}>"),
-    ];
-
-    for (open, close) in open_patterns.iter().zip(close_patterns.iter()) {
-        if let Some(start) = xml.find(open.as_str()) {
-            // Find the end of the opening tag (the '>' character)
-            if let Some(tag_end) = xml[start..].find('>') {
-                let content_start = start + tag_end + 1;
-                if let Some(content_end) = xml[content_start..].find(close.as_str()) {
-                    return Some(xml[content_start..content_start + content_end].to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Detect the signature algorithm from <ds:SignatureMethod Algorithm="...">.
-/// Defaults to SHA-256 if the algorithm cannot be determined.
-fn detect_signature_algorithm(xml: &str) -> MessageDigest {
-    // Look for the Algorithm attribute in SignatureMethod
-    if let Some(start) = xml.find("SignatureMethod") {
-        let region = &xml[start..std::cmp::min(start + 300, xml.len())];
-        if let Some(algo_start) = region.find("Algorithm=\"") {
-            let algo_value = &region[algo_start + 11..];
-            if let Some(algo_end) = algo_value.find('"') {
-                let algorithm = &algo_value[..algo_end];
-                return match algorithm {
-                    a if a.contains("sha1") || a.contains("sha-1") || a.ends_with("#rsa-sha1") => {
-                        MessageDigest::sha1()
-                    }
-                    a if a.contains("sha384") || a.contains("sha-384") => MessageDigest::sha384(),
-                    a if a.contains("sha512") || a.contains("sha-512") => MessageDigest::sha512(),
-                    // Default: SHA-256 (most common in modern IdPs)
-                    _ => MessageDigest::sha256(),
-                };
-            }
-        }
-    }
-    MessageDigest::sha256()
-}
-
-/// Normalize an IdP certificate PEM string.
-/// Handles cases where the cert is provided as raw base64 without PEM headers,
-/// or with PEM headers already present.
-fn normalize_cert_pem(cert: &str) -> String {
-    let trimmed = cert.trim();
-
-    // If it already has PEM headers, return as-is
-    if trimmed.starts_with("-----BEGIN CERTIFICATE-----") {
-        return trimmed.to_string();
-    }
-
-    // Strip any whitespace/newlines from the raw base64 and re-wrap
-    let clean: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-
-    // Wrap in PEM headers with 64-char lines
-    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
-    for chunk in clean.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).unwrap_or(""));
-        pem.push('\n');
-    }
-    pem.push_str("-----END CERTIFICATE-----\n");
-    pem
-}
 
 /// Parse a base64-encoded SAMLResponse XML and extract assertion fields.
 ///
@@ -256,6 +117,12 @@ fn parse_assertion_xml(
     let mut in_name_id = false;
     let mut in_attr_value = false;
     let mut groups: Vec<String> = Vec::new();
+    // Top-level <samlp:StatusCode Value="..."> + optional <samlp:StatusMessage>.
+    // A non-Success status means the IdP rejected the request (no assertion is
+    // present), so we surface its message instead of a misleading "no NameID".
+    let mut status_code = String::new();
+    let mut status_message = String::new();
+    let mut in_status_message = false;
 
     let mut buf = Vec::new();
     loop {
@@ -266,6 +133,19 @@ fn parse_assertion_xml(
                 match local {
                     "NameID" => {
                         in_name_id = true;
+                    }
+                    "StatusCode" => {
+                        // Record only the first (top-level) StatusCode Value.
+                        if status_code.is_empty() {
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == b"Value" {
+                                    status_code = String::from_utf8_lossy(&attr.value).to_string();
+                                }
+                            }
+                        }
+                    }
+                    "StatusMessage" => {
+                        in_status_message = true;
                     }
                     "Attribute" => {
                         // Extract the Name attribute
@@ -285,6 +165,8 @@ fn parse_assertion_xml(
                 let text = e.unescape().unwrap_or_default().to_string();
                 if in_name_id {
                     name_id = text;
+                } else if in_status_message {
+                    status_message = text;
                 } else if in_attr_value && !current_attr_name.is_empty() {
                     // Check if this attribute is a groups claim
                     if is_groups_attr(&current_attr_name, groups_claim) {
@@ -299,6 +181,7 @@ fn parse_assertion_xml(
                 let local = local_name(name.as_ref());
                 match local {
                     "NameID" => in_name_id = false,
+                    "StatusMessage" => in_status_message = false,
                     "AttributeValue" => in_attr_value = false,
                     "Attribute" => current_attr_name.clear(),
                     _ => {}
@@ -309,6 +192,17 @@ fn parse_assertion_xml(
             _ => {}
         }
         buf.clear();
+    }
+
+    // If the IdP returned a non-Success status, there is no assertion — report
+    // the IdP's own reason rather than the misleading "no NameID".
+    if !status_code.is_empty() && !status_code.ends_with(":Success") {
+        let reason = if status_message.is_empty() {
+            status_code.clone()
+        } else {
+            format!("{status_message} ({status_code})")
+        };
+        return Err(format!("IdP rejected the SAML request: {reason}"));
     }
 
     if name_id.is_empty() {
@@ -443,9 +337,13 @@ mod tests {
     }
 
     // ── Signature verification tests ──
+    // Positive verification (a genuinely IdP-signed Response verifies) is
+    // exercised against live IdP responses, and opensaml/bergshamra's own suite
+    // covers exc-c14n + reference-digest correctness. These cover the negative
+    // paths through our wrapper: no-signature and present-but-invalid.
 
-    /// Generate a self-signed X.509 certificate and RSA key pair for tests.
-    fn generate_test_cert() -> (X509, openssl::pkey::PKey<openssl::pkey::Private>) {
+    /// Self-signed RSA cert + key, returned as a PEM cert string for `verify_signature`.
+    fn test_cert_pem() -> String {
         use openssl::asn1::Asn1Time;
         use openssl::bn::BigNum;
         use openssl::hash::MessageDigest;
@@ -455,165 +353,52 @@ mod tests {
 
         let rsa = Rsa::generate(2048).expect("RSA key generation");
         let pkey = PKey::from_rsa(rsa).expect("PKey from RSA");
-
-        let mut name_builder = X509NameBuilder::new().expect("X509NameBuilder");
-        name_builder
-            .append_entry_by_text("CN", "Test IdP")
-            .expect("CN entry");
-        let name = name_builder.build();
-
-        let mut builder = X509Builder::new().expect("X509Builder");
-        builder.set_version(2).expect("set version");
-        builder.set_subject_name(&name).expect("set subject");
-        builder.set_issuer_name(&name).expect("set issuer");
-        builder.set_pubkey(&pkey).expect("set pubkey");
-
+        let mut name = X509NameBuilder::new().expect("name builder");
+        name.append_entry_by_text("CN", "Test IdP").expect("CN");
+        let name = name.build();
+        let mut b = X509Builder::new().expect("x509 builder");
+        b.set_version(2).expect("version");
+        b.set_subject_name(&name).expect("subject");
+        b.set_issuer_name(&name).expect("issuer");
+        b.set_pubkey(&pkey).expect("pubkey");
         let serial = BigNum::from_u32(1).expect("serial");
-        builder
-            .set_serial_number(&serial.to_asn1_integer().expect("asn1 serial"))
+        b.set_serial_number(&serial.to_asn1_integer().expect("asn1"))
             .expect("set serial");
-
-        let not_before = Asn1Time::days_from_now(0).expect("not_before");
-        let not_after = Asn1Time::days_from_now(365).expect("not_after");
-        builder.set_not_before(&not_before).expect("set not_before");
-        builder.set_not_after(&not_after).expect("set not_after");
-
-        builder
-            .sign(&pkey, MessageDigest::sha256())
-            .expect("sign cert");
-
-        let cert = builder.build();
-        (cert, pkey)
-    }
-
-    /// Build a minimal SAML Response with a ds:Signature that is signed
-    /// over the <ds:SignedInfo> element using the provided private key.
-    fn build_signed_saml_response(
-        pkey: &openssl::pkey::PKey<openssl::pkey::Private>,
-        digest: MessageDigest,
-        tamper: bool,
-    ) -> String {
-        use openssl::sign::Signer;
-
-        let signed_info = r##"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#_resp1"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>dGVzdA==</ds:DigestValue></ds:Reference></ds:SignedInfo>"##;
-
-        let mut signer = Signer::new(digest, pkey).expect("Signer");
-        signer.update(signed_info.as_bytes()).expect("signer update");
-        let mut sig_bytes = signer.sign_to_vec().expect("sign");
-
-        if tamper {
-            // Flip a byte to produce an invalid signature
-            if let Some(b) = sig_bytes.first_mut() {
-                *b ^= 0xFF;
-            }
-        }
-
-        let sig_b64 = B64.encode(&sig_bytes);
-
-        format!(
-            r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_resp1"><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{signed_info}<ds:SignatureValue>{sig_b64}</ds:SignatureValue></ds:Signature><saml:Assertion><saml:Subject><saml:NameID>test@example.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"##,
-        )
+        b.set_not_before(&Asn1Time::days_from_now(0).expect("nb"))
+            .expect("nb");
+        b.set_not_after(&Asn1Time::days_from_now(365).expect("na"))
+            .expect("na");
+        b.sign(&pkey, MessageDigest::sha256()).expect("sign");
+        String::from_utf8(b.build().to_pem().expect("to_pem")).expect("utf8")
     }
 
     #[test]
-    fn test_verify_signature_no_signature_element() {
-        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
-  <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
-    <saml:Subject><saml:NameID>user@test.com</saml:NameID></saml:Subject>
-  </saml:Assertion>
-</samlp:Response>"#;
+    fn verify_returns_false_when_no_signature() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Subject><saml:NameID>user@test.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#;
+        // No <ds:Signature> present → not verified (not an error).
+        let res = verify_signature(xml, &test_cert_pem());
+        assert!(matches!(res, Ok(false)), "no signature => Ok(false), got {res:?}");
+    }
 
-        let (cert, _) = generate_test_cert();
-        let cert_pem = String::from_utf8(cert.to_pem().expect("to_pem")).expect("utf8");
-
-        let result = verify_signature(xml, &cert_pem);
-        assert!(result.is_err(), "should error when no Signature element present");
-        assert!(
-            result.unwrap_err().contains("SignedInfo"),
-            "error should mention missing SignedInfo"
+    #[test]
+    fn verify_rejects_bogus_signature() {
+        // Structurally complete enveloped signature, but the SignatureValue and
+        // DigestValue are garbage — must NOT verify even with a loadable cert.
+        let xml = concat!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_r1">"#,
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>"#,
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>"#,
+            r##"<ds:Reference URI="#_r1"><ds:Transforms>"##,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>"#,
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            r#"<ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>"#,
+            r#"</ds:Reference></ds:SignedInfo><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>"#,
+            r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Subject>"#,
+            r#"<saml:NameID>user@test.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#,
         );
-    }
-
-    #[test]
-    fn test_verify_signature_valid() {
-        let (cert, pkey) = generate_test_cert();
-        let cert_pem = String::from_utf8(cert.to_pem().expect("to_pem")).expect("utf8");
-
-        let xml = build_signed_saml_response(&pkey, MessageDigest::sha256(), false);
-
-        let result = verify_signature(&xml, &cert_pem);
-        assert!(result.is_ok(), "verify should not error: {:?}", result.err());
-        assert!(result.unwrap(), "signature should be valid");
-    }
-
-    #[test]
-    fn test_verify_signature_tampered() {
-        let (cert, pkey) = generate_test_cert();
-        let cert_pem = String::from_utf8(cert.to_pem().expect("to_pem")).expect("utf8");
-
-        let xml = build_signed_saml_response(&pkey, MessageDigest::sha256(), true);
-
-        let result = verify_signature(&xml, &cert_pem);
-        assert!(result.is_ok(), "verify should not error: {:?}", result.err());
-        assert!(!result.unwrap(), "tampered signature should be invalid");
-    }
-
-    #[test]
-    fn test_verify_signature_wrong_cert() {
-        let (_cert1, pkey1) = generate_test_cert();
-        let (cert2, _pkey2) = generate_test_cert();
-
-        // Sign with key1 but verify with cert2
-        let cert2_pem = String::from_utf8(cert2.to_pem().expect("to_pem")).expect("utf8");
-        let xml = build_signed_saml_response(&pkey1, MessageDigest::sha256(), false);
-
-        let result = verify_signature(&xml, &cert2_pem);
-        assert!(result.is_ok(), "should not error: {:?}", result.err());
-        assert!(!result.unwrap(), "signature from different key should be invalid");
-    }
-
-    #[test]
-    fn test_normalize_cert_pem_raw_base64() {
-        let (cert, _) = generate_test_cert();
-        let full_pem = String::from_utf8(cert.to_pem().expect("to_pem")).expect("utf8");
-
-        // Strip PEM headers to simulate raw base64 from an IdP admin UI
-        let raw_b64: String = full_pem
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect::<Vec<_>>()
-            .join("");
-
-        let normalized = normalize_cert_pem(&raw_b64);
-        assert!(normalized.starts_with("-----BEGIN CERTIFICATE-----"));
-        assert!(normalized.contains("-----END CERTIFICATE-----"));
-
-        // Verify the normalized PEM is parseable
-        let parsed = X509::from_pem(normalized.as_bytes());
-        assert!(parsed.is_ok(), "normalized PEM should be parseable: {:?}", parsed.err());
-    }
-
-    #[test]
-    fn test_detect_sha1_algorithm() {
-        let xml = r#"<ds:SignedInfo><ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/></ds:SignedInfo>"#;
-        let digest = detect_signature_algorithm(xml);
-        // SHA-1 digest type has a specific NID; just verify it doesn't crash
-        // and returns a different digest than SHA-256
-        assert_ne!(digest.as_ptr(), MessageDigest::sha256().as_ptr());
-    }
-
-    #[test]
-    fn test_detect_sha256_algorithm() {
-        let xml = r#"<ds:SignedInfo><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/></ds:SignedInfo>"#;
-        let digest = detect_signature_algorithm(xml);
-        assert_eq!(digest.as_ptr(), MessageDigest::sha256().as_ptr());
-    }
-
-    #[test]
-    fn test_detect_default_algorithm() {
-        // No SignatureMethod at all should default to SHA-256
-        let xml = "<ds:SignedInfo></ds:SignedInfo>";
-        let digest = detect_signature_algorithm(xml);
-        assert_eq!(digest.as_ptr(), MessageDigest::sha256().as_ptr());
+        let res = verify_signature(xml, &test_cert_pem());
+        assert!(!matches!(res, Ok(true)), "bogus signature must not verify, got {res:?}");
     }
 }

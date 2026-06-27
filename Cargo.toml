@@ -65,6 +65,10 @@ base64 = "0.22"
 quick-xml = "0.37"
 url = "2"
 openssl = "0.10"
+# Pure-Rust SAML signature verification (XML-DSig + exclusive C14N via bergshamra).
+# No native/xmlsec deps; works on macOS dev and Linux prod. Verifies the signed
+# SAML Response (signature + reference digest) and guards against XSW / dup-ID.
+opensaml = "0.1.4"
 dashmap = "6"
 bincode = "1"
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace", "logs", "metrics"] }

@@ -1,4 +1,4 @@
-FROM rust:1.87-slim AS builder
+FROM rust:1.88-slim AS builder
 
 # build-essential (gcc + make) is required to compile jemalloc-sys, which runs
 # jemalloc's own configure + make during the build of the tikv-jemallocator dep.
