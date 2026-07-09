@@ -1250,7 +1250,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/sso/mappings/{id}",
-            delete(handlers::sso::delete_idp_group_mapping),
+            put(handlers::sso::update_idp_group_mapping).delete(handlers::sso::delete_idp_group_mapping),
         )
         .route("/api/v1/sso/status", get(handlers::sso::sso_status))
         .route(

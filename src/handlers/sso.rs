@@ -75,6 +75,12 @@ pub struct CreateMappingRequest {
 }
 
 #[derive(Deserialize)]
+pub struct UpdateMappingRequest {
+    pub idp_group: String,
+    pub rush_group_id: String,
+}
+
+#[derive(Deserialize)]
 pub struct SsoCallbackQuery {
     pub code: String,
     pub state: String,
@@ -683,6 +689,42 @@ pub async fn create_idp_group_mapping(
     ).await;
 
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
+}
+
+/// PUT /api/v1/sso/mappings/{id} -- Update a mapping
+pub async fn update_idp_group_mapping(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<UpdateMappingRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let caller = require_admin(&state, &headers).await?;
+
+    let prev = state
+        .config_db
+        .update_idp_group_mapping(&id, &req.idp_group, &req.rush_group_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+
+    let Some((old_idp_group, old_rush_group_id)) = prev else {
+        return Err((StatusCode::NOT_FOUND, "mapping not found".to_string()));
+    };
+
+    // AUDIT: IdP→group mapping updated.
+    state.audit.log(
+        crate::audit::AuditEvent::new("sso.group_mapping_change", "user")
+            .actor(caller.0.clone(), caller.1.clone())
+            .tenant(caller.3.clone())
+            .resource("idp_group_mapping", id.clone())
+            .changes(serde_json::json!({
+                "action": "update",
+                "before": { "idp_group": old_idp_group, "rush_group_id": old_rush_group_id },
+                "after": { "idp_group": req.idp_group, "rush_group_id": req.rush_group_id }
+            }).to_string())
+            .description("idp group mapping updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// DELETE /api/v1/sso/mappings/{id} -- Delete a mapping

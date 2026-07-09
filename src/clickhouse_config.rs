@@ -571,14 +571,6 @@ impl ConfigDb {
             "ALTER TABLE config_anomaly_rules ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
             "ALTER TABLE config_anomaly_events ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
 
-            // Tenant-scope existing SLO tables (deployments created before SLOs
-            // carried a tenant). Idempotent; existing rows backfill to 'default'
-            // via the column DEFAULT. config_slos already has the column on fresh
-            // installs, but older deployments may predate it — ADD … IF NOT EXISTS
-            // is harmless either way.
-            "ALTER TABLE config_slos ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
-            "ALTER TABLE config_slo_events ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
-
             // ── Monitors ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_monitors (
                 id                    String,
@@ -695,6 +687,15 @@ impl ConfigDb {
                 created_at             String DEFAULT toString(now())
             ) ENGINE = MergeTree()
             ORDER BY (slo_id, created_at)",
+
+            // Tenant-scope pre-existing SLO tables for deployments created before
+            // SLOs carried a tenant. Placed AFTER the config_slos / config_slo_events
+            // CREATEs above so a fresh install (tables don't exist yet) doesn't ALTER
+            // a missing table and abort migrations. The CREATEs already include
+            // tenant_id, so on fresh installs these are no-ops; on older deployments
+            // they retrofit the column. Idempotent (ADD COLUMN IF NOT EXISTS).
+            "ALTER TABLE config_slos ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+            "ALTER TABLE config_slo_events ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
 
             // ── Deploy markers ────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_deploy_markers (
@@ -2020,6 +2021,23 @@ impl ConfigDb {
             .execute()
             .await?;
         Ok(id)
+    }
+
+    /// Update an existing mapping's idp_group / rush_group_id, preserving its id,
+    /// provider_id, and created_at. Returns the prior (idp_group, rush_group_id) on
+    /// success so callers can audit the before/after, or None if the id is unknown.
+    pub async fn update_idp_group_mapping(&self, id: &str, idp_group: &str, rush_group_id: &str) -> anyhow::Result<Option<(String, String)>> {
+        let mappings = self.list_idp_group_mappings(None).await?;
+        let found = mappings.iter().find(|(mid, _, _, _, _)| mid == id);
+        if found.is_none() { return Ok(None); }
+        let (_, old_idp_group, old_rush_group_id, provider_id, created_at) = found.unwrap().clone();
+        let ver = Self::next_version();
+        self.client
+            .query("INSERT INTO config_idp_group_mappings (id, idp_group, rush_group_id, provider_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0)")
+            .bind(id).bind(idp_group).bind(rush_group_id).bind(&provider_id).bind(&created_at).bind(ver)
+            .execute()
+            .await?;
+        Ok(Some((old_idp_group, old_rush_group_id)))
     }
 
     pub async fn delete_idp_group_mapping(&self, id: &str) -> anyhow::Result<bool> {
