@@ -357,7 +357,7 @@ async fn persist_no_data(
 async fn eval_one_slo(
     config_db: &ConfigDb,
     ch: &Client,
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
     slo: &crate::models::slo::Slo,
     now: chrono::DateTime<chrono::Utc>,
     now_str: &str,
@@ -522,7 +522,7 @@ async fn eval_one_slo(
                             "message": message,
                         }),
                     };
-                    if let Err(e) = http_client.post(url).json(&payload).send().await {
+                    if let Err(e) = crate::outbound::post_json(url, &payload).await {
                         tracing::warn!("slo {}: notification to {} failed: {e}", slo.id, channel.name);
                     }
                 }

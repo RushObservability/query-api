@@ -41,6 +41,22 @@ fn sre_base() -> String {
         .to_string()
 }
 
+/// Shared credential for the internal SRE-agent API. Refusing to proxy when it
+/// is absent avoids silently falling back to an unauthenticated agent.
+fn sre_internal_token() -> Result<String, (StatusCode, String)> {
+    std::env::var("SRE_AGENT_INTERNAL_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SRE agent internal authentication is not configured".to_string(),
+        ))
+}
+
+fn with_internal_token(request: reqwest::RequestBuilder, token: String) -> reqwest::RequestBuilder {
+    request.header("x-rush-internal-token", token)
+}
+
 fn unavailable(e: impl std::fmt::Display) -> (StatusCode, String) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -82,8 +98,8 @@ pub async fn investigate(
     }
 
     let url = format!("{}/api/v1/investigate", sre_base());
-    let resp = client()
-        .post(&url)
+    let internal_token = sre_internal_token()?;
+    let resp = with_internal_token(client().post(&url), internal_token)
         .json(&payload)
         .send()
         .await
@@ -112,7 +128,11 @@ pub async fn investigate(
 
 /// Forward a buffered (JSON) GET to the agent, returning its status + body.
 async fn forward_get(url: String) -> Result<Response, (StatusCode, String)> {
-    let resp = client().get(&url).send().await.map_err(unavailable)?;
+    let internal_token = sre_internal_token()?;
+    let resp = with_internal_token(client().get(&url), internal_token)
+        .send()
+        .await
+        .map_err(unavailable)?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = resp
         .headers()
@@ -161,7 +181,11 @@ pub async fn delete_session(
 ) -> Result<Response, (StatusCode, String)> {
     require_write(&state, &headers).await?;
     let url = format!("{}/api/v1/sessions/{}", sre_base(), urlencoding::encode(&id));
-    let resp = client().delete(&url).send().await.map_err(unavailable)?;
+    let internal_token = sre_internal_token()?;
+    let resp = with_internal_token(client().delete(&url), internal_token)
+        .send()
+        .await
+        .map_err(unavailable)?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let bytes = resp.bytes().await.map_err(unavailable)?;
     Ok((status, bytes).into_response())
@@ -174,4 +198,23 @@ pub async fn list_investigation_templates(
 ) -> Result<Response, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
     forward_get(format!("{}/api/v1/investigation-templates", sre_base())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_internal_token;
+
+    #[test]
+    fn proxy_attaches_the_internal_agent_credential() {
+        let request = with_internal_token(
+            reqwest::Client::new().get("http://agent.internal/api/v1/sessions"),
+            "test-token".to_string(),
+        )
+        .build()
+        .expect("request builds");
+        assert_eq!(
+            request.headers().get("x-rush-internal-token").and_then(|v| v.to_str().ok()),
+            Some("test-token")
+        );
+    }
 }

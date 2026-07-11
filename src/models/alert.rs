@@ -22,6 +22,21 @@ pub struct NotificationChannelResponse {
     pub created_at: String,
 }
 
+const SECRET_CONFIG_KEYS: &[&str] = &["url", "webhook_url", "token", "routing_key", "api_key", "headers"];
+
+fn redact_config(config: &str) -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_str(config)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    if let Some(object) = value.as_object_mut() {
+        for key in SECRET_CONFIG_KEYS {
+            if object.remove(*key).is_some() {
+                object.insert(format!("{key}_configured"), serde_json::Value::Bool(true));
+            }
+        }
+    }
+    value
+}
+
 impl From<NotificationChannel> for NotificationChannelResponse {
     fn from(c: NotificationChannel) -> Self {
         Self {
@@ -29,7 +44,7 @@ impl From<NotificationChannel> for NotificationChannelResponse {
             tenant_id: c.tenant_id,
             name: c.name,
             channel_type: c.channel_type,
-            config: serde_json::from_str(&c.config).unwrap_or(serde_json::Value::Object(Default::default())),
+            config: redact_config(&c.config),
             enabled: c.enabled,
             created_at: c.created_at,
         }
@@ -204,4 +219,23 @@ fn default_signal_type() -> String {
 
 fn default_empty_array() -> serde_json::Value {
     serde_json::json!([])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_config;
+
+    #[test]
+    fn notification_response_redacts_credentials_and_endpoints() {
+        let redacted = redact_config(r#"{
+            "webhook_url":"https://hooks.example.test/secret",
+            "token":"xoxb-secret",
+            "channel":"alerts"
+        }"#);
+        assert_eq!(redacted["webhook_url_configured"], true);
+        assert_eq!(redacted["token_configured"], true);
+        assert_eq!(redacted["channel"], "alerts");
+        assert!(redacted.get("webhook_url").is_none());
+        assert!(redacted.get("token").is_none());
+    }
 }

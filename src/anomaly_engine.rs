@@ -479,7 +479,7 @@ fn anomaly_log_tuple(
 
 async fn send_notifications(
     config_db: &ConfigDb,
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
     rule: &AnomalyRule,
@@ -524,7 +524,7 @@ async fn send_notifications(
                 "slack" => {
                     if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
                         let payload = serde_json::json!({ "text": message });
-                        if let Err(e) = http_client.post(url).json(&payload).send().await {
+                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
                             tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "slack", "notification failed");
                         }
                     }
@@ -537,7 +537,7 @@ async fn send_notifications(
                             "state": if is_anomalous { "anomalous" } else { "normal" },
                             "message": message,
                         });
-                        if let Err(e) = http_client.post(url).json(&payload).send().await {
+                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
                             tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "webhook", "notification failed");
                         }
                     }

@@ -12,6 +12,7 @@ pub mod migrations;
 pub mod models;
 pub mod monitor_engine;
 pub mod object_store_spool;
+pub mod outbound;
 pub mod promql;
 pub mod query_builder;
 pub mod retention_enforcer;

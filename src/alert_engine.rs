@@ -248,12 +248,9 @@ pub async fn send_channel_notification(
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "slack channel config missing webhook_url".to_string())?;
 
-            if !url.starts_with("https://") {
-                return Err(format!("channel URL must use HTTPS (got: {url})"));
-            }
-
             let payload = build_slack_payload(alert_name, alert_state, value, threshold, signal_type, condition_op, description, alert_id, runbook_url);
-            http_client.post(url).json(&payload).send().await
+            crate::outbound::public_https_request(reqwest::Method::POST, url).await?
+                .json(&payload).send().await
                 .map_err(|e| format!("slack notification failed: {e}"))?;
             Ok(())
         }
@@ -261,10 +258,6 @@ pub async fn send_channel_notification(
             let url = config.get("url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "webhook channel config missing url".to_string())?;
-
-            if !url.starts_with("https://") {
-                return Err(format!("channel URL must use HTTPS (got: {url})"));
-            }
 
             let method = config.get("method")
                 .and_then(|m| m.as_str())
@@ -278,10 +271,8 @@ pub async fn send_channel_notification(
                 "message": message,
             });
 
-            let mut req_builder = match method.to_uppercase().as_str() {
-                "PUT" => http_client.put(url),
-                _ => http_client.post(url),
-            };
+            let method = if method.eq_ignore_ascii_case("PUT") { reqwest::Method::PUT } else { reqwest::Method::POST };
+            let mut req_builder = crate::outbound::public_https_request(method, url).await?;
 
             // Apply custom headers
             if let Some(headers) = config.get("headers").and_then(|h| h.as_object()) {
@@ -413,9 +404,6 @@ pub async fn send_channel_notification(
             let url = config.get("webhook_url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "discord channel config missing webhook_url".to_string())?;
-            if !url.starts_with("https://") {
-                return Err(format!("channel URL must use HTTPS (got: {url})"));
-            }
             let color: u32 = if alert_state == "RESOLVED" || alert_state == "ok" { 0x57F287 } else { 0xED4245 };
             let payload = serde_json::json!({
                 "embeds": [{
@@ -428,7 +416,8 @@ pub async fn send_channel_notification(
                     ],
                 }]
             });
-            http_client.post(url).json(&payload).send().await
+            crate::outbound::public_https_request(reqwest::Method::POST, url).await?
+                .json(&payload).send().await
                 .map_err(|e| format!("discord notification failed: {e}"))?;
             Ok(())
         }
@@ -436,9 +425,6 @@ pub async fn send_channel_notification(
             let base_url = config.get("url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "alertmanager channel config missing url".to_string())?;
-            if !base_url.starts_with("https://") {
-                return Err(format!("channel URL must use HTTPS (got: {base_url})"));
-            }
             let api_url = format!("{}/api/v2/alerts", base_url.trim_end_matches('/'));
             let status = if alert_state == "RESOLVED" || alert_state == "ok" { "resolved" } else { "firing" };
             let extra_labels = config.get("labels").cloned().unwrap_or_else(|| serde_json::json!({}));
@@ -451,7 +437,8 @@ pub async fn send_channel_notification(
                 "annotations": { "summary": message, "value": value.to_string() },
                 "status": status,
             }]);
-            http_client.post(&api_url).json(&payload).send().await
+            crate::outbound::public_https_request(reqwest::Method::POST, &api_url).await?
+                .json(&payload).send().await
                 .map_err(|e| format!("alertmanager notification failed: {e}"))?;
             Ok(())
         }

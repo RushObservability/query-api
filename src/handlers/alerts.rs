@@ -16,7 +16,7 @@ pub async fn list_channels(
     headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_write(&state, &headers).await?;
     let channels = state
         .config_db
         .list_channels(&tenant.tenant_id).await
@@ -31,7 +31,7 @@ pub async fn create_channel(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateChannelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
     }
@@ -44,7 +44,7 @@ pub async fn create_channel(
     }
 
     // Validate type-specific config
-    validate_channel_config(&req.channel_type, &req.config)?;
+    validate_channel_config(&req.channel_type, &req.config).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let config = serde_json::to_string(&req.config)
@@ -61,6 +61,15 @@ pub async fn create_channel(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created channel".to_string()))?;
 
+    state.audit.log(
+        crate::audit::AuditEvent::new("notification_channel.create", "user")
+            .actor(caller.0, caller.1)
+            .tenant(tenant.tenant_id.clone())
+            .resource("notification_channel", id)
+            .changes(serde_json::json!({ "name": req.name, "channel_type": req.channel_type }).to_string())
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(NotificationChannelResponse::from(channel))))
 }
 
@@ -71,8 +80,17 @@ pub async fn update_channel(
     Path(id): Path<String>,
     Json(req): Json<UpdateChannelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
-    let config = serde_json::to_string(&req.config)
+    let caller = require_write(&state, &headers).await?;
+    let existing = state
+        .config_db
+        .get_channel(&id, &tenant.tenant_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "channel not found".to_string()))?;
+    let existing_config = serde_json::from_str(&existing.config)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stored channel config is invalid".to_string()))?;
+    let config_value = merge_channel_config(existing_config, req.config);
+    validate_channel_config(&existing.channel_type, &config_value).await?;
+    let config = serde_json::to_string(&config_value)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let updated = state
@@ -89,6 +107,15 @@ pub async fn update_channel(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read updated channel".to_string()))?;
 
+    state.audit.log(
+        crate::audit::AuditEvent::new("notification_channel.update", "user")
+            .actor(caller.0, caller.1)
+            .tenant(tenant.tenant_id.clone())
+            .resource("notification_channel", id)
+            .changes(serde_json::json!({ "name": req.name, "enabled": req.enabled }).to_string())
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok(Json(NotificationChannelResponse::from(channel)))
 }
 
@@ -98,7 +125,7 @@ pub async fn delete_channel(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_channel(&id, &tenant.tenant_id).await
@@ -106,6 +133,13 @@ pub async fn delete_channel(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "channel not found".to_string()));
     }
+    state.audit.log(
+        crate::audit::AuditEvent::new("notification_channel.delete", "user")
+            .actor(caller.0, caller.1)
+            .tenant(tenant.tenant_id.clone())
+            .resource("notification_channel", id)
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -115,7 +149,7 @@ pub async fn test_channel(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_write(&state, &headers).await?;
     let channel = state
         .config_db
         .get_channel(&id, &tenant.tenant_id).await
@@ -202,13 +236,9 @@ pub async fn notify_channel(
         .and_then(|v| v.as_str())
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "channel config missing url".to_string()))?;
 
-    if !url.starts_with("https://") {
-        return Err((StatusCode::BAD_REQUEST, format!("channel URL must use HTTPS (got: {})", url)));
-    }
-
-    let client = reqwest::Client::new();
-    client
-        .post(url)
+    crate::outbound::public_https_request(reqwest::Method::POST, url)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?
         .json(&payload)
         .send()
         .await
@@ -230,7 +260,21 @@ pub async fn list_notification_log(
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
-fn validate_channel_config(channel_type: &str, config: &serde_json::Value) -> Result<(), (StatusCode, String)> {
+fn merge_channel_config(mut existing: serde_json::Value, incoming: serde_json::Value) -> serde_json::Value {
+    let (Some(existing), Some(incoming)) = (existing.as_object_mut(), incoming.as_object()) else {
+        return incoming;
+    };
+    for (key, value) in incoming {
+        let preserve_secret = matches!(key.as_str(), "url" | "webhook_url" | "token" | "routing_key" | "api_key" | "headers")
+            && (value.is_null() || value.as_str().is_some_and(str::is_empty));
+        if !preserve_secret {
+            existing.insert(key.clone(), value.clone());
+        }
+    }
+    existing.clone().into()
+}
+
+async fn validate_channel_config(channel_type: &str, config: &serde_json::Value) -> Result<(), (StatusCode, String)> {
     match channel_type {
         "slack" => {
             let has_url = config.get("webhook_url").and_then(|v| v.as_str()).is_some()
@@ -280,6 +324,14 @@ fn validate_channel_config(channel_type: &str, config: &serde_json::Value) -> Re
             }
         }
         _ => {}
+    }
+    if matches!(channel_type, "slack" | "webhook" | "discord" | "alertmanager") {
+        let url = config.get("url").or_else(|| config.get("webhook_url"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "channel config missing URL".to_string()))?;
+        let _ = crate::outbound::public_https_request(reqwest::Method::POST, url)
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     Ok(())
 }
