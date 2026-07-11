@@ -27,6 +27,20 @@ pub struct BubbleUpRequest {
     pub filters: Vec<Filter>,
     /// Max number of values to return per dimension (default 10).
     pub top_k: Option<u32>,
+    /// Optional span-duration bounds defining the selected cohort. These make
+    /// a latency brush compare the dots the user actually enclosed instead of
+    /// every span that happened during the same time interval.
+    #[serde(default)]
+    pub selection_min_duration_ns: Option<u64>,
+    #[serde(default)]
+    pub selection_max_duration_ns: Option<u64>,
+    /// Restrict the selected span cohort to errors / HTTP 5xx responses.
+    #[serde(default)]
+    pub selection_errors_only: bool,
+    /// Remove the selected cohort from the baseline so lift is not diluted by
+    /// comparing a selection against a population that contains itself.
+    #[serde(default)]
+    pub exclude_selection_from_baseline: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +212,56 @@ fn resolve_log_filter_field(field: &str) -> String {
     }
 }
 
+fn comparison_conditions(
+    req: &BubbleUpRequest,
+    ts_col: &str,
+    sel_from: &str,
+    sel_to: &str,
+    base_from: &str,
+    base_to: &str,
+) -> Result<(String, String), (StatusCode, String)> {
+    if let (Some(min), Some(max)) = (req.selection_min_duration_ns, req.selection_max_duration_ns) {
+        if min > max {
+            return Err((StatusCode::BAD_REQUEST, "selection minimum duration must not exceed maximum duration".into()));
+        }
+    }
+    if req.signal != "spans"
+        && (req.selection_min_duration_ns.is_some()
+            || req.selection_max_duration_ns.is_some()
+            || req.selection_errors_only)
+    {
+        return Err((StatusCode::BAD_REQUEST, "duration/error cohort filters are supported only for spans".into()));
+    }
+
+    let mut cohort_parts = Vec::new();
+    if let Some(min) = req.selection_min_duration_ns {
+        cohort_parts.push(format!("duration_ns >= {min}"));
+    }
+    if let Some(max) = req.selection_max_duration_ns {
+        cohort_parts.push(format!("duration_ns <= {max}"));
+    }
+    if req.selection_errors_only {
+        cohort_parts.push("(status = 'ERROR' OR http_status_code >= 500)".to_string());
+    }
+    let cohort_suffix = if cohort_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", cohort_parts.join(" AND "))
+    };
+    let selection = format!(
+        "{ts_col} >= parseDateTime64BestEffort('{sel_from}') AND {ts_col} <= parseDateTime64BestEffort('{sel_to}'){cohort_suffix}"
+    );
+    let baseline_time = format!(
+        "{ts_col} >= parseDateTime64BestEffort('{base_from}') AND {ts_col} <= parseDateTime64BestEffort('{base_to}')"
+    );
+    let baseline = if req.exclude_selection_from_baseline {
+        format!("{baseline_time} AND NOT ({selection})")
+    } else {
+        baseline_time
+    };
+    Ok((selection, baseline))
+}
+
 // ── Handler ──
 
 /// BubbleUp comparison analysis: compare the distribution of every dimension
@@ -230,6 +294,10 @@ pub async fn bubbleup(
 
     let additional_filters = build_filter_conditions(&req.filters, &req.signal);
 
+    let (selection_condition, baseline_condition) = comparison_conditions(
+        &req, ts_col, &sel_from, &sel_to, &base_from, &base_to,
+    )?;
+
     // A user `Body LIKE` filter (logs signal) is backed by the `idx_body_text` text
     // index, which an explicit PREWHERE on tenant/time would defeat (CH reads the whole
     // index instead of pruning granules). When such a filter is present, fold the scope
@@ -239,14 +307,14 @@ pub async fn bubbleup(
     let scan_clause = if has_like {
         format!(
             "WHERE tenant_id = '{escaped_tenant}' \
-               AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
-               AND {ts_col} <= parseDateTimeBestEffort('{latest}') {additional_filters}"
+               AND {ts_col} >= parseDateTime64BestEffort('{earliest}') \
+               AND {ts_col} <= parseDateTime64BestEffort('{latest}') {additional_filters}"
         )
     } else {
         format!(
             "PREWHERE tenant_id = '{escaped_tenant}' \
-               AND {ts_col} >= parseDateTimeBestEffort('{earliest}') \
-               AND {ts_col} <= parseDateTimeBestEffort('{latest}') \
+               AND {ts_col} >= parseDateTime64BestEffort('{earliest}') \
+               AND {ts_col} <= parseDateTime64BestEffort('{latest}') \
              WHERE TRUE {additional_filters}"
         )
     };
@@ -254,10 +322,8 @@ pub async fn bubbleup(
     // ── Total counts query ──
     let totals_sql = format!(
         "SELECT \
-            countIf({ts_col} >= parseDateTimeBestEffort('{sel_from}') \
-                AND {ts_col} <= parseDateTimeBestEffort('{sel_to}')) AS selection_count, \
-            countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
-                AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS baseline_count \
+            countIf({selection_condition}) AS selection_count, \
+            countIf({baseline_condition}) AS baseline_count \
          FROM {table} \
          {scan_clause}"
     );
@@ -300,10 +366,8 @@ pub async fn bubbleup(
         "SELECT \
             toUInt8({dim_idx_expr}) AS dim_idx, \
             {value_expr} AS value, \
-            countIf({ts_col} >= parseDateTimeBestEffort('{sel_from}') \
-                AND {ts_col} <= parseDateTimeBestEffort('{sel_to}')) AS sel_count, \
-            countIf({ts_col} >= parseDateTimeBestEffort('{base_from}') \
-                AND {ts_col} <= parseDateTimeBestEffort('{base_to}')) AS base_count \
+            countIf({selection_condition}) AS sel_count, \
+            countIf({baseline_condition}) AS base_count \
          FROM {table} \
          {scan_clause} \
          GROUP BY GROUPING SETS ({grouping_sets}) \
@@ -396,4 +460,51 @@ pub async fn bubbleup(
         selection_count,
         baseline_count,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(signal: &str) -> BubbleUpRequest {
+        BubbleUpRequest {
+            selection: TimeWindow { from: "2026-01-01T00:05:00Z".into(), to: "2026-01-01T00:06:00Z".into() },
+            baseline: TimeWindow { from: "2026-01-01T00:00:00Z".into(), to: "2026-01-01T00:10:00Z".into() },
+            signal: signal.into(), filters: vec![], top_k: None,
+            selection_min_duration_ns: None, selection_max_duration_ns: None,
+            selection_errors_only: false, exclude_selection_from_baseline: false,
+        }
+    }
+
+    #[test]
+    fn span_cohort_keeps_duration_and_error_bounds_and_excludes_it_from_baseline() {
+        let mut req = request("spans");
+        req.selection_min_duration_ns = Some(100_000_000);
+        req.selection_max_duration_ns = Some(2_000_000_000);
+        req.selection_errors_only = true;
+        req.exclude_selection_from_baseline = true;
+        let (selection, baseline) = comparison_conditions(&req, "timestamp", "sel-from", "sel-to", "base-from", "base-to").unwrap();
+        assert!(selection.contains("duration_ns >= 100000000"));
+        assert!(selection.contains("duration_ns <= 2000000000"));
+        assert!(selection.contains("status = 'ERROR' OR http_status_code >= 500"));
+        assert!(selection.contains("parseDateTime64BestEffort('sel-from')"));
+        assert!(baseline.contains("AND NOT (timestamp >="));
+        assert!(baseline.contains(&selection));
+    }
+
+    #[test]
+    fn legacy_comparison_keeps_full_baseline_when_exclusion_is_off() {
+        let req = request("logs");
+        let (_, baseline) = comparison_conditions(&req, "Timestamp", "sel-from", "sel-to", "base-from", "base-to").unwrap();
+        assert!(!baseline.contains("NOT"));
+        assert!(baseline.contains("base-from"));
+    }
+
+    #[test]
+    fn rejects_reversed_duration_bounds() {
+        let mut req = request("spans");
+        req.selection_min_duration_ns = Some(20);
+        req.selection_max_duration_ns = Some(10);
+        assert!(comparison_conditions(&req, "timestamp", "a", "b", "c", "d").is_err());
+    }
 }
