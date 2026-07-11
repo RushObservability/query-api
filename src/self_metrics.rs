@@ -29,17 +29,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Fixed latency histogram bucket upper bounds, in milliseconds. Chosen to cover sub-ms
 /// (effectively the first bucket) through 10s. `+Inf` is implicit (the `_count`).
 /// This is the default bucket set used by [`SelfMetrics::observe_histogram`].
-pub const LATENCY_BUCKETS_MS: [f64; 11] =
-    [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0];
+pub const LATENCY_BUCKETS_MS: [f64; 11] = [
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+];
 
 /// Latency bucket bounds (ms) sized for *search* — which can be much slower than the
 /// HTTP/engine paths — covering 10ms through 60s.
-pub const SEARCH_LATENCY_BUCKETS_MS: [f64; 11] =
-    [10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0];
+pub const SEARCH_LATENCY_BUCKETS_MS: [f64; 11] = [
+    10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+];
 
 /// Result-row-count bucket bounds (unitless counts), for `rush_search_result_rows`.
-pub const RESULT_COUNT_BUCKETS: [f64; 10] =
-    [0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0];
+pub const RESULT_COUNT_BUCKETS: [f64; 10] = [
+    0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0,
+];
 
 /// Free-text query-length bucket bounds (characters), for `rush_search_query_length_chars`.
 pub const QUERY_LEN_BUCKETS: [f64; 10] =
@@ -83,7 +86,10 @@ impl AtomicF64 {
         let mut cur = self.bits.load(Ordering::Relaxed);
         loop {
             let next = (f64::from_bits(cur) + delta).to_bits();
-            match self.bits.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            match self
+                .bits
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }
@@ -132,7 +138,11 @@ impl Histogram {
 
     /// Snapshot the per-bucket (non-cumulative) counts, the total count, and the sum.
     fn snapshot(&self) -> (Vec<u64>, u64, f64) {
-        let b: Vec<u64> = self.buckets.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        let b: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .collect();
         (b, self.count.load(Ordering::Relaxed), self.sum.get())
     }
 }
@@ -183,7 +193,10 @@ impl SelfMetrics {
 
     /// Sort a label slice into the canonical (key-sorted) order used as the map key.
     fn norm(labels: &[(&'static str, &str)]) -> Labels {
-        let mut v: Labels = labels.iter().map(|(k, val)| (*k, (*val).to_string())).collect();
+        let mut v: Labels = labels
+            .iter()
+            .map(|(k, val)| (*k, (*val).to_string()))
+            .collect();
         v.sort_by(|a, b| a.0.cmp(b.0));
         v
     }
@@ -195,7 +208,10 @@ impl SelfMetrics {
             c.fetch_add(n, Ordering::Relaxed);
         } else {
             // Insert-or-add: another thread may have raced us; `entry` resolves it.
-            self.counters.entry(key).or_default().fetch_add(n, Ordering::Relaxed);
+            self.counters
+                .entry(key)
+                .or_default()
+                .fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -222,7 +238,12 @@ impl SelfMetrics {
     /// Observe a value (milliseconds) into a histogram using the default
     /// [`LATENCY_BUCKETS_MS`] bucket set. The bucket set is bound to the series on first
     /// use; later calls reuse the existing histogram (and its bounds).
-    pub fn observe_histogram(&self, name: &'static str, labels: &[(&'static str, &str)], value_ms: f64) {
+    pub fn observe_histogram(
+        &self,
+        name: &'static str,
+        labels: &[(&'static str, &str)],
+        value_ms: f64,
+    ) {
         self.observe_histogram_with(name, labels, value_ms, &LATENCY_BUCKETS_MS);
     }
 
@@ -242,7 +263,10 @@ impl SelfMetrics {
         if let Some(h) = self.histograms.get(&key) {
             h.observe(value);
         } else {
-            self.histograms.entry(key).or_insert_with(|| Histogram::new(bounds)).observe(value);
+            self.histograms
+                .entry(key)
+                .or_insert_with(|| Histogram::new(bounds))
+                .observe(value);
         }
     }
 
@@ -290,7 +314,11 @@ impl SelfMetrics {
     ) {
         let signal_label = [("signal", signal)];
         let outcome = if ok { "ok" } else { "error" };
-        self.inc_counter("rush_search_queries_total", &[("signal", signal), ("outcome", outcome)], 1);
+        self.inc_counter(
+            "rush_search_queries_total",
+            &[("signal", signal), ("outcome", outcome)],
+            1,
+        );
         self.observe_histogram_with(
             "rush_search_duration_ms",
             &signal_label,
@@ -489,7 +517,9 @@ fn render_labels_with_le(labels: &Labels, le: &str) -> String {
 
 /// Escape a label value per the Prometheus exposition spec: backslash, double-quote, newline.
 fn escape_label_value(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Format an f64 for Prometheus output: integers without a trailing `.0`, otherwise the
@@ -499,7 +529,11 @@ fn fmt_f64(v: f64) -> String {
         return "NaN".to_string();
     }
     if v.is_infinite() {
-        return if v > 0.0 { "+Inf".to_string() } else { "-Inf".to_string() };
+        return if v > 0.0 {
+            "+Inf".to_string()
+        } else {
+            "-Inf".to_string()
+        };
     }
     if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
@@ -515,8 +549,24 @@ mod tests {
     #[test]
     fn counter_and_gauge_render() {
         let m = SelfMetrics::new();
-        m.inc_counter("rush_http_requests_total", &[("route", "/api/v1/query"), ("method", "POST"), ("status_class", "2xx")], 3);
-        m.inc_counter("rush_http_requests_total", &[("route", "/api/v1/query"), ("method", "POST"), ("status_class", "2xx")], 2);
+        m.inc_counter(
+            "rush_http_requests_total",
+            &[
+                ("route", "/api/v1/query"),
+                ("method", "POST"),
+                ("status_class", "2xx"),
+            ],
+            3,
+        );
+        m.inc_counter(
+            "rush_http_requests_total",
+            &[
+                ("route", "/api/v1/query"),
+                ("method", "POST"),
+                ("status_class", "2xx"),
+            ],
+            2,
+        );
         m.set_gauge("rush_http_requests_in_flight", &[], 4.0);
         m.add_gauge("rush_http_requests_in_flight", &[], -1.0);
 
@@ -529,7 +579,10 @@ mod tests {
         );
         // Gauge with no labels, 4 - 1 = 3.
         assert!(text.contains("# TYPE rush_http_requests_in_flight gauge"));
-        assert!(text.contains("rush_http_requests_in_flight 3\n"), "gauge render wrong:\n{text}");
+        assert!(
+            text.contains("rush_http_requests_in_flight 3\n"),
+            "gauge render wrong:\n{text}"
+        );
     }
 
     #[test]
@@ -550,9 +603,15 @@ mod tests {
         assert!(text.contains("le=\"50\"} 3"), "le=50 wrong:\n{text}");
         // +Inf bucket and _count both equal total observations (4).
         assert!(text.contains("le=\"+Inf\"} 4"), "+Inf wrong:\n{text}");
-        assert!(text.contains("rush_http_request_duration_ms_count{method=\"GET\",route=\"/x\"} 4"), "count wrong:\n{text}");
+        assert!(
+            text.contains("rush_http_request_duration_ms_count{method=\"GET\",route=\"/x\"} 4"),
+            "count wrong:\n{text}"
+        );
         // _sum = 3 + 7 + 40 + 99999 = 100049.
-        assert!(text.contains("rush_http_request_duration_ms_sum{method=\"GET\",route=\"/x\"} 100049"), "sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_http_request_duration_ms_sum{method=\"GET\",route=\"/x\"} 100049"),
+            "sum wrong:\n{text}"
+        );
         // Buckets must be monotonically non-decreasing (cumulative invariant).
         let counts = extract_bucket_counts(&text, "rush_http_request_duration_ms");
         for w in counts.windows(2) {
@@ -584,7 +643,10 @@ mod tests {
 
         // Empty histogram → all quantiles 0.
         let empty = [0u64; LATENCY_BUCKETS_MS.len()];
-        assert_eq!(quantile_from_buckets(&empty, &LATENCY_BUCKETS_MS, 0, 0.99), 0.0);
+        assert_eq!(
+            quantile_from_buckets(&empty, &LATENCY_BUCKETS_MS, 0, 0.99),
+            0.0
+        );
 
         // Spread across buckets: 5 in [0,5], 5 in (5,10]. p50 rank=5 lands at boundary of
         // first bucket → 5.0; p95 rank=9.5 → in second bucket: 5 + (10-5)*((9.5-5)/5)=9.5.
@@ -600,9 +662,17 @@ mod tests {
     #[test]
     fn snapshot_series_flattens_histogram() {
         let m = SelfMetrics::new();
-        m.inc_counter("rush_ingest_events_total", &[("signal", "logs"), ("outcome", "accepted")], 7);
+        m.inc_counter(
+            "rush_ingest_events_total",
+            &[("signal", "logs"), ("outcome", "accepted")],
+            7,
+        );
         m.set_gauge("rush_ingest_spool_bytes", &[], 1234.0);
-        m.observe_histogram("rush_engine_run_duration_ms", &[("engine", "stats_engine")], 12.0);
+        m.observe_histogram(
+            "rush_engine_run_duration_ms",
+            &[("engine", "stats_engine")],
+            12.0,
+        );
 
         let points = m.snapshot_series();
         // Counter present as Sum.
@@ -615,7 +685,11 @@ mod tests {
             && (p.value - 1234.0).abs() < 1e-9));
         // Histogram flattened to _count, _sum, and p-quantile gauges (no raw _bucket).
         assert!(points.iter().any(|p| p.name == "rush_engine_run_duration_ms_count" && p.kind == MetricKind::Sum));
-        assert!(points.iter().any(|p| p.name == "rush_engine_run_duration_ms_sum" && p.kind == MetricKind::Sum));
+        assert!(
+            points
+                .iter()
+                .any(|p| p.name == "rush_engine_run_duration_ms_sum" && p.kind == MetricKind::Sum)
+        );
         assert!(points.iter().any(|p| p.name == "rush_engine_run_duration_ms_p99" && p.kind == MetricKind::Gauge));
         assert!(!points.iter().any(|p| p.name.contains("_bucket")));
     }
@@ -625,10 +699,30 @@ mod tests {
         let m = SelfMetrics::new();
         let labels = [("signal", "logs")];
         // RESULT_COUNT_BUCKETS = [0,1,5,10,50,100,500,1000,5000,10000].
-        m.observe_histogram_with("rush_search_result_rows", &labels, 0.0, &RESULT_COUNT_BUCKETS); // <=0
-        m.observe_histogram_with("rush_search_result_rows", &labels, 3.0, &RESULT_COUNT_BUCKETS); // <=5
-        m.observe_histogram_with("rush_search_result_rows", &labels, 7.0, &RESULT_COUNT_BUCKETS); // <=10
-        m.observe_histogram_with("rush_search_result_rows", &labels, 99999.0, &RESULT_COUNT_BUCKETS); // +Inf
+        m.observe_histogram_with(
+            "rush_search_result_rows",
+            &labels,
+            0.0,
+            &RESULT_COUNT_BUCKETS,
+        ); // <=0
+        m.observe_histogram_with(
+            "rush_search_result_rows",
+            &labels,
+            3.0,
+            &RESULT_COUNT_BUCKETS,
+        ); // <=5
+        m.observe_histogram_with(
+            "rush_search_result_rows",
+            &labels,
+            7.0,
+            &RESULT_COUNT_BUCKETS,
+        ); // <=10
+        m.observe_histogram_with(
+            "rush_search_result_rows",
+            &labels,
+            99999.0,
+            &RESULT_COUNT_BUCKETS,
+        ); // +Inf
 
         let text = m.render_prometheus();
         assert!(text.contains("# TYPE rush_search_result_rows histogram"));
@@ -638,18 +732,35 @@ mod tests {
         assert!(text.contains("le=\"10\"} 3"), "le=10 wrong:\n{text}");
         // +Inf and _count = 4 total; _sum = 0+3+7+99999 = 100009.
         assert!(text.contains("le=\"+Inf\"} 4"), "+Inf wrong:\n{text}");
-        assert!(text.contains("rush_search_result_rows_count{signal=\"logs\"} 4"), "count wrong:\n{text}");
-        assert!(text.contains("rush_search_result_rows_sum{signal=\"logs\"} 100009"), "sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_result_rows_count{signal=\"logs\"} 4"),
+            "count wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_result_rows_sum{signal=\"logs\"} 100009"),
+            "sum wrong:\n{text}"
+        );
         // The default ms bucket bound (5000) is NOT emitted as a separate le from this set;
         // confirm the highest finite bound is the custom one (10000), not 10000-from-latency.
         assert!(text.contains("le=\"10000\"} 3"), "le=10000 wrong:\n{text}");
 
         // Snapshot uses the same custom bounds for quantiles (no panic / no wrong scale).
         let points = m.snapshot_series();
-        assert!(points.iter().any(|p| p.name == "rush_search_result_rows_count" && (p.value - 4.0).abs() < 1e-9));
-        let p99 = points.iter().find(|p| p.name == "rush_search_result_rows_p99").unwrap();
+        assert!(
+            points
+                .iter()
+                .any(|p| p.name == "rush_search_result_rows_count" && (p.value - 4.0).abs() < 1e-9)
+        );
+        let p99 = points
+            .iter()
+            .find(|p| p.name == "rush_search_result_rows_p99")
+            .unwrap();
         // p99 of {0,3,7,large} should land within the bucket bounds (max finite bound 10000).
-        assert!(p99.value <= 10000.0 && p99.value >= 0.0, "p99={}", p99.value);
+        assert!(
+            p99.value <= 10000.0 && p99.value >= 0.0,
+            "p99={}",
+            p99.value
+        );
     }
 
     #[test]
@@ -665,31 +776,67 @@ mod tests {
         let text = m.render_prometheus();
 
         // Counter with signal+outcome, low cardinality.
-        assert!(text.contains("rush_search_queries_total{outcome=\"ok\",signal=\"logs\"} 2"), "queries ok wrong:\n{text}");
-        assert!(text.contains("rush_search_queries_total{outcome=\"error\",signal=\"spans\"} 1"), "queries err wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_queries_total{outcome=\"ok\",signal=\"logs\"} 2"),
+            "queries ok wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_queries_total{outcome=\"error\",signal=\"spans\"} 1"),
+            "queries err wrong:\n{text}"
+        );
 
         // Empty counter: the 0-row browse (logs) and the 0-row failed spans search.
-        assert!(text.contains("rush_search_empty_total{signal=\"logs\"} 1"), "empty logs wrong:\n{text}");
-        assert!(text.contains("rush_search_empty_total{signal=\"spans\"} 1"), "empty spans wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_empty_total{signal=\"logs\"} 1"),
+            "empty logs wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_empty_total{signal=\"spans\"} 1"),
+            "empty spans wrong:\n{text}"
+        );
 
         // Duration histogram uses SEARCH_LATENCY_BUCKETS_MS (le="100" exists, not the ms set's 250-cap).
         assert!(text.contains("# TYPE rush_search_duration_ms histogram"));
         // logs: two observations (120ms, 50ms) → _count 2, _sum 170.
-        assert!(text.contains("rush_search_duration_ms_count{signal=\"logs\"} 2"), "dur count wrong:\n{text}");
-        assert!(text.contains("rush_search_duration_ms_sum{signal=\"logs\"} 170"), "dur sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_duration_ms_count{signal=\"logs\"} 2"),
+            "dur count wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_duration_ms_sum{signal=\"logs\"} 170"),
+            "dur sum wrong:\n{text}"
+        );
         // SEARCH_LATENCY_BUCKETS_MS starts at 10 — confirm that bound exists.
-        assert!(text.contains("rush_search_duration_ms_bucket{signal=\"logs\",le=\"10\"}"), "search latency bounds wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_duration_ms_bucket{signal=\"logs\",le=\"10\"}"),
+            "search latency bounds wrong:\n{text}"
+        );
 
         // Result-rows histogram: logs got 3 and 0 → _count 2, _sum 3.
-        assert!(text.contains("rush_search_result_rows_count{signal=\"logs\"} 2"), "rows count wrong:\n{text}");
-        assert!(text.contains("rush_search_result_rows_sum{signal=\"logs\"} 3"), "rows sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_result_rows_count{signal=\"logs\"} 2"),
+            "rows count wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_result_rows_sum{signal=\"logs\"} 3"),
+            "rows sum wrong:\n{text}"
+        );
 
         // Query-length histogram: ONLY the two searches with a term (logs len=4) recorded
         // for logs → _count 1; the browse (None) was skipped.
-        assert!(text.contains("rush_search_query_length_chars_count{signal=\"logs\"} 1"), "qlen count wrong:\n{text}");
-        assert!(text.contains("rush_search_query_length_chars_sum{signal=\"logs\"} 4"), "qlen sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_query_length_chars_count{signal=\"logs\"} 1"),
+            "qlen count wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_query_length_chars_sum{signal=\"logs\"} 4"),
+            "qlen sum wrong:\n{text}"
+        );
         // spans length histogram recorded once (len=10).
-        assert!(text.contains("rush_search_query_length_chars_count{signal=\"spans\"} 1"), "qlen spans count wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_query_length_chars_count{signal=\"spans\"} 1"),
+            "qlen spans count wrong:\n{text}"
+        );
 
         // No high-cardinality labels leaked (no tenant/route/query labels).
         assert!(!text.contains("tenant"), "tenant label leaked:\n{text}");
@@ -709,19 +856,46 @@ mod tests {
         let text = m.render_prometheus();
 
         // signal="metrics" appears on the counter with the same outcome dimension as logs/spans.
-        assert!(text.contains("rush_search_queries_total{outcome=\"ok\",signal=\"metrics\"} 2"), "metrics ok wrong:\n{text}");
-        assert!(text.contains("rush_search_queries_total{outcome=\"error\",signal=\"metrics\"} 1"), "metrics err wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_queries_total{outcome=\"ok\",signal=\"metrics\"} 2"),
+            "metrics ok wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_queries_total{outcome=\"error\",signal=\"metrics\"} 1"),
+            "metrics err wrong:\n{text}"
+        );
         // Empty counter: the 0-series range query + the failed query.
-        assert!(text.contains("rush_search_empty_total{signal=\"metrics\"} 2"), "metrics empty wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_empty_total{signal=\"metrics\"} 2"),
+            "metrics empty wrong:\n{text}"
+        );
         // Duration histogram: three observations (30+12+7) → _count 3, _sum 49.
-        assert!(text.contains("rush_search_duration_ms_count{signal=\"metrics\"} 3"), "metrics dur count wrong:\n{text}");
-        assert!(text.contains("rush_search_duration_ms_sum{signal=\"metrics\"} 49"), "metrics dur sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_duration_ms_count{signal=\"metrics\"} 3"),
+            "metrics dur count wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_duration_ms_sum{signal=\"metrics\"} 49"),
+            "metrics dur sum wrong:\n{text}"
+        );
         // Result-rows histogram: series counts 2,0,0 → _count 3, _sum 2.
-        assert!(text.contains("rush_search_result_rows_count{signal=\"metrics\"} 3"), "metrics rows count wrong:\n{text}");
-        assert!(text.contains("rush_search_result_rows_sum{signal=\"metrics\"} 2"), "metrics rows sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_result_rows_count{signal=\"metrics\"} 3"),
+            "metrics rows count wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_result_rows_sum{signal=\"metrics\"} 2"),
+            "metrics rows sum wrong:\n{text}"
+        );
         // Query-length histogram: all three had a query_len → _count 3, _sum 28 (8+15+5).
-        assert!(text.contains("rush_search_query_length_chars_count{signal=\"metrics\"} 3"), "metrics qlen count wrong:\n{text}");
-        assert!(text.contains("rush_search_query_length_chars_sum{signal=\"metrics\"} 28"), "metrics qlen sum wrong:\n{text}");
+        assert!(
+            text.contains("rush_search_query_length_chars_count{signal=\"metrics\"} 3"),
+            "metrics qlen count wrong:\n{text}"
+        );
+        assert!(
+            text.contains("rush_search_query_length_chars_sum{signal=\"metrics\"} 28"),
+            "metrics qlen sum wrong:\n{text}"
+        );
 
         // Cardinality stays bounded: signal is the only added dimension; no tenant/route/query labels.
         assert!(!text.contains("tenant"), "tenant label leaked:\n{text}");

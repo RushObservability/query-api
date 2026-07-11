@@ -1,8 +1,8 @@
 use axum::{
+    Extension, Json,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Extension, Json,
 };
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
@@ -126,7 +126,11 @@ pub async fn usage_summary(
     let escaped_tenant = escape_string_literal(tenant_id);
 
     let now = chrono::Utc::now();
-    let from = sanitize_datetime(&params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()));
+    let from = sanitize_datetime(
+        &params
+            .from
+            .unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()),
+    );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
 
     let tenant_filter = if is_global {
@@ -196,7 +200,11 @@ pub async fn usage_breakdown(
     let escaped_tenant = escape_string_literal(tenant_id);
 
     let now = chrono::Utc::now();
-    let from = sanitize_datetime(&params.from.unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339()));
+    let from = sanitize_datetime(
+        &params
+            .from
+            .unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339()),
+    );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
     let interval = params.interval.as_deref().unwrap_or("hour");
 
@@ -237,16 +245,13 @@ pub async fn usage_breakdown(
     // Group by timestamp
     let mut buckets_map: HashMap<String, HashMap<String, SignalCounts>> = HashMap::new();
     for row in rows {
-        buckets_map
-            .entry(row.ts.clone())
-            .or_default()
-            .insert(
-                row.signal,
-                SignalCounts {
-                    events_count: row.events,
-                    bytes_count: row.bytes,
-                },
-            );
+        buckets_map.entry(row.ts.clone()).or_default().insert(
+            row.signal,
+            SignalCounts {
+                events_count: row.events,
+                bytes_count: row.bytes,
+            },
+        );
     }
 
     let mut buckets: Vec<BreakdownBucket> = buckets_map
@@ -273,7 +278,11 @@ pub async fn usage_tenants(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
     let now = chrono::Utc::now();
-    let from = sanitize_datetime(&params.from.unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()));
+    let from = sanitize_datetime(
+        &params
+            .from
+            .unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()),
+    );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
     let limit = params.limit.unwrap_or(50).min(500);
 
@@ -302,14 +311,14 @@ pub async fn usage_tenants(
     // Pivot: (tenant_id, signal) rows -> nested tenant entries
     let mut tenant_map: HashMap<String, TenantUsageEntry> = HashMap::new();
     for row in rows {
-        let entry = tenant_map.entry(row.tenant_id.clone()).or_insert_with(|| {
-            TenantUsageEntry {
+        let entry = tenant_map
+            .entry(row.tenant_id.clone())
+            .or_insert_with(|| TenantUsageEntry {
                 tenant_id: row.tenant_id.clone(),
                 events_count: 0,
                 bytes_count: 0,
                 signals: HashMap::new(),
-            }
-        });
+            });
         entry.events_count += row.events;
         entry.bytes_count += row.bytes;
         entry.signals.insert(

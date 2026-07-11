@@ -1,4 +1,9 @@
-use axum::{Json, extract::{Query, State}, http::StatusCode, response::IntoResponse, Extension};
+use axum::{
+    Extension, Json,
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
@@ -26,9 +31,9 @@ pub async fn list_services(
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let rows = crate::tenant_query(
-            &state.ch,
-            &format!(
-                "SELECT
+        &state.ch,
+        &format!(
+            "SELECT
                     service_name,
                     http_path,
                     http_method,
@@ -37,18 +42,15 @@ pub async fn list_services(
                 FROM services
                 WHERE tenant_id = '{escaped_tenant}'
                 ORDER BY service_name, http_path",
-            ),
-            tenant_id,
-        )
-        .fetch_all::<ServiceEntry>()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, handler = "list_services", "query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "query failed".into(),
-            )
-        })?;
+        ),
+        tenant_id,
+    )
+    .fetch_all::<ServiceEntry>()
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, handler = "list_services", "query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
 
     tracing::info!(
         tenant_id = %tenant_id,
@@ -262,7 +264,12 @@ pub async fn service_latency_histogram(
     })?;
 
     // No rows ⇒ no traffic in window; return an empty distribution rather than 500.
-    let pct = pct_res.unwrap_or(LatencyPercentilesRow { p50_ms: 0.0, p95_ms: 0.0, p99_ms: 0.0, total: 0 });
+    let pct = pct_res.unwrap_or(LatencyPercentilesRow {
+        p50_ms: 0.0,
+        p95_ms: 0.0,
+        p99_ms: 0.0,
+        total: 0,
+    });
 
     Ok(Json(LatencyHistResponse {
         buckets,
@@ -371,7 +378,11 @@ pub async fn service_endpoints(
 
     Ok(Json(EndpointsResponse {
         endpoints,
-        mode: if operation_mode { "operation".into() } else { "server".into() },
+        mode: if operation_mode {
+            "operation".into()
+        } else {
+            "server".into()
+        },
     }))
 }
 
@@ -478,6 +489,10 @@ pub async fn service_errors(
 
     Ok(Json(ErrorsResponse {
         groups,
-        mode: if message_mode { "message".into() } else { "endpoint".into() },
+        mode: if message_mode {
+            "message".into()
+        } else {
+            "endpoint".into()
+        },
     }))
 }

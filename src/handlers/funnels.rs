@@ -1,3 +1,6 @@
+use crate::handlers::users::{require_auth, require_write};
+use crate::query_builder::{QueryClauses, sanitize_datetime};
+use crate::{AppState, TenantContext};
 use axum::{
     Json,
     extract::{Extension, Path, State},
@@ -5,9 +8,6 @@ use axum::{
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use crate::{AppState, TenantContext};
-use crate::handlers::users::{require_auth, require_write};
-use crate::query_builder::{QueryClauses, sanitize_datetime};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FunnelStep {
@@ -85,7 +85,10 @@ fn step_clauses(step: &FunnelStep, from: &str, to: &str, tenant_id: &str) -> Que
     if let Some(max) = step.max_status_code {
         conditions.push(format!("http_status_code <= {max}"));
     }
-    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
+    QueryClauses {
+        prewhere,
+        where_clause: conditions.join(" AND "),
+    }
 }
 
 pub async fn list_funnels(
@@ -94,12 +97,23 @@ pub async fn list_funnels(
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
-    let rows = state.config_db.list_funnels(&tenant.tenant_id).await
+    let rows = state
+        .config_db
+        .list_funnels(&tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let funnels: Vec<FunnelResponse> = rows.into_iter().filter_map(|(id, name, steps_json, created_at)| {
-        let steps: Vec<FunnelStep> = serde_json::from_str(&steps_json).ok()?;
-        Some(FunnelResponse { id, name, steps, created_at })
-    }).collect();
+    let funnels: Vec<FunnelResponse> = rows
+        .into_iter()
+        .filter_map(|(id, name, steps_json, created_at)| {
+            let steps: Vec<FunnelStep> = serde_json::from_str(&steps_json).ok()?;
+            Some(FunnelResponse {
+                id,
+                name,
+                steps,
+                created_at,
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({ "funnels": funnels })))
 }
 
@@ -114,20 +128,35 @@ pub async fn create_funnel(
         return Err((StatusCode::BAD_REQUEST, "name required".to_string()));
     }
     if req.name.len() > 255 {
-        return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not exceed 255 characters".to_string(),
+        ));
     }
     if req.steps.len() < 2 {
-        return Err((StatusCode::BAD_REQUEST, "funnel requires at least 2 steps".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "funnel requires at least 2 steps".to_string(),
+        ));
     }
     if req.steps.len() > 10 {
-        return Err((StatusCode::BAD_REQUEST, "funnel supports at most 10 steps".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "funnel supports at most 10 steps".to_string(),
+        ));
     }
-    let steps_json = serde_json::to_string(&req.steps)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let steps_json =
+        serde_json::to_string(&req.steps).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let id = uuid::Uuid::new_v4().to_string();
-    state.config_db.create_funnel(&id, &req.name, &steps_json, &tenant.tenant_id).await
+    state
+        .config_db
+        .create_funnel(&id, &req.name, &steps_json, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id, "ok": true }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "ok": true })),
+    ))
 }
 
 pub async fn delete_funnel(
@@ -137,7 +166,10 @@ pub async fn delete_funnel(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let deleted = state.config_db.delete_funnel(&id, &tenant.tenant_id).await
+    let deleted = state
+        .config_db
+        .delete_funnel(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "funnel not found".to_string()));
@@ -153,7 +185,10 @@ pub async fn run_funnel(
     Json(req): Json<RunFunnelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let row = state.config_db.get_funnel(&id, &tenant.tenant_id).await
+    let row = state
+        .config_db
+        .get_funnel(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "funnel not found".to_string()))?;
 
@@ -161,14 +196,23 @@ pub async fn run_funnel(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Build all SQL strings up front, then fire all step queries in parallel.
-    let sqls: Vec<String> = steps.iter().map(|step| {
-        let clauses = step_clauses(step, &req.from, &req.to, &tenant.tenant_id);
-        format!("SELECT count(DISTINCT trace_id) as count FROM spans {}", clauses.to_sql())
-    }).collect();
+    let sqls: Vec<String> = steps
+        .iter()
+        .map(|step| {
+            let clauses = step_clauses(step, &req.from, &req.to, &tenant.tenant_id);
+            format!(
+                "SELECT count(DISTINCT trace_id) as count FROM spans {}",
+                clauses.to_sql()
+            )
+        })
+        .collect();
 
-    let futures: Vec<_> = sqls.iter().map(|sql| {
-        crate::tenant_query(&state.ch, sql, &tenant.tenant_id).fetch_one::<TraceCountRow>()
-    }).collect();
+    let futures: Vec<_> = sqls
+        .iter()
+        .map(|sql| {
+            crate::tenant_query(&state.ch, sql, &tenant.tenant_id).fetch_one::<TraceCountRow>()
+        })
+        .collect();
 
     let step_counts: Vec<u64> = futures_util::future::join_all(futures)
         .await
@@ -181,9 +225,23 @@ pub async fn run_funnel(
     let mut prev = 0u64;
 
     for (i, (step, &count)) in steps.iter().zip(step_counts.iter()).enumerate() {
-        let pct_of_first = if first > 0.0 { (count as f64 / first) * 100.0 } else { 0.0 };
-        let pct_of_prev = if i == 0 { 100.0 } else if prev > 0 { (count as f64 / prev as f64) * 100.0 } else { 0.0 };
-        let drop_off = if i == 0 { 0 } else { prev.saturating_sub(count) };
+        let pct_of_first = if first > 0.0 {
+            (count as f64 / first) * 100.0
+        } else {
+            0.0
+        };
+        let pct_of_prev = if i == 0 {
+            100.0
+        } else if prev > 0 {
+            (count as f64 / prev as f64) * 100.0
+        } else {
+            0.0
+        };
+        let drop_off = if i == 0 {
+            0
+        } else {
+            prev.saturating_sub(count)
+        };
         result_steps.push(FunnelResultStep {
             label: step.label.clone(),
             count,
@@ -194,5 +252,8 @@ pub async fn run_funnel(
         prev = count;
     }
 
-    Ok(Json(FunnelResult { funnel_id: id, steps: result_steps }))
+    Ok(Json(FunnelResult {
+        funnel_id: id,
+        steps: result_steps,
+    }))
 }

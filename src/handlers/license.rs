@@ -1,4 +1,4 @@
-use axum::{response::IntoResponse, Json};
+use axum::{Json, response::IntoResponse};
 
 /// `GET /api/v1/license` — current license status + entitlements.
 /// Non-sensitive (it's the customer's own license), so no auth required; the UI

@@ -1,11 +1,13 @@
-use std::sync::Arc;
 use crate::clickhouse_config::ConfigDb;
 use crate::models::query::Filter;
-use crate::query_builder::{build_where_clause, build_metrics_where_clause, build_logs_where_clause};
+use crate::query_builder::{
+    build_logs_where_clause, build_metrics_where_clause, build_where_clause,
+};
 use clickhouse::Client;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct SmtpConfig {
@@ -59,7 +61,16 @@ pub fn spawn_alert_engine(config_db: Arc<ConfigDb>, ch: Client, smtp_config: Smt
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
-            if let Err(e) = eval_alerts(&config_db, &ch, &http_client, &smtp_config, &smtp_transport, &mut eval_state).await {
+            if let Err(e) = eval_alerts(
+                &config_db,
+                &ch,
+                &http_client,
+                &smtp_config,
+                &smtp_transport,
+                &mut eval_state,
+            )
+            .await
+            {
                 tracing::error!("alert engine error: {e}");
             }
         }
@@ -82,7 +93,7 @@ fn build_slack_payload(
     runbook_url: &str,
 ) -> serde_json::Value {
     let is_firing = !matches!(alert_state, "RESOLVED" | "ok" | "TEST");
-    let is_test   = alert_state == "TEST";
+    let is_test = alert_state == "TEST";
 
     let (color, status_emoji, status_label) = if is_test {
         ("#888888", "🔔", "TEST")
@@ -93,18 +104,22 @@ fn build_slack_payload(
     };
 
     let signal_label = match signal_type {
-        "metrics"  => "Metrics",
-        "logs"     => "Logs",
-        "apm"      => "APM / Traces",
+        "metrics" => "Metrics",
+        "logs" => "Logs",
+        "apm" => "APM / Traces",
         "monitors" => "Monitor",
         s if s.is_empty() => "—",
         s => s,
     };
 
     let fmt_num = |n: f64| -> String {
-        if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n:.2}") }
+        if n.fract() == 0.0 {
+            format!("{}", n as i64)
+        } else {
+            format!("{n:.2}")
+        }
     };
-    let value_str     = fmt_num(value);
+    let value_str = fmt_num(value);
     let threshold_str = fmt_num(threshold);
 
     let condition_str = if condition_op.is_empty() {
@@ -114,7 +129,8 @@ fn build_slack_payload(
     };
 
     let ts = chrono::Utc::now().timestamp();
-    let fallback = format!("[{status_label}] {alert_name} — {value_str} {condition_op} {threshold_str}");
+    let fallback =
+        format!("[{status_label}] {alert_name} — {value_str} {condition_op} {threshold_str}");
 
     // Resolve base URL for deep links; fall back gracefully if unset
     let base_url = std::env::var("RUSH_BASE_URL")
@@ -124,11 +140,11 @@ fn build_slack_payload(
 
     // Build action buttons
     let view_query_path = match signal_type {
-        "metrics"  => "/?mode=metrics",
-        "logs"     => "/?mode=logs",
-        "apm"      => "/?mode=traces",
+        "metrics" => "/?mode=metrics",
+        "logs" => "/?mode=logs",
+        "apm" => "/?mode=traces",
         "monitors" => "/monitors",
-        _          => "/",
+        _ => "/",
     };
     // NOTE: these go into the legacy attachment `actions` array (below), which expects
     // `text` to be a plain STRING. (Block Kit buttons use an object for `text`; putting a
@@ -202,30 +218,39 @@ pub async fn send_channel_notification(
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
 ) -> Result<(), String> {
-    let config: serde_json::Value = serde_json::from_str(&channel.config)
-        .unwrap_or(serde_json::json!({}));
+    let config: serde_json::Value =
+        serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
 
     match channel.channel_type.as_str() {
         "email" => {
-            let recipients = config.get("recipients")
+            let recipients = config
+                .get("recipients")
                 .and_then(|r| r.as_str())
                 .or_else(|| config.get("to").and_then(|t| t.as_str()))
                 .ok_or_else(|| "email channel config missing recipients".to_string())?;
 
-            let transport = smtp_transport.as_ref()
+            let transport = smtp_transport
+                .as_ref()
                 .ok_or_else(|| "email channel configured but SMTP not set up".to_string())?;
 
-            let subject = format!(
-                "[Rush Alert] {} - {}",
-                alert_name,
-                alert_state,
-            );
+            let subject = format!("[Rush Alert] {} - {}", alert_name, alert_state,);
 
             // Send to each recipient
-            for to_addr in recipients.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for to_addr in recipients
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 match Message::builder()
-                    .from(smtp_config.from.parse().unwrap_or_else(|_| "wide@localhost".parse().unwrap()))
-                    .to(to_addr.parse().unwrap_or_else(|_| "noreply@localhost".parse().unwrap()))
+                    .from(
+                        smtp_config
+                            .from
+                            .parse()
+                            .unwrap_or_else(|_| "wide@localhost".parse().unwrap()),
+                    )
+                    .to(to_addr
+                        .parse()
+                        .unwrap_or_else(|_| "noreply@localhost".parse().unwrap()))
                     .subject(&subject)
                     .header(ContentType::TEXT_PLAIN)
                     .body(message.to_string())
@@ -243,23 +268,39 @@ pub async fn send_channel_notification(
             Ok(())
         }
         "slack" => {
-            let url = config.get("webhook_url")
+            let url = config
+                .get("webhook_url")
                 .or_else(|| config.get("url"))
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "slack channel config missing webhook_url".to_string())?;
 
-            let payload = build_slack_payload(alert_name, alert_state, value, threshold, signal_type, condition_op, description, alert_id, runbook_url);
-            crate::outbound::public_https_request(reqwest::Method::POST, url).await?
-                .json(&payload).send().await
+            let payload = build_slack_payload(
+                alert_name,
+                alert_state,
+                value,
+                threshold,
+                signal_type,
+                condition_op,
+                description,
+                alert_id,
+                runbook_url,
+            );
+            crate::outbound::public_https_request(reqwest::Method::POST, url)
+                .await?
+                .json(&payload)
+                .send()
+                .await
                 .map_err(|e| format!("slack notification failed: {e}"))?;
             Ok(())
         }
         "webhook" => {
-            let url = config.get("url")
+            let url = config
+                .get("url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "webhook channel config missing url".to_string())?;
 
-            let method = config.get("method")
+            let method = config
+                .get("method")
                 .and_then(|m| m.as_str())
                 .unwrap_or("POST");
 
@@ -271,7 +312,11 @@ pub async fn send_channel_notification(
                 "message": message,
             });
 
-            let method = if method.eq_ignore_ascii_case("PUT") { reqwest::Method::PUT } else { reqwest::Method::POST };
+            let method = if method.eq_ignore_ascii_case("PUT") {
+                reqwest::Method::PUT
+            } else {
+                reqwest::Method::POST
+            };
             let mut req_builder = crate::outbound::public_https_request(method, url).await?;
 
             // Apply custom headers
@@ -283,12 +328,16 @@ pub async fn send_channel_notification(
                 }
             }
 
-            req_builder.json(&payload).send().await
+            req_builder
+                .json(&payload)
+                .send()
+                .await
                 .map_err(|e| format!("webhook notification failed: {e}"))?;
             Ok(())
         }
         "pagerduty" => {
-            let routing_key = config.get("routing_key")
+            let routing_key = config
+                .get("routing_key")
                 .and_then(|r| r.as_str())
                 .ok_or_else(|| "pagerduty channel config missing routing_key".to_string())?;
 
@@ -298,7 +347,8 @@ pub async fn send_channel_notification(
                 "trigger"
             };
 
-            let pd_severity = config.get("severity_mapping")
+            let pd_severity = config
+                .get("severity_mapping")
                 .and_then(|m| m.get("critical"))
                 .and_then(|s| s.as_str())
                 .unwrap_or("critical");
@@ -327,7 +377,8 @@ pub async fn send_channel_notification(
             Ok(())
         }
         "opsgenie" => {
-            let api_key = config.get("api_key")
+            let api_key = config
+                .get("api_key")
                 .and_then(|k| k.as_str())
                 .ok_or_else(|| "opsgenie channel config missing api_key".to_string())?;
 
@@ -348,7 +399,8 @@ pub async fn send_channel_notification(
                     .await
                     .map_err(|e| format!("opsgenie close failed: {e}"))?;
             } else {
-                let priority = config.get("priority_mapping")
+                let priority = config
+                    .get("priority_mapping")
                     .and_then(|m| m.get("critical"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("P1");
@@ -382,15 +434,32 @@ pub async fn send_channel_notification(
             Ok(())
         }
         "slack_app" => {
-            let token = config.get("token")
+            let token = config
+                .get("token")
                 .and_then(|t| t.as_str())
                 .ok_or_else(|| "slack_app channel config missing token".to_string())?;
-            let channel = config.get("channel")
+            let channel = config
+                .get("channel")
                 .and_then(|c| c.as_str())
                 .ok_or_else(|| "slack_app channel config missing channel".to_string())?;
-            let mut payload = build_slack_payload(alert_name, alert_state, value, threshold, signal_type, condition_op, description, alert_id, runbook_url);
+            let mut payload = build_slack_payload(
+                alert_name,
+                alert_state,
+                value,
+                threshold,
+                signal_type,
+                condition_op,
+                description,
+                alert_id,
+                runbook_url,
+            );
             payload["channel"] = serde_json::json!(channel);
-            payload["username"] = serde_json::json!(config.get("username").and_then(|u| u.as_str()).unwrap_or("Rush Alerts"));
+            payload["username"] = serde_json::json!(
+                config
+                    .get("username")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("Rush Alerts")
+            );
             http_client
                 .post("https://slack.com/api/chat.postMessage")
                 .header("Authorization", format!("Bearer {token}"))
@@ -401,10 +470,15 @@ pub async fn send_channel_notification(
             Ok(())
         }
         "discord" => {
-            let url = config.get("webhook_url")
+            let url = config
+                .get("webhook_url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "discord channel config missing webhook_url".to_string())?;
-            let color: u32 = if alert_state == "RESOLVED" || alert_state == "ok" { 0x57F287 } else { 0xED4245 };
+            let color: u32 = if alert_state == "RESOLVED" || alert_state == "ok" {
+                0x57F287
+            } else {
+                0xED4245
+            };
             let payload = serde_json::json!({
                 "embeds": [{
                     "title": format!("[{}] {}", alert_state, alert_name),
@@ -416,42 +490,61 @@ pub async fn send_channel_notification(
                     ],
                 }]
             });
-            crate::outbound::public_https_request(reqwest::Method::POST, url).await?
-                .json(&payload).send().await
+            crate::outbound::public_https_request(reqwest::Method::POST, url)
+                .await?
+                .json(&payload)
+                .send()
+                .await
                 .map_err(|e| format!("discord notification failed: {e}"))?;
             Ok(())
         }
         "alertmanager" => {
-            let base_url = config.get("url")
+            let base_url = config
+                .get("url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "alertmanager channel config missing url".to_string())?;
             let api_url = format!("{}/api/v2/alerts", base_url.trim_end_matches('/'));
-            let status = if alert_state == "RESOLVED" || alert_state == "ok" { "resolved" } else { "firing" };
-            let extra_labels = config.get("labels").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let status = if alert_state == "RESOLVED" || alert_state == "ok" {
+                "resolved"
+            } else {
+                "firing"
+            };
+            let extra_labels = config
+                .get("labels")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
             let mut labels = serde_json::json!({ "alertname": alert_name, "severity": "critical" });
             if let (Some(lobj), Some(eobj)) = (labels.as_object_mut(), extra_labels.as_object()) {
-                for (k, v) in eobj { lobj.insert(k.clone(), v.clone()); }
+                for (k, v) in eobj {
+                    lobj.insert(k.clone(), v.clone());
+                }
             }
             let payload = serde_json::json!([{
                 "labels": labels,
                 "annotations": { "summary": message, "value": value.to_string() },
                 "status": status,
             }]);
-            crate::outbound::public_https_request(reqwest::Method::POST, &api_url).await?
-                .json(&payload).send().await
+            crate::outbound::public_https_request(reqwest::Method::POST, &api_url)
+                .await?
+                .json(&payload)
+                .send()
+                .await
                 .map_err(|e| format!("alertmanager notification failed: {e}"))?;
             Ok(())
         }
-        other => {
-            Err(format!("unsupported channel type: {other}"))
-        }
+        other => Err(format!("unsupported channel type: {other}")),
     }
 }
 
 /// Build the count SQL for one alert rule. The metrics variant pushes `count()`
 /// into each UNION ALL leg (and sums the per-leg counts) instead of streaming
 /// every TimeUnix value out of 5 tables just to count rows in the outer query.
-fn build_alert_count_sql(signal_type: &str, query_config: &AlertQueryConfig, from: &str, to: &str) -> String {
+fn build_alert_count_sql(
+    signal_type: &str,
+    query_config: &AlertQueryConfig,
+    from: &str,
+    to: &str,
+) -> String {
     match signal_type {
         "metrics" => {
             let mc = build_metrics_where_clause(&query_config.filters, from, to);
@@ -467,7 +560,10 @@ fn build_alert_count_sql(signal_type: &str, query_config: &AlertQueryConfig, fro
         }
         "logs" => {
             let lc = build_logs_where_clause(&query_config.filters, from, to);
-            format!("SELECT count() as count FROM observability.logs {}", lc.to_sql())
+            format!(
+                "SELECT count() as count FROM observability.logs {}",
+                lc.to_sql()
+            )
         }
         _ => {
             // "apm" (default) — query spans
@@ -503,22 +599,32 @@ async fn eval_alerts(
         .collect();
 
     let now_str_ref = now_str.as_str();
-    let outcomes: Vec<(String, bool)> = futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
-        let persisted = match eval_alert_rule(
-            config_db, ch, http_client, smtp_config, smtp_transport,
-            &rule, now, now_str_ref, should_flush,
-        ).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("alert {}: evaluation error: {e}", rule.id);
-                false
-            }
-        };
-        (rule.id, persisted)
-    }))
-    .buffer_unordered(ENGINE_CONCURRENCY)
-    .collect()
-    .await;
+    let outcomes: Vec<(String, bool)> =
+        futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
+            let persisted = match eval_alert_rule(
+                config_db,
+                ch,
+                http_client,
+                smtp_config,
+                smtp_transport,
+                &rule,
+                now,
+                now_str_ref,
+                should_flush,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("alert {}: evaluation error: {e}", rule.id);
+                    false
+                }
+            };
+            (rule.id, persisted)
+        }))
+        .buffer_unordered(ENGINE_CONCURRENCY)
+        .collect()
+        .await;
 
     for (id, persisted) in outcomes {
         eval_state.record(id, now, persisted);
@@ -555,13 +661,20 @@ async fn eval_alert_rule(
 
     let sql = build_alert_count_sql(&rule.signal_type, &query_config, &from, now_str);
 
-    let value = match ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<CountRow>().await {
+    let value = match ch
+        .query(&sql)
+        .with_option("max_execution_time", "30")
+        .fetch_one::<CountRow>()
+        .await
+    {
         Ok(row) => row.count as f64,
         Err(e) => {
             tracing::warn!("alert {}: query failed: {e}", rule.id);
             if rule.state != "no_data" {
                 // Transition into no_data persists immediately, as before.
-                config_db.update_alert_state(&rule.id, "no_data", now_str, None).await?;
+                config_db
+                    .update_alert_state(&rule.id, "no_data", now_str, None)
+                    .await?;
                 return Ok(true);
             }
             if should_flush {
@@ -598,27 +711,27 @@ async fn eval_alert_rule(
             rule.condition_op,
         );
 
-        config_db.create_alert_event(
-            &event_id,
-            &rule.id,
-            new_state,
-            value,
-            threshold,
-            &message,
-        ).await?;
+        config_db
+            .create_alert_event(&event_id, &rule.id, new_state, value, threshold, &message)
+            .await?;
 
         let triggered_at = if triggered { Some(now_str) } else { None };
-        config_db.update_alert_state(&rule.id, new_state, now_str, triggered_at).await?;
+        config_db
+            .update_alert_state(&rule.id, new_state, now_str, triggered_at)
+            .await?;
 
         // Skip notifications during active maintenance windows
         if config_db.is_in_maintenance(now_str, Some(&rule.id)).await {
-            tracing::debug!("alert '{}': skipping notification — maintenance window active", rule.id);
+            tracing::debug!(
+                "alert '{}': skipping notification — maintenance window active",
+                rule.id
+            );
             return Ok(true);
         }
 
         // Send notifications
-        let channel_ids: Vec<String> = serde_json::from_str(&rule.notification_channel_ids)
-            .unwrap_or_default();
+        let channel_ids: Vec<String> =
+            serde_json::from_str(&rule.notification_channel_ids).unwrap_or_default();
         let alert_state_str = if triggered { "FIRING" } else { "RESOLVED" };
         for channel_id in &channel_ids {
             if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
@@ -640,29 +753,41 @@ async fn eval_alert_rule(
                     http_client,
                     smtp_config,
                     smtp_transport,
-                ).await;
+                )
+                .await;
 
                 let (status, error_msg) = match &result {
                     Ok(()) => ("sent", String::new()),
                     Err(e) => {
-                        tracing::warn!("alert {}: notification to {} failed: {e}", rule.id, channel.name);
+                        tracing::warn!(
+                            "alert {}: notification to {} failed: {e}",
+                            rule.id,
+                            channel.name
+                        );
                         ("failed", e.clone())
                     }
                 };
 
-                let _ = config_db.create_notification_log(
-                    channel_id,
-                    &channel.tenant_id,
-                    "alert_rule",
-                    &rule.name,
-                    "",
-                    status,
-                    &error_msg,
-                ).await;
+                let _ = config_db
+                    .create_notification_log(
+                        channel_id,
+                        &channel.tenant_id,
+                        "alert_rule",
+                        &rule.name,
+                        "",
+                        status,
+                        &error_msg,
+                    )
+                    .await;
             }
         }
 
-        tracing::info!("alert '{}' state: {} -> {}", rule.name, old_state, new_state);
+        tracing::info!(
+            "alert '{}' state: {} -> {}",
+            rule.name,
+            old_state,
+            new_state
+        );
         Ok(true)
     } else if should_flush {
         // No transition: coarse last_eval_at flush from the row we already hold.
@@ -685,18 +810,49 @@ mod count_sql_tests {
     // (per-leg pushdown) instead of streaming TimeUnix rows to an outer count().
     #[test]
     fn metrics_count_uses_per_leg_pushdown() {
-        let sql = build_alert_count_sql("metrics", &cfg(), "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
-        assert!(sql.starts_with("SELECT sum(c) as count FROM ("), "outer sum over per-leg counts: {sql}");
-        assert_eq!(sql.matches("SELECT count() AS c FROM").count(), 5, "5 per-leg counts: {sql}");
-        assert!(!sql.contains("SELECT TimeUnix"), "must not stream TimeUnix rows: {sql}");
+        let sql = build_alert_count_sql(
+            "metrics",
+            &cfg(),
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+        );
+        assert!(
+            sql.starts_with("SELECT sum(c) as count FROM ("),
+            "outer sum over per-leg counts: {sql}"
+        );
+        assert_eq!(
+            sql.matches("SELECT count() AS c FROM").count(),
+            5,
+            "5 per-leg counts: {sql}"
+        );
+        assert!(
+            !sql.contains("SELECT TimeUnix"),
+            "must not stream TimeUnix rows: {sql}"
+        );
     }
 
     #[test]
     fn logs_and_apm_counts_unchanged() {
-        let logs = build_alert_count_sql("logs", &cfg(), "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
-        assert!(logs.starts_with("SELECT count() as count FROM observability.logs"), "{logs}");
-        let apm = build_alert_count_sql("apm", &cfg(), "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
-        assert!(apm.starts_with("SELECT count() as count FROM spans"), "{apm}");
+        let logs = build_alert_count_sql(
+            "logs",
+            &cfg(),
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+        );
+        assert!(
+            logs.starts_with("SELECT count() as count FROM observability.logs"),
+            "{logs}"
+        );
+        let apm = build_alert_count_sql(
+            "apm",
+            &cfg(),
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+        );
+        assert!(
+            apm.starts_with("SELECT count() as count FROM spans"),
+            "{apm}"
+        );
     }
 }
 
@@ -709,22 +865,41 @@ mod slack_payload_tests {
     #[test]
     fn action_buttons_have_string_text() {
         // SAFETY: tests are single-threaded here; set base URL so buttons are emitted.
-        unsafe { std::env::set_var("RUSH_BASE_URL", "https://rush.example.com"); }
+        unsafe {
+            std::env::set_var("RUSH_BASE_URL", "https://rush.example.com");
+        }
         let payload = build_slack_payload(
-            "Payments Service Activity", "FIRING", 578.0, 10.0,
-            "apm", ">", "Alerts when payments generates > 10 spans", "alert-123",
+            "Payments Service Activity",
+            "FIRING",
+            578.0,
+            10.0,
+            "apm",
+            ">",
+            "Alerts when payments generates > 10 spans",
+            "alert-123",
             "https://runbook.example.com/payments",
         );
-        let actions = payload["attachments"][0]["actions"].as_array().expect("actions array");
+        let actions = payload["attachments"][0]["actions"]
+            .as_array()
+            .expect("actions array");
         assert!(!actions.is_empty(), "expected action buttons");
         for btn in actions {
             let text = &btn["text"];
-            assert!(text.is_string(), "button text must be a string, got: {text}");
-            assert!(!text.as_str().unwrap().is_empty(), "button text must be non-empty");
+            assert!(
+                text.is_string(),
+                "button text must be a string, got: {text}"
+            );
+            assert!(
+                !text.as_str().unwrap().is_empty(),
+                "button text must be non-empty"
+            );
             assert!(btn["url"].is_string(), "link button must have a url");
         }
         // Spot-check the expected labels are present.
-        let labels: Vec<&str> = actions.iter().map(|b| b["text"].as_str().unwrap()).collect();
+        let labels: Vec<&str> = actions
+            .iter()
+            .map(|b| b["text"].as_str().unwrap())
+            .collect();
         assert!(labels.contains(&"View Alert"));
         assert!(labels.contains(&"View Query"));
     }

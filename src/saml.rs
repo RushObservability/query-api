@@ -34,7 +34,9 @@ pub fn build_authn_request(sp_entity_id: &str, acs_url: &str, idp_sso_url: &str)
 /// Deflate-compress, base64-encode, and URL-encode a SAMLRequest for HTTP-Redirect binding.
 pub fn encode_authn_request_redirect(authn_request_xml: &str) -> String {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(authn_request_xml.as_bytes()).expect("deflate write");
+    encoder
+        .write_all(authn_request_xml.as_bytes())
+        .expect("deflate write");
     let compressed = encoder.finish().expect("deflate finish");
     let b64 = B64.encode(&compressed);
     urlencoding::encode(&b64).into_owned()
@@ -53,9 +55,7 @@ pub fn build_login_redirect_url(
     let relay_encoded = urlencoding::encode(relay_state);
 
     let sep = if idp_sso_url.contains('?') { "&" } else { "?" };
-    format!(
-        "{idp_sso_url}{sep}SAMLRequest={encoded}&RelayState={relay_encoded}"
-    )
+    format!("{idp_sso_url}{sep}SAMLRequest={encoded}&RelayState={relay_encoded}")
 }
 
 /// Verify the enveloped XML signature of a SAML Response against the IdP's
@@ -86,7 +86,6 @@ pub fn verify_signature(xml: &str, idp_cert_pem: &str) -> Result<bool, String> {
     }
 }
 
-
 /// Parse a base64-encoded SAMLResponse XML and extract assertion fields.
 ///
 /// If `idp_cert_pem` is provided (non-empty), the XML signature will be
@@ -97,7 +96,8 @@ pub fn parse_saml_response(
     b64_response: &str,
     groups_claim: &str,
 ) -> Result<SamlAssertion, String> {
-    let xml_bytes = B64.decode(b64_response.trim())
+    let xml_bytes = B64
+        .decode(b64_response.trim())
         .map_err(|e| format!("failed to base64-decode SAMLResponse: {e}"))?;
     let xml = String::from_utf8_lossy(&xml_bytes);
 
@@ -105,10 +105,7 @@ pub fn parse_saml_response(
 }
 
 /// Parse assertion fields from raw SAML Response XML.
-fn parse_assertion_xml(
-    xml: &str,
-    groups_claim: &str,
-) -> Result<SamlAssertion, String> {
+fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, String> {
     let mut reader = Reader::from_str(xml);
 
     let mut name_id = String::new();
@@ -151,7 +148,8 @@ fn parse_assertion_xml(
                         // Extract the Name attribute
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"Name" {
-                                current_attr_name = String::from_utf8_lossy(&attr.value).to_string();
+                                current_attr_name =
+                                    String::from_utf8_lossy(&attr.value).to_string();
                             }
                         }
                     }
@@ -210,13 +208,17 @@ fn parse_assertion_xml(
     }
 
     // Try to extract email and display name from common attribute names
-    let email = attributes.get("email")
-        .or_else(|| attributes.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"))
+    let email = attributes
+        .get("email")
+        .or_else(|| {
+            attributes.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
+        })
         .or_else(|| attributes.get("urn:oid:0.9.2342.19200300.100.1.3"))
         .or_else(|| attributes.get("mail"))
         .cloned();
 
-    let display_name = attributes.get("displayName")
+    let display_name = attributes
+        .get("displayName")
         .or_else(|| attributes.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"))
         .or_else(|| attributes.get("urn:oid:2.16.840.1.113730.3.1.241"))
         .or_else(|| attributes.get("cn"))
@@ -377,7 +379,10 @@ mod tests {
         let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Subject><saml:NameID>user@test.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#;
         // No <ds:Signature> present → not verified (not an error).
         let res = verify_signature(xml, &test_cert_pem());
-        assert!(matches!(res, Ok(false)), "no signature => Ok(false), got {res:?}");
+        assert!(
+            matches!(res, Ok(false)),
+            "no signature => Ok(false), got {res:?}"
+        );
     }
 
     #[test]
@@ -399,6 +404,9 @@ mod tests {
             r#"<saml:NameID>user@test.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#,
         );
         let res = verify_signature(xml, &test_cert_pem());
-        assert!(!matches!(res, Ok(true)), "bogus signature must not verify, got {res:?}");
+        assert!(
+            !matches!(res, Ok(true)),
+            "bogus signature must not verify, got {res:?}"
+        );
     }
 }

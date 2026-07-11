@@ -21,17 +21,13 @@ pub fn evaluate_range_func(
         RangeFunc::CountOverTime => compute_count_over_time(samples),
         RangeFunc::StddevOverTime => compute_stddev_over_time(samples),
         RangeFunc::StdvarOverTime => compute_stdvar_over_time(samples),
-        RangeFunc::QuantileOverTime => {
-            compute_quantile_over_time(param.unwrap_or(0.5), samples)
-        }
+        RangeFunc::QuantileOverTime => compute_quantile_over_time(param.unwrap_or(0.5), samples),
         RangeFunc::LastOverTime => compute_last_over_time(samples),
         RangeFunc::FirstOverTime => compute_first_over_time(samples),
         RangeFunc::Delta => compute_delta(samples),
         RangeFunc::Idelta => compute_idelta(samples),
         RangeFunc::Deriv => compute_deriv(samples),
-        RangeFunc::PredictLinear => {
-            compute_predict_linear(samples, param.unwrap_or(0.0))
-        }
+        RangeFunc::PredictLinear => compute_predict_linear(samples, param.unwrap_or(0.0)),
         RangeFunc::Changes => compute_changes(samples),
         RangeFunc::Resets => compute_resets(samples),
         RangeFunc::AbsentOverTime => compute_absent_over_time(samples),
@@ -262,20 +258,12 @@ pub fn compute_resets(samples: &[(f64, f64)]) -> Option<f64> {
 
 /// Absent over time: returns 1 if there are no samples, None otherwise.
 pub fn compute_absent_over_time(samples: &[(f64, f64)]) -> Option<f64> {
-    if samples.is_empty() {
-        Some(1.0)
-    } else {
-        None
-    }
+    if samples.is_empty() { Some(1.0) } else { None }
 }
 
 /// Present over time: returns 1 if there are samples, None otherwise.
 pub fn compute_present_over_time(samples: &[(f64, f64)]) -> Option<f64> {
-    if samples.is_empty() {
-        None
-    } else {
-        Some(1.0)
-    }
+    if samples.is_empty() { None } else { Some(1.0) }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -290,9 +278,17 @@ mod tests {
     // Source: app/vmselect/promql/rollup_test.go
 
     fn test_samples() -> Vec<(f64, f64)> {
-        let timestamps = [5.0, 15.0, 24.0, 36.0, 49.0, 60.0, 78.0, 80.0, 97.0, 115.0, 120.0, 130.0];
-        let values = [123.0, 34.0, 44.0, 21.0, 54.0, 34.0, 99.0, 12.0, 44.0, 32.0, 34.0, 34.0];
-        timestamps.iter().zip(values.iter()).map(|(t, v)| (*t, *v)).collect()
+        let timestamps = [
+            5.0, 15.0, 24.0, 36.0, 49.0, 60.0, 78.0, 80.0, 97.0, 115.0, 120.0, 130.0,
+        ];
+        let values = [
+            123.0, 34.0, 44.0, 21.0, 54.0, 34.0, 99.0, 12.0, 44.0, 32.0, 34.0, 34.0,
+        ];
+        timestamps
+            .iter()
+            .zip(values.iter())
+            .map(|(t, v)| (*t, *v))
+            .collect()
     }
 
     fn assert_approx(actual: f64, expected: f64, epsilon: f64) {
@@ -454,7 +450,10 @@ mod tests {
     fn test_compute_predict_linear() {
         let samples = test_samples();
         let predicted = compute_predict_linear(&samples, 60.0).unwrap();
-        assert!(predicted > -100.0 && predicted < 200.0, "predicted = {predicted}");
+        assert!(
+            predicted > -100.0 && predicted < 200.0,
+            "predicted = {predicted}"
+        );
     }
 
     #[test]
@@ -558,7 +557,7 @@ mod tests {
             (0.0, 0.0),
             (10.0, 5.0),
             (20.0, 10.0),
-            (30.0, 3.0),  // reset
+            (30.0, 3.0), // reset
             (40.0, 8.0),
         ];
         let rate = compute_rate(&samples).unwrap();
@@ -568,11 +567,7 @@ mod tests {
 
     #[test]
     fn test_constant_values() {
-        let constant = vec![
-            (10.0, 42.0),
-            (20.0, 42.0),
-            (30.0, 42.0),
-        ];
+        let constant = vec![(10.0, 42.0), (20.0, 42.0), (30.0, 42.0)];
         assert_approx(compute_rate(&constant).unwrap(), 0.0, 0.001);
         assert_approx(compute_delta(&constant).unwrap(), 0.0, 0.001);
         assert_approx(compute_stdvar_over_time(&constant).unwrap(), 0.0, 0.001);

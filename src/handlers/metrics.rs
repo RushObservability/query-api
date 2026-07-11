@@ -1,9 +1,8 @@
 use axum::{
-    Form, Json,
+    Extension, Form, Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Extension,
 };
 use dashmap::DashMap;
 use serde::Deserialize;
@@ -86,19 +85,20 @@ async fn prom_query_inner(
         .unwrap_or(now);
 
     let query_len = params.query.chars().count();
-    let series = promql::evaluate_instant_query(&state.ch, &params.query, eval_time, 300.0, tenant_id)
-        .await
-        .map_err(|e| {
-            // Additive self-metric; never fails the request.
-            state.self_metrics.record_search(
-                "metrics",
-                Some(query_len),
-                0,
-                start.elapsed().as_millis() as u64,
-                false,
-            );
-            (StatusCode::BAD_REQUEST, format!("PromQL error: {e}"))
-        })?;
+    let series =
+        promql::evaluate_instant_query(&state.ch, &params.query, eval_time, 300.0, tenant_id)
+            .await
+            .map_err(|e| {
+                // Additive self-metric; never fails the request.
+                state.self_metrics.record_search(
+                    "metrics",
+                    Some(query_len),
+                    0,
+                    start.elapsed().as_millis() as u64,
+                    false,
+                );
+                (StatusCode::BAD_REQUEST, format!("PromQL error: {e}"))
+            })?;
 
     // Return the latest value from each series
     let result: Vec<VectorResult> = series
@@ -192,25 +192,30 @@ async fn prom_query_range_inner(
         .unwrap_or(15.0);
 
     let query_len = params.query.chars().count();
-    let series = promql::evaluate_range_query(&state.ch, &params.query, start, end, step, tenant_id)
-        .await
-        .map_err(|e| {
-            // Additive self-metric; never fails the request.
-            state.self_metrics.record_search(
-                "metrics",
-                Some(query_len),
-                0,
-                query_start.elapsed().as_millis() as u64,
-                false,
-            );
-            (StatusCode::BAD_REQUEST, format!("PromQL error: {e}"))
-        })?;
+    let series =
+        promql::evaluate_range_query(&state.ch, &params.query, start, end, step, tenant_id)
+            .await
+            .map_err(|e| {
+                // Additive self-metric; never fails the request.
+                state.self_metrics.record_search(
+                    "metrics",
+                    Some(query_len),
+                    0,
+                    query_start.elapsed().as_millis() as u64,
+                    false,
+                );
+                (StatusCode::BAD_REQUEST, format!("PromQL error: {e}"))
+            })?;
 
     let result: Vec<MatrixResult> = series
         .into_iter()
         .map(|ts| MatrixResult {
             metric: ts.labels,
-            values: ts.samples.iter().map(|(t, v)| (*t, format_value(*v))).collect(),
+            values: ts
+                .samples
+                .iter()
+                .map(|(t, v)| (*t, format_value(*v)))
+                .collect(),
         })
         .collect();
 
@@ -297,8 +302,16 @@ async fn prom_series_inner(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
-    let start_secs = params.start.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(now_secs - 3600.0);
-    let end_secs = params.end.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(now_secs);
+    let start_secs = params
+        .start
+        .as_ref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(now_secs - 3600.0);
+    let end_secs = params
+        .end
+        .as_ref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(now_secs);
 
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let mut all_series = Vec::new();
@@ -322,11 +335,17 @@ async fn prom_series_inner(
         ];
         if let Some(name) = &vs.name {
             if !name.is_empty() {
-                where_parts.push(format!("MetricName = '{}'", crate::query_builder::escape_string_literal(&name)));
+                where_parts.push(format!(
+                    "MetricName = '{}'",
+                    crate::query_builder::escape_string_literal(&name)
+                ));
             }
         }
         // Add matchers (skip __name__ since we handle it via vs.name)
-        let non_name_matchers: Vec<_> = vs.matchers.matchers.iter()
+        let non_name_matchers: Vec<_> = vs
+            .matchers
+            .matchers
+            .iter()
             .filter(|m| m.name != "__name__")
             .cloned()
             .collect();
@@ -351,12 +370,13 @@ async fn prom_series_inner(
             crate::tenant_query(&state.ch, &sum_sql, tenant_id).fetch_all::<SeriesRow>(),
         );
 
-        for row in gauge_rows.unwrap_or_default().into_iter().chain(sum_rows.unwrap_or_default()) {
-            let labels = promql::build_label_set(
-                &row.metric_name,
-                &row.service_name,
-                &row.attributes,
-            );
+        for row in gauge_rows
+            .unwrap_or_default()
+            .into_iter()
+            .chain(sum_rows.unwrap_or_default())
+        {
+            let labels =
+                promql::build_label_set(&row.metric_name, &row.service_name, &row.attributes);
             all_series.push(labels);
         }
     }
@@ -388,9 +408,15 @@ pub async fn prom_labels(
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
 
     // 60s TTL cache keyed by (tenant, match expression).
-    let cache_key = format!("labels|{tenant_id}|{}", params.match_expr.as_deref().unwrap_or(""));
+    let cache_key = format!(
+        "labels|{tenant_id}|{}",
+        params.match_expr.as_deref().unwrap_or("")
+    );
     if let Some(cached) = prom_meta_cache_get(&cache_key) {
-        return Ok(Json(PromResponse { status: "success", data: cached }));
+        return Ok(Json(PromResponse {
+            status: "success",
+            data: cached,
+        }));
     }
 
     // Return well-known labels plus discovered attribute keys
@@ -406,13 +432,21 @@ pub async fn prom_labels(
     let metric_filter = params.match_expr.as_ref().and_then(|m| {
         let trimmed = m.trim().trim_start_matches('{').trim_end_matches('}');
         // Exact match: __name__="value"
-        if let Some(val) = trimmed.strip_prefix("__name__=\"").and_then(|s| s.strip_suffix('"')) {
+        if let Some(val) = trimmed
+            .strip_prefix("__name__=\"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
             let escaped = crate::query_builder::escape_string_literal(&val);
             return Some(format!("AND MetricName = '{escaped}'"));
         }
         // Regex match: __name__=~"value"
-        if let Some(val) = trimmed.strip_prefix("__name__=~\"").and_then(|s| s.strip_suffix('"')) {
-            let like = crate::query_builder::escape_string_literal(&val.replace(".*", "%").replace('.', "_"));
+        if let Some(val) = trimmed
+            .strip_prefix("__name__=~\"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            let like = crate::query_builder::escape_string_literal(
+                &val.replace(".*", "%").replace('.', "_"),
+            );
             return Some(format!("AND MetricName LIKE '{like}'"));
         }
         // Fallback: treat as literal metric name
@@ -442,7 +476,11 @@ pub async fn prom_labels(
         crate::tenant_query(&state.ch, &sum_sql, tenant_id).fetch_all::<LabelNameRow>(),
     );
 
-    for row in gauge_rows.unwrap_or_default().into_iter().chain(sum_rows.unwrap_or_default()) {
+    for row in gauge_rows
+        .unwrap_or_default()
+        .into_iter()
+        .chain(sum_rows.unwrap_or_default())
+    {
         if !row.name.is_empty() && !labels.contains(&row.name) {
             labels.push(row.name);
         }
@@ -476,19 +514,30 @@ pub async fn prom_label_values(
         params.match_expr.as_deref().unwrap_or("")
     );
     if let Some(cached) = prom_meta_cache_get(&cache_key) {
-        return Ok(Json(PromResponse { status: "success", data: cached }));
+        return Ok(Json(PromResponse {
+            status: "success",
+            data: cached,
+        }));
     }
 
     let mut values = Vec::new();
 
     let metric_filter = params.match_expr.as_ref().and_then(|m| {
         let trimmed = m.trim().trim_start_matches('{').trim_end_matches('}');
-        if let Some(val) = trimmed.strip_prefix("__name__=\"").and_then(|s| s.strip_suffix('"')) {
+        if let Some(val) = trimmed
+            .strip_prefix("__name__=\"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
             let escaped = crate::query_builder::escape_string_literal(&val);
             return Some(format!("AND MetricName = '{escaped}'"));
         }
-        if let Some(val) = trimmed.strip_prefix("__name__=~\"").and_then(|s| s.strip_suffix('"')) {
-            let like = crate::query_builder::escape_string_literal(&val.replace(".*", "%").replace('.', "_"));
+        if let Some(val) = trimmed
+            .strip_prefix("__name__=~\"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            let like = crate::query_builder::escape_string_literal(
+                &val.replace(".*", "%").replace('.', "_"),
+            );
             return Some(format!("AND MetricName LIKE '{like}'"));
         }
         if !trimmed.is_empty() {
@@ -534,7 +583,11 @@ pub async fn prom_label_values(
         crate::tenant_query(&state.ch, &sum_sql, tenant_id).fetch_all::<LabelValueRow>(),
     );
 
-    for row in gauge_rows.unwrap_or_default().into_iter().chain(sum_rows.unwrap_or_default()) {
+    for row in gauge_rows
+        .unwrap_or_default()
+        .into_iter()
+        .chain(sum_rows.unwrap_or_default())
+    {
         if !row.value.is_empty() && !values.contains(&row.value) {
             values.push(row.value);
         }
@@ -554,17 +607,19 @@ pub async fn prom_label_values(
 // ═══ Helpers ═══
 
 fn parse_timestamp(s: &str) -> Result<f64, (StatusCode, String)> {
-    s.parse::<f64>().map_err(|_| {
-        // Try ISO 8601
-        chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.timestamp() as f64)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid timestamp '{s}': {e}"),
-                )
-            })
-    }).or_else(|r| r)
+    s.parse::<f64>()
+        .map_err(|_| {
+            // Try ISO 8601
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.timestamp() as f64)
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid timestamp '{s}': {e}"),
+                    )
+                })
+        })
+        .or_else(|r| r)
 }
 
 fn parse_step(s: &str) -> Result<f64, String> {
@@ -656,7 +711,10 @@ mod tests {
     #[test]
     fn test_parse_timestamp_rfc3339() {
         // 2020-01-01T00:00:00Z == 1577836800 unix seconds.
-        assert_eq!(parse_timestamp("2020-01-01T00:00:00Z").unwrap(), 1577836800.0);
+        assert_eq!(
+            parse_timestamp("2020-01-01T00:00:00Z").unwrap(),
+            1577836800.0
+        );
     }
 
     #[test]
@@ -679,8 +737,7 @@ mod tests {
 
     #[test]
     fn test_vector_response_shape() {
-        let metric: BTreeMap<String, String> =
-            [("__name__".to_string(), "up".to_string())].into();
+        let metric: BTreeMap<String, String> = [("__name__".to_string(), "up".to_string())].into();
         let resp = PromResponse {
             status: "success",
             data: VectorData {
@@ -703,8 +760,7 @@ mod tests {
 
     #[test]
     fn test_matrix_response_shape() {
-        let metric: BTreeMap<String, String> =
-            [("__name__".to_string(), "up".to_string())].into();
+        let metric: BTreeMap<String, String> = [("__name__".to_string(), "up".to_string())].into();
         let resp = PromResponse {
             status: "success",
             data: MatrixData {

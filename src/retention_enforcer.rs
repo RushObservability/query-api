@@ -2,14 +2,22 @@ use clickhouse::Client;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{MetricRetentionRule, TraceRetentionRule, RushConfig};
 use crate::clickhouse_config::ConfigDb;
+use crate::config::{MetricRetentionRule, RushConfig, TraceRetentionRule};
 
 /// Spawn the retention enforcer as a background task (fire-and-forget).
 /// Follows the same pattern as `alert_engine::spawn_alert_engine`.
-pub fn spawn_retention_enforcer(ch: Client, config: RushConfig, config_db: Arc<ConfigDb>, self_metrics: Arc<crate::self_metrics::SelfMetrics>) {
+pub fn spawn_retention_enforcer(
+    ch: Client,
+    config: RushConfig,
+    config_db: Arc<ConfigDb>,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+) {
     if !config.retention.enforcer.enabled {
-        tracing::info!(engine = "retention", "retention enforcer disabled by config");
+        tracing::info!(
+            engine = "retention",
+            "retention enforcer disabled by config"
+        );
         return;
     }
 
@@ -47,7 +55,11 @@ pub fn spawn_retention_enforcer(ch: Client, config: RushConfig, config_db: Arc<C
                 tracing::error!(error = %e, engine = "retention", "tenant retention enforcement failed");
                 ok = false;
             }
-            self_metrics.record_engine("retention_enforcer", start.elapsed().as_millis() as u64, ok);
+            self_metrics.record_engine(
+                "retention_enforcer",
+                start.elapsed().as_millis() as u64,
+                ok,
+            );
         }
     });
 }
@@ -61,7 +73,10 @@ async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<(
     // OR all rules' predicates together so each metric table gets ONE mutation
     // per tick instead of one per rule (mutations are heavyweight in ClickHouse
     // and queue serially).
-    let metric_preds: Vec<String> = config.retention.metrics.iter()
+    let metric_preds: Vec<String> = config
+        .retention
+        .metrics
+        .iter()
         .filter(|rule| rule.retain_days < table_metrics_ttl)
         .filter_map(|rule| {
             let where_clause = build_metric_where(rule);
@@ -92,11 +107,19 @@ async fn enforce_retention(ch: &Client, config: &RushConfig) -> anyhow::Result<(
 
     // ── Trace rules ── (same combining, per span table)
     // spans_raw is gone — spans are stored only in the wide `spans` table below.
-    let wide_preds: Vec<String> = config.retention.traces.iter()
+    let wide_preds: Vec<String> = config
+        .retention
+        .traces
+        .iter()
         .filter(|rule| rule.retain_days < table_traces_ttl)
-        .filter_map(|rule| build_trace_where_wide(rule).map(|clause| format!(
-            "(toDateTime(timestamp) < now() - INTERVAL {} DAY AND {clause})", rule.retain_days
-        )))
+        .filter_map(|rule| {
+            build_trace_where_wide(rule).map(|clause| {
+                format!(
+                    "(toDateTime(timestamp) < now() - INTERVAL {} DAY AND {clause})",
+                    rule.retain_days
+                )
+            })
+        })
         .collect();
     if !wide_preds.is_empty() {
         let sql = format!(
@@ -155,7 +178,11 @@ fn build_trace_where_wide(rule: &TraceRetentionRule) -> Option<String> {
 
 async fn execute_or_log(ch: &Client, sql: &str, dry_run: bool) {
     if dry_run {
-        tracing::info!(engine = "retention", dry_run = true, "would execute retention delete");
+        tracing::info!(
+            engine = "retention",
+            dry_run = true,
+            "would execute retention delete"
+        );
         return;
     }
     tracing::debug!(engine = "retention", "executing retention delete");
@@ -216,9 +243,15 @@ async fn enforce_tenant_retention(
     // Caps come from the global-retention store (falling back to rush.toml only
     // if the store hasn't been seeded yet).
     let store = config_db.get_global_retention().await?;
-    let global_metrics = store.map(|g| g.effective_metrics()).unwrap_or(config.effective_metrics_ttl_days() as i32);
-    let global_traces = store.map(|g| g.effective_apm()).unwrap_or(config.effective_traces_ttl_days() as i32);
-    let global_logs = store.map(|g| g.effective_logs()).unwrap_or(config.effective_logs_ttl_days() as i32);
+    let global_metrics = store
+        .map(|g| g.effective_metrics())
+        .unwrap_or(config.effective_metrics_ttl_days() as i32);
+    let global_traces = store
+        .map(|g| g.effective_apm())
+        .unwrap_or(config.effective_traces_ttl_days() as i32);
+    let global_logs = store
+        .map(|g| g.effective_logs())
+        .unwrap_or(config.effective_logs_ttl_days() as i32);
 
     for (tenant_id, signal, retain_days) in &overrides {
         let global_days = match signal.as_str() {

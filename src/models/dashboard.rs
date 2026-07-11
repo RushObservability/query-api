@@ -56,9 +56,12 @@ impl From<Widget> for WidgetResponse {
             dashboard_id: w.dashboard_id,
             title: w.title,
             widget_type: w.widget_type,
-            query_config: serde_json::from_str(&w.query_config).unwrap_or(serde_json::Value::Object(Default::default())),
-            position: serde_json::from_str(&w.position).unwrap_or(serde_json::Value::Object(Default::default())),
-            display_config: serde_json::from_str(&w.display_config).unwrap_or(serde_json::Value::Object(Default::default())),
+            query_config: serde_json::from_str(&w.query_config)
+                .unwrap_or(serde_json::Value::Object(Default::default())),
+            position: serde_json::from_str(&w.position)
+                .unwrap_or(serde_json::Value::Object(Default::default())),
+            display_config: serde_json::from_str(&w.display_config)
+                .unwrap_or(serde_json::Value::Object(Default::default())),
             created_at: w.created_at,
             updated_at: w.updated_at,
         }

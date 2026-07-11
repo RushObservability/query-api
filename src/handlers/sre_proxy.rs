@@ -47,10 +47,12 @@ fn sre_internal_token() -> Result<String, (StatusCode, String)> {
     std::env::var("SRE_AGENT_INTERNAL_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SRE agent internal authentication is not configured".to_string(),
-        ))
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SRE agent internal authentication is not configured".to_string(),
+            )
+        })
 }
 
 fn with_internal_token(request: reqwest::RequestBuilder, token: String) -> reqwest::RequestBuilder {
@@ -141,7 +143,12 @@ async fn forward_get(url: String) -> Result<Response, (StatusCode, String)> {
         .unwrap_or("application/json")
         .to_string();
     let bytes = resp.bytes().await.map_err(unavailable)?;
-    Ok((status, [(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response())
+    Ok((
+        status,
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        bytes,
+    )
+        .into_response())
 }
 
 /// `GET /api/v1/sessions` — list the caller's investigation sessions.
@@ -180,7 +187,11 @@ pub async fn delete_session(
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let url = format!("{}/api/v1/sessions/{}", sre_base(), urlencoding::encode(&id));
+    let url = format!(
+        "{}/api/v1/sessions/{}",
+        sre_base(),
+        urlencoding::encode(&id)
+    );
     let internal_token = sre_internal_token()?;
     let resp = with_internal_token(client().delete(&url), internal_token)
         .send()
@@ -213,7 +224,10 @@ mod tests {
         .build()
         .expect("request builds");
         assert_eq!(
-            request.headers().get("x-rush-internal-token").and_then(|v| v.to_str().ok()),
+            request
+                .headers()
+                .get("x-rush-internal-token")
+                .and_then(|v| v.to_str().ok()),
             Some("test-token")
         );
     }

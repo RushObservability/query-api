@@ -1,4 +1,4 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse, Extension};
+use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -28,8 +28,8 @@ pub async fn parse_promql(
     Extension(_tenant): Extension<TenantContext>,
     Json(req): Json<ParsePromqlRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let base_url = std::env::var("LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let base_url =
+        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
     let api_key = match std::env::var("LLM_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => {
@@ -44,11 +44,18 @@ pub async fn parse_promql(
     let metric_hint = if req.metric_names.is_empty() {
         String::new()
     } else {
-        let names = req.metric_names.iter().take(50).cloned().collect::<Vec<_>>().join(", ");
+        let names = req
+            .metric_names
+            .iter()
+            .take(50)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         format!("\n\nKnown metrics in this system: {names}")
     };
 
-    let system_prompt = format!(r#"You are a PromQL expert for an observability platform. Convert the user's natural language description into a valid PromQL expression.
+    let system_prompt = format!(
+        r#"You are a PromQL expert for an observability platform. Convert the user's natural language description into a valid PromQL expression.
 
 PromQL rules:
 - Use rate() for counters (metrics ending in _total, _count, _sum, _bucket)
@@ -84,7 +91,8 @@ Input: "increase in errors over 1 hour"
 Output: {{"promql":"increase(http_requests_total{{status_code=~\"5..\"}}[1h])","confidence":0.85}}
 
 Input: "average cpu usage"
-Output: {{"promql":"avg(cpu_usage)","confidence":0.8}}{metric_hint}"#);
+Output: {{"promql":"avg(cpu_usage)","confidence":0.8}}{metric_hint}"#
+    );
 
     let client = reqwest::Client::new();
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -111,13 +119,18 @@ Output: {{"promql":"avg(cpu_usage)","confidence":0.8}}{metric_hint}"#);
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err((StatusCode::BAD_GATEWAY, format!("LLM error {status}: {text}")));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("LLM error {status}: {text}"),
+        ));
     }
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("LLM response parse failed: {e}")))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("LLM response parse failed: {e}"),
+        )
+    })?;
 
     let content = json
         .get("choices")
@@ -134,12 +147,11 @@ Output: {{"promql":"avg(cpu_usage)","confidence":0.8}}{metric_hint}"#);
         .trim_end_matches("```")
         .trim();
 
-    let parsed: ParsePromqlResponse = serde_json::from_str(cleaned).unwrap_or_else(|_| {
-        ParsePromqlResponse {
+    let parsed: ParsePromqlResponse =
+        serde_json::from_str(cleaned).unwrap_or_else(|_| ParsePromqlResponse {
             promql: req.query.clone(),
             confidence: 0.0,
-        }
-    });
+        });
 
     Ok(Json(parsed))
 }

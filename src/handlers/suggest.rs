@@ -1,9 +1,8 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Extension,
 };
 use serde::Deserialize;
 
@@ -40,15 +39,25 @@ pub async fn suggest_values(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     if params.prefix.len() > 200 {
-        return Err((StatusCode::BAD_REQUEST, "prefix too long (max 200 chars)".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prefix too long (max 200 chars)".into(),
+        ));
     }
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     let col_expr = if let Some(attr_path) = field.strip_prefix("attributes.") {
         // OTel attributes use flat dotted keys — try flat key first, nested as fallback.
         // Validate every dot-separated segment to prevent SQL injection via attr_path.
         let parts: Vec<&str> = attr_path.split('.').collect();
-        if parts.is_empty() || parts.iter().any(|p| !crate::query_builder::is_safe_column_name(p)) {
-            return Err((StatusCode::BAD_REQUEST, format!("invalid attribute path: {attr_path}")));
+        if parts.is_empty()
+            || parts
+                .iter()
+                .any(|p| !crate::query_builder::is_safe_column_name(p))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid attribute path: {attr_path}"),
+            ));
         }
         if parts.len() == 1 {
             format!("JSONExtractString(attributes, '{attr_path}')")
@@ -94,9 +103,8 @@ pub async fn suggest_values(
     // PREWHERE: tenant_id + timestamp (both in primary key of spans) →
     // evaluated at granule level before decompression, avoiding full table scan.
     // WHERE: the LIKE filter on the computed alias (ClickHouse allows alias refs in WHERE).
-    let prewhere = format!(
-        "tenant_id = '{escaped_tenant}' AND timestamp >= now() - INTERVAL 24 HOUR"
-    );
+    let prewhere =
+        format!("tenant_id = '{escaped_tenant}' AND timestamp >= now() - INTERVAL 24 HOUR");
     let prefix_filter = if !params.prefix.is_empty() {
         let escaped = crate::query_builder::escape_string_literal(&params.prefix);
         format!("WHERE val LIKE '{escaped}%'")
@@ -121,7 +129,11 @@ pub async fn suggest_values(
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
-    let values: Vec<String> = rows.into_iter().map(|r| r.val).filter(|v| !v.is_empty()).collect();
+    let values: Vec<String> = rows
+        .into_iter()
+        .map(|r| r.val)
+        .filter(|v| !v.is_empty())
+        .collect();
     suggest_cache().insert(cache_key, (values.clone(), std::time::Instant::now()));
     Ok(Json(values))
 }

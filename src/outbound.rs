@@ -52,7 +52,11 @@ pub async fn public_https_request(method: Method, raw_url: &str) -> Result<Reque
         .await
         .map_err(|_| "notification host could not be resolved".to_string())?
         .collect();
-    if addresses.is_empty() || addresses.iter().any(|address| blocked_address(address.ip())) {
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| blocked_address(address.ip()))
+    {
         return Err("notification URL must resolve only to public addresses".to_string());
     }
 

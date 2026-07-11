@@ -17,7 +17,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::audit::{compute_hash, AuditRow};
+use crate::audit::{AuditRow, compute_hash};
 use crate::handlers::users::require_admin;
 use crate::query_builder::escape_string_literal;
 
@@ -51,10 +51,16 @@ pub async fn list_audit(
     let mut conds: Vec<String> = Vec::new();
 
     if let Some(from) = params.from.as_deref().filter(|s| !s.is_empty()) {
-        conds.push(format!("timestamp >= parseDateTime64BestEffort('{}')", escape_string_literal(from)));
+        conds.push(format!(
+            "timestamp >= parseDateTime64BestEffort('{}')",
+            escape_string_literal(from)
+        ));
     }
     if let Some(to) = params.to.as_deref().filter(|s| !s.is_empty()) {
-        conds.push(format!("timestamp <= parseDateTime64BestEffort('{}')", escape_string_literal(to)));
+        conds.push(format!(
+            "timestamp <= parseDateTime64BestEffort('{}')",
+            escape_string_literal(to)
+        ));
     }
     if let Some(actor) = params.actor.as_deref().filter(|s| !s.is_empty()) {
         let e = escape_string_literal(actor);
@@ -63,9 +69,16 @@ pub async fn list_audit(
     if let Some(action) = params.action.as_deref().filter(|s| !s.is_empty()) {
         // Treat a trailing '.' or '*' as a prefix match; otherwise exact.
         if let Some(prefix) = action.strip_suffix('*').or_else(|| {
-            if action.ends_with('.') { Some(action) } else { None }
+            if action.ends_with('.') {
+                Some(action)
+            } else {
+                None
+            }
         }) {
-            conds.push(format!("startsWith(action, '{}')", escape_string_literal(prefix)));
+            conds.push(format!(
+                "startsWith(action, '{}')",
+                escape_string_literal(prefix)
+            ));
         } else {
             conds.push(format!("action = '{}'", escape_string_literal(action)));
         }
@@ -116,7 +129,10 @@ pub async fn list_audit(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "audit list query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
         })?;
 
     let events: Vec<serde_json::Value> = rows.iter().map(audit_row_json).collect();
@@ -153,7 +169,10 @@ pub async fn verify_audit(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "audit verify query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
         })?;
 
     let secret = state.audit.secret();

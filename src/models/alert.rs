@@ -22,7 +22,14 @@ pub struct NotificationChannelResponse {
     pub created_at: String,
 }
 
-const SECRET_CONFIG_KEYS: &[&str] = &["url", "webhook_url", "token", "routing_key", "api_key", "headers"];
+const SECRET_CONFIG_KEYS: &[&str] = &[
+    "url",
+    "webhook_url",
+    "token",
+    "routing_key",
+    "api_key",
+    "headers",
+];
 
 fn redact_config(config: &str) -> serde_json::Value {
     let mut value: serde_json::Value = serde_json::from_str(config)
@@ -120,11 +127,13 @@ impl From<AlertRule> for AlertRuleResponse {
             description: r.description,
             enabled: r.enabled,
             signal_type: r.signal_type,
-            query_config: serde_json::from_str(&r.query_config).unwrap_or(serde_json::Value::Object(Default::default())),
+            query_config: serde_json::from_str(&r.query_config)
+                .unwrap_or(serde_json::Value::Object(Default::default())),
             condition_op: r.condition_op,
             condition_threshold: r.condition_threshold,
             eval_interval_secs: r.eval_interval_secs,
-            notification_channel_ids: serde_json::from_str(&r.notification_channel_ids).unwrap_or(serde_json::json!([])),
+            notification_channel_ids: serde_json::from_str(&r.notification_channel_ids)
+                .unwrap_or(serde_json::json!([])),
             runbook_url: r.runbook_url,
             state: r.state,
             last_eval_at: r.last_eval_at,
@@ -227,11 +236,13 @@ mod tests {
 
     #[test]
     fn notification_response_redacts_credentials_and_endpoints() {
-        let redacted = redact_config(r#"{
+        let redacted = redact_config(
+            r#"{
             "webhook_url":"https://hooks.example.test/secret",
             "token":"xoxb-secret",
             "channel":"alerts"
-        }"#);
+        }"#,
+        );
         assert_eq!(redacted["webhook_url_configured"], true);
         assert_eq!(redacted["token_configured"], true);
         assert_eq!(redacted["channel"], "alerts");

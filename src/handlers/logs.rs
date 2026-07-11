@@ -1,16 +1,15 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Extension,
 };
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::models::log::LogRecord;
+use crate::models::log::{LogListRecord, LogRecord};
 use crate::models::query::{CountBucket, CountQueryRequest, Filter, FilterOp, TimeRange};
-use crate::query_builder::{format_value, build_log_search_sql, sanitize_datetime, QueryClauses};
+use crate::query_builder::{QueryClauses, build_log_search_sql, format_value, sanitize_datetime};
 
 /// Resolve a log field name to a ClickHouse column expression.
 /// Uses materialized columns for common resource attributes (avoids Map lookups).
@@ -50,7 +49,13 @@ fn resolve_log_field(field: &str) -> String {
 /// Build PREWHERE-optimized query clauses for logs.
 /// tenant_id + time range go into PREWHERE (evaluated at granule level before decompression);
 /// column filters and full-text search go into WHERE.
-fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str>, tenant_id: &str) -> QueryClauses {
+fn build_log_where(
+    filters: &[Filter],
+    from: &str,
+    to: &str,
+    search: Option<&str>,
+    tenant_id: &str,
+) -> QueryClauses {
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
@@ -78,8 +83,14 @@ fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str
             FilterOp::Lte => format!("{field} <= {}", format_value(&filter.value)),
             FilterOp::Like => format!("{field} LIKE {}", format_value(&filter.value)),
             FilterOp::NotLike => format!("{field} NOT LIKE {}", format_value(&filter.value)),
-            FilterOp::In => format!("{field} IN {}", crate::query_builder::format_array_value(&filter.value)),
-            FilterOp::NotIn => format!("{field} NOT IN {}", crate::query_builder::format_array_value(&filter.value)),
+            FilterOp::In => format!(
+                "{field} IN {}",
+                crate::query_builder::format_array_value(&filter.value)
+            ),
+            FilterOp::NotIn => format!(
+                "{field} NOT IN {}",
+                crate::query_builder::format_array_value(&filter.value)
+            ),
         };
         conditions.push(condition);
     }
@@ -92,9 +103,9 @@ fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str
         }
     }
 
-    // A free-text term compiles to a `lower(Body) LIKE …` (or TraceId/SpanId match)
-    // that relies on a skip index — for Body that's the `idx_body_text` full-text
-    // index. An *explicit* PREWHERE on tenant/time defeats that index: ClickHouse
+    // A free-text term compiles to a native token predicate, a wildcard substring
+    // predicate, or a TraceId/SpanId match. Body predicates rely on the text/search
+    // indexes. An *explicit* PREWHERE on tenant/time defeats those indexes: ClickHouse
     // reads the entire index (tens of GiB) instead of using it to skip granules,
     // turning a ~150 ms query into multi-second / tens-of-GiB scans. Emitting a
     // single WHERE lets `optimize_move_to_prewhere` re-derive the prewhere while
@@ -104,9 +115,15 @@ fn build_log_where(filters: &[Filter], from: &str, to: &str, search: Option<&str
         let mut all = Vec::with_capacity(conditions.len() + 1);
         all.push(time_tenant);
         all.extend(conditions);
-        QueryClauses { prewhere: String::new(), where_clause: all.join(" AND ") }
+        QueryClauses {
+            prewhere: String::new(),
+            where_clause: all.join(" AND "),
+        }
     } else {
-        QueryClauses { prewhere: time_tenant, where_clause: conditions.join(" AND ") }
+        QueryClauses {
+            prewhere: time_tenant,
+            where_clause: conditions.join(" AND "),
+        }
     }
 }
 
@@ -122,9 +139,38 @@ pub struct LogQueryRequest {
     pub offset: u64,
     #[serde(default)]
     pub search: Option<String>,
+    /// Omit large attribute maps and return lazy-detail locators.
+    #[serde(default)]
+    pub slim: bool,
 }
 
-fn default_limit() -> u64 { 100 }
+fn default_limit() -> u64 {
+    100
+}
+
+const LOG_LIST_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
+    SeverityNumber, ServiceName, Body, toString(toUnixTimestamp64Nano(Timestamp)) AS TimestampNs, \
+    toString(_block_number) AS BlockNumber, toString(_block_offset) AS BlockOffset, \
+    toString(cityHash64(Body)) AS BodyHash";
+
+const LOG_DETAIL_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
+    SeverityNumber, ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum LogQueryRows {
+    Full(Vec<LogRecord>),
+    Slim(Vec<LogListRecord>),
+}
+
+impl LogQueryRows {
+    fn len(&self) -> usize {
+        match self {
+            Self::Full(rows) => rows.len(),
+            Self::Slim(rows) => rows.len(),
+        }
+    }
+}
 
 /// Query logs from logs.
 pub async fn query_logs(
@@ -137,19 +183,31 @@ pub async fn query_logs(
 
     if let Some(ref s) = req.search {
         if s.len() > 512 {
-            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "search query too long (max 512 chars)".into(),
+            ));
         }
     }
     let offset = req.offset.min(100_000);
     let limit = req.limit.min(1000);
-    let select_cols = "Timestamp, TraceId, SpanId, SeverityText, SeverityNumber, \
-         ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
+    let select_cols = if req.slim {
+        LOG_LIST_SELECT_COLS
+    } else {
+        LOG_DETAIL_SELECT_COLS
+    };
 
     // Fast path: when browsing logs (no search), try a narrow recent window first.
     // The table's primary key is (ServiceName, TimestampTime, Timestamp), so a
     // wide time range without ServiceName filter requires a full scan.  Querying
     // just the last hour first is nearly instant and usually returns enough rows.
-    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+    let clauses = build_log_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+        tenant_id,
+    );
 
     let (rows, total) = if req.offset == 0 {
         // Progressive fast path (applies to browse AND free-text search): try a narrow
@@ -158,7 +216,7 @@ pub async fn query_logs(
         //
         // Browsing (no search term) already terminates early over wide ranges via
         // read-in-order on the time-first primary key. A free-text term compiles to a
-        // `lower(Body) LIKE …` that defeats that early-termination, so a wide search
+        // Body search predicate that defeats that early-termination, so a wide search
         // would otherwise scan the entire range (measured ~31s over 48h on a hot,
         // high-volume service). Starting with the last hour returns the newest matches
         // in well under a second in the common "what's happening now" case; the search
@@ -181,22 +239,41 @@ pub async fn query_logs(
 
         let narrow_rows = if worth_probing {
             let narrow_from = probe_from_dt.to_rfc3339();
-            let narrow_clauses = build_log_where(&req.filters, &narrow_from, narrow_to, req.search.as_deref(), tenant_id);
+            let narrow_clauses = build_log_where(
+                &req.filters,
+                &narrow_from,
+                narrow_to,
+                req.search.as_deref(),
+                tenant_id,
+            );
             let narrow_sql = format!(
                 "SELECT {select_cols} FROM logs {} \
                  ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
                 narrow_clauses.to_sql(),
             );
-            crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
-                .fetch_all::<LogRecord>()
-                .await
+            let result = if req.slim {
+                crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
+                    .fetch_all::<LogListRecord>()
+                    .await
+                    .map(LogQueryRows::Slim)
+            } else {
+                crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
+                    .fetch_all::<LogRecord>()
+                    .await
+                    .map(LogQueryRows::Full)
+            };
+            result
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
                     state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
                 })?
         } else {
-            Vec::new()
+            if req.slim {
+                LogQueryRows::Slim(Vec::new())
+            } else {
+                LogQueryRows::Full(Vec::new())
+            }
         };
 
         if worth_probing && (narrow_rows.len() as u64) >= limit {
@@ -210,9 +287,18 @@ pub async fn query_logs(
                  ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
                 clauses.to_sql(),
             );
-            let rows = crate::tenant_query(&state.ch, &full_sql, tenant_id)
-                .fetch_all::<LogRecord>()
-                .await
+            let result = if req.slim {
+                crate::tenant_query(&state.ch, &full_sql, tenant_id)
+                    .fetch_all::<LogListRecord>()
+                    .await
+                    .map(LogQueryRows::Slim)
+            } else {
+                crate::tenant_query(&state.ch, &full_sql, tenant_id)
+                    .fetch_all::<LogRecord>()
+                    .await
+                    .map(LogQueryRows::Full)
+            };
+            let rows = result
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
                     state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
@@ -230,10 +316,24 @@ pub async fn query_logs(
             offset,
         );
         if req.search.is_some() {
-            tracing::debug!(signal = "logs", handler = "query_logs", "log search query executing");
+            tracing::debug!(
+                signal = "logs",
+                handler = "query_logs",
+                "log search query executing"
+            );
         }
-        let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-            .fetch_all::<LogRecord>().await
+        let result = if req.slim {
+            crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch_all::<LogListRecord>()
+                .await
+                .map(LogQueryRows::Slim)
+        } else {
+            crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch_all::<LogRecord>()
+                .await
+                .map(LogQueryRows::Full)
+        };
+        let rows = result
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "logs", handler = "query_logs", "search query failed");
                 state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
@@ -267,16 +367,137 @@ pub async fn query_logs(
 
     // Only track usage if the query returned results
     if total > 0 {
-        let filter_pairs: Vec<(String, String)> = req.filters.iter()
-            .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+        let filter_pairs: Vec<(String, String)> = req
+            .filters
+            .iter()
+            .map(|f| {
+                (
+                    f.field.clone(),
+                    f.value.as_str().unwrap_or_default().to_string(),
+                )
+            })
             .collect();
         let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
         state.usage.track_many(signals, "log", "explore");
     }
 
     #[derive(serde::Serialize)]
-    struct Resp { rows: Vec<LogRecord>, total: u64 }
+    struct Resp {
+        rows: LogQueryRows,
+        total: u64,
+    }
     Ok(Json(Resp { rows, total }))
+}
+
+/// Locator returned with a slim list row and posted back when the row is opened.
+/// The stable fields are deliberately duplicated with the block coordinates so
+/// details remain available if a background merge replaces the original part.
+#[derive(Debug, serde::Deserialize)]
+pub struct LogDetailRequest {
+    pub timestamp_ns: String,
+    pub block_number: String,
+    pub block_offset: String,
+    pub body_hash: String,
+    pub service_name: String,
+    pub severity_text: String,
+    #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
+    pub span_id: String,
+}
+
+fn log_detail_sql(req: &LogDetailRequest, tenant_id: &str) -> (String, String) {
+    let tenant = crate::query_builder::escape_string_literal(tenant_id);
+    let service = crate::query_builder::escape_string_literal(&req.service_name);
+    let severity = crate::query_builder::escape_string_literal(&req.severity_text);
+    let trace_id = crate::query_builder::escape_string_literal(&req.trace_id);
+    let span_id = crate::query_builder::escape_string_literal(&req.span_id);
+    let ts = req
+        .timestamp_ns
+        .parse::<i64>()
+        .expect("validated timestamp locator");
+    let block_number = req
+        .block_number
+        .parse::<u64>()
+        .expect("validated block locator");
+    let block_offset = req
+        .block_offset
+        .parse::<u64>()
+        .expect("validated offset locator");
+    let body_hash = req
+        .body_hash
+        .parse::<u64>()
+        .expect("validated body hash locator");
+
+    let coordinate = format!(
+        "SELECT {LOG_DETAIL_SELECT_COLS} FROM logs \
+         PREWHERE tenant_id = '{tenant}' \
+           AND TimestampDate = toDate(fromUnixTimestamp64Nano({ts})) \
+         WHERE Timestamp = fromUnixTimestamp64Nano({ts}) \
+           AND _block_number = {} AND _block_offset = {} \
+         LIMIT 1",
+        block_number, block_offset,
+    );
+
+    let stable = format!(
+        "SELECT {LOG_DETAIL_SELECT_COLS} FROM logs \
+         PREWHERE tenant_id = '{tenant}' \
+           AND TimestampDate = toDate(fromUnixTimestamp64Nano({ts})) \
+           AND Timestamp = fromUnixTimestamp64Nano({ts}) \
+         WHERE ServiceName = '{service}' AND SeverityText = '{severity}' \
+           AND TraceId = '{trace_id}' AND SpanId = '{span_id}' \
+           AND cityHash64(Body) = {} \
+         LIMIT 1",
+        body_hash,
+    );
+
+    (coordinate, stable)
+}
+
+/// Fetch the full attribute maps for one row selected from the slim log list.
+pub async fn get_log_detail(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(req): Json<LogDetailRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if req.service_name.len() > 1024
+        || req.severity_text.len() > 128
+        || req.trace_id.len() > 128
+        || req.span_id.len() > 128
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid log detail locator".into()));
+    }
+    if req.timestamp_ns.parse::<i64>().is_err()
+        || req.block_number.parse::<u64>().is_err()
+        || req.block_offset.parse::<u64>().is_err()
+        || req.body_hash.parse::<u64>().is_err()
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid log detail locator".into()));
+    }
+
+    let (coordinate_sql, stable_sql) = log_detail_sql(&req, &tenant.tenant_id);
+    let coordinate_row = crate::tenant_query(&state.ch, &coordinate_sql, &tenant.tenant_id)
+        .fetch_optional::<LogRecord>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "logs", handler = "get_log_detail", "coordinate lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "detail query failed".into())
+        })?;
+
+    if let Some(row) = coordinate_row {
+        return Ok(Json(row));
+    }
+
+    let stable_row = crate::tenant_query(&state.ch, &stable_sql, &tenant.tenant_id)
+        .fetch_optional::<LogRecord>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "logs", handler = "get_log_detail", "stable lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "detail query failed".into())
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "log detail no longer available".into()))?;
+
+    Ok(Json(stable_row))
 }
 
 /// Log export request — same shape as a log query plus output format and an
@@ -309,7 +530,10 @@ pub async fn export_logs(
 
     if let Some(ref s) = req.search {
         if s.len() > 512 {
-            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "search query too long (max 512 chars)".into(),
+            ));
         }
     }
 
@@ -320,7 +544,10 @@ pub async fn export_logs(
     // sensitive values) — only a has_search boolean and the row cap.
     {
         let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
-            Some(tok) => state.config_db.get_session_user(&tok).await
+            Some(tok) => state
+                .config_db
+                .get_session_user(&tok)
+                .await
                 .map(|c| (c.0, c.1))
                 .unwrap_or_default(),
             None => (String::new(), String::new()),
@@ -343,7 +570,13 @@ pub async fn export_logs(
 
     let select_cols = "Timestamp, TraceId, SpanId, SeverityText, SeverityNumber, \
          ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
-    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+    let clauses = build_log_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+        tenant_id,
+    );
     let sql = format!(
         "SELECT {select_cols} FROM logs {} \
          ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
@@ -360,8 +593,11 @@ pub async fn export_logs(
             // to the previous fetch_all path. The LIMIT in the SQL still enforces the
             // configured row cap. tenant_query carries tenant settings/row-policy.
             let mut prelude = export::csv_query_preamble(
-                "logs", &req.time_range.from, &req.time_range.to,
-                req.search.as_deref(), req.query_text.as_deref(),
+                "logs",
+                &req.time_range.from,
+                &req.time_range.to,
+                req.search.as_deref(),
+                req.query_text.as_deref(),
             );
             prelude.push_str("Timestamp,Severity,ServiceName,Body,TraceId\n");
 
@@ -382,7 +618,12 @@ pub async fn export_logs(
                     export::csv_field(&r.trace_id),
                 )
             };
-            Ok(export::stream_csv_response(cursor, prelude, fmt_row, &format!("rush-logs-{unix}.csv")))
+            Ok(export::stream_csv_response(
+                cursor,
+                prelude,
+                fmt_row,
+                &format!("rush-logs-{unix}.csv"),
+            ))
         }
         export::ExportFormat::Json => {
             // JSON export stays on the buffered fetch_all path: its output is
@@ -407,7 +648,11 @@ pub async fn export_logs(
                 "rows": rows,
             });
             let s = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
-            Ok(export::file_response(s, "application/json; charset=utf-8", &format!("rush-logs-{unix}.json")))
+            Ok(export::file_response(
+                s,
+                "application/json; charset=utf-8",
+                &format!("rush-logs-{unix}.json"),
+            ))
         }
     }
 }
@@ -419,13 +664,23 @@ pub async fn count_logs(
     Json(req): Json<CountQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+    let clauses = build_log_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+        tenant_id,
+    );
 
     // The interval is client-supplied: clamp so (range / interval) <= 2000 buckets
     // (a 1s interval over 30d would otherwise be ~2.6M GROUP BY buckets).
     let interval = crate::query_builder::clamp_bucket_interval(
-        &req.interval, &req.time_range.from, &req.time_range.to, 2000,
-    ).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        &req.interval,
+        &req.time_range.from,
+        &req.time_range.to,
+        2000,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let interval_fn = match interval {
         "1s" => "toStartOfSecond(Timestamp)",
         "10s" => "toStartOfTenSeconds(Timestamp)",
@@ -487,11 +742,20 @@ pub async fn log_histogram(
 
     if let Some(ref s) = req.search {
         if s.len() > 512 {
-            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "search query too long (max 512 chars)".into(),
+            ));
         }
     }
 
-    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+    let clauses = build_log_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+        tenant_id,
+    );
 
     // Parse from/to (RFC3339, tolerating a missing 'Z' like query_logs does) to
     // size the bucket. Fall back to a 1s bucket if the range can't be parsed.
@@ -523,7 +787,10 @@ pub async fn log_histogram(
     );
 
     #[derive(Debug, clickhouse::Row, serde::Deserialize)]
-    struct HistoRow { bucket: i64, c: u64 }
+    struct HistoRow {
+        bucket: i64,
+        c: u64,
+    }
 
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<HistoRow>()
@@ -534,12 +801,27 @@ pub async fn log_histogram(
         })?;
 
     #[derive(serde::Serialize)]
-    struct Bucket { ts: i64, count: u64 }
+    struct Bucket {
+        ts: i64,
+        count: u64,
+    }
     #[derive(serde::Serialize)]
-    struct Resp { interval_secs: u64, buckets: Vec<Bucket> }
+    struct Resp {
+        interval_secs: u64,
+        buckets: Vec<Bucket>,
+    }
 
-    let buckets = rows.into_iter().map(|r| Bucket { ts: r.bucket, count: r.c }).collect();
-    Ok(Json(Resp { interval_secs: bucket_secs, buckets }))
+    let buckets = rows
+        .into_iter()
+        .map(|r| Bucket {
+            ts: r.bucket,
+            count: r.c,
+        })
+        .collect();
+    Ok(Json(Resp {
+        interval_secs: bucket_secs,
+        buckets,
+    }))
 }
 
 /// Group logs by a single field (e.g. SeverityText) → top-N {field, count}.
@@ -551,12 +833,21 @@ pub async fn group_logs(
     Json(req): Json<crate::models::query::QueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if req.group_by.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "group_by must have at least one field".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "group_by must have at least one field".to_string(),
+        ));
     }
     let field = &req.group_by[0];
     let col = resolve_log_field(field);
     let tenant_id = &tenant.tenant_id;
-    let clauses = build_log_where(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref(), tenant_id);
+    let clauses = build_log_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+        tenant_id,
+    );
 
     let sql = format!(
         "SELECT toString({col}) as group_0, count() as count \
@@ -569,7 +860,10 @@ pub async fn group_logs(
     );
 
     #[derive(Debug, serde::Serialize, serde::Deserialize, clickhouse::Row)]
-    struct SingleGroupRow { group_0: String, count: u64 }
+    struct SingleGroupRow {
+        group_0: String,
+        count: u64,
+    }
 
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<SingleGroupRow>()
@@ -585,4 +879,44 @@ pub async fn group_logs(
         .collect();
 
     Ok(Json(serde_json::json!({ "groups": json_rows })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slim_projection_excludes_attribute_maps() {
+        assert!(!LOG_LIST_SELECT_COLS.contains("ResourceAttributes"));
+        assert!(!LOG_LIST_SELECT_COLS.contains("LogAttributes"));
+        assert!(
+            LOG_LIST_SELECT_COLS
+                .contains("toString(toUnixTimestamp64Nano(Timestamp)) AS TimestampNs")
+        );
+        assert!(LOG_LIST_SELECT_COLS.contains("toString(_block_number) AS BlockNumber"));
+        assert!(LOG_LIST_SELECT_COLS.contains("toString(_block_offset) AS BlockOffset"));
+        assert!(LOG_LIST_SELECT_COLS.contains("toString(cityHash64(Body)) AS BodyHash"));
+    }
+
+    #[test]
+    fn detail_lookup_is_tenant_scoped_and_has_merge_fallback() {
+        let req = LogDetailRequest {
+            timestamp_ns: "1720000000123456789".into(),
+            block_number: "42".into(),
+            block_offset: "7".into(),
+            body_hash: "99".into(),
+            service_name: "api'edge".into(),
+            severity_text: "ERROR".into(),
+            trace_id: "abc".into(),
+            span_id: "def".into(),
+        };
+        let (coordinate, stable) = log_detail_sql(&req, "tenant'one");
+
+        assert!(coordinate.contains("tenant_id = 'tenant''one'"));
+        assert!(coordinate.contains("_block_number = 42 AND _block_offset = 7"));
+        assert!(coordinate.contains("Timestamp = fromUnixTimestamp64Nano(1720000000123456789)"));
+        assert!(stable.contains("ServiceName = 'api''edge'"));
+        assert!(stable.contains("cityHash64(Body) = 99"));
+        assert!(stable.contains("TraceId = 'abc' AND SpanId = 'def'"));
+    }
 }

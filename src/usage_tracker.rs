@@ -103,7 +103,11 @@ async fn flush(ch: &Client, events: Vec<UsageEvent>) {
     if let Err(e) = ch.query(&sql).execute().await {
         tracing::warn!("Failed to flush signal usage: {e}");
     } else {
-        tracing::debug!("Flushed {} usage entries ({} events)", counts.len(), events.len());
+        tracing::debug!(
+            "Flushed {} usage entries ({} events)",
+            counts.len(),
+            events.len()
+        );
     }
 }
 

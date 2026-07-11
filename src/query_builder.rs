@@ -89,10 +89,16 @@ impl QueryClauses {
             } else {
                 format!("{prefix} AND {}", self.where_clause)
             };
-            QueryClauses { prewhere: String::new(), where_clause }
+            QueryClauses {
+                prewhere: String::new(),
+                where_clause,
+            }
         } else {
             let prewhere = format!("{prefix} AND {}", self.prewhere);
-            QueryClauses { prewhere, where_clause: self.where_clause.clone() }
+            QueryClauses {
+                prewhere,
+                where_clause: self.where_clause.clone(),
+            }
         }
     }
 
@@ -103,7 +109,10 @@ impl QueryClauses {
         } else {
             format!("{} AND {extra}", self.where_clause)
         };
-        QueryClauses { prewhere: self.prewhere.clone(), where_clause }
+        QueryClauses {
+            prewhere: self.prewhere.clone(),
+            where_clause,
+        }
     }
 }
 
@@ -115,7 +124,10 @@ pub fn resolve_field(field: &str) -> String {
         // Escape single quotes in every path segment to prevent SQL injection
         let flat_key = escape_string_literal(attr_path);
         let flat = format!("JSONExtractString(attributes, '{flat_key}')");
-        let parts: Vec<String> = attr_path.split('.').map(|p| escape_string_literal(p)).collect();
+        let parts: Vec<String> = attr_path
+            .split('.')
+            .map(|p| escape_string_literal(p))
+            .collect();
         if parts.len() == 1 {
             return flat;
         }
@@ -202,9 +214,15 @@ pub fn build_where_clause_with_search(
         let mut all = Vec::with_capacity(conditions.len() + 1);
         all.push(time_range);
         all.extend(conditions);
-        QueryClauses { prewhere: String::new(), where_clause: all.join(" AND ") }
+        QueryClauses {
+            prewhere: String::new(),
+            where_clause: all.join(" AND "),
+        }
     } else {
-        QueryClauses { prewhere: time_range, where_clause: conditions.join(" AND ") }
+        QueryClauses {
+            prewhere: time_range,
+            where_clause: conditions.join(" AND "),
+        }
     }
 }
 
@@ -402,9 +420,7 @@ fn kv_match_sql(key: &str, value: &str, ctx: SearchContext) -> String {
                     "(LogAttributes['{ek}'] ILIKE '{pattern}' OR ResourceAttributes['{ek}'] ILIKE '{pattern}')"
                 )
             } else {
-                format!(
-                    "(LogAttributes['{ek}'] = '{ev}' OR ResourceAttributes['{ek}'] = '{ev}')"
-                )
+                format!("(LogAttributes['{ek}'] = '{ev}' OR ResourceAttributes['{ek}'] = '{ev}')")
             }
         }
         SearchContext::Spans => {
@@ -443,21 +459,41 @@ pub fn build_span_search_sql(search: &str) -> Option<String> {
 }
 
 /// Build a SQL condition for free-text search on log columns (logs table).
-/// Free text searches `lower(Body)` via `LIKE`, backed by the native `text` index
-/// `idx_body_text` (ngrams(4)). Exact trace/span IDs route to indexed equality.
-/// Map columns are searched via `key=value` syntax (direct map lookup).
+/// Whole words search `lower(Body)` through the native word text index using
+/// `hasToken`, `hasAllTokens`, or `hasAnyTokens`. Wildcards use substring predicates,
+/// exact trace/span IDs route to indexed equality, and map columns use `key=value`.
 pub fn build_log_search_sql(search: &str) -> Option<String> {
     let expr = parse_search_expr(search)?;
     Some(log_search_expr_to_sql(&expr))
 }
 
-/// Recursively generate SQL for a log search expression, using hasToken for Body.
+/// Recursively generate SQL for a log search expression.
+///
+/// Plain token groups use ClickHouse's native multi-token predicates. Besides emitting
+/// less SQL, these predicates let the text-index planner perform one direct read instead
+/// of independently evaluating multiple `hasToken` expressions. Mixed groups retain
+/// their specialized ID, wildcard, and attribute predicates.
 fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
     match expr {
         SearchExpr::Term(term) => log_term_match_sql(term),
         SearchExpr::KeyValue(key, value) => kv_match_sql(key, value, SearchContext::Logs),
         SearchExpr::And(exprs) => {
-            let parts: Vec<String> = exprs.iter().map(log_search_expr_to_sql).collect();
+            let mut tokens = Vec::new();
+            let mut parts = Vec::new();
+
+            for expr in exprs {
+                match expr {
+                    SearchExpr::Term(term) => match log_plain_tokens(term) {
+                        Some(term_tokens) => tokens.extend(term_tokens),
+                        None => parts.push(log_search_expr_to_sql(expr)),
+                    },
+                    _ => parts.push(log_search_expr_to_sql(expr)),
+                }
+            }
+
+            if !tokens.is_empty() {
+                parts.insert(0, log_token_predicate_sql(&tokens));
+            }
             format!("({})", parts.join(" AND "))
         }
         SearchExpr::Or(exprs) => {
@@ -466,6 +502,12 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
             // pass over lower(Body) (computed once) instead of N separate LIKE evaluations.
             // Same substring semantics, and it still prunes via the idx_body_ngram skip index
             // for selective needles. Token/ID/key=value/internal-wildcard branches fall back to OR.
+            //
+            // Validated on 26.6.1 (ntt-japan-prod, 157k granules, needles reset/closed/refused):
+            // the OR-of-LIKEs form is additionally analyzed against idx_body_text, but under OR
+            // a granule survives if ANY needle might match, so for common needles both forms
+            // prune ~0.3% — and the LIKE form's index analysis cost ~9× more (91s vs 10s).
+            // Keep the collapse; do not dismantle it in favor of OR-of-LIKEs.
             let needles: Option<Vec<String>> = exprs.iter().map(body_substring_needle).collect();
             match needles {
                 Some(ns) if ns.len() >= 2 => {
@@ -477,6 +519,23 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
                     format!("multiSearchAny(lower(Body), [{arr}])")
                 }
                 _ => {
+                    // `foo OR bar` can use one native direct read. Only collapse branches
+                    // that each represent exactly one whole token: a quoted/multi-token
+                    // branch means AND within that branch and cannot be flattened safely.
+                    let tokens: Option<Vec<String>> = exprs
+                        .iter()
+                        .map(|expr| {
+                            let SearchExpr::Term(term) = expr else {
+                                return None;
+                            };
+                            let tokens = log_plain_tokens(term)?;
+                            (tokens.len() == 1).then(|| tokens.into_iter().next().unwrap())
+                        })
+                        .collect();
+                    if let Some(tokens) = tokens.filter(|tokens| tokens.len() >= 2) {
+                        return log_any_token_predicate_sql(&tokens);
+                    }
+
                     let parts: Vec<String> = exprs.iter().map(log_search_expr_to_sql).collect();
                     format!("({})", parts.join(" OR "))
                 }
@@ -492,7 +551,9 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
 /// Returns None for bare token terms (which use hasToken), ID terms, key=value, empty
 /// cores, or patterns with an internal wildcard (`a*b`) that aren't one literal substring.
 fn body_substring_needle(expr: &SearchExpr) -> Option<String> {
-    let SearchExpr::Term(term) = expr else { return None };
+    let SearchExpr::Term(term) = expr else {
+        return None;
+    };
     let t = term.trim();
     if !t.contains('*') {
         return None; // bare term → hasToken (whole-word), not a substring match
@@ -505,18 +566,69 @@ fn body_substring_needle(expr: &SearchExpr) -> Option<String> {
     Some(core.to_string())
 }
 
+/// Return the whole-word tokens represented by a plain log term. Wildcards and exact
+/// trace/span IDs deliberately return `None` so their specialized predicates are kept.
+fn log_plain_tokens(term: &str) -> Option<Vec<String>> {
+    let term = term.trim();
+    if term.is_empty() || term.contains('*') {
+        return None;
+    }
+    if term.chars().all(|c| c.is_ascii_hexdigit()) && matches!(term.len(), 16 | 32) {
+        return None;
+    }
+
+    let tokens: Vec<String> = term
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn format_token_array(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|token| format!("'{}'", escape_string_literal(token)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn log_token_predicate_sql(tokens: &[String]) -> String {
+    if tokens.len() == 1 {
+        format!(
+            "hasToken(lower(Body), '{}')",
+            escape_string_literal(&tokens[0])
+        )
+    } else {
+        format!(
+            "hasAllTokens(lower(Body), [{}])",
+            format_token_array(tokens)
+        )
+    }
+}
+
+fn log_any_token_predicate_sql(tokens: &[String]) -> String {
+    format!(
+        "hasAnyTokens(lower(Body), [{}])",
+        format_token_array(tokens)
+    )
+}
+
 /// Generate a ClickHouse predicate for a single free-text log search term.
 ///
 /// Backed by the native `text` index `idx_body_text` on `lower(Body)`, which uses a
 /// word tokenizer (`splitByNonAlpha`). Strategy:
 /// - Exact 32-hex / 16-hex terms route to `TraceId = …` / `SpanId = …` (idx_trace_id
 ///   bloom filter) — separate ID lookup from free text.
-/// - A `*` wildcard term falls back to a substring `lower(Body) LIKE` (no index
-///   acceleration, but correct) — the token index can't serve arbitrary substrings.
+/// - A `*` wildcard term falls back to a substring `lower(Body) LIKE` — on 26.6+
+///   the LIKE pattern itself is analyzed against the text index (and the ngram
+///   bloom index), so this is index-accelerated, not a full scan (see the
+///   measurement note in the wildcard branch below).
 /// - Every other term is split into word tokens the same way the index tokenizes
-///   (`splitByNonAlpha`: maximal alphanumeric runs), and matched with `hasToken(...)`
-///   AND-ed together. A multi-word/quoted phrase therefore matches rows containing all
-///   of its words (not necessarily adjacent).
+///   (`splitByNonAlpha`: maximal alphanumeric runs), and matched with `hasToken` or
+///   `hasAllTokens`. A multi-word/quoted phrase therefore matches rows containing all of
+///   its words (not necessarily adjacent).
 ///
 /// Trade-offs vs the previous `ngrams(4)` + `LIKE '%term%'` approach: the index is ~6×
 /// smaller and common-term scans are faster, but free text no longer substring-matches
@@ -535,6 +647,14 @@ fn log_term_match_sql(term: &str) -> String {
     let lower = t.to_lowercase();
 
     // Wildcard terms need substring semantics the token index can't provide → LIKE.
+    //
+    // Deliberately LIKE, not `multiSearchAny(lower(Body), ['needle'])`: measured on
+    // 26.6.1 (ntt-japan-prod, 157k granules), `LIKE '%refused%'` is analyzed against
+    // the idx_body_text token index (→ 26.5k granules, fast analysis) while the
+    // single-needle multiSearchAny form is NOT — despite ClickHouse#106279 — and
+    // falls back to idx_body_ngram only (→ 53.5k granules) with ~28s (warm) index
+    // analysis. Do not "upgrade" this to multiSearchAny without re-measuring
+    // EXPLAIN indexes=1 on a production-sized logs table.
     if lower.contains('*') {
         let inner = escape_string_literal(&lower)
             .replace('%', "\\%")
@@ -543,28 +663,15 @@ fn log_term_match_sql(term: &str) -> String {
         return format!("lower(Body) LIKE '%{inner}%'");
     }
 
-    // Tokenize like the index (`splitByNonAlpha`): maximal alphanumeric runs.
-    let tokens: Vec<String> = lower
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-
-    if tokens.is_empty() {
+    let Some(tokens) = log_plain_tokens(t) else {
         // Nothing tokenizable (e.g. pure punctuation) → substring LIKE fallback.
-        let inner = escape_string_literal(&lower).replace('%', "\\%").replace('_', "\\_");
+        let inner = escape_string_literal(&lower)
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         return format!("lower(Body) LIKE '%{inner}%'");
-    }
+    };
 
-    let parts: Vec<String> = tokens
-        .iter()
-        .map(|tok| format!("hasToken(lower(Body), '{}')", escape_string_literal(tok)))
-        .collect();
-    if parts.len() == 1 {
-        parts.into_iter().next().unwrap()
-    } else {
-        format!("({})", parts.join(" AND "))
-    }
+    log_token_predicate_sql(&tokens)
 }
 
 pub fn format_value(value: &serde_json::Value) -> String {
@@ -620,7 +727,13 @@ fn resolve_metric_field(field: &str) -> String {
         match field {
             "metric_name" | "MetricName" => "MetricName".to_string(),
             "service_name" | "ServiceName" => "ServiceName".to_string(),
-            _ => if is_safe_column_name(field) { field.to_string() } else { "NULL".to_string() },
+            _ => {
+                if is_safe_column_name(field) {
+                    field.to_string()
+                } else {
+                    "NULL".to_string()
+                }
+            }
         }
     }
 }
@@ -656,7 +769,10 @@ pub fn build_metrics_where_clause(filters: &[Filter], from: &str, to: &str) -> Q
         conditions.push(condition);
     }
 
-    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
+    QueryClauses {
+        prewhere,
+        where_clause: conditions.join(" AND "),
+    }
 }
 
 // ── Logs query builder ──
@@ -675,7 +791,13 @@ fn resolve_log_field(field: &str) -> String {
             "service_name" | "ServiceName" => "ServiceName".to_string(),
             "severity" | "SeverityText" => "SeverityText".to_string(),
             "body" | "Body" => "Body".to_string(),
-            _ => if is_safe_column_name(field) { field.to_string() } else { "NULL".to_string() },
+            _ => {
+                if is_safe_column_name(field) {
+                    field.to_string()
+                } else {
+                    "NULL".to_string()
+                }
+            }
         }
     }
 }
@@ -708,7 +830,10 @@ pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> Quer
         conditions.push(condition);
     }
 
-    QueryClauses { prewhere, where_clause: conditions.join(" AND ") }
+    QueryClauses {
+        prewhere,
+        where_clause: conditions.join(" AND "),
+    }
 }
 
 /// Whitelisted time-bucket intervals (token, seconds), ascending.
@@ -733,7 +858,11 @@ fn parse_datetime_secs(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&format!("{s}Z")) {
         return Some(dt.timestamp());
     }
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+    ] {
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
             return Some(naive.and_utc().timestamp());
         }
@@ -764,7 +893,8 @@ pub fn clamp_bucket_interval(
         .copied()
         .unwrap_or(("1m", 60));
 
-    let (Some(from_secs), Some(to_secs)) = (parse_datetime_secs(from), parse_datetime_secs(to)) else {
+    let (Some(from_secs), Some(to_secs)) = (parse_datetime_secs(from), parse_datetime_secs(to))
+    else {
         // Unparsable range: leave as-is, the SQL layer validates the range itself.
         return Ok(effective);
     };
@@ -814,7 +944,9 @@ impl KeysetCursor {
     /// than erroring, keeping a stale/garbage cursor non-fatal.
     pub fn decode(token: &str) -> Option<KeysetCursor> {
         use base64::Engine;
-        let bytes = base64::engine::general_purpose::STANDARD.decode(token.as_bytes()).ok()?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(token.as_bytes())
+            .ok()?;
         let s = String::from_utf8(bytes).ok()?;
         let (ts_str, span_id) = s.split_once(':')?;
         let timestamp: i64 = ts_str.parse().ok()?;
@@ -822,7 +954,10 @@ impl KeysetCursor {
         if span_id.is_empty() || !span_id.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
-        Some(KeysetCursor { timestamp, span_id: span_id.to_string() })
+        Some(KeysetCursor {
+            timestamp,
+            span_id: span_id.to_string(),
+        })
     }
 
     /// SQL predicate for "rows strictly before this cursor" under
@@ -849,7 +984,10 @@ mod keyset_tests {
 
     #[test]
     fn cursor_roundtrips() {
-        let c = KeysetCursor { timestamp: 1_749_600_000_123_456_789, span_id: "a1b2c3d4e5f60718".to_string() };
+        let c = KeysetCursor {
+            timestamp: 1_749_600_000_123_456_789,
+            span_id: "a1b2c3d4e5f60718".to_string(),
+        };
         let token = c.encode();
         let decoded = KeysetCursor::decode(&token).unwrap();
         assert_eq!(decoded, c);
@@ -876,7 +1014,10 @@ mod keyset_tests {
 
     #[test]
     fn before_predicate_binds_timestamp_and_escapes_span_id() {
-        let c = KeysetCursor { timestamp: 42, span_id: "deadbeefcafe0001".to_string() };
+        let c = KeysetCursor {
+            timestamp: 42,
+            span_id: "deadbeefcafe0001".to_string(),
+        };
         let pred = c.before_predicate();
         assert_eq!(
             pred,
@@ -909,7 +1050,10 @@ mod search_tests {
     #[test]
     fn free_text_matches_name_columns() {
         let sql = build_span_search_sql("timeout").unwrap();
-        assert_eq!(sql, "(span_name ILIKE '%timeout%' OR service_name ILIKE '%timeout%')");
+        assert_eq!(
+            sql,
+            "(span_name ILIKE '%timeout%' OR service_name ILIKE '%timeout%')"
+        );
         assert!(!sql.contains("positionCaseInsensitive"));
         assert!(!sql.contains("arrayExists"));
         // Must NOT scan the attributes blob (the dropped full-text path).
@@ -920,7 +1064,10 @@ mod search_tests {
     #[test]
     fn wildcard_term_stays_index_friendly() {
         let sql = build_span_search_sql("slack*posted").unwrap();
-        assert_eq!(sql, "(span_name ILIKE '%slack%posted%' OR service_name ILIKE '%slack%posted%')");
+        assert_eq!(
+            sql,
+            "(span_name ILIKE '%slack%posted%' OR service_name ILIKE '%slack%posted%')"
+        );
         assert!(!sql.contains("positionCaseInsensitive"));
     }
 
@@ -951,17 +1098,24 @@ mod search_tests {
         assert!(!sql.contains("positionCaseInsensitive"));
         assert!(!sql.contains("ServiceName"));
 
-        // Multi-word phrase → AND of per-word hasToken (matches all words).
+        // Multi-word phrase → one native all-token predicate (matches all words).
         let sql = build_log_search_sql("\"Using passed request\"").unwrap();
         assert_eq!(
             sql,
-            "(hasToken(lower(Body), 'using') AND hasToken(lower(Body), 'passed') AND hasToken(lower(Body), 'request'))"
+            "hasAllTokens(lower(Body), ['using', 'passed', 'request'])"
         );
 
-        // Wildcards fall back to a substring LIKE (token index can't serve them).
+        // Wildcards fall back to a substring LIKE — kept as LIKE deliberately:
+        // on 26.6 the LIKE pattern is text-index analyzed, while single-needle
+        // multiSearchAny is not (see log_term_match_sql). Not the token index.
         let sql = build_log_search_sql("time*").unwrap();
         assert_eq!(sql, "lower(Body) LIKE '%time%%'");
         assert!(!sql.contains("hasToken"));
+
+        // Internal wildcards keep ordered `%a%b%` semantics.
+        let sql = build_log_search_sql("time*out").unwrap();
+        assert_eq!(sql, "lower(Body) LIKE '%time%out%'");
+        assert!(!sql.contains("multiSearchAny"));
     }
 
     // An OR of substring wildcards collapses to ONE vectorized multiSearchAny
@@ -969,16 +1123,51 @@ mod search_tests {
     #[test]
     fn log_or_of_wildcards_collapses_to_multisearchany() {
         let sql = build_log_search_sql("*reset* OR *closed* OR *refused*").unwrap();
-        assert_eq!(sql, "multiSearchAny(lower(Body), ['reset', 'closed', 'refused'])");
+        assert_eq!(
+            sql,
+            "multiSearchAny(lower(Body), ['reset', 'closed', 'refused'])"
+        );
     }
 
-    // OR of bare tokens stays token-precise (hasToken) — NOT collapsed to substring
+    // OR of bare tokens uses one native any-token direct read — NOT substring
     // multiSearchAny (whole-word 'error' vs the substring 'error' are different).
     #[test]
-    fn log_or_of_tokens_stays_hastoken() {
+    fn log_or_of_tokens_uses_has_any_tokens() {
         let sql = build_log_search_sql("error OR warn").unwrap();
-        assert_eq!(sql, "(hasToken(lower(Body), 'error') OR hasToken(lower(Body), 'warn'))");
+        assert_eq!(sql, "hasAnyTokens(lower(Body), ['error', 'warn'])");
         assert!(!sql.contains("multiSearchAny"));
+    }
+
+    #[test]
+    fn log_and_of_tokens_uses_has_all_tokens() {
+        let sql = build_log_search_sql("connection timeout").unwrap();
+        assert_eq!(
+            sql,
+            "(hasAllTokens(lower(Body), ['connection', 'timeout']))"
+        );
+    }
+
+    // Mixed groups combine plain words into one direct read while retaining specialized
+    // wildcard and attribute predicates.
+    #[test]
+    fn log_mixed_and_preserves_specialized_predicates() {
+        let sql =
+            build_log_search_sql("connection timeout *refused* db.system=postgresql").unwrap();
+        assert_eq!(
+            sql,
+            "(hasAllTokens(lower(Body), ['connection', 'timeout']) AND lower(Body) LIKE '%%refused%%' AND (LogAttributes['db.system'] = 'postgresql' OR ResourceAttributes['db.system'] = 'postgresql'))"
+        );
+    }
+
+    // A branch containing multiple required words cannot be flattened into hasAnyTokens,
+    // which would change `(foo AND bar) OR baz` into `foo OR bar OR baz`.
+    #[test]
+    fn log_or_with_multi_token_branch_preserves_grouping() {
+        let sql = build_log_search_sql("\"connection timeout\" OR refused").unwrap();
+        assert_eq!(
+            sql,
+            "(hasAllTokens(lower(Body), ['connection', 'timeout']) OR hasToken(lower(Body), 'refused'))"
+        );
     }
 
     // A mixed OR (wildcard + bare token) does not collapse; falls back to OR.
@@ -1014,60 +1203,46 @@ mod bucket_interval_tests {
     // 1h range at 1s interval = 3600 buckets > 2000 → snaps up to 10s (360 buckets).
     #[test]
     fn snaps_interval_up_when_bucket_count_exceeds_cap() {
-        let got = clamp_bucket_interval(
-            "1s",
-            "2026-06-10T00:00:00Z",
-            "2026-06-10T01:00:00Z",
-            2000,
-        )
-        .unwrap();
+        let got = clamp_bucket_interval("1s", "2026-06-10T00:00:00Z", "2026-06-10T01:00:00Z", 2000)
+            .unwrap();
         assert_eq!(got, "10s");
     }
 
     // 30d range at 1s = 2.59M buckets → snaps far up (30d/2000 = 1296s → 1h).
     #[test]
     fn snaps_to_hour_for_month_range_at_one_second() {
-        let got = clamp_bucket_interval(
-            "1s",
-            "2026-05-11T00:00:00Z",
-            "2026-06-10T00:00:00Z",
-            2000,
-        )
-        .unwrap();
+        let got = clamp_bucket_interval("1s", "2026-05-11T00:00:00Z", "2026-06-10T00:00:00Z", 2000)
+            .unwrap();
         assert_eq!(got, "1h");
     }
 
     // Interval already coarse enough is returned unchanged.
     #[test]
     fn keeps_interval_when_within_cap() {
-        let got = clamp_bucket_interval(
-            "1m",
-            "2026-06-10T00:00:00Z",
-            "2026-06-10T06:00:00Z",
-            2000,
-        )
-        .unwrap();
+        let got = clamp_bucket_interval("1m", "2026-06-10T00:00:00Z", "2026-06-10T06:00:00Z", 2000)
+            .unwrap();
         assert_eq!(got, "1m");
     }
 
     // Unknown token falls back to the handlers' 1m default before clamping.
     #[test]
     fn unknown_token_defaults_to_one_minute() {
-        let got = clamp_bucket_interval(
-            "7m",
-            "2026-06-10T00:00:00Z",
-            "2026-06-10T01:00:00Z",
-            2000,
-        )
-        .unwrap();
+        let got = clamp_bucket_interval("7m", "2026-06-10T00:00:00Z", "2026-06-10T01:00:00Z", 2000)
+            .unwrap();
         assert_eq!(got, "1m");
     }
 
     // Zero / negative range is the only 400 case.
     #[test]
     fn rejects_non_positive_range() {
-        assert!(clamp_bucket_interval("1m", "2026-06-10T01:00:00Z", "2026-06-10T01:00:00Z", 2000).is_err());
-        assert!(clamp_bucket_interval("1m", "2026-06-10T02:00:00Z", "2026-06-10T01:00:00Z", 2000).is_err());
+        assert!(
+            clamp_bucket_interval("1m", "2026-06-10T01:00:00Z", "2026-06-10T01:00:00Z", 2000)
+                .is_err()
+        );
+        assert!(
+            clamp_bucket_interval("1m", "2026-06-10T02:00:00Z", "2026-06-10T01:00:00Z", 2000)
+                .is_err()
+        );
     }
 
     // Unparsable range strings are passed through (ClickHouse validates them later).
@@ -1094,13 +1269,8 @@ mod bucket_interval_tests {
     // A range bigger than max_buckets days still resolves to the coarsest interval.
     #[test]
     fn huge_range_clamps_to_coarsest() {
-        let got = clamp_bucket_interval(
-            "1s",
-            "2016-06-10T00:00:00Z",
-            "2026-06-10T00:00:00Z",
-            2000,
-        )
-        .unwrap();
+        let got = clamp_bucket_interval("1s", "2016-06-10T00:00:00Z", "2026-06-10T00:00:00Z", 2000)
+            .unwrap();
         assert_eq!(got, "1d");
     }
 }

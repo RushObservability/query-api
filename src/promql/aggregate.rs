@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
 use super::compute::quantile_sorted;
 use super::types::{AggOp, TimeSeries};
+use std::collections::BTreeMap;
 
 // ═══════════════════════════════════════════════════════════════════
 // Aggregation
@@ -84,10 +84,8 @@ pub fn aggregate_series(
                         AggOp::Group => 1.0,
                         AggOp::CountValues => {
                             // Count distinct values (simplified — returns count of unique values)
-                            let mut unique: Vec<i64> = values
-                                .iter()
-                                .map(|v| (*v * 1_000_000.0) as i64)
-                                .collect();
+                            let mut unique: Vec<i64> =
+                                values.iter().map(|v| (*v * 1_000_000.0) as i64).collect();
                             unique.sort();
                             unique.dedup();
                             unique.len() as f64
@@ -154,7 +152,9 @@ fn aggregate_topk_bottomk(
         members.sort_by(|a, b| {
             let a_val = a.samples.last().map(|(_, v)| *v).unwrap_or(0.0);
             let b_val = b.samples.last().map(|(_, v)| *v).unwrap_or(0.0);
-            a_val.partial_cmp(&b_val).unwrap_or(std::cmp::Ordering::Equal)
+            a_val
+                .partial_cmp(&b_val)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let selected: Vec<TimeSeries> = match op {
@@ -251,8 +251,7 @@ mod tests {
                 samples: vec![(10.0, i as f64 * 10.0)],
             })
             .collect();
-        let result =
-            aggregate_series(series, AggOp::Quantile, &[], false, &[10.0], Some(0.5));
+        let result = aggregate_series(series, AggOp::Quantile, &[], false, &[10.0], Some(0.5));
         assert_approx(result[0].samples[0].1, 45.0, 0.1);
     }
 
@@ -357,8 +356,12 @@ mod tests {
         result
             .iter()
             .find(|s| s.labels == want_map)
-            .unwrap_or_else(|| panic!("no group with labels {want_map:?} in {:?}",
-                result.iter().map(|s| &s.labels).collect::<Vec<_>>()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no group with labels {want_map:?} in {:?}",
+                    result.iter().map(|s| &s.labels).collect::<Vec<_>>()
+                )
+            })
     }
 
     #[test]
@@ -415,8 +418,14 @@ mod tests {
     fn test_quantile_by_job() {
         let by = vec!["job".to_string()];
         // api values at t=0: [10,20]. median = linear interp at rank 0.5 → 15.
-        let result =
-            aggregate_series(three_series(), AggOp::Quantile, &by, false, &STEPS, Some(0.5));
+        let result = aggregate_series(
+            three_series(),
+            AggOp::Quantile,
+            &by,
+            false,
+            &STEPS,
+            Some(0.5),
+        );
         assert_approx(group(&result, &[("job", "api")]).samples[0].1, 15.0, 0.001);
     }
 
@@ -465,8 +474,14 @@ mod tests {
         assert_eq!(top_api.len(), 1);
         assert_eq!(top_api[0].labels.get("inst").unwrap(), "b");
 
-        let bottom =
-            aggregate_series(three_series(), AggOp::Bottomk, &by, false, &STEPS, Some(1.0));
+        let bottom = aggregate_series(
+            three_series(),
+            AggOp::Bottomk,
+            &by,
+            false,
+            &STEPS,
+            Some(1.0),
+        );
         let bot_api: Vec<_> = bottom
             .iter()
             .filter(|s| s.labels.get("job").map(|j| j == "api").unwrap_or(false))

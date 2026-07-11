@@ -36,35 +36,65 @@ pub struct FirewallRuleInput {
     pub drop_label_regex: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
-fn b(v: bool) -> u8 { if v { 1 } else { 0 } }
+fn b(v: bool) -> u8 {
+    if v { 1 } else { 0 }
+}
 
 /// Validate an input and (on success) return a storage row with the given id/created_at.
-fn validate(input: &FirewallRuleInput, id: String, created_at: String) -> Result<MetricFirewallRule, (StatusCode, String)> {
+fn validate(
+    input: &FirewallRuleInput,
+    id: String,
+    created_at: String,
+) -> Result<MetricFirewallRule, (StatusCode, String)> {
     if input.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name is required".into()));
     }
     if input.action != "allow" && input.action != "block" && input.action != "drop_label" {
-        return Err((StatusCode::BAD_REQUEST, "action must be 'allow', 'block' or 'drop_label'".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "action must be 'allow', 'block' or 'drop_label'".into(),
+        ));
     }
     // Validate any regexes so the user gets immediate feedback.
     let check = |pat: &str, is_re: bool, label: &str| -> Result<(), (StatusCode, String)> {
         if is_re && !pat.is_empty() {
-            regex::Regex::new(pat).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid {label} regex: {e}")))?;
+            regex::Regex::new(pat).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid {label} regex: {e}"),
+                )
+            })?;
         }
         Ok(())
     };
     check(&input.metric_pattern, input.metric_regex, "metric")?;
-    check(&input.match_label_value, input.match_label_value_regex, "label value")?;
-    check(&input.drop_label_pattern, input.drop_label_regex, "drop label")?;
+    check(
+        &input.match_label_value,
+        input.match_label_value_regex,
+        "label value",
+    )?;
+    check(
+        &input.drop_label_pattern,
+        input.drop_label_regex,
+        "drop label",
+    )?;
 
     if input.action == "drop_label" && input.drop_label_pattern.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "drop_label rules require a drop label pattern".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "drop_label rules require a drop label pattern".into(),
+        ));
     }
     // An allow rule with no criteria would exempt every series and silently
     // neuter all block rules — allowing everything is already the default.
-    if input.action == "allow" && input.metric_pattern.is_empty() && input.match_label_key.is_empty() {
+    if input.action == "allow"
+        && input.metric_pattern.is_empty()
+        && input.match_label_key.is_empty()
+    {
         return Err((StatusCode::BAD_REQUEST, "allow rules need a metric pattern and/or a label match (allowing everything is the default)".into()));
     }
 
@@ -98,7 +128,11 @@ fn forbid_block_everything(rules_after: &[MetricFirewallRule]) -> Result<(), (St
             && r.metric_pattern.is_empty()
             && r.match_label_key.is_empty()
     });
-    if catch_all_block && !rules_after.iter().any(|r| r.enabled == 1 && r.action == "allow") {
+    if catch_all_block
+        && !rules_after
+            .iter()
+            .any(|r| r.enabled == 1 && r.action == "allow")
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             "this change would leave the firewall blocking every series: a block rule with no match criteria requires at least one enabled allow rule (allowlist mode)".into(),
@@ -125,7 +159,10 @@ pub async fn list(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
-    let rules = state.config_db.list_metric_firewall().await
+    let rules = state
+        .config_db
+        .list_metric_firewall()
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     Ok(Json(serde_json::json!({ "rules": rules })))
 }
@@ -140,11 +177,17 @@ pub async fn create(
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let rule = validate(&input, id, created_at)?;
-    let mut after = state.config_db.list_metric_firewall().await
+    let mut after = state
+        .config_db
+        .list_metric_firewall()
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     after.push(rule.clone());
     forbid_block_everything(&after)?;
-    state.config_db.upsert_metric_firewall(&rule).await
+    state
+        .config_db
+        .upsert_metric_firewall(&rule)
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     reload(&state).await;
 
@@ -170,10 +213,16 @@ pub async fn update(
     Json(input): Json<FirewallRuleInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
-    let existing = state.config_db.list_metric_firewall().await
+    let existing = state
+        .config_db
+        .list_metric_firewall()
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     // Preserve the original created_at if the rule exists.
-    let created_at = existing.iter().find(|r| r.id == id).map(|r| r.created_at.clone())
+    let created_at = existing
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| r.created_at.clone())
         .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string());
     let rule = validate(&input, id.clone(), created_at)?;
     // Check the invariant against the post-update rule set (the old version of
@@ -182,7 +231,10 @@ pub async fn update(
     let mut after: Vec<MetricFirewallRule> = existing.into_iter().filter(|r| r.id != id).collect();
     after.push(rule.clone());
     forbid_block_everything(&after)?;
-    state.config_db.upsert_metric_firewall(&rule).await
+    state
+        .config_db
+        .upsert_metric_firewall(&rule)
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     reload(&state).await;
 
@@ -209,11 +261,19 @@ pub async fn delete(
     let caller = require_admin(&state, &headers).await?;
     // Deleting the last allow rule while a catch-all block exists would leave
     // the firewall blocking everything — reject it (delete the block first).
-    let after: Vec<MetricFirewallRule> = state.config_db.list_metric_firewall().await
+    let after: Vec<MetricFirewallRule> = state
+        .config_db
+        .list_metric_firewall()
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?
-        .into_iter().filter(|r| r.id != id).collect();
+        .into_iter()
+        .filter(|r| r.id != id)
+        .collect();
     forbid_block_everything(&after)?;
-    let deleted = state.config_db.delete_metric_firewall(&id).await
+    let deleted = state
+        .config_db
+        .delete_metric_firewall(&id)
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "rule not found".into()));
@@ -221,14 +281,17 @@ pub async fn delete(
     reload(&state).await;
 
     // AUDIT: metric firewall rule deleted.
-    state.audit.log(
-        crate::audit::AuditEvent::new("firewall.rule_delete", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("metric_firewall_rule", id.clone())
-            .description("metric firewall rule deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("firewall.rule_delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("metric_firewall_rule", id.clone())
+                .description("metric firewall rule deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -35,8 +35,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use ch_writer::ChWriter;
-use config::RushConfig;
 use clickhouse_config::ConfigDb;
+use config::RushConfig;
 use usage_accumulator::UsageAccumulator;
 use usage_tracker::UsageTracker;
 
@@ -102,7 +102,9 @@ fn query_guards() -> &'static QueryGuards {
 pub async fn probe_row_policy_support(ch: &Client) {
     #[derive(clickhouse::Row, serde::Deserialize)]
     #[allow(dead_code)]
-    struct Probe { n: u8 }
+    struct Probe {
+        n: u8,
+    }
     let result = ch
         .query("SELECT 1 AS n")
         .with_option("rush_tenant_id", "probe")
@@ -110,7 +112,9 @@ pub async fn probe_row_policy_support(ch: &Client) {
         .await;
     match result {
         Ok(_) => {
-            tracing::info!("ClickHouse accepts rush_tenant_id custom setting — row policies enforcing");
+            tracing::info!(
+                "ClickHouse accepts rush_tenant_id custom setting — row policies enforcing"
+            );
             ROW_POLICY_SUPPORTED.store(1, Ordering::Relaxed);
         }
         Err(_) => {
@@ -147,8 +151,14 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
         .with_option("max_result_rows", "500000")
         .with_option("result_overflow_mode", "break")
         .with_option("max_memory_usage", guards.max_memory_usage.as_str())
-        .with_option("max_bytes_before_external_group_by", guards.max_bytes_external.as_str())
-        .with_option("max_bytes_before_external_sort", guards.max_bytes_external.as_str())
+        .with_option(
+            "max_bytes_before_external_group_by",
+            guards.max_bytes_external.as_str(),
+        )
+        .with_option(
+            "max_bytes_before_external_sort",
+            guards.max_bytes_external.as_str(),
+        )
         // ClickHouse 26.2 query condition cache: caches the per-granule match bitset
         // for a WHERE predicate so repeated identical predicates (dashboard refreshes,
         // the count+list+histogram+timeseries siblings of one Explore search, monitor/

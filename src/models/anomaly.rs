@@ -65,8 +65,7 @@ impl From<AnomalyRule> for AnomalyRuleResponse {
             alpha: r.alpha,
             eval_interval_secs: r.eval_interval_secs,
             window_secs: r.window_secs,
-            split_labels: serde_json::from_str(&r.split_labels)
-                .unwrap_or(serde_json::json!([])),
+            split_labels: serde_json::from_str(&r.split_labels).unwrap_or(serde_json::json!([])),
             notification_channel_ids: serde_json::from_str(&r.notification_channel_ids)
                 .unwrap_or(serde_json::json!([])),
             state: r.state,

@@ -39,11 +39,7 @@ pub fn apply_scalar_op(func: ScalarFunc, v: f64, args: &[f64]) -> f64 {
         ScalarFunc::Floor => v.floor(),
         ScalarFunc::Round => {
             let to = args.first().copied().unwrap_or(1.0);
-            if to == 0.0 {
-                v
-            } else {
-                (v / to).round() * to
-            }
+            if to == 0.0 { v } else { (v / to).round() * to }
         }
         ScalarFunc::Sqrt => v.sqrt(),
         ScalarFunc::Exp => v.exp(),
@@ -125,10 +121,7 @@ fn compute_histogram_quantile(phi: f64, series: &[TimeSeries]) -> Vec<TimeSeries
                 return None;
             }
 
-            let total = buckets
-                .last()
-                .map(|(_, v)| *v)
-                .unwrap_or(0.0);
+            let total = buckets.last().map(|(_, v)| *v).unwrap_or(0.0);
             if total == 0.0 {
                 return None;
             }
@@ -200,14 +193,26 @@ mod tests {
     #[test]
     fn test_scalar_round() {
         assert_approx(apply_scalar_op(ScalarFunc::Round, 3.456, &[]), 3.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::Round, 3.456, &[0.1]), 3.5, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::Round, 3.456, &[0.01]), 3.46, 0.001);
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Round, 3.456, &[0.1]),
+            3.5,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Round, 3.456, &[0.01]),
+            3.46,
+            0.001,
+        );
     }
 
     #[test]
     fn test_scalar_sqrt() {
         assert_approx(apply_scalar_op(ScalarFunc::Sqrt, 16.0, &[]), 4.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::Sqrt, 2.0, &[]), std::f64::consts::SQRT_2, 0.001);
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Sqrt, 2.0, &[]),
+            std::f64::consts::SQRT_2,
+            0.001,
+        );
     }
 
     #[test]
@@ -228,13 +233,41 @@ mod tests {
 
     #[test]
     fn test_scalar_clamp() {
-        assert_approx(apply_scalar_op(ScalarFunc::ClampMin, -5.0, &[0.0]), 0.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::ClampMin, 5.0, &[0.0]), 5.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::ClampMax, 150.0, &[100.0]), 100.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::ClampMax, 50.0, &[100.0]), 50.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::Clamp, -5.0, &[0.0, 100.0]), 0.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::Clamp, 50.0, &[0.0, 100.0]), 50.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::Clamp, 150.0, &[0.0, 100.0]), 100.0, 0.001);
+        assert_approx(
+            apply_scalar_op(ScalarFunc::ClampMin, -5.0, &[0.0]),
+            0.0,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::ClampMin, 5.0, &[0.0]),
+            5.0,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::ClampMax, 150.0, &[100.0]),
+            100.0,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::ClampMax, 50.0, &[100.0]),
+            50.0,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Clamp, -5.0, &[0.0, 100.0]),
+            0.0,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Clamp, 50.0, &[0.0, 100.0]),
+            50.0,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Clamp, 150.0, &[0.0, 100.0]),
+            100.0,
+            0.001,
+        );
     }
 
     #[test]
@@ -246,8 +279,16 @@ mod tests {
             1.0,
             0.001,
         );
-        assert_approx(apply_scalar_op(ScalarFunc::Deg, std::f64::consts::PI, &[]), 180.0, 0.001);
-        assert_approx(apply_scalar_op(ScalarFunc::Rad, 180.0, &[]), std::f64::consts::PI, 0.001);
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Deg, std::f64::consts::PI, &[]),
+            180.0,
+            0.001,
+        );
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Rad, 180.0, &[]),
+            std::f64::consts::PI,
+            0.001,
+        );
     }
 
     #[test]
@@ -279,7 +320,11 @@ mod tests {
 
     #[test]
     fn test_scalar_pi_exp0_ln1() {
-        assert_approx(apply_scalar_op(ScalarFunc::Pi, 0.0, &[]), std::f64::consts::PI, 1e-12);
+        assert_approx(
+            apply_scalar_op(ScalarFunc::Pi, 0.0, &[]),
+            std::f64::consts::PI,
+            1e-12,
+        );
         assert_approx(apply_scalar_op(ScalarFunc::Exp, 0.0, &[]), 1.0, 1e-12);
         assert_approx(apply_scalar_op(ScalarFunc::Ln, 1.0, &[]), 0.0, 1e-12);
     }
@@ -331,7 +376,10 @@ mod tests {
     fn bucket(le: &str, count: f64) -> TimeSeries {
         TimeSeries {
             labels: [
-                ("__name__".into(), "http_request_duration_seconds_bucket".into()),
+                (
+                    "__name__".into(),
+                    "http_request_duration_seconds_bucket".into(),
+                ),
                 ("le".into(), le.into()),
             ]
             .into(),
@@ -355,7 +403,10 @@ mod tests {
         // result = 0.5 + (1 - 0.5)*1.0 = 1.0.
         let result = apply_scalar_func(classic_buckets(), ScalarFunc::HistogramQuantile, &[0.5]);
         assert_eq!(result.len(), 1);
-        assert!(!result[0].labels.contains_key("le"), "le label must be dropped");
+        assert!(
+            !result[0].labels.contains_key("le"),
+            "le label must be dropped"
+        );
         assert_approx(result[0].samples[0].1, 1.0, 1e-9);
     }
 

@@ -1,6 +1,11 @@
 //! Ingest-buffer status (durable spool depth) for the Stats/Settings surface.
 
-use axum::{Json, extract::State, http::{HeaderMap, StatusCode}, response::IntoResponse};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 
 use crate::AppState;
 use crate::handlers::users::require_admin;
@@ -14,7 +19,11 @@ pub async fn buffer_status(
     let b = &state.writer.buffer;
     let pending_bytes = b.total_bytes();
     let max_bytes = b.max_bytes();
-    let pct = if max_bytes > 0 { (pending_bytes as f64 / max_bytes as f64 * 100.0).min(100.0) } else { 0.0 };
+    let pct = if max_bytes > 0 {
+        (pending_bytes as f64 / max_bytes as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
     let oldest_age_secs = b.oldest_age_secs().await.unwrap_or(0);
     Ok(Json(serde_json::json!({
         "backend": b.backend_name(),

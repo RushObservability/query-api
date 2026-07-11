@@ -93,7 +93,7 @@ pub fn evaluate() -> LicenseStatus {
 }
 
 fn verify(token: &str, pubkey: &str) -> LicenseStatus {
-    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 
     let key = match DecodingKey::from_ed_pem(pubkey.as_bytes()) {
         Ok(k) => k,
@@ -106,13 +106,16 @@ fn verify(token: &str, pubkey: &str) -> LicenseStatus {
     match decode::<LicenseClaims>(token, &key, &validation) {
         Ok(data) => {
             let c = data.claims;
-            let expires_at = chrono::DateTime::from_timestamp(c.exp, 0)
-                .map(|dt| dt.to_rfc3339());
+            let expires_at = chrono::DateTime::from_timestamp(c.exp, 0).map(|dt| dt.to_rfc3339());
             LicenseStatus {
                 valid: true,
                 status: "active".into(),
                 customer: Some(c.sub),
-                plan: if c.plan.is_empty() { "licensed".into() } else { c.plan },
+                plan: if c.plan.is_empty() {
+                    "licensed".into()
+                } else {
+                    c.plan
+                },
                 entitlements: c.entitlements,
                 expires_at,
                 reason: None,

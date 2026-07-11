@@ -1,8 +1,13 @@
-use axum::{Json, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::IntoResponse};
-use serde::{Deserialize, Serialize};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::AppState;
 use crate::handlers::users::{require_admin, require_auth};
@@ -34,7 +39,9 @@ pub struct CreateApiKeyRequest {
 fn generate_api_key() -> String {
     let mut rng = rand::rng();
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
-    (0..64).map(|_| chars[rng.random_range(0..chars.len())]).collect()
+    (0..64)
+        .map(|_| chars[rng.random_range(0..chars.len())])
+        .collect()
 }
 
 /// Hash an API key using HMAC-SHA256 keyed with RUSH_API_KEY_SECRET.
@@ -57,8 +64,8 @@ pub fn hash_api_key(key: &str) -> String {
             );
         });
     }
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(key.as_bytes());
     format!("{:x}", mac.finalize().into_bytes())
 }
@@ -74,7 +81,12 @@ pub async fn list_api_keys(
     })?;
     let keys: Vec<ApiKeyListEntry> = rows
         .into_iter()
-        .map(|(id, name, prefix, created_at)| ApiKeyListEntry { id, name, prefix, created_at })
+        .map(|(id, name, prefix, created_at)| ApiKeyListEntry {
+            id,
+            name,
+            prefix,
+            created_at,
+        })
         .collect();
     Ok(Json(serde_json::json!({ "keys": keys })))
 }
@@ -90,10 +102,14 @@ pub async fn create_api_key(
     let key_hash = hash_api_key(&key);
     let prefix = key[..8].to_string();
 
-    state.config_db.create_api_key(&id, &req.name, &key_hash, &prefix).await.map_err(|e| {
-        tracing::error!(error = %e, "internal error");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-    })?;
+    state
+        .config_db
+        .create_api_key(&id, &req.name, &key_hash, &prefix)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     tracing::info!(
         event = "api_key_created",
@@ -105,15 +121,21 @@ pub async fn create_api_key(
 
     // AUDIT: API key created. NEVER log the key value or its hash — only the
     // name, the public prefix, and the tenant.
-    state.audit.log(
-        crate::audit::AuditEvent::new("apikey.create", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("api_key", id.clone())
-            .changes(serde_json::json!({ "name": req.name, "prefix": prefix, "tenant": caller.3 }).to_string())
-            .description("api key created")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("apikey.create", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("api_key", id.clone())
+                .changes(
+                    serde_json::json!({ "name": req.name, "prefix": prefix, "tenant": caller.3 })
+                        .to_string(),
+                )
+                .description("api key created")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     // Return the full key ONLY on creation
     Ok(Json(ApiKeyCreated {
@@ -127,13 +149,12 @@ pub async fn create_api_key(
 
 /// GET /api/v1/features — public, no auth required.
 /// Returns which optional integrations are enabled so the UI can hide/show nav items.
-pub async fn get_features(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn get_features(State(state): State<AppState>) -> impl IntoResponse {
     let argocd_enabled = std::env::var("ARGOCD_NAMESPACE").is_ok()
         || state
             .config_db
-            .get_setting("argocd_enabled").await
+            .get_setting("argocd_enabled")
+            .await
             .ok()
             .flatten()
             .map(|v| v == "true")
@@ -142,7 +163,8 @@ pub async fn get_features(
     let fluxcd_enabled = std::env::var("FLUXCD_NAMESPACE").is_ok()
         || state
             .config_db
-            .get_setting("fluxcd_enabled").await
+            .get_setting("fluxcd_enabled")
+            .await
             .ok()
             .flatten()
             .map(|v| v == "true")
@@ -153,7 +175,8 @@ pub async fn get_features(
         .unwrap_or(false)
         || state
             .config_db
-            .get_setting("kubernetes_enabled").await
+            .get_setting("kubernetes_enabled")
+            .await
             .ok()
             .flatten()
             .map(|v| v == "true")
@@ -164,7 +187,8 @@ pub async fn get_features(
         .unwrap_or(false)
         || state
             .config_db
-            .get_setting("cloudwatch_enabled").await
+            .get_setting("cloudwatch_enabled")
+            .await
             .ok()
             .flatten()
             .map(|v| v == "true")
@@ -172,7 +196,8 @@ pub async fn get_features(
 
     let sre_agent_enabled = state
         .config_db
-        .get_setting("sre_agent_enabled").await
+        .get_setting("sre_agent_enabled")
+        .await
         .ok()
         .flatten()
         .map(|v| v == "true")
@@ -184,7 +209,8 @@ pub async fn get_features(
     // Defaults ON (unset → true); only an explicit "false" disables it.
     let deploy_markers_enabled = state
         .config_db
-        .get_setting("deploy_markers_enabled").await
+        .get_setting("deploy_markers_enabled")
+        .await
         .ok()
         .flatten()
         .map(|v| v != "false")
@@ -194,7 +220,8 @@ pub async fn get_features(
     // (unset → true); only an explicit "false" disables it.
     let rum_enabled = state
         .config_db
-        .get_setting("rum_enabled").await
+        .get_setting("rum_enabled")
+        .await
         .ok()
         .flatten()
         .map(|v| v != "false")
@@ -220,7 +247,8 @@ pub async fn get_rum_setting(
     require_admin(&state, &headers).await?;
     let enabled = state
         .config_db
-        .get_setting("rum_enabled").await
+        .get_setting("rum_enabled")
+        .await
         .ok()
         .flatten()
         .map(|v| v != "false")
@@ -237,24 +265,40 @@ pub async fn set_rum_setting(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
-    let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
-    })?;
-    state.config_db.set_setting("rum_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to save rum_enabled");
-        (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-    })?;
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid 'enabled' (expected a boolean)".to_string(),
+            )
+        })?;
+    state
+        .config_db
+        .set_setting("rum_enabled", if enabled { "true" } else { "false" })
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to save rum_enabled");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save setting".to_string(),
+            )
+        })?;
 
     // AUDIT: RUM setting change.
-    state.audit.log(
-        crate::audit::AuditEvent::new("settings.update", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("setting", "rum_enabled")
-            .changes(serde_json::json!({ "key": "rum_enabled", "value": enabled }).to_string())
-            .description("rum setting updated")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("settings.update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("setting", "rum_enabled")
+                .changes(serde_json::json!({ "key": "rum_enabled", "value": enabled }).to_string())
+                .description("rum setting updated")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "enabled": enabled })))
 }
@@ -273,18 +317,22 @@ pub async fn get_cloudwatch_setting(
         .unwrap_or(false)
         || state
             .config_db
-            .get_setting("cloudwatch_enabled").await
+            .get_setting("cloudwatch_enabled")
+            .await
             .ok()
             .flatten()
             .map(|v| v == "true")
             .unwrap_or(false);
     let default_tenant = state
         .config_db
-        .get_setting("cloudwatch_default_tenant").await
+        .get_setting("cloudwatch_default_tenant")
+        .await
         .ok()
         .flatten()
         .unwrap_or_default();
-    Ok(Json(serde_json::json!({ "enabled": enabled, "default_tenant": default_tenant })))
+    Ok(Json(
+        serde_json::json!({ "enabled": enabled, "default_tenant": default_tenant }),
+    ))
 }
 
 /// PUT /api/v1/settings/cloudwatch — admin only. Body: { enabled: bool, default_tenant?: string }.
@@ -296,42 +344,74 @@ pub async fn set_cloudwatch_setting(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
-    let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
-    })?;
-    state.config_db.set_setting("cloudwatch_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to save cloudwatch_enabled");
-        (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-    })?;
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid 'enabled' (expected a boolean)".to_string(),
+            )
+        })?;
+    state
+        .config_db
+        .set_setting("cloudwatch_enabled", if enabled { "true" } else { "false" })
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to save cloudwatch_enabled");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save setting".to_string(),
+            )
+        })?;
 
     // AUDIT: CloudWatch integration toggle.
-    state.audit.log(
-        crate::audit::AuditEvent::new("integration.update", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("integration", "cloudwatch")
-            .changes(serde_json::json!({ "key": "cloudwatch_enabled", "enabled": enabled }).to_string())
-            .description("cloudwatch integration toggled")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("integration.update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("integration", "cloudwatch")
+                .changes(
+                    serde_json::json!({ "key": "cloudwatch_enabled", "enabled": enabled })
+                        .to_string(),
+                )
+                .description("cloudwatch integration toggled")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     // Optional default_tenant (UI hint only). Present → persist (empty clears it).
     if let Some(dt_val) = body.get("default_tenant") {
         let dt = dt_val.as_str().unwrap_or("").trim();
         if dt.len() > 128 {
-            return Err((StatusCode::BAD_REQUEST, "default_tenant too long".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "default_tenant too long".to_string(),
+            ));
         }
-        state.config_db.set_setting("cloudwatch_default_tenant", dt).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to save cloudwatch_default_tenant");
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-        })?;
+        state
+            .config_db
+            .set_setting("cloudwatch_default_tenant", dt)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to save cloudwatch_default_tenant");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save setting".to_string(),
+                )
+            })?;
     }
     let default_tenant = state
         .config_db
-        .get_setting("cloudwatch_default_tenant").await
+        .get_setting("cloudwatch_default_tenant")
+        .await
         .ok()
         .flatten()
         .unwrap_or_default();
-    Ok(Json(serde_json::json!({ "enabled": enabled, "default_tenant": default_tenant })))
+    Ok(Json(
+        serde_json::json!({ "enabled": enabled, "default_tenant": default_tenant }),
+    ))
 }
 
 /// GET /api/v1/settings/deploy-markers — admin only. Returns { enabled }.
@@ -342,7 +422,8 @@ pub async fn get_deploy_markers_setting(
     require_admin(&state, &headers).await?;
     let enabled = state
         .config_db
-        .get_setting("deploy_markers_enabled").await
+        .get_setting("deploy_markers_enabled")
+        .await
         .ok()
         .flatten()
         .map(|v| v != "false")
@@ -358,24 +439,46 @@ pub async fn set_deploy_markers_setting(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
-    let enabled = body.get("enabled").and_then(|v| v.as_bool()).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
-    })?;
-    state.config_db.set_setting("deploy_markers_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to save deploy_markers_enabled");
-        (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-    })?;
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid 'enabled' (expected a boolean)".to_string(),
+            )
+        })?;
+    state
+        .config_db
+        .set_setting(
+            "deploy_markers_enabled",
+            if enabled { "true" } else { "false" },
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to save deploy_markers_enabled");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save setting".to_string(),
+            )
+        })?;
 
     // AUDIT: deploy-markers setting change.
-    state.audit.log(
-        crate::audit::AuditEvent::new("settings.update", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("setting", "deploy_markers_enabled")
-            .changes(serde_json::json!({ "key": "deploy_markers_enabled", "value": enabled }).to_string())
-            .description("deploy markers setting updated")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("settings.update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("setting", "deploy_markers_enabled")
+                .changes(
+                    serde_json::json!({ "key": "deploy_markers_enabled", "value": enabled })
+                        .to_string(),
+                )
+                .description("deploy markers setting updated")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "enabled": enabled })))
 }
@@ -390,25 +493,40 @@ pub async fn set_export_max_rows(
     let caller = crate::handlers::users::require_admin(&state, &headers).await?;
 
     let value = body.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
-        (axum::http::StatusCode::BAD_REQUEST, "missing or invalid 'value' (expected a positive integer)".to_string())
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing or invalid 'value' (expected a positive integer)".to_string(),
+        )
     })?;
     let value = value.clamp(1, crate::handlers::export::EXPORT_MAX_ROWS_CEILING);
 
-    state.config_db.set_setting("export_max_rows", &value.to_string()).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to set export_max_rows");
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-    })?;
+    state
+        .config_db
+        .set_setting("export_max_rows", &value.to_string())
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to set export_max_rows");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save setting".to_string(),
+            )
+        })?;
 
     // AUDIT: export-max-rows setting change.
-    state.audit.log(
-        crate::audit::AuditEvent::new("settings.update", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("setting", "export_max_rows")
-            .changes(serde_json::json!({ "key": "export_max_rows", "value": value }).to_string())
-            .description("export max rows setting updated")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("settings.update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("setting", "export_max_rows")
+                .changes(
+                    serde_json::json!({ "key": "export_max_rows", "value": value }).to_string(),
+                )
+                .description("export max rows setting updated")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "export_max_rows": value })))
 }
@@ -419,8 +537,15 @@ const SRE_AGENT_DEFAULT_MAX_TOOL_STEPS: u64 = 40;
 const SRE_AGENT_DEFAULT_MAX_LLM_CALLS: u64 = 55;
 /// Common OpenAI models offered as a combo-box suggestion list in the UI. The field is
 /// free-text, so any model name (incl. non-OpenAI when LLM_BASE_URL is changed) still works.
-const SRE_AGENT_MODEL_SUGGESTIONS: &[&str] =
-    &["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o4-mini"];
+const SRE_AGENT_MODEL_SUGGESTIONS: &[&str] = &[
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "o4-mini",
+];
 /// Reasoning-effort levels for thinking models (OpenAI gpt-5 / o-series).
 const SRE_AGENT_REASONING_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
 
@@ -473,7 +598,10 @@ fn parse_allowed_models(raw: &str) -> Vec<AllowedModel> {
             } else {
                 Vec::new()
             };
-            Some(AllowedModel { id: id.to_string(), reasoning })
+            Some(AllowedModel {
+                id: id.to_string(),
+                reasoning,
+            })
         })
         .collect()
 }
@@ -502,7 +630,10 @@ pub async fn get_sre_agent_settings(
     let read = |key: &'static str, default: u64| {
         let db = state.config_db.clone();
         async move {
-            db.get_setting(key).await.ok().flatten()
+            db.get_setting(key)
+                .await
+                .ok()
+                .flatten()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(default)
         }
@@ -510,16 +641,37 @@ pub async fn get_sre_agent_settings(
     let max_tool_steps = read("sre_agent_max_tool_steps", SRE_AGENT_DEFAULT_MAX_TOOL_STEPS).await;
     let max_llm_calls = read("sre_agent_max_llm_calls", SRE_AGENT_DEFAULT_MAX_LLM_CALLS).await;
     // Same key /api/v1/features exposes as `sre_agent` — this is the UI switch.
-    let enabled = state.config_db.get_setting("sre_agent_enabled").await
-        .ok().flatten().map(|v| v == "true").unwrap_or(false);
+    let enabled = state
+        .config_db
+        .get_setting("sre_agent_enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
     // Operator-chosen model (empty = use the agent's LLM_MODEL env default).
-    let model = state.config_db.get_setting("sre_agent_model").await
-        .ok().flatten().unwrap_or_default();
-    let reasoning_effort = state.config_db.get_setting("sre_agent_reasoning_effort").await
-        .ok().flatten().unwrap_or_default();
+    let model = state
+        .config_db
+        .get_setting("sre_agent_model")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let reasoning_effort = state
+        .config_db
+        .get_setting("sre_agent_reasoning_effort")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     // Admin-defined policy: which models users may pick + per-model thinking levels.
-    let allowed_raw = state.config_db.get_setting("sre_agent_allowed_models").await
-        .ok().flatten().unwrap_or_default();
+    let allowed_raw = state
+        .config_db
+        .get_setting("sre_agent_allowed_models")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let allowed_models = parse_allowed_models(&allowed_raw);
     Ok(Json(serde_json::json!({
         "enabled": enabled,
@@ -556,15 +708,18 @@ pub async fn set_sre_agent_settings(
         let caller = caller.clone();
         let ctx = crate::audit::actor_context_from_headers(&headers);
         async move {
-            state.audit.log(
-                crate::audit::AuditEvent::new("settings.update", "user")
-                    .actor(caller.0.clone(), caller.1.clone())
-                    .tenant(caller.3.clone())
-                    .resource("setting", key)
-                    .changes(serde_json::json!({ "key": key, "value": value }).to_string())
-                    .description("sre-agent setting updated")
-                    .context(ctx),
-            ).await;
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("settings.update", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("setting", key)
+                        .changes(serde_json::json!({ "key": key, "value": value }).to_string())
+                        .description("sre-agent setting updated")
+                        .context(ctx),
+                )
+                .await;
         }
     };
 
@@ -575,10 +730,17 @@ pub async fn set_sre_agent_settings(
         if model.len() > 100 {
             return Err((StatusCode::BAD_REQUEST, "model name too long".to_string()));
         }
-        state.config_db.set_setting("sre_agent_model", model).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to save sre_agent_model");
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-        })?;
+        state
+            .config_db
+            .set_setting("sre_agent_model", model)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to save sre_agent_model");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save setting".to_string(),
+                )
+            })?;
         audit_setting("sre_agent_model", serde_json::json!(model)).await;
     }
 
@@ -586,13 +748,22 @@ pub async fn set_sre_agent_settings(
     if let Some(re_val) = body.get("reasoning_effort") {
         let re = re_val.as_str().unwrap_or("").trim();
         if !re.is_empty() && !SRE_AGENT_REASONING_LEVELS.contains(&re) {
-            return Err((StatusCode::BAD_REQUEST,
-                "invalid 'reasoning_effort' (expected minimal|low|medium|high)".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "invalid 'reasoning_effort' (expected minimal|low|medium|high)".to_string(),
+            ));
         }
-        state.config_db.set_setting("sre_agent_reasoning_effort", re).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to save sre_agent_reasoning_effort");
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-        })?;
+        state
+            .config_db
+            .set_setting("sre_agent_reasoning_effort", re)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to save sre_agent_reasoning_effort");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save setting".to_string(),
+                )
+            })?;
         audit_setting("sre_agent_reasoning_effort", serde_json::json!(re)).await;
     }
 
@@ -602,16 +773,25 @@ pub async fn set_sre_agent_settings(
     // dropped for non-reasoning ids) before re-serializing to the JSON setting.
     if let Some(am_val) = body.get("allowed_models") {
         let arr = am_val.as_array().ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "invalid 'allowed_models' (expected an array)".to_string())
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid 'allowed_models' (expected an array)".to_string(),
+            )
         })?;
         let mut normalized: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
         for item in arr {
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
             if id.is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "allowed_models: each model needs a non-empty 'id'".to_string()));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "allowed_models: each model needs a non-empty 'id'".to_string(),
+                ));
             }
             if id.len() > 100 {
-                return Err((StatusCode::BAD_REQUEST, "allowed_models: model id too long".to_string()));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "allowed_models: model id too long".to_string(),
+                ));
             }
             let reasoning: Vec<String> = if is_reasoning_model(id) {
                 let mut levels = Vec::new();
@@ -637,11 +817,21 @@ pub async fn set_sre_agent_settings(
             normalized.push(serde_json::json!({ "id": id, "reasoning": reasoning }));
         }
         let serialized = serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string());
-        state.config_db.set_setting("sre_agent_allowed_models", &serialized).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to save sre_agent_allowed_models");
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-        })?;
-        let model_ids: Vec<&str> = normalized.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str())).collect();
+        state
+            .config_db
+            .set_setting("sre_agent_allowed_models", &serialized)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to save sre_agent_allowed_models");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save setting".to_string(),
+                )
+            })?;
+        let model_ids: Vec<&str> = normalized
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .collect();
         audit_setting("sre_agent_allowed_models", serde_json::json!(model_ids)).await;
     }
 
@@ -659,12 +849,22 @@ pub async fn set_sre_agent_settings(
     // Optional `enabled` toggle: strictly a JSON bool when present.
     if let Some(enabled_val) = body.get("enabled") {
         let enabled = enabled_val.as_bool().ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "invalid 'enabled' (expected a boolean)".to_string())
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid 'enabled' (expected a boolean)".to_string(),
+            )
         })?;
-        state.config_db.set_setting("sre_agent_enabled", if enabled { "true" } else { "false" }).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to save sre_agent_enabled");
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-        })?;
+        state
+            .config_db
+            .set_setting("sre_agent_enabled", if enabled { "true" } else { "false" })
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to save sre_agent_enabled");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save setting".to_string(),
+                )
+            })?;
         audit_setting("sre_agent_enabled", serde_json::json!(enabled)).await;
         // Toggle-only update: budget fields are optional in this case.
         if body.get("max_tool_steps").is_none() && body.get("max_llm_calls").is_none() {
@@ -672,12 +872,24 @@ pub async fn set_sre_agent_settings(
         }
     }
 
-    let steps = body.get("max_tool_steps").and_then(|v| v.as_u64()).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "missing or invalid 'max_tool_steps' (expected a positive integer)".to_string())
-    })?;
-    let calls = body.get("max_llm_calls").and_then(|v| v.as_u64()).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "missing or invalid 'max_llm_calls' (expected a positive integer)".to_string())
-    })?;
+    let steps = body
+        .get("max_tool_steps")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing or invalid 'max_tool_steps' (expected a positive integer)".to_string(),
+            )
+        })?;
+    let calls = body
+        .get("max_llm_calls")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing or invalid 'max_llm_calls' (expected a positive integer)".to_string(),
+            )
+        })?;
 
     let steps = steps.clamp(4, 200);
     // LLM calls must exceed tool steps (retries/critique/summary need slack).
@@ -687,10 +899,17 @@ pub async fn set_sre_agent_settings(
         ("sre_agent_max_tool_steps", steps),
         ("sre_agent_max_llm_calls", calls),
     ] {
-        state.config_db.set_setting(key, &value.to_string()).await.map_err(|e| {
-            tracing::error!(error = %e, key, "failed to save sre-agent setting");
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to save setting".to_string())
-        })?;
+        state
+            .config_db
+            .set_setting(key, &value.to_string())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, key, "failed to save sre-agent setting");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save setting".to_string(),
+                )
+            })?;
     }
 
     // AUDIT: sre-agent budget update.
@@ -704,7 +923,9 @@ pub async fn set_sre_agent_settings(
             .context(crate::audit::actor_context_from_headers(&headers)),
     ).await;
 
-    Ok(Json(serde_json::json!({ "max_tool_steps": steps, "max_llm_calls": calls })))
+    Ok(Json(
+        serde_json::json!({ "max_tool_steps": steps, "max_llm_calls": calls }),
+    ))
 }
 
 /// GET /api/v1/sre-agent/options — any authenticated user (NOT admin-only).
@@ -716,11 +937,21 @@ pub async fn get_sre_agent_options(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
-    let allowed_raw = state.config_db.get_setting("sre_agent_allowed_models").await
-        .ok().flatten().unwrap_or_default();
+    let allowed_raw = state
+        .config_db
+        .get_setting("sre_agent_allowed_models")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let allowed_models = parse_allowed_models(&allowed_raw);
-    let default = state.config_db.get_setting("sre_agent_model").await
-        .ok().flatten().unwrap_or_default();
+    let default = state
+        .config_db
+        .get_setting("sre_agent_model")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let default_model = resolve_default_model(&default, &allowed_models);
     Ok(Json(serde_json::json!({
         "models": allowed_models,
@@ -747,7 +978,8 @@ pub async fn list_sre_agent_models(
         Some(k) => k,
         None => return Ok(fallback()),
     };
-    let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
+    let base_url =
+        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .get(&url)
@@ -776,7 +1008,9 @@ pub async fn list_sre_agent_models(
     if models.is_empty() {
         return Ok(fallback());
     }
-    Ok(Json(serde_json::json!({ "models": models, "source": "provider" })))
+    Ok(Json(
+        serde_json::json!({ "models": models, "source": "provider" }),
+    ))
 }
 
 /// Filter `/v1/models` ids down to chat-completions-capable models.
@@ -787,9 +1021,20 @@ fn is_chat_model(id: &str) -> bool {
         || m.starts_with("o1")
         || m.starts_with("o3")
         || m.starts_with("o4");
-    let excluded = ["embedding", "audio", "realtime", "transcribe", "tts", "whisper", "image", "moderation", "instruct", "search"]
-        .iter()
-        .any(|x| m.contains(x));
+    let excluded = [
+        "embedding",
+        "audio",
+        "realtime",
+        "transcribe",
+        "tts",
+        "whisper",
+        "image",
+        "moderation",
+        "instruct",
+        "search",
+    ]
+    .iter()
+    .any(|x| m.contains(x));
     chatty && !excluded
 }
 
@@ -814,14 +1059,17 @@ pub async fn delete_api_key(
     );
 
     // AUDIT: API key revoked/deleted.
-    state.audit.log(
-        crate::audit::AuditEvent::new("apikey.revoke", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("api_key", id.clone())
-            .description("api key revoked")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("apikey.revoke", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("api_key", id.clone())
+                .description("api key revoked")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

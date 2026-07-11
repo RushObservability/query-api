@@ -31,14 +31,22 @@ pub struct EvalState {
 
 impl EvalState {
     pub fn new(flush_every: u32) -> Self {
-        Self { map: HashMap::new(), flush_every: flush_every.max(1) }
+        Self {
+            map: HashMap::new(),
+            flush_every: flush_every.max(1),
+        }
     }
 
     /// In-memory due check. Combined with the engine's existing DB-side check
     /// this yields `max(db, mem) + interval <= now` semantics: a rule is due
     /// only when BOTH the (coarse) DB value and the (exact) in-memory value say
     /// the interval has elapsed. Unknown rules (fresh start) are due.
-    pub fn is_due(&self, rule_id: &str, now: chrono::DateTime<chrono::Utc>, interval_secs: i64) -> bool {
+    pub fn is_due(
+        &self,
+        rule_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        interval_secs: i64,
+    ) -> bool {
         match self.map.get(rule_id) {
             None => true,
             Some((last, _)) => (now - *last).num_seconds() >= interval_secs,
@@ -62,7 +70,11 @@ impl EvalState {
     pub fn record(&mut self, rule_id: String, now: chrono::DateTime<chrono::Utc>, persisted: bool) {
         let entry = self.map.entry(rule_id).or_insert((now, 0));
         entry.0 = now;
-        entry.1 = if persisted { 0 } else { entry.1.saturating_add(1) };
+        entry.1 = if persisted {
+            0
+        } else {
+            entry.1.saturating_add(1)
+        };
     }
 }
 
@@ -125,6 +137,9 @@ mod tests {
         let mut st = EvalState::new(0);
         let t0 = Utc::now();
         st.record("r1".into(), t0, false);
-        assert!(st.should_flush("r1"), "flush_every is clamped to at least 1");
+        assert!(
+            st.should_flush("r1"),
+            "flush_every is clamped to at least 1"
+        );
     }
 }

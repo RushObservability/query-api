@@ -10,7 +10,6 @@
 ///
 /// Replay:       `spawn_replayer` consumes the oldest segment every ~5 s,
 ///               retrying with exponential back-off up to 60 s.
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +17,10 @@ use clickhouse::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::models::ingest::{ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, RumReplayChunk, SumRow, SummaryRow, TraceInsertRow};
+use crate::models::ingest::{
+    ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, RumReplayChunk, SumRow, SummaryRow,
+    TraceInsertRow,
+};
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
 use crate::spool::{IngestBuffer, SpoolFull};
@@ -172,7 +174,10 @@ impl SpoolBatch {
             (SpoolBatch::ExpHistogram(a), SpoolBatch::ExpHistogram(b)) => a.extend(b),
             (SpoolBatch::Summary(a), SpoolBatch::Summary(b)) => a.extend(b),
             // Variant mismatch is a programming error (slots keep them apart).
-            _ => debug_assert!(false, "extend_from called with mismatched SpoolBatch variants"),
+            _ => debug_assert!(
+                false,
+                "extend_from called with mismatched SpoolBatch variants"
+            ),
         }
     }
 }
@@ -274,7 +279,10 @@ impl BatchConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(500u64);
-        BatchConfig { max_rows, max_age: Duration::from_millis(max_ms) }
+        BatchConfig {
+            max_rows,
+            max_age: Duration::from_millis(max_ms),
+        }
     }
 
     /// True when batching is effectively disabled (flush every write inline).
@@ -285,7 +293,10 @@ impl BatchConfig {
 
 impl Default for BatchConfig {
     fn default() -> Self {
-        BatchConfig { max_rows: 5_000, max_age: Duration::from_millis(500) }
+        BatchConfig {
+            max_rows: 5_000,
+            max_age: Duration::from_millis(500),
+        }
     }
 }
 
@@ -421,7 +432,11 @@ impl ChWriter {
             _ => 0,
         };
         if dropped > 0 {
-            tracing::debug!(dropped = dropped, table = batch.table(), "metric firewall blocked datapoints");
+            tracing::debug!(
+                dropped = dropped,
+                table = batch.table(),
+                "metric firewall blocked datapoints"
+            );
         }
     }
 
@@ -729,20 +744,50 @@ mod batch_tests {
 
     #[test]
     fn config_disabled_detection() {
-        assert!(BatchConfig { max_rows: 1, max_age: Duration::from_millis(500) }.disabled());
-        assert!(BatchConfig { max_rows: 5000, max_age: Duration::ZERO }.disabled());
-        assert!(BatchConfig { max_rows: 0, max_age: Duration::from_millis(500) }.disabled());
-        assert!(!BatchConfig { max_rows: 5000, max_age: Duration::from_millis(500) }.disabled());
+        assert!(
+            BatchConfig {
+                max_rows: 1,
+                max_age: Duration::from_millis(500)
+            }
+            .disabled()
+        );
+        assert!(
+            BatchConfig {
+                max_rows: 5000,
+                max_age: Duration::ZERO
+            }
+            .disabled()
+        );
+        assert!(
+            BatchConfig {
+                max_rows: 0,
+                max_age: Duration::from_millis(500)
+            }
+            .disabled()
+        );
+        assert!(
+            !BatchConfig {
+                max_rows: 5000,
+                max_age: Duration::from_millis(500)
+            }
+            .disabled()
+        );
     }
 
     #[tokio::test]
     async fn row_count_threshold_triggers_inline_flush() {
-        let acc = BatchAccumulator::new(BatchConfig { max_rows: 10, max_age: Duration::from_secs(60) });
+        let acc = BatchAccumulator::new(BatchConfig {
+            max_rows: 10,
+            max_age: Duration::from_secs(60),
+        });
         // Under threshold: buffered, nothing returned.
         assert!(acc.enqueue(gauge(4)).await.is_none());
         assert!(acc.enqueue(gauge(3)).await.is_none());
         // Crossing the threshold returns the coalesced batch (4+3+5 = 12 >= 10).
-        let due = acc.enqueue(gauge(5)).await.expect("should flush at threshold");
+        let due = acc
+            .enqueue(gauge(5))
+            .await
+            .expect("should flush at threshold");
         assert_eq!(due.len(), 12, "all buffered rows coalesce into one flush");
         // Slot is now empty again.
         assert!(acc.enqueue(gauge(1)).await.is_none());
@@ -750,35 +795,57 @@ mod batch_tests {
 
     #[tokio::test]
     async fn time_threshold_triggers_aged_flush() {
-        let acc = BatchAccumulator::new(BatchConfig { max_rows: 1_000_000, max_age: Duration::from_millis(20) });
-        assert!(acc.enqueue(gauge(3)).await.is_none(), "below row threshold → buffered");
+        let acc = BatchAccumulator::new(BatchConfig {
+            max_rows: 1_000_000,
+            max_age: Duration::from_millis(20),
+        });
+        assert!(
+            acc.enqueue(gauge(3)).await.is_none(),
+            "below row threshold → buffered"
+        );
         let slot = gauge(1).slot();
         // Not yet aged.
         assert!(acc.take_aged(slot, Instant::now()).await.is_none());
         // After max_age elapses, the buffer is due.
         let later = Instant::now() + Duration::from_millis(25);
-        let aged = acc.take_aged(slot, later).await.expect("should be due after max_age");
+        let aged = acc
+            .take_aged(slot, later)
+            .await
+            .expect("should be due after max_age");
         assert_eq!(aged.len(), 3);
         // Drained: no longer due.
-        assert!(acc.take_aged(slot, later + Duration::from_secs(1)).await.is_none());
+        assert!(
+            acc.take_aged(slot, later + Duration::from_secs(1))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn separate_tables_buffer_independently() {
-        let acc = BatchAccumulator::new(BatchConfig { max_rows: 5, max_age: Duration::from_secs(60) });
+        let acc = BatchAccumulator::new(BatchConfig {
+            max_rows: 5,
+            max_age: Duration::from_secs(60),
+        });
         assert!(acc.enqueue(gauge(3)).await.is_none());
         // Sum rows go to a different slot; gauge's 3 rows don't trip the sum slot.
         let sums = SpoolBatch::Sum(Vec::new());
         // (empty Sum batch just exercises slot independence; 3 gauge rows stay put)
         let _ = sums.slot();
-        assert!(acc.enqueue(gauge(1)).await.is_none(), "gauge still at 4 < 5");
+        assert!(
+            acc.enqueue(gauge(1)).await.is_none(),
+            "gauge still at 4 < 5"
+        );
         let due = acc.enqueue(gauge(1)).await.expect("gauge reaches 5");
         assert_eq!(due.len(), 5);
     }
 
     #[tokio::test]
     async fn drain_all_empties_every_slot() {
-        let acc = BatchAccumulator::new(BatchConfig { max_rows: 1_000_000, max_age: Duration::from_secs(60) });
+        let acc = BatchAccumulator::new(BatchConfig {
+            max_rows: 1_000_000,
+            max_age: Duration::from_secs(60),
+        });
         acc.enqueue(gauge(2)).await;
         acc.enqueue(SpoolBatch::Logs(Vec::new())).await; // empty, still creates a slot entry
         acc.enqueue(gauge(3)).await; // coalesces with first gauge → 5
@@ -802,7 +869,10 @@ mod batch_tests {
     fn spool_roundtrips_through_zstd_msgpack() {
         let batch = gauge(3);
         let encoded = encode_spool(&batch).expect("encode");
-        assert_eq!(encoded[0], SPOOL_FMT_MSGPACK_ZSTD, "new writes use the zstd-msgpack tag");
+        assert_eq!(
+            encoded[0], SPOOL_FMT_MSGPACK_ZSTD,
+            "new writes use the zstd-msgpack tag"
+        );
         let decoded = decode_spool(&encoded).expect("decode");
         assert!(same_batch(&batch, &decoded));
         assert_eq!(decoded.len(), 3);
@@ -813,7 +883,10 @@ mod batch_tests {
         // A payload written by the pre-change binary: raw serde_json, no tag byte.
         let batch = gauge(2);
         let legacy = serde_json::to_vec(&batch).unwrap();
-        assert_eq!(legacy[0], b'{', "legacy JSON starts with '{{', never a tag byte");
+        assert_eq!(
+            legacy[0], b'{',
+            "legacy JSON starts with '{{', never a tag byte"
+        );
         let decoded = decode_spool(&legacy).expect("legacy json still decodes");
         assert!(same_batch(&batch, &decoded));
     }
@@ -836,4 +909,3 @@ mod batch_tests {
         assert!(serde_json::from_slice::<serde_json::Value>(&encoded).is_err());
     }
 }
-

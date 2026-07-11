@@ -1,4 +1,4 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse, Extension};
+use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
 use clickhouse::Row;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -216,7 +216,11 @@ pub async fn get_stats(
     // granularity in the key so rolling UI ranges (recomputed each refresh) can
     // still hit within the TTL.
     let cache_key = match &req.time_range {
-        Some(tr) => format!("{tenant_id}|{}|{}", bucket_ts_15s(&tr.from), bucket_ts_15s(&tr.to)),
+        Some(tr) => format!(
+            "{tenant_id}|{}|{}",
+            bucket_ts_15s(&tr.from),
+            bucket_ts_15s(&tr.to)
+        ),
         None => format!("{tenant_id}|default"),
     };
     if let Some(entry) = STATS_CACHE.get(&cache_key) {
@@ -240,33 +244,53 @@ pub async fn get_stats(
 
     // ── Build all query futures ──
     // Combined total + rate in one query per signal to halve span/log round-trips.
-    let span_stats_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as total, count() / {range_secs} as rate \
+    let span_stats_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            "SELECT count() as total, count() / {range_secs} as rate \
          FROM spans \
          PREWHERE tenant_id = '{escaped_tenant}' \
            AND timestamp >= parseDateTimeBestEffort('{from}') \
            AND timestamp <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<TotalRateResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<TotalRateResult>();
 
-    let span_today_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as count FROM spans \
+    let span_today_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            "SELECT count() as count FROM spans \
          PREWHERE tenant_id = '{escaped_tenant}' AND toDate(timestamp) = '{today_start}'"
-    ), tenant_id).fetch_one::<CountResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<CountResult>();
 
-    let log_stats_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as total, count() / {range_secs} as rate \
+    let log_stats_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            "SELECT count() as total, count() / {range_secs} as rate \
          FROM logs \
          PREWHERE tenant_id = '{escaped_tenant}' \
            AND Timestamp >= parseDateTimeBestEffort('{from}') \
            AND Timestamp <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<TotalRateResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<TotalRateResult>();
 
-    let log_today_fut = crate::tenant_query(&state.ch, &format!(
-        // logs PARTITION BY TimestampDate — query the partition column directly so the
-        // predicate prunes to one partition (toDate(Timestamp) wouldn't match the key).
-        "SELECT count() as count FROM logs \
+    let log_today_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            // logs PARTITION BY TimestampDate — query the partition column directly so the
+            // predicate prunes to one partition (toDate(Timestamp) wouldn't match the key).
+            "SELECT count() as count FROM logs \
          PREWHERE tenant_id = '{escaped_tenant}' AND TimestampDate = '{today_start}'"
-    ), tenant_id).fetch_one::<CountResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<CountResult>();
 
     // Combined total + rate per metrics table (was two scans of the same window each).
     //
@@ -278,33 +302,57 @@ pub async fn get_stats(
     // every branch.
     let mg_count = metric_count_source("metrics_gauge", &from, &to, &escaped_tenant, &range_secs);
     let ms_count = metric_count_source("metrics_sum", &from, &to, &escaped_tenant, &range_secs);
-    let mg_stats_fut = crate::tenant_query(&state.ch, &mg_count, tenant_id).fetch_one::<TotalRateResult>();
-    let ms_stats_fut = crate::tenant_query(&state.ch, &ms_count, tenant_id).fetch_one::<TotalRateResult>();
+    let mg_stats_fut =
+        crate::tenant_query(&state.ch, &mg_count, tenant_id).fetch_one::<TotalRateResult>();
+    let ms_stats_fut =
+        crate::tenant_query(&state.ch, &ms_count, tenant_id).fetch_one::<TotalRateResult>();
 
-    let mh_total_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as count FROM metrics_histogram \
+    let mh_total_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            "SELECT count() as count FROM metrics_histogram \
          PREWHERE tenant_id = '{escaped_tenant}' \
            AND TimeUnix >= parseDateTimeBestEffort('{from}') \
            AND TimeUnix <= parseDateTimeBestEffort('{to}')"
-    ), tenant_id).fetch_one::<CountResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<CountResult>();
 
-    let mg_today_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as count FROM metrics_gauge \
+    let mg_today_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            "SELECT count() as count FROM metrics_gauge \
          PREWHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
-    ), tenant_id).fetch_one::<CountResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<CountResult>();
 
-    let ms_today_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT count() as count FROM metrics_sum \
+    let ms_today_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            "SELECT count() as count FROM metrics_sum \
          PREWHERE tenant_id = '{escaped_tenant}' AND toDate(TimeUnix) = '{today_start}'"
-    ), tenant_id).fetch_one::<CountResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<CountResult>();
 
-    let unique_series_fut = crate::tenant_query(&state.ch, &format!(
-        "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge \
+    let unique_series_fut = crate::tenant_query(
+        &state.ch,
+        &format!(
+            "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge \
          PREWHERE tenant_id = '{escaped_tenant}' AND TimeUnix >= now() - INTERVAL 1 HOUR"
-    ), tenant_id).fetch_one::<CountResult>();
+        ),
+        tenant_id,
+    )
+    .fetch_one::<CountResult>();
 
-    let storage_fut = state.ch.query(
-        "SELECT \
+    let storage_fut = state
+        .ch
+        .query(
+            "SELECT \
              p.table as table_name, \
              sum(p.rows) as total_rows, \
              sum(p.bytes_on_disk) as bytes_on_disk, \
@@ -316,61 +364,111 @@ pub async fn get_stats(
          LEFT JOIN system.disks AS d ON p.disk_name = d.name \
          WHERE p.database = 'observability' AND p.active \
          GROUP BY table_name \
-         ORDER BY bytes_on_disk DESC"
-    ).fetch_all::<TableStorage>();
+         ORDER BY bytes_on_disk DESC",
+        )
+        .fetch_all::<TableStorage>();
 
-    let usage_fut = state.ch.query(&format!(
-        "SELECT signal, sum(events_count) AS events, sum(bytes_count) AS bytes \
+    let usage_fut = state
+        .ch
+        .query(&format!(
+            "SELECT signal, sum(events_count) AS events, sum(bytes_count) AS bytes \
          FROM observability.tenant_usage \
          WHERE tenant_id = '{escaped_tenant}' AND bucket >= toStartOfDay(now()) \
          GROUP BY signal"
-    )).fetch_all::<UsageRow>();
+        ))
+        .fetch_all::<UsageRow>();
 
     // ── Fire all 12 queries concurrently ──
     let (
-        span_stats_res, span_today_res,
-        log_stats_res, log_today_res,
-        mg_stats_res, ms_stats_res, mh_total_res,
-        mg_today_res, ms_today_res,
+        span_stats_res,
+        span_today_res,
+        log_stats_res,
+        log_today_res,
+        mg_stats_res,
+        ms_stats_res,
+        mh_total_res,
+        mg_today_res,
+        ms_today_res,
         unique_series_res,
-        storage_res, usage_rows_res,
+        storage_res,
+        usage_rows_res,
     ) = tokio::join!(
-        span_stats_fut, span_today_fut,
-        log_stats_fut, log_today_fut,
-        mg_stats_fut, ms_stats_fut, mh_total_fut,
-        mg_today_fut, ms_today_fut,
+        span_stats_fut,
+        span_today_fut,
+        log_stats_fut,
+        log_today_fut,
+        mg_stats_fut,
+        ms_stats_fut,
+        mh_total_fut,
+        mg_today_fut,
+        ms_today_fut,
         unique_series_fut,
-        storage_fut, usage_fut,
+        storage_fut,
+        usage_fut,
     );
 
     // ── Unpack results (failures fall back to zero rather than failing the whole request) ──
-    let span_stats = span_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
+    let span_stats = span_stats_res.unwrap_or(TotalRateResult {
+        total: 0,
+        rate: 0.0,
+    });
     let span_today = span_today_res.map(|r| r.count).unwrap_or(0);
-    let log_stats = log_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
+    let log_stats = log_stats_res.unwrap_or(TotalRateResult {
+        total: 0,
+        rate: 0.0,
+    });
     let log_today = log_today_res.map(|r| r.count).unwrap_or(0);
-    let mg_stats = mg_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
-    let ms_stats = ms_stats_res.unwrap_or(TotalRateResult { total: 0, rate: 0.0 });
-    let metric_total = mg_stats.total
-        + ms_stats.total
-        + mh_total_res.map(|r| r.count).unwrap_or(0);
+    let mg_stats = mg_stats_res.unwrap_or(TotalRateResult {
+        total: 0,
+        rate: 0.0,
+    });
+    let ms_stats = ms_stats_res.unwrap_or(TotalRateResult {
+        total: 0,
+        rate: 0.0,
+    });
+    let metric_total = mg_stats.total + ms_stats.total + mh_total_res.map(|r| r.count).unwrap_or(0);
     let metric_rate = mg_stats.rate + ms_stats.rate;
-    let metric_today = mg_today_res.map(|r| r.count).unwrap_or(0)
-        + ms_today_res.map(|r| r.count).unwrap_or(0);
+    let metric_today =
+        mg_today_res.map(|r| r.count).unwrap_or(0) + ms_today_res.map(|r| r.count).unwrap_or(0);
     let unique_series = unique_series_res.map(|r| r.count).unwrap_or(0);
     let storage: Vec<TableStorage> = storage_res.unwrap_or_default();
     let usage_rows: Vec<UsageRow> = usage_rows_res.unwrap_or_default();
 
-    let mut usage_traces = UsageSignalStats { events_count: 0, bytes_count: 0 };
-    let mut usage_logs = UsageSignalStats { events_count: 0, bytes_count: 0 };
-    let mut usage_metrics = UsageSignalStats { events_count: 0, bytes_count: 0 };
-    let mut usage_rum = UsageSignalStats { events_count: 0, bytes_count: 0 };
+    let mut usage_traces = UsageSignalStats {
+        events_count: 0,
+        bytes_count: 0,
+    };
+    let mut usage_logs = UsageSignalStats {
+        events_count: 0,
+        bytes_count: 0,
+    };
+    let mut usage_metrics = UsageSignalStats {
+        events_count: 0,
+        bytes_count: 0,
+    };
+    let mut usage_rum = UsageSignalStats {
+        events_count: 0,
+        bytes_count: 0,
+    };
 
     for row in &usage_rows {
         match row.signal.as_str() {
-            "traces" => { usage_traces.events_count = row.events; usage_traces.bytes_count = row.bytes; }
-            "logs" => { usage_logs.events_count = row.events; usage_logs.bytes_count = row.bytes; }
-            "metrics" => { usage_metrics.events_count = row.events; usage_metrics.bytes_count = row.bytes; }
-            "rum" => { usage_rum.events_count = row.events; usage_rum.bytes_count = row.bytes; }
+            "traces" => {
+                usage_traces.events_count = row.events;
+                usage_traces.bytes_count = row.bytes;
+            }
+            "logs" => {
+                usage_logs.events_count = row.events;
+                usage_logs.bytes_count = row.bytes;
+            }
+            "metrics" => {
+                usage_metrics.events_count = row.events;
+                usage_metrics.bytes_count = row.bytes;
+            }
+            "rum" => {
+                usage_rum.events_count = row.events;
+                usage_rum.bytes_count = row.bytes;
+            }
             _ => {}
         }
     }
@@ -382,9 +480,13 @@ pub async fn get_stats(
     let object_store_enabled = match OBJECT_STORE_ENABLED.get() {
         Some(v) => *v,
         None => {
-            let probed = state.ch.query(
-                "SELECT count() AS count FROM system.disks WHERE type != 'Local'"
-            ).fetch_one::<CountResult>().await.map(|r| r.count > 0).unwrap_or(false);
+            let probed = state
+                .ch
+                .query("SELECT count() AS count FROM system.disks WHERE type != 'Local'")
+                .fetch_one::<CountResult>()
+                .await
+                .map(|r| r.count > 0)
+                .unwrap_or(false);
             *OBJECT_STORE_ENABLED.get_or_init(|| probed)
         }
     };
@@ -423,11 +525,13 @@ pub async fn get_stats(
     };
 
     // Cache the serialized response (same JSON the client receives).
-    let value = serde_json::to_value(&response)
-        .map_err(|e| {
-            tracing::error!(error = %e, handler = "get_stats", "response serialization failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "serialization failed".into())
-        })?;
+    let value = serde_json::to_value(&response).map_err(|e| {
+        tracing::error!(error = %e, handler = "get_stats", "response serialization failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization failed".into(),
+        )
+    })?;
     if STATS_CACHE.len() > STATS_CACHE_MAX {
         // Evict only expired entries first — clear() would also wipe hot entries.
         STATS_CACHE.retain(|_, v| v.1.elapsed() < STATS_CACHE_TTL);
@@ -497,8 +601,10 @@ pub async fn get_storage_partitions(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     crate::handlers::users::require_admin(&state, &headers).await?;
 
-    let rows = state.ch.query(
-        "SELECT \
+    let rows = state
+        .ch
+        .query(
+            "SELECT \
              p.table AS table, \
              p.partition AS partition, \
              sum(p.rows) AS rows, \
@@ -512,68 +618,92 @@ pub async fn get_storage_partitions(
            AND p.table IN ('logs','spans','metrics_gauge','metrics_sum','metrics_histogram', \
                            'metrics_exp_histogram','metrics_summary','rum','rum_replay') \
          GROUP BY table, partition \
-         ORDER BY table, partition DESC"
-    ).fetch_all::<PartitionRow>().await.map_err(|e| {
-        tracing::error!(error = %e, handler = "get_storage_partitions", "query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".to_string())
-    })?;
+         ORDER BY table, partition DESC",
+        )
+        .fetch_all::<PartitionRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, handler = "get_storage_partitions", "query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "query failed".to_string(),
+            )
+        })?;
 
     let tiering = &state.config.storage.tiering;
     let ret = &state.config.retention.defaults;
     let now = chrono::Utc::now().timestamp();
 
-    let partitions = rows.into_iter().map(|r| {
-        let (signal, move_days, retention_days) = match r.table.as_str() {
-            "logs" => ("logs", tiering.logs_move_after_days, ret.logs_days),
-            "spans" => ("traces", tiering.traces_move_after_days, ret.traces_days),
-            "rum" | "rum_replay" => ("traces", tiering.traces_move_after_days, ret.traces_days),
-            t if t.starts_with("metrics_") => ("metrics", tiering.metrics_move_after_days, ret.metrics_days),
-            _ => ("other", 0, 0),
-        };
-        let tier = if r.bytes_local > 0 && r.bytes_object_store > 0 {
-            "mixed"
-        } else if r.bytes_local == 0 && r.bytes_object_store > 0 {
-            "cold"
-        } else {
-            "local"
-        };
-        let delete_at = if r.delete_due_ts > 0 { Some(r.delete_due_ts as i64) } else { None };
-        // Estimate the move only while there's still hot data and tiering is on.
-        let move_at_estimate = if r.bytes_local > 0 && move_days > 0 {
-            chrono::NaiveDate::parse_from_str(&r.partition, "%Y-%m-%d").ok()
-                .and_then(|d| d.checked_add_days(chrono::Days::new(move_days as u64)))
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-                .map(|dt| dt.and_utc().timestamp())
-        } else {
-            None
-        };
-        PartitionStorage {
-            table: r.table,
-            signal: signal.to_string(),
-            partition: r.partition,
-            rows: r.rows,
-            bytes_total: r.bytes_total,
-            bytes_local: r.bytes_local,
-            bytes_object_store: r.bytes_object_store,
-            tier: tier.to_string(),
-            move_after_days: move_days,
-            retention_days,
-            delete_at,
-            move_at_estimate,
-        }
-    }).collect();
+    let partitions = rows
+        .into_iter()
+        .map(|r| {
+            let (signal, move_days, retention_days) = match r.table.as_str() {
+                "logs" => ("logs", tiering.logs_move_after_days, ret.logs_days),
+                "spans" => ("traces", tiering.traces_move_after_days, ret.traces_days),
+                "rum" | "rum_replay" => ("traces", tiering.traces_move_after_days, ret.traces_days),
+                t if t.starts_with("metrics_") => {
+                    ("metrics", tiering.metrics_move_after_days, ret.metrics_days)
+                }
+                _ => ("other", 0, 0),
+            };
+            let tier = if r.bytes_local > 0 && r.bytes_object_store > 0 {
+                "mixed"
+            } else if r.bytes_local == 0 && r.bytes_object_store > 0 {
+                "cold"
+            } else {
+                "local"
+            };
+            let delete_at = if r.delete_due_ts > 0 {
+                Some(r.delete_due_ts as i64)
+            } else {
+                None
+            };
+            // Estimate the move only while there's still hot data and tiering is on.
+            let move_at_estimate = if r.bytes_local > 0 && move_days > 0 {
+                chrono::NaiveDate::parse_from_str(&r.partition, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| d.checked_add_days(chrono::Days::new(move_days as u64)))
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .map(|dt| dt.and_utc().timestamp())
+            } else {
+                None
+            };
+            PartitionStorage {
+                table: r.table,
+                signal: signal.to_string(),
+                partition: r.partition,
+                rows: r.rows,
+                bytes_total: r.bytes_total,
+                bytes_local: r.bytes_local,
+                bytes_object_store: r.bytes_object_store,
+                tier: tier.to_string(),
+                move_after_days: move_days,
+                retention_days,
+                delete_at,
+                move_at_estimate,
+            }
+        })
+        .collect();
 
     let object_store_enabled = match OBJECT_STORE_ENABLED.get() {
         Some(v) => *v,
         None => {
-            let probed = state.ch.query(
-                "SELECT count() AS count FROM system.disks WHERE type != 'Local'"
-            ).fetch_one::<CountResult>().await.map(|r| r.count > 0).unwrap_or(false);
+            let probed = state
+                .ch
+                .query("SELECT count() AS count FROM system.disks WHERE type != 'Local'")
+                .fetch_one::<CountResult>()
+                .await
+                .map(|r| r.count > 0)
+                .unwrap_or(false);
             *OBJECT_STORE_ENABLED.get_or_init(|| probed)
         }
     };
 
-    Ok(Json(PartitionStorageResponse { object_store_enabled, now, partitions }))
+    Ok(Json(PartitionStorageResponse {
+        object_store_enabled,
+        now,
+        partitions,
+    }))
 }
 
 #[cfg(test)]

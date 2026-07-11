@@ -1,19 +1,18 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Extension,
 };
 
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
 use crate::models::ingest::RumReplayChunk;
-use crate::models::query::{TimeRange, Filter, FilterOp};
+use crate::models::query::{Filter, FilterOp, TimeRange};
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
-use crate::query_builder::{format_value, format_array_value, QueryClauses, sanitize_datetime};
+use crate::query_builder::{QueryClauses, format_array_value, format_value, sanitize_datetime};
 
 // ── Field resolver ──
 
@@ -96,9 +95,15 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) ->
         let mut all = Vec::with_capacity(conditions.len() + 1);
         all.push(scope);
         all.extend(conditions);
-        QueryClauses { prewhere: String::new(), where_clause: all.join(" AND ") }
+        QueryClauses {
+            prewhere: String::new(),
+            where_clause: all.join(" AND "),
+        }
     } else {
-        QueryClauses { prewhere: scope, where_clause: conditions.join(" AND ") }
+        QueryClauses {
+            prewhere: scope,
+            where_clause: conditions.join(" AND "),
+        }
     }
 }
 
@@ -189,7 +194,9 @@ pub struct RumQueryRequest {
     pub offset: u64,
 }
 
-fn default_limit() -> u64 { 100 }
+fn default_limit() -> u64 {
+    100
+}
 
 #[derive(Debug, serde::Serialize, clickhouse::Row, serde::Deserialize)]
 pub struct RumAppRow {
@@ -256,7 +263,8 @@ pub struct RumSessionRow {
 async fn rum_enabled(state: &AppState) -> bool {
     state
         .config_db
-        .get_setting("rum_enabled").await
+        .get_setting("rum_enabled")
+        .await
         .ok()
         .flatten()
         .map(|v| v != "false")
@@ -278,8 +286,10 @@ pub async fn ingest(
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
     // Build all rum rows and write via the durable writer.
-    let rum_rows: Vec<RumRecord> = payload.events.iter().map(|evt| {
-        RumRecord {
+    let rum_rows: Vec<RumRecord> = payload
+        .events
+        .iter()
+        .map(|evt| RumRecord {
             tenant_id: tenant_id.clone(),
             timestamp: evt.timestamp.unwrap_or(now_ns),
             app_name: meta.app_name.clone(),
@@ -312,13 +322,18 @@ pub async fn ingest(
             trace_id: evt.trace_id.clone(),
             span_id: evt.span_id.clone(),
             attributes: evt.attributes.clone(),
-        }
-    }).collect();
+        })
+        .collect();
 
-    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Rum(rum_rows)).await.map_err(|e| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
-    })?;
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Rum(rum_rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        })?;
 
     // Insert synthetic spans into spans for RUM events with trace IDs.
     // This allows clicking "View trace" on pageview events in the RUM dashboard.
@@ -335,53 +350,71 @@ pub async fn ingest(
             synthetic_spans = trace_events.len(),
             "creating synthetic spans in spans"
         );
-        let span_rows: Vec<WideEvent> = trace_events.iter().map(|evt| {
-            let ts = evt.timestamp.unwrap_or(now_ns);
-            let duration_ns = (evt.duration_ms * 1_000_000.0) as u64;
-            let attrs = serde_json::json!({
-                "rum.session_id": meta.session_id,
-                "rum.event_type": evt.event_type,
-                "browser.name": meta.browser_name,
-                "browser.version": meta.browser_version,
-                "os.name": meta.os_name,
-                "os.version": meta.os_version,
-                "device.type": meta.device_type,
-                "screen.width": meta.screen_width,
-                "screen.height": meta.screen_height,
-                "referrer": meta.referrer,
-            });
-            WideEvent {
-                tenant_id: tenant_id.clone(),
-                timestamp: ts,
-                trace_id: evt.trace_id.clone(),
-                span_id: evt.span_id.clone(),
-                parent_span_id: String::new(),
-                service_name: meta.app_name.clone(),
-                span_name: format!("pageview {}", meta.page_path),
-                kind: "CLIENT".to_string(),
-                status: "OK".to_string(),
-                duration_ns,
-                http_method: "GET".to_string(),
-                http_path: meta.page_path.clone(),
-                http_status_code: 200,
-                attributes: attrs.to_string(),
-                event_names: vec![],
-                event_timestamps: vec![],
-                event_attributes: vec![],
-                link_trace_ids: vec![],
-                link_span_ids: vec![],
-            }
-        }).collect();
+        let span_rows: Vec<WideEvent> = trace_events
+            .iter()
+            .map(|evt| {
+                let ts = evt.timestamp.unwrap_or(now_ns);
+                let duration_ns = (evt.duration_ms * 1_000_000.0) as u64;
+                let attrs = serde_json::json!({
+                    "rum.session_id": meta.session_id,
+                    "rum.event_type": evt.event_type,
+                    "browser.name": meta.browser_name,
+                    "browser.version": meta.browser_version,
+                    "os.name": meta.os_name,
+                    "os.version": meta.os_version,
+                    "device.type": meta.device_type,
+                    "screen.width": meta.screen_width,
+                    "screen.height": meta.screen_height,
+                    "referrer": meta.referrer,
+                });
+                WideEvent {
+                    tenant_id: tenant_id.clone(),
+                    timestamp: ts,
+                    trace_id: evt.trace_id.clone(),
+                    span_id: evt.span_id.clone(),
+                    parent_span_id: String::new(),
+                    service_name: meta.app_name.clone(),
+                    span_name: format!("pageview {}", meta.page_path),
+                    kind: "CLIENT".to_string(),
+                    status: "OK".to_string(),
+                    duration_ns,
+                    http_method: "GET".to_string(),
+                    http_path: meta.page_path.clone(),
+                    http_status_code: 200,
+                    attributes: attrs.to_string(),
+                    event_names: vec![],
+                    event_timestamps: vec![],
+                    event_attributes: vec![],
+                    link_trace_ids: vec![],
+                    link_span_ids: vec![],
+                }
+            })
+            .collect();
 
-        if let Err(e) = crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(span_rows)).await {
+        if let Err(e) = crate::handlers::ingest_gate::write_gated(
+            &state,
+            tenant_id,
+            SpoolBatch::Spans(span_rows),
+        )
+        .await
+        {
             tracing::error!(error = %e, signal = "rum", handler = "rum_ingest", "synthetic span write failed");
         } else {
-            tracing::debug!(signal = "rum", synthetic_spans = trace_events.len(), "synthetic spans committed");
+            tracing::debug!(
+                signal = "rum",
+                synthetic_spans = trace_events.len(),
+                "synthetic spans committed"
+            );
         }
     }
 
     // Record usage for per-tenant ingest metering — exact wire bytes received.
-    state.usage_accumulator.record(tenant_id, "rum", payload.events.len() as u64, body.len() as u64);
+    state.usage_accumulator.record(
+        tenant_id,
+        "rum",
+        payload.events.len() as u64,
+        body.len() as u64,
+    );
 
     tracing::info!(
         signal = "rum",
@@ -392,7 +425,10 @@ pub async fn ingest(
         "ingested RUM events"
     );
 
-    Ok((StatusCode::OK, Json(serde_json::json!({ "accepted": payload.events.len() }))))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "accepted": payload.events.len() })),
+    ))
 }
 
 /// GET /api/v1/rum/apps — list known apps
@@ -426,7 +462,12 @@ pub async fn query_events(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let clauses = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        tenant_id,
+    );
 
     let sql = format!(
         "SELECT tenant_id, Timestamp, AppName, AppVersion, Environment, SessionId, UserId, \
@@ -475,7 +516,12 @@ pub async fn vitals(
         op: FilterOp::Eq,
         value: serde_json::Value::String("web_vital".to_string()),
     });
-    let clauses = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(
+        &filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        tenant_id,
+    );
 
     let sql = format!(
         "SELECT \
@@ -509,7 +555,12 @@ pub async fn pages(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let clauses = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        tenant_id,
+    );
 
     let sql = format!(
         "SELECT \
@@ -551,7 +602,12 @@ pub async fn errors(
         op: FilterOp::Eq,
         value: serde_json::Value::String("error".to_string()),
     });
-    let clauses = build_rum_where(&filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(
+        &filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        tenant_id,
+    );
 
     let sql = format!(
         "SELECT \
@@ -588,7 +644,12 @@ pub async fn sessions(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let clauses = build_rum_where(&req.filters, &req.time_range.from, &req.time_range.to, tenant_id);
+    let clauses = build_rum_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        tenant_id,
+    );
 
     let sql = format!(
         "SELECT \
@@ -688,7 +749,10 @@ pub async fn list_replay_sessions(
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<ReplaySessionRow>()
         .await
-        .map_err(|e| { tracing::error!(error = %e, "query failed"); (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into()) })?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
     let ids: Vec<String> = rows.into_iter().map(|r| r.session_id).collect();
     Ok(Json(serde_json::json!({ "session_ids": ids })))
 }
@@ -725,8 +789,17 @@ pub async fn ingest_replay(
         events_json,
     };
 
-    crate::handlers::ingest_gate::write_gated(&state, &tenant.tenant_id, SpoolBatch::RumReplay(vec![row])).await.map_err(|e| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+    crate::handlers::ingest_gate::write_gated(
+        &state,
+        &tenant.tenant_id,
+        SpoolBatch::RumReplay(vec![row]),
+    )
+    .await
+    .map_err(|e| match e {
+        WriteError::Backpressure => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+        ),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 

@@ -90,7 +90,10 @@ fn api_resource(group: &str, version: &str, kind: &str, plural: &str) -> ApiReso
 }
 
 fn s(v: &Value, ptr: &str) -> String {
-    v.pointer(ptr).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    v.pointer(ptr)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 fn i(v: &Value, ptr: &str) -> i64 {
     v.pointer(ptr).and_then(|x| x.as_i64()).unwrap_or(0)
@@ -114,7 +117,9 @@ fn creation_ts(o: &DynamicObject) -> String {
 fn pod_status(d: &Value) -> (String, String, i64, bool) {
     // returns (ready "x/y", status_text, restarts, unhealthy)
     let phase = s(d, "/status/phase");
-    let cs = d.pointer("/status/containerStatuses").and_then(|v| v.as_array());
+    let cs = d
+        .pointer("/status/containerStatuses")
+        .and_then(|v| v.as_array());
     let (mut ready, mut total, mut restarts) = (0i64, 0i64, 0i64);
     let mut waiting_reason = String::new();
     if let Some(arr) = cs {
@@ -184,7 +189,10 @@ fn summarise(kind: &str, o: &DynamicObject) -> Value {
         }
         "jobs" => {
             let succeeded = i(d, "/status/succeeded");
-            let completions = d.pointer("/spec/completions").and_then(|v| v.as_i64()).unwrap_or(1);
+            let completions = d
+                .pointer("/spec/completions")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1);
             let failed = i(d, "/status/failed");
             unhealthy = failed > 0;
             json!({ "completions": format!("{succeeded}/{completions}"), "active": i(d, "/status/active").to_string(), "failed": failed.to_string() })
@@ -193,39 +201,77 @@ fn summarise(kind: &str, o: &DynamicObject) -> Value {
             json!({ "schedule": s(d, "/spec/schedule"), "suspend": d.pointer("/spec/suspend").and_then(|v| v.as_bool()).unwrap_or(false).to_string(), "active": d.pointer("/status/active").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0).to_string(), "last_schedule": s(d, "/status/lastScheduleTime") })
         }
         "services" => {
-            let ports = d.pointer("/spec/ports").and_then(|v| v.as_array()).map(|a| {
-                a.iter().map(|p| {
-                    let port = p.get("port").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
-                    format!("{port}/{proto}")
-                }).collect::<Vec<_>>().join(", ")
-            }).unwrap_or_default();
+            let ports = d
+                .pointer("/spec/ports")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|p| {
+                            let port = p.get("port").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
+                            format!("{port}/{proto}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
             json!({ "type": s(d, "/spec/type"), "cluster_ip": s(d, "/spec/clusterIP"), "ports": ports })
         }
         "ingresses" => {
-            let hosts = d.pointer("/spec/rules").and_then(|v| v.as_array()).map(|a| {
-                a.iter().filter_map(|r| r.get("host").and_then(|h| h.as_str())).collect::<Vec<_>>().join(", ")
-            }).unwrap_or_default();
-            let addr = d.pointer("/status/loadBalancer/ingress/0/ip").and_then(|v| v.as_str())
-                .or_else(|| d.pointer("/status/loadBalancer/ingress/0/hostname").and_then(|v| v.as_str()))
-                .unwrap_or("").to_string();
+            let hosts = d
+                .pointer("/spec/rules")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|r| r.get("host").and_then(|h| h.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let addr = d
+                .pointer("/status/loadBalancer/ingress/0/ip")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    d.pointer("/status/loadBalancer/ingress/0/hostname")
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
             json!({ "class": s(d, "/spec/ingressClassName"), "hosts": hosts, "address": addr })
         }
         "configmaps" => {
-            let keys = d.get("data").and_then(|v| v.as_object()).map(|m| m.len()).unwrap_or(0);
+            let keys = d
+                .get("data")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len())
+                .unwrap_or(0);
             json!({ "keys": keys.to_string() })
         }
         "secrets" => {
             // keys/count only — never values
-            let keys = d.get("data").and_then(|v| v.as_object()).map(|m| m.len()).unwrap_or(0);
+            let keys = d
+                .get("data")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len())
+                .unwrap_or(0);
             json!({ "type": s(d, "/type"), "keys": keys.to_string() })
         }
         "nodes" => {
             let ready = node_ready(d);
             unhealthy = !ready;
-            let roles = o.metadata.labels.as_ref().map(|l| {
-                l.keys().filter_map(|k| k.strip_prefix("node-role.kubernetes.io/")).filter(|r| !r.is_empty()).collect::<Vec<_>>().join(",")
-            }).filter(|s| !s.is_empty()).unwrap_or_else(|| "<none>".into());
+            let roles = o
+                .metadata
+                .labels
+                .as_ref()
+                .map(|l| {
+                    l.keys()
+                        .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
+                        .filter(|r| !r.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "<none>".into());
             json!({ "status": if ready { "Ready" } else { "NotReady" }, "roles": roles, "version": s(d, "/status/nodeInfo/kubeletVersion") })
         }
         "namespaces" => {
@@ -236,7 +282,11 @@ fn summarise(kind: &str, o: &DynamicObject) -> Value {
         "events" => {
             let etype = s(d, "/type");
             unhealthy = etype == "Warning";
-            let obj = format!("{}/{}", s(d, "/involvedObject/kind"), s(d, "/involvedObject/name"));
+            let obj = format!(
+                "{}/{}",
+                s(d, "/involvedObject/kind"),
+                s(d, "/involvedObject/name")
+            );
             json!({ "type": etype, "reason": s(d, "/reason"), "object": obj, "message": s(d, "/message"), "count": i(d, "/count").to_string() })
         }
         _ => json!({}),
@@ -266,7 +316,12 @@ async fn list_kind(
     api.list(&ListParams::default())
         .await
         .map(|l| l.items)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list {kind}: {e}")))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to list {kind}: {e}"),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -296,9 +351,14 @@ pub async fn summary(
         }
     }
 
-    let namespaces = list_kind(&client, "namespaces", None).await.unwrap_or_default();
+    let namespaces = list_kind(&client, "namespaces", None)
+        .await
+        .unwrap_or_default();
     let events = list_kind(&client, "events", None).await.unwrap_or_default();
-    let warnings = events.iter().filter(|e| s(&e.data, "/type") == "Warning").count();
+    let warnings = events
+        .iter()
+        .filter(|e| s(&e.data, "/type") == "Warning")
+        .count();
 
     Ok(Json(json!({
         "nodes_ready": nodes_ready,
@@ -372,10 +432,12 @@ pub async fn get_resource(
     } else {
         Api::all_with(client.clone(), &ar)
     };
-    let obj = api
-        .get(&name)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{kind} '{name}' not found: {e}")))?;
+    let obj = api.get(&name).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("{kind} '{name}' not found: {e}"),
+        )
+    })?;
 
     let d = &obj.data;
     let summary = summarise(&kind, &obj);

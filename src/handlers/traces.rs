@@ -1,15 +1,14 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Extension,
 };
 use std::collections::HashMap;
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::models::trace::{nanos_to_string, SpanEvent, SpanNode, TraceResponse, WideEvent};
+use crate::models::trace::{SpanEvent, SpanNode, TraceResponse, WideEvent, nanos_to_string};
 
 pub async fn get_trace(
     State(state): State<AppState>,
@@ -39,18 +38,18 @@ pub async fn get_trace(
     }
 
     let bounds = crate::tenant_query(
-            &state.ch,
-            &format!(
-                "SELECT min(toUnixTimestamp64Nano(timestamp)) AS min_ns, \
+        &state.ch,
+        &format!(
+            "SELECT min(toUnixTimestamp64Nano(timestamp)) AS min_ns, \
                  max(toUnixTimestamp64Nano(timestamp)) AS max_ns, count() AS cnt \
                  FROM spans_by_trace \
                  PREWHERE tenant_id = '{escaped_tenant}' WHERE trace_id = ?"
-            ),
-            tenant_id,
-        )
-        .bind(&trace_id)
-        .fetch_one::<TraceTimeBounds>()
-        .await;
+        ),
+        tenant_id,
+    )
+    .bind(&trace_id)
+    .fetch_one::<TraceTimeBounds>()
+    .await;
 
     // Time bound for the spans fetch, when the MV knows the trace. lo/hi are
     // server-computed i64 nanoseconds (not user input). ±5 min pad for clock skew.
@@ -59,7 +58,9 @@ pub async fn get_trace(
         Ok(b) if b.cnt > 0 => {
             let lo = b.min_ns.saturating_sub(PAD_NS);
             let hi = b.max_ns.saturating_add(PAD_NS);
-            format!(" AND timestamp >= fromUnixTimestamp64Nano({lo}) AND timestamp <= fromUnixTimestamp64Nano({hi})")
+            format!(
+                " AND timestamp >= fromUnixTimestamp64Nano({lo}) AND timestamp <= fromUnixTimestamp64Nano({hi})"
+            )
         }
         Ok(_) => String::new(),
         Err(e) => {
@@ -130,11 +131,7 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
-                    let ts = e
-                        .event_timestamps
-                        .get(i)
-                        .copied()
-                        .unwrap_or_default();
+                    let ts = e.event_timestamps.get(i).copied().unwrap_or_default();
                     let attrs: serde_json::Value = e
                         .event_attributes
                         .get(i)
@@ -169,13 +166,15 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
     let span_count = nodes.len();
 
     // Collect services and max duration before taking ownership
-    let mut services: Vec<String> = nodes.iter()
+    let mut services: Vec<String> = nodes
+        .iter()
         .filter_map(|n| n.as_ref().map(|n| n.service_name.clone()))
         .collect();
     services.sort_unstable();
     services.dedup();
 
-    let total_duration = nodes.iter()
+    let total_duration = nodes
+        .iter()
         .filter_map(|n| n.as_ref().map(|n| n.duration_ns))
         .max()
         .unwrap_or(0);

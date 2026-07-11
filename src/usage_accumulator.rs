@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use clickhouse::Client;
 use dashmap::DashMap;
+use std::sync::Arc;
 
 /// Accumulates ingest counts in memory, flushes to ClickHouse every 10 seconds.
 /// Uses DashMap for lock-free concurrent writes from ingest handlers.

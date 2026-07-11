@@ -54,24 +54,33 @@ pub async fn login(
         } else {
             (count + 1, window_start)
         };
-        state.login_limiter.insert(rate_key, (new_count, new_window));
+        state
+            .login_limiter
+            .insert(rate_key, (new_count, new_window));
         if new_count > 10 {
             // AUDIT: rate-limit lockout. Awaited (low volume) — the audit logger
             // swallows its own errors so this never affects the response.
-            state.audit.log(
-                crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
-                    .actor_name(req.username.clone())
-                    .outcome("failure")
-                    .description("login rate limit exceeded")
-                    .context(crate::audit::actor_context_from_headers(&headers)),
-            ).await;
-            return Err((StatusCode::TOO_MANY_REQUESTS, "too many login attempts, try again later".to_string()));
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
+                        .actor_name(req.username.clone())
+                        .outcome("failure")
+                        .description("login rate limit exceeded")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many login attempts, try again later".to_string(),
+            ));
         }
     }
 
     let (user_id, username, display_name, tenant_id, role) = match state
         .config_db
-        .authenticate(&req.username, &req.password).await
+        .authenticate(&req.username, &req.password)
+        .await
     {
         Some(u) => u,
         None => {
@@ -83,13 +92,16 @@ pub async fn login(
             );
             // AUDIT: failed login. Actor is anonymous (unauthenticated); record
             // the attempted username so the trail shows who was targeted.
-            state.audit.log(
-                crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
-                    .actor_name(req.username.clone())
-                    .outcome("failure")
-                    .description("invalid username or password")
-                    .context(crate::audit::actor_context_from_headers(&headers)),
-            ).await;
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                        .actor_name(req.username.clone())
+                        .outcome("failure")
+                        .description("invalid username or password")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "invalid username or password".to_string(),
@@ -99,8 +111,14 @@ pub async fn login(
 
     let token = state
         .config_db
-        .create_session(&user_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}")))?;
+        .create_session(&user_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("session error: {e}"),
+            )
+        })?;
 
     tracing::info!(
         event = "login",
@@ -113,22 +131,22 @@ pub async fn login(
 
     // AUDIT: successful login. `tenant_id` is the user's actual (affected)
     // tenant — the row itself still lives in observability.audit_events.
-    state.audit.log(
-        crate::audit::AuditEvent::new("auth.login.success", "user")
-            .actor(user_id.clone(), username.clone())
-            .tenant(tenant_id.clone())
-            .outcome("success")
-            .description("user authenticated (local)")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("auth.login.success", "user")
+                .actor(user_id.clone(), username.clone())
+                .tenant(tenant_id.clone())
+                .outcome("success")
+                .description("user authenticated (local)")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     let cookie = session_cookie(&token, 86400);
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
-        cookie.parse().unwrap(),
-    );
+    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
 
     Ok((
         headers,
@@ -147,10 +165,7 @@ pub async fn login(
 /// POST /api/v1/auth/logout
 ///
 /// Reads the `rush_session` cookie, deletes that session, and clears the cookie.
-pub async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(token) = extract_session_cookie(&headers) {
         state.config_db.delete_session(&token).await;
     }
@@ -158,10 +173,7 @@ pub async fn logout(
     let clear_cookie = session_cookie("", 0);
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        header::SET_COOKIE,
-        clear_cookie.parse().unwrap(),
-    );
+    resp_headers.insert(header::SET_COOKIE, clear_cookie.parse().unwrap());
 
     (resp_headers, Json(serde_json::json!({ "ok": true })))
 }
@@ -174,13 +186,13 @@ pub async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let token = extract_session_cookie(&headers).ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, "not authenticated".to_string())
-    })?;
+    let token = extract_session_cookie(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
 
     let (user_id, username, display_name, tenant_id, role) = state
         .config_db
-        .get_session_user(&token).await
+        .get_session_user(&token)
+        .await
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -215,7 +227,9 @@ fn session_cookie(token: &str, max_age: i64) -> String {
     if insecure {
         format!("rush_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
     } else {
-        format!("__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}")
+        format!(
+            "__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}"
+        )
     }
 }
 
@@ -223,7 +237,10 @@ pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie_header.split(';') {
         let part = part.trim();
-        if let Some(value) = part.strip_prefix("__Host-rush_session=").or_else(|| part.strip_prefix("rush_session=")) {
+        if let Some(value) = part
+            .strip_prefix("__Host-rush_session=")
+            .or_else(|| part.strip_prefix("rush_session="))
+        {
             let value = value.trim();
             if !value.is_empty() {
                 return Some(value.to_string());

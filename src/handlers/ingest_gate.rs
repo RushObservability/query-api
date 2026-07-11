@@ -40,7 +40,9 @@ pub async fn write_gated(
     if !state.config_db.tenant_signal_enabled(tenant_id, cat).await {
         // Accepted-but-dropped: no error to the sender, but count it so the
         // tenant-signals endpoint can surface the blocked volume.
-        state.usage_accumulator.record_dropped(tenant_id, cat, n as u64, 0);
+        state
+            .usage_accumulator
+            .record_dropped(tenant_id, cat, n as u64, 0);
         record_ingest(state, signal, "dropped", n as u64, bytes);
         tracing::debug!(
             tenant_id = %tenant_id,
@@ -70,8 +72,18 @@ pub async fn write_gated(
 }
 
 /// Record one ingest outcome into the self-metrics registry (counters only — cheap).
-fn record_ingest(state: &AppState, signal: &'static str, outcome: &'static str, events: u64, bytes: u64) {
+fn record_ingest(
+    state: &AppState,
+    signal: &'static str,
+    outcome: &'static str,
+    events: u64,
+    bytes: u64,
+) {
     let labels = [("signal", signal), ("outcome", outcome)];
-    state.self_metrics.inc_counter("rush_ingest_events_total", &labels, events);
-    state.self_metrics.inc_counter("rush_ingest_bytes_total", &labels, bytes);
+    state
+        .self_metrics
+        .inc_counter("rush_ingest_events_total", &labels, events);
+    state
+        .self_metrics
+        .inc_counter("rush_ingest_bytes_total", &labels, bytes);
 }

@@ -153,7 +153,10 @@ impl RushConfig {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
-            tracing::info!("config file not found at {}, using defaults", path.display());
+            tracing::info!(
+                "config file not found at {}, using defaults",
+                path.display()
+            );
             return Ok(Self::default());
         }
         let contents = std::fs::read_to_string(path)?;

@@ -55,8 +55,7 @@ impl From<DetectionRule> for DetectionRuleResponse {
             severity: r.severity,
             window_secs: r.window_secs,
             enabled: r.enabled,
-            channels: serde_json::from_str(&r.channels)
-                .unwrap_or(serde_json::json!([])),
+            channels: serde_json::from_str(&r.channels).unwrap_or(serde_json::json!([])),
             created_by: r.created_by,
             last_eval_at: r.last_eval_at,
             last_triggered_at: r.last_triggered_at,

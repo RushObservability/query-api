@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use crate::clickhouse_config::ConfigDb;
 use crate::models::detection::DetectionRule;
 use clickhouse::Client;
+use std::sync::Arc;
 
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct CountRow {
@@ -16,17 +16,26 @@ const EVAL_FLUSH_EVERY: u32 = 10;
 
 /// Spawn the SIEM detection engine as a background task.
 /// Runs every 60 seconds, evaluating all enabled detection rules that are due.
-pub fn spawn(ch: Client, config_db: Arc<ConfigDb>, self_metrics: Arc<crate::self_metrics::SelfMetrics>) {
+pub fn spawn(
+    ch: Client,
+    config_db: Arc<ConfigDb>,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
-        tracing::info!(engine = "siem", interval_secs = 60, "detection engine started");
+        tracing::info!(
+            engine = "siem",
+            interval_secs = 60,
+            "detection engine started"
+        );
 
         let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
             let start = std::time::Instant::now();
-            let ok = match run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state).await {
+            let ok = match run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state).await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(error = %e, engine = "siem", "detection cycle failed");
@@ -71,24 +80,35 @@ async fn run_detection_cycle(
     let evaluated = jobs.len() as u32;
     let now_str_ref = now_str.as_str();
 
-    let outcomes: Vec<(String, bool, bool)> = futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
-        match evaluate_rule(ch, config_db, http_client, &rule, &now, now_str_ref, should_flush).await {
-            Ok((did_fire, persisted)) => (rule.id, did_fire, persisted),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    engine = "siem",
-                    rule_name = %rule.name,
-                    rule_id = %rule.id,
-                    "rule evaluation failed"
-                );
-                (rule.id, false, false)
+    let outcomes: Vec<(String, bool, bool)> =
+        futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
+            match evaluate_rule(
+                ch,
+                config_db,
+                http_client,
+                &rule,
+                &now,
+                now_str_ref,
+                should_flush,
+            )
+            .await
+            {
+                Ok((did_fire, persisted)) => (rule.id, did_fire, persisted),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        engine = "siem",
+                        rule_name = %rule.name,
+                        rule_id = %rule.id,
+                        "rule evaluation failed"
+                    );
+                    (rule.id, false, false)
+                }
             }
-        }
-    }))
-    .buffer_unordered(ENGINE_CONCURRENCY)
-    .collect()
-    .await;
+        }))
+        .buffer_unordered(ENGINE_CONCURRENCY)
+        .collect()
+        .await;
 
     let mut fired = 0u32;
     for (id, did_fire, persisted) in outcomes {
@@ -117,7 +137,9 @@ fn is_rule_due(rule: &DetectionRule, now: &chrono::DateTime<chrono::Utc>) -> boo
         None => true, // never evaluated
         Some(last_eval) => {
             let parsed = chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%SZ")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%S%.fZ"));
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%S%.fZ")
+                });
             match parsed {
                 Ok(dt) => {
                     let last_eval_utc = dt.and_utc();
@@ -169,7 +191,9 @@ async fn evaluate_rule(
          SETTINGS max_execution_time = 10"
     );
 
-    let row = crate::tenant_query(ch, &count_sql, &rule.tenant_id).fetch_one::<CountRow>().await?;
+    let row = crate::tenant_query(ch, &count_sql, &rule.tenant_id)
+        .fetch_one::<CountRow>()
+        .await?;
     let match_count = row.count as i64;
     let did_fire = match_count >= rule.threshold;
 
@@ -177,13 +201,17 @@ async fn evaluate_rule(
         // Fires persist last_triggered_at immediately, from the rule row we
         // already hold (no SELECT…FINAL re-read).
         fire_detection(config_db, http_client, rule, match_count, "[]", now_str).await;
-        config_db.persist_detection_rule_eval(rule, now_str, Some(now_str)).await?;
+        config_db
+            .persist_detection_rule_eval(rule, now_str, Some(now_str))
+            .await?;
         return Ok((true, true));
     }
 
     // No fire: only flush last_eval_at on the coarse cadence.
     if should_flush {
-        config_db.persist_detection_rule_eval(rule, now_str, None).await?;
+        config_db
+            .persist_detection_rule_eval(rule, now_str, None)
+            .await?;
         return Ok((false, true));
     }
 
@@ -251,8 +279,8 @@ fn parse_cte_names(sql: &str) -> std::collections::HashSet<String> {
                 ci += 1;
             } else {
                 let rest = &lower[byte_pos..];
-                let prev_is_boundary = ci == 0
-                    || matches!(chars[ci - 1].1, ' ' | '\n' | '\t' | '\r' | '(' | ',');
+                let prev_is_boundary =
+                    ci == 0 || matches!(chars[ci - 1].1, ' ' | '\n' | '\t' | '\r' | '(' | ',');
                 if prev_is_boundary
                     && (rest.starts_with("with ")
                         || rest.starts_with("with\n")
@@ -475,13 +503,16 @@ fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
         }
 
         // Identify keyword/identifier tokens at a word boundary.
-        let prev_is_boundary = ci == 0
-            || !(chars[ci - 1].1.is_alphanumeric() || chars[ci - 1].1 == '_');
+        let prev_is_boundary =
+            ci == 0 || !(chars[ci - 1].1.is_alphanumeric() || chars[ci - 1].1 == '_');
 
         // WHERE handling.
         let rest = &lower[byte_pos..];
         if prev_is_boundary
-            && (rest.starts_with("where ") || rest.starts_with("where\n") || rest.starts_with("where\t") || rest.starts_with("where\r"))
+            && (rest.starts_with("where ")
+                || rest.starts_with("where\n")
+                || rest.starts_with("where\t")
+                || rest.starts_with("where\r"))
             && ci + 6 <= n
         {
             collecting_from = None;
@@ -489,8 +520,7 @@ fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
 
             // Decide whether to inject for this WHERE based on depth's FROM list.
             let tables = &from_tables[depth];
-            let skip = !tables.is_empty()
-                && tables.iter().all(|t| cte_names.contains(t));
+            let skip = !tables.is_empty() && tables.iter().all(|t| cte_names.contains(t));
 
             // Push "WHERE " from original SQL preserving the caller's case.
             result.push_str(&sql[byte_pos..byte_pos + 6]);
@@ -505,7 +535,11 @@ fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
 
         // FROM / JOIN start collecting table identifiers at the current depth.
         if prev_is_boundary
-            && (rest.starts_with("from ") || rest.starts_with("from\n") || rest.starts_with("from\t") || rest.starts_with("from\r") || rest.starts_with("from("))
+            && (rest.starts_with("from ")
+                || rest.starts_with("from\n")
+                || rest.starts_with("from\t")
+                || rest.starts_with("from\r")
+                || rest.starts_with("from("))
         {
             // New FROM clause at this depth: reset its table list.
             from_tables[depth].clear();
@@ -516,7 +550,11 @@ fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
             continue;
         }
         if prev_is_boundary
-            && (rest.starts_with("join ") || rest.starts_with("join\n") || rest.starts_with("join\t") || rest.starts_with("join\r") || rest.starts_with("join("))
+            && (rest.starts_with("join ")
+                || rest.starts_with("join\n")
+                || rest.starts_with("join\t")
+                || rest.starts_with("join\r")
+                || rest.starts_with("join("))
         {
             collecting_from = Some(depth);
             expect_alias_skip = false;
@@ -526,10 +564,7 @@ fn inject_tenant_filter(sql: &str, tenant_id: &str) -> String {
         }
 
         // If we are collecting FROM-table identifiers, process tokens.
-        if collecting_from == Some(depth)
-            && prev_is_boundary
-            && (ch.is_alphabetic() || ch == '_')
-        {
+        if collecting_from == Some(depth) && prev_is_boundary && (ch.is_alphabetic() || ch == '_') {
             // Read the identifier token.
             let id_start = byte_pos;
             let mut j = ci;
@@ -628,14 +663,17 @@ async fn fire_detection(
         "detection rule fired"
     );
 
-    if let Err(e) = config_db.create_detection_event(
-        &event_id,
-        &rule.id,
-        &rule.tenant_id,
-        &rule.severity,
-        match_count,
-        sample_data,
-    ).await {
+    if let Err(e) = config_db
+        .create_detection_event(
+            &event_id,
+            &rule.id,
+            &rule.tenant_id,
+            &rule.severity,
+            match_count,
+            sample_data,
+        )
+        .await
+    {
         tracing::error!(error = %e, engine = "siem", rule_name = %rule.name, "failed to create detection event");
     }
 
@@ -657,7 +695,11 @@ async fn fire_detection(
 
             match channel.channel_type.as_str() {
                 "slack" => {
-                    if let Some(url) = config.get("url").or_else(|| config.get("webhook_url")).and_then(|u| u.as_str()) {
+                    if let Some(url) = config
+                        .get("url")
+                        .or_else(|| config.get("webhook_url"))
+                        .and_then(|u| u.as_str())
+                    {
                         let payload = serde_json::json!({ "text": message });
                         if let Err(e) = crate::outbound::post_json(url, &payload).await {
                             tracing::warn!(error = %e, engine = "siem", rule_name = %rule.name, channel = "slack", "notification failed");
@@ -706,7 +748,9 @@ pub async fn test_detection_query(
          SETTINGS max_execution_time = 10"
     );
 
-    let row = crate::tenant_query(ch, &count_sql, tenant_id).fetch_one::<CountRow>().await?;
+    let row = crate::tenant_query(ch, &count_sql, tenant_id)
+        .fetch_one::<CountRow>()
+        .await?;
     Ok((row.count, count_sql))
 }
 
@@ -742,7 +786,8 @@ mod tests {
     #[test]
     fn test_build_scoped_query_replaces_placeholders() {
         let sql = "SELECT count() FROM logs WHERE Timestamp BETWEEN @window_start AND @window_end";
-        let result = build_scoped_query(sql, "default", "2024-01-01 00:00:00", "2024-01-01 00:05:00");
+        let result =
+            build_scoped_query(sql, "default", "2024-01-01 00:00:00", "2024-01-01 00:05:00");
         assert!(result.contains("'2024-01-01 00:00:00'"));
         assert!(result.contains("'2024-01-01 00:05:00'"));
         assert!(result.contains("tenant_id = 'default'"));
@@ -756,8 +801,15 @@ mod tests {
         let sql = "SELECT count() FROM logs WHERE Body LIKE 'show where errors occurred'";
         let result = inject_tenant_filter(sql, "sec");
         // Should inject exactly once (the real WHERE), not twice
-        assert_eq!(result.matches("tenant_id = 'sec'").count(), 1, "got: {result}");
-        assert!(result.contains("show where errors occurred"), "string literal mangled: {result}");
+        assert_eq!(
+            result.matches("tenant_id = 'sec'").count(),
+            1,
+            "got: {result}"
+        );
+        assert!(
+            result.contains("show where errors occurred"),
+            "string literal mangled: {result}"
+        );
     }
 
     #[test]
@@ -765,7 +817,10 @@ mod tests {
         // Queries without WHERE must still get a tenant filter appended
         let sql = "SELECT count() FROM logs";
         let result = inject_tenant_filter(sql, "acme");
-        assert!(result.contains("WHERE tenant_id = 'acme'"), "missing tenant filter: {result}");
+        assert!(
+            result.contains("WHERE tenant_id = 'acme'"),
+            "missing tenant filter: {result}"
+        );
     }
 
     #[test]
@@ -773,8 +828,15 @@ mod tests {
         // A single base table WHERE must get the tenant filter injected.
         let sql = "SELECT * FROM logs WHERE Timestamp > 'x'";
         let result = inject_tenant_filter(sql, "sec");
-        assert_eq!(result.matches("tenant_id = 'sec'").count(), 1, "got: {result}");
-        assert!(result.contains("WHERE tenant_id = 'sec' AND Timestamp > 'x'"), "got: {result}");
+        assert_eq!(
+            result.matches("tenant_id = 'sec'").count(),
+            1,
+            "got: {result}"
+        );
+        assert!(
+            result.contains("WHERE tenant_id = 'sec' AND Timestamp > 'x'"),
+            "got: {result}"
+        );
     }
 
     #[test]
@@ -838,7 +900,14 @@ mod tests {
         // An unknown (non-CTE) table reference must always be scoped (fail-closed).
         let sql = "SELECT * FROM some_unknown_table WHERE x = 1";
         let result = inject_tenant_filter(sql, "t1");
-        assert_eq!(result.matches("tenant_id = 't1'").count(), 1, "got: {result}");
-        assert!(result.contains("WHERE tenant_id = 't1' AND x = 1"), "got: {result}");
+        assert_eq!(
+            result.matches("tenant_id = 't1'").count(),
+            1,
+            "got: {result}"
+        );
+        assert!(
+            result.contains("WHERE tenant_id = 't1' AND x = 1"),
+            "got: {result}"
+        );
     }
 }

@@ -1,9 +1,8 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Extension,
 };
 
 use crate::AppState;
@@ -16,20 +15,51 @@ fn validate_detection_sql(query_sql: &str) -> Result<(), (StatusCode, String)> {
     let lower = trimmed.to_lowercase();
 
     // Must start with SELECT
-    if !lower.starts_with("select ") && !lower.starts_with("select\n") && !lower.starts_with("select\t") {
-        return Err((StatusCode::BAD_REQUEST, "query_sql must be a SELECT statement".to_string()));
+    if !lower.starts_with("select ")
+        && !lower.starts_with("select\n")
+        && !lower.starts_with("select\t")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_sql must be a SELECT statement".to_string(),
+        ));
     }
 
     // Block DDL/DML, dangerous builtins, and ClickHouse data-exfiltration table functions
     const FORBIDDEN: &[&str] = &[
-        "insert ", "update ", "delete ", "drop ", "create ", "alter ",
-        "truncate ", "exec(", "execute(", "call ", "system(", "grant ", "revoke ",
-        "file(", "load_file(", "into outfile", "into dumpfile",
+        "insert ",
+        "update ",
+        "delete ",
+        "drop ",
+        "create ",
+        "alter ",
+        "truncate ",
+        "exec(",
+        "execute(",
+        "call ",
+        "system(",
+        "grant ",
+        "revoke ",
+        "file(",
+        "load_file(",
+        "into outfile",
+        "into dumpfile",
         // ClickHouse table functions that can reach external systems
-        "url(", "remote(", "remotesecure(", "s3(", "hdfs(", "mysql(", "postgresql(",
-        "jdbc(", "odbc(", "sqlite(",
+        "url(",
+        "remote(",
+        "remotesecure(",
+        "s3(",
+        "hdfs(",
+        "mysql(",
+        "postgresql(",
+        "jdbc(",
+        "odbc(",
+        "sqlite(",
         // ClickHouse cluster/input functions and SQL comment sequences
-        "clusterallreplicas(", "input(", "--", "/*",
+        "clusterallreplicas(",
+        "input(",
+        "--",
+        "/*",
     ];
     for kw in FORBIDDEN {
         if lower.contains(kw) {
@@ -42,11 +72,13 @@ fn validate_detection_sql(query_sql: &str) -> Result<(), (StatusCode, String)> {
 
     // No semicolons — prevents statement chaining
     if trimmed.contains(';') {
-        return Err((StatusCode::BAD_REQUEST, "query_sql must not contain semicolons".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_sql must not contain semicolons".to_string(),
+        ));
     }
 
-    Ok(()
-    )
+    Ok(())
 }
 use crate::models::detection::*;
 
@@ -70,7 +102,8 @@ pub async fn list_detection_rules(
     require_auth(&state, &headers).await?;
     let rules = state
         .config_db
-        .list_detection_rules(Some(&tenant.tenant_id)).await
+        .list_detection_rules(Some(&tenant.tenant_id))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<DetectionRuleResponse> =
         rules.into_iter().map(DetectionRuleResponse::from).collect();
@@ -87,27 +120,46 @@ pub async fn create_detection_rule(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not be empty".to_string(),
+        ));
     }
     if req.name.len() > 255 {
-        return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not exceed 255 characters".to_string(),
+        ));
     }
     if req.description.len() > 1024 {
-        return Err((StatusCode::BAD_REQUEST, "description must not exceed 1024 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "description must not exceed 1024 characters".to_string(),
+        ));
     }
     if req.query_sql.len() > 10_000 {
-        return Err((StatusCode::BAD_REQUEST, "query_sql must not exceed 10000 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_sql must not exceed 10000 characters".to_string(),
+        ));
     }
     let valid_severities = ["critical", "high", "medium", "low", "info"];
     if !valid_severities.contains(&req.severity.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("invalid severity: {} (must be one of: {})", req.severity, valid_severities.join(", ")),
+            format!(
+                "invalid severity: {} (must be one of: {})",
+                req.severity,
+                valid_severities.join(", ")
+            ),
         ));
     }
 
     if req.query_sql.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "query_sql cannot be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_sql cannot be empty".to_string(),
+        ));
     }
     validate_detection_sql(&req.query_sql)?;
 
@@ -130,12 +182,14 @@ pub async fn create_detection_rule(
             req.enabled,
             &channels,
             &caller.1, // created_by: username from session
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let rule = state
         .config_db
-        .get_detection_rule(&id).await
+        .get_detection_rule(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -169,13 +223,22 @@ pub async fn get_detection_rule(
     require_auth(&state, &headers).await?;
     let rule = state
         .config_db
-        .get_detection_rule(&id).await
+        .get_detection_rule(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "detection rule not found".to_string(),
+            )
+        })?;
 
     // Ensure the caller can only see rules in their tenant
     if rule.tenant_id != tenant.tenant_id {
-        return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "detection rule not found".to_string(),
+        ));
     }
 
     Ok(Json(DetectionRuleResponse::from(rule)))
@@ -192,16 +255,28 @@ pub async fn update_detection_rule(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not be empty".to_string(),
+        ));
     }
     if req.name.len() > 255 {
-        return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not exceed 255 characters".to_string(),
+        ));
     }
     if req.description.len() > 1024 {
-        return Err((StatusCode::BAD_REQUEST, "description must not exceed 1024 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "description must not exceed 1024 characters".to_string(),
+        ));
     }
     if req.query_sql.len() > 10_000 {
-        return Err((StatusCode::BAD_REQUEST, "query_sql must not exceed 10000 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_sql must not exceed 10000 characters".to_string(),
+        ));
     }
     let valid_severities = ["critical", "high", "medium", "low", "info"];
     if !valid_severities.contains(&req.severity.as_str()) {
@@ -212,18 +287,30 @@ pub async fn update_detection_rule(
     }
 
     if req.query_sql.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "query_sql cannot be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_sql cannot be empty".to_string(),
+        ));
     }
     validate_detection_sql(&req.query_sql)?;
 
     // Verify ownership
     let existing = state
         .config_db
-        .get_detection_rule(&id).await
+        .get_detection_rule(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "detection rule not found".to_string(),
+            )
+        })?;
     if existing.tenant_id != tenant.tenant_id {
-        return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "detection rule not found".to_string(),
+        ));
     }
 
     let channels = serde_json::to_string(&req.channels)
@@ -242,15 +329,20 @@ pub async fn update_detection_rule(
             req.window_secs,
             req.enabled,
             &channels,
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
-        return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "detection rule not found".to_string(),
+        ));
     }
 
     let rule = state
         .config_db
-        .get_detection_rule(&id).await
+        .get_detection_rule(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -285,31 +377,47 @@ pub async fn delete_detection_rule(
     // Verify ownership
     let existing = state
         .config_db
-        .get_detection_rule(&id).await
+        .get_detection_rule(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "detection rule not found".to_string(),
+            )
+        })?;
     if existing.tenant_id != tenant.tenant_id {
-        return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "detection rule not found".to_string(),
+        ));
     }
 
     let deleted = state
         .config_db
-        .delete_detection_rule(&id).await
+        .delete_detection_rule(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
-        return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "detection rule not found".to_string(),
+        ));
     }
 
     // AUDIT: detection rule deleted.
-    state.audit.log(
-        crate::audit::AuditEvent::new("detection_rule.delete", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(tenant.tenant_id.clone())
-            .resource("detection_rule", id.clone())
-            .changes(serde_json::json!({ "name": existing.name }).to_string())
-            .description("detection rule deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("detection_rule.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("detection_rule", id.clone())
+                .changes(serde_json::json!({ "name": existing.name }).to_string())
+                .description("detection rule deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -325,28 +433,36 @@ pub async fn test_detection_rule(
     require_write(&state, &headers).await?;
     let rule = state
         .config_db
-        .get_detection_rule(&id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "detection rule not found".to_string()))?;
-
-    if rule.tenant_id != tenant.tenant_id {
-        return Err((StatusCode::NOT_FOUND, "detection rule not found".to_string()));
-    }
-
-    let (row_count, query_executed) =
-        crate::siem_engine::test_detection_query(
-            &state.ch,
-            &rule.query_sql,
-            &rule.tenant_id,
-            rule.window_secs,
-        )
+        .get_detection_rule(&id)
         .await
-        .map_err(|e| {
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| {
             (
-                StatusCode::BAD_REQUEST,
-                format!("detection query failed: {e}"),
+                StatusCode::NOT_FOUND,
+                "detection rule not found".to_string(),
             )
         })?;
+
+    if rule.tenant_id != tenant.tenant_id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "detection rule not found".to_string(),
+        ));
+    }
+
+    let (row_count, query_executed) = crate::siem_engine::test_detection_query(
+        &state.ch,
+        &rule.query_sql,
+        &rule.tenant_id,
+        rule.window_secs,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("detection query failed: {e}"),
+        )
+    })?;
 
     Ok(Json(TestDetectionRuleResponse {
         row_count,
@@ -367,7 +483,8 @@ pub async fn list_detection_events(
     require_auth(&state, &headers).await?;
     let events = state
         .config_db
-        .list_detection_events(&tenant.tenant_id, params.limit).await
+        .list_detection_events(&tenant.tenant_id, params.limit)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }

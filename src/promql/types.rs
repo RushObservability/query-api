@@ -116,9 +116,7 @@ pub fn build_label_set(
 }
 
 /// Group raw samples into individual time series by their label set.
-pub fn group_into_series(
-    samples: Vec<(BTreeMap<String, String>, f64, f64)>,
-) -> Vec<TimeSeries> {
+pub fn group_into_series(samples: Vec<(BTreeMap<String, String>, f64, f64)>) -> Vec<TimeSeries> {
     let mut map: BTreeMap<BTreeMap<String, String>, Vec<(f64, f64)>> = BTreeMap::new();
     for (labels, ts, val) in samples {
         map.entry(labels).or_default().push((ts, val));

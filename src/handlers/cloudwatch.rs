@@ -1,9 +1,9 @@
 use axum::{
+    Json,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use base64::Engine;
 use serde::Deserialize;
@@ -183,15 +183,28 @@ pub async fn ingest_firehose_with_tenant(
     if !state.config_db.is_tenant_enabled(&tenant_override).await {
         return (
             StatusCode::BAD_REQUEST,
-            firehose_response(&request_id, Some(&format!("tenant '{}' not found or disabled", tenant_override))),
+            firehose_response(
+                &request_id,
+                Some(&format!(
+                    "tenant '{}' not found or disabled",
+                    tenant_override
+                )),
+            ),
         );
     }
 
     // Enforce the tenant's auth policy. For an auth-required tenant, require a valid
     // API key (resolving to this tenant) in the Firehose access-key or Bearer header.
-    if state.config_db.is_tenant_auth_required(&tenant_override).await {
+    if state
+        .config_db
+        .is_tenant_auth_required(&tenant_override)
+        .await
+    {
         if let Err(msg) = authorize_protected_tenant(&state, &tenant_override, &headers).await {
-            return (StatusCode::FORBIDDEN, firehose_response(&request_id, Some(&msg)));
+            return (
+                StatusCode::FORBIDDEN,
+                firehose_response(&request_id, Some(&msg)),
+            );
         }
     }
 
@@ -278,7 +291,10 @@ async fn ingest_firehose_inner(
         match gunzip_capped(&body) {
             Ok(b) => b,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, firehose_response(&request_id, Some(&e)));
+                return (
+                    StatusCode::BAD_REQUEST,
+                    firehose_response(&request_id, Some(&e)),
+                );
             }
         }
     } else {
@@ -314,7 +330,8 @@ async fn ingest_firehose_inner(
 
     for record in &req.records {
         // Each record's data is base64 → gzip → CloudWatch Logs JSON.
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(record.data.as_bytes()) {
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(record.data.as_bytes())
+        {
             Ok(d) => d,
             Err(e) => {
                 return (
@@ -326,7 +343,10 @@ async fn ingest_firehose_inner(
         let inflated = match gunzip_capped(&decoded) {
             Ok(b) => b,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, firehose_response(&request_id, Some(&e)));
+                return (
+                    StatusCode::BAD_REQUEST,
+                    firehose_response(&request_id, Some(&e)),
+                );
             }
         };
         let payload: CwlPayload = match serde_json::from_slice(&inflated) {
@@ -334,7 +354,10 @@ async fn ingest_firehose_inner(
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    firehose_response(&request_id, Some(&format!("invalid CloudWatch Logs JSON: {e}"))),
+                    firehose_response(
+                        &request_id,
+                        Some(&format!("invalid CloudWatch Logs JSON: {e}")),
+                    ),
                 );
             }
         };
@@ -346,8 +369,14 @@ async fn ingest_firehose_inner(
 
         // Resource attributes are constant across this record's events.
         let resource_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(vec![
-            ("aws.cloudwatch.log_group".to_string(), payload.log_group.clone()),
-            ("aws.cloudwatch.log_stream".to_string(), payload.log_stream.clone()),
+            (
+                "aws.cloudwatch.log_group".to_string(),
+                payload.log_group.clone(),
+            ),
+            (
+                "aws.cloudwatch.log_stream".to_string(),
+                payload.log_stream.clone(),
+            ),
             ("cloud.account.id".to_string(), payload.owner.clone()),
             ("cloud.provider".to_string(), "aws".to_string()),
         ]);
@@ -395,7 +424,9 @@ async fn ingest_firehose_inner(
     }
 
     let count = rows.len() as u64;
-    if let Err(e) = crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows)).await {
+    if let Err(e) =
+        crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows)).await
+    {
         let (status, msg) = match e {
             WriteError::Backpressure => (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -407,7 +438,9 @@ async fn ingest_firehose_inner(
     }
 
     // Record usage for per-tenant ingest metering.
-    state.usage_accumulator.record(&tenant_id, "logs", count, raw_len);
+    state
+        .usage_accumulator
+        .record(&tenant_id, "logs", count, raw_len);
 
     tracing::info!(
         signal = "logs",

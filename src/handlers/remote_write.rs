@@ -1,8 +1,8 @@
 use axum::{
+    Extension,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    Extension,
 };
 use prost::Message;
 
@@ -133,7 +133,12 @@ pub async fn prom_remote_write(
             })
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode task failed: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("decode task failed: {e}"),
+        )
+    })??;
 
     if write_req.timeseries.is_empty() {
         return Ok(StatusCode::NO_CONTENT);
@@ -149,11 +154,7 @@ pub async fn prom_remote_write(
     }
 
     // Count samples for logging
-    let sample_count: usize = write_req
-        .timeseries
-        .iter()
-        .map(|ts| ts.samples.len())
-        .sum();
+    let sample_count: usize = write_req.timeseries.iter().map(|ts| ts.samples.len()).sum();
     tracing::debug!(
         signal = "metrics",
         source = "prometheus",
@@ -191,10 +192,7 @@ pub async fn prom_remote_write(
             continue; // Skip timeseries without a metric name
         }
 
-        let (description, unit) = meta_map
-            .get(&metric_name)
-            .cloned()
-            .unwrap_or_default();
+        let (description, unit) = meta_map.get(&metric_name).cloned().unwrap_or_default();
 
         // P1: Build template row once per timeseries, only update time+value per sample
         let template = GaugeRow {
@@ -230,13 +228,23 @@ pub async fn prom_remote_write(
         }
     }
 
-    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
-    })?;
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        })?;
 
     // Record usage for per-tenant ingest metering (use decompressed size for bytes)
-    state.usage_accumulator.record(tenant_id, "metrics", sample_count as u64, decompressed_len as u64);
+    state.usage_accumulator.record(
+        tenant_id,
+        "metrics",
+        sample_count as u64,
+        decompressed_len as u64,
+    );
 
     tracing::info!(
         signal = "metrics",

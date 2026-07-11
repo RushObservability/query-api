@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
-use std::pin::Pin;
-use std::future::Future;
-use std::sync::LazyLock;
-use std::time::{Duration, Instant};
 use clickhouse::Client;
 use dashmap::DashMap;
 use promql_parser::parser::{self, Expr};
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use super::types::TimeSeries;
 use super::{aggregate, binary, compute, scalar, sql, translate, types};
@@ -42,7 +42,15 @@ pub async fn evaluate_instant_query(
 ) -> Result<Vec<TimeSeries>, String> {
     let expr = parser::parse(query).map_err(|e| format!("{e}"))?;
     let step_timestamps = vec![eval_time];
-    evaluate(&expr, ch, eval_time - lookback, eval_time, &step_timestamps, tenant_id).await
+    evaluate(
+        &expr,
+        ch,
+        eval_time - lookback,
+        eval_time,
+        &step_timestamps,
+        tenant_id,
+    )
+    .await
 }
 
 /// Evaluate a range query (multiple points across a time range).
@@ -57,7 +65,15 @@ pub async fn evaluate_range_query(
     let expr = parser::parse(query).map_err(|e| format!("{e}"))?;
     let lookback = extract_lookback(&expr);
     let step_timestamps = generate_steps(start, end, step);
-    evaluate(&expr, ch, start - lookback, end, &step_timestamps, tenant_id).await
+    evaluate(
+        &expr,
+        ch,
+        start - lookback,
+        end,
+        &step_timestamps,
+        tenant_id,
+    )
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -74,122 +90,186 @@ fn evaluate<'a>(
     tenant_id: &'a str,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<TimeSeries>, String>> + Send + 'a>> {
     Box::pin(async move {
-    match expr {
-        Expr::VectorSelector(vs) => {
-            query_clickhouse(ch, vs, query_start, query_end, step_timestamps, true, tenant_id).await
-        }
-
-        Expr::MatrixSelector(ms) => {
-            // MatrixSelector wraps a VectorSelector with a range duration.
-            // We query the full range needed and keep ALL raw samples
-            // so that range functions (rate, increase, etc.) have enough data.
-            let range_secs = ms.range.as_secs_f64();
-            let adjusted_start = query_start - range_secs;
-            query_clickhouse(ch, &ms.vs, adjusted_start, query_end, step_timestamps, false, tenant_id).await
-        }
-
-        Expr::Call(call) => {
-            let func_name = call.func.name;
-
-            // Check if it's a range function
-            if let Some(range_func) = translate::to_range_func(func_name) {
-                return evaluate_range_call(
-                    &call.args.args, range_func, func_name, ch, query_start, query_end, step_timestamps, tenant_id,
+        match expr {
+            Expr::VectorSelector(vs) => {
+                query_clickhouse(
+                    ch,
+                    vs,
+                    query_start,
+                    query_end,
+                    step_timestamps,
+                    true,
+                    tenant_id,
                 )
-                .await;
+                .await
             }
 
-            // Check if it's a scalar function
-            if let Some(scalar_func) = translate::to_scalar_func(func_name) {
-                return evaluate_scalar_call(
-                    &call.args.args, scalar_func, func_name, ch, query_start, query_end, step_timestamps, tenant_id,
+            Expr::MatrixSelector(ms) => {
+                // MatrixSelector wraps a VectorSelector with a range duration.
+                // We query the full range needed and keep ALL raw samples
+                // so that range functions (rate, increase, etc.) have enough data.
+                let range_secs = ms.range.as_secs_f64();
+                let adjusted_start = query_start - range_secs;
+                query_clickhouse(
+                    ch,
+                    &ms.vs,
+                    adjusted_start,
+                    query_end,
+                    step_timestamps,
+                    false,
+                    tenant_id,
                 )
-                .await;
+                .await
             }
 
-            Err(format!("unsupported function: {func_name}"))
-        }
+            Expr::Call(call) => {
+                let func_name = call.func.name;
 
-        Expr::Aggregate(agg) => {
-            let op = translate::to_agg_op(agg.op)?;
-            let (by_labels, without) = translate::extract_label_modifier(&agg.modifier);
-
-            let inner = evaluate(&agg.expr, ch, query_start, query_end, step_timestamps, tenant_id).await?;
-
-            // Extract param (e.g., for quantile, topk, bottomk)
-            let param = match &agg.param {
-                Some(p) => extract_number_literal(p),
-                None => None,
-            };
-
-            Ok(aggregate::aggregate_series(
-                inner,
-                op,
-                &by_labels,
-                without,
-                step_timestamps,
-                param,
-            ))
-        }
-
-        Expr::Binary(bin) => {
-            // Evaluate both sides in parallel
-            let (lhs_result, rhs_result) = tokio::join!(
-                evaluate(&bin.lhs, ch, query_start, query_end, step_timestamps, tenant_id),
-                evaluate(&bin.rhs, ch, query_start, query_end, step_timestamps, tenant_id),
-            );
-
-            let lhs = lhs_result?;
-            let rhs = rhs_result?;
-
-            Ok(binary::apply_binary_op(
-                bin.op,
-                lhs,
-                rhs,
-                &bin.modifier,
-                step_timestamps,
-            ))
-        }
-
-        Expr::Unary(unary) => {
-            let mut inner = evaluate(&unary.expr, ch, query_start, query_end, step_timestamps, tenant_id).await?;
-            // Negate all values
-            for ts in &mut inner {
-                for sample in &mut ts.samples {
-                    sample.1 = -sample.1;
+                // Check if it's a range function
+                if let Some(range_func) = translate::to_range_func(func_name) {
+                    return evaluate_range_call(
+                        &call.args.args,
+                        range_func,
+                        func_name,
+                        ch,
+                        query_start,
+                        query_end,
+                        step_timestamps,
+                        tenant_id,
+                    )
+                    .await;
                 }
+
+                // Check if it's a scalar function
+                if let Some(scalar_func) = translate::to_scalar_func(func_name) {
+                    return evaluate_scalar_call(
+                        &call.args.args,
+                        scalar_func,
+                        func_name,
+                        ch,
+                        query_start,
+                        query_end,
+                        step_timestamps,
+                        tenant_id,
+                    )
+                    .await;
+                }
+
+                Err(format!("unsupported function: {func_name}"))
             }
-            Ok(inner)
-        }
 
-        Expr::Paren(paren) => {
-            evaluate(&paren.expr, ch, query_start, query_end, step_timestamps, tenant_id).await
-        }
+            Expr::Aggregate(agg) => {
+                let op = translate::to_agg_op(agg.op)?;
+                let (by_labels, without) = translate::extract_label_modifier(&agg.modifier);
 
-        Expr::NumberLiteral(num) => {
-            // Return a scalar series with the literal value at each step
-            let samples: Vec<(f64, f64)> = step_timestamps
-                .iter()
-                .map(|&t| (t, num.val))
-                .collect();
-            Ok(vec![TimeSeries {
-                labels: BTreeMap::new(),
-                samples,
-            }])
-        }
+                let inner = evaluate(
+                    &agg.expr,
+                    ch,
+                    query_start,
+                    query_end,
+                    step_timestamps,
+                    tenant_id,
+                )
+                .await?;
 
-        Expr::StringLiteral(_) => {
-            Err("string literals are not supported in evaluation".to_string())
-        }
+                // Extract param (e.g., for quantile, topk, bottomk)
+                let param = match &agg.param {
+                    Some(p) => extract_number_literal(p),
+                    None => None,
+                };
 
-        Expr::Subquery(_) => {
-            Err("subqueries are not yet supported".to_string())
-        }
+                Ok(aggregate::aggregate_series(
+                    inner,
+                    op,
+                    &by_labels,
+                    without,
+                    step_timestamps,
+                    param,
+                ))
+            }
 
-        Expr::Extension(_) => {
-            Err("extension expressions are not supported".to_string())
+            Expr::Binary(bin) => {
+                // Evaluate both sides in parallel
+                let (lhs_result, rhs_result) = tokio::join!(
+                    evaluate(
+                        &bin.lhs,
+                        ch,
+                        query_start,
+                        query_end,
+                        step_timestamps,
+                        tenant_id
+                    ),
+                    evaluate(
+                        &bin.rhs,
+                        ch,
+                        query_start,
+                        query_end,
+                        step_timestamps,
+                        tenant_id
+                    ),
+                );
+
+                let lhs = lhs_result?;
+                let rhs = rhs_result?;
+
+                Ok(binary::apply_binary_op(
+                    bin.op,
+                    lhs,
+                    rhs,
+                    &bin.modifier,
+                    step_timestamps,
+                ))
+            }
+
+            Expr::Unary(unary) => {
+                let mut inner = evaluate(
+                    &unary.expr,
+                    ch,
+                    query_start,
+                    query_end,
+                    step_timestamps,
+                    tenant_id,
+                )
+                .await?;
+                // Negate all values
+                for ts in &mut inner {
+                    for sample in &mut ts.samples {
+                        sample.1 = -sample.1;
+                    }
+                }
+                Ok(inner)
+            }
+
+            Expr::Paren(paren) => {
+                evaluate(
+                    &paren.expr,
+                    ch,
+                    query_start,
+                    query_end,
+                    step_timestamps,
+                    tenant_id,
+                )
+                .await
+            }
+
+            Expr::NumberLiteral(num) => {
+                // Return a scalar series with the literal value at each step
+                let samples: Vec<(f64, f64)> =
+                    step_timestamps.iter().map(|&t| (t, num.val)).collect();
+                Ok(vec![TimeSeries {
+                    labels: BTreeMap::new(),
+                    samples,
+                }])
+            }
+
+            Expr::StringLiteral(_) => {
+                Err("string literals are not supported in evaluation".to_string())
+            }
+
+            Expr::Subquery(_) => Err("subqueries are not yet supported".to_string()),
+
+            Expr::Extension(_) => Err("extension expressions are not supported".to_string()),
         }
-    }
     }) // Box::pin
 }
 
@@ -221,9 +301,9 @@ async fn evaluate_range_call(
         _ => (0, None),
     };
 
-    let matrix_arg = args.get(matrix_arg_idx).ok_or_else(|| {
-        format!("{func_name} requires a matrix argument")
-    })?;
+    let matrix_arg = args
+        .get(matrix_arg_idx)
+        .ok_or_else(|| format!("{func_name} requires a matrix argument"))?;
 
     // Extract the range duration from the matrix selector
     let range_secs = match matrix_arg.as_ref() {
@@ -315,8 +395,20 @@ async fn evaluate_scalar_call(
         }
     };
 
-    let inner_series = evaluate(inner_expr, ch, query_start, query_end, step_timestamps, tenant_id).await?;
-    Ok(scalar::apply_scalar_func(inner_series, scalar_func, &extra_args))
+    let inner_series = evaluate(
+        inner_expr,
+        ch,
+        query_start,
+        query_end,
+        step_timestamps,
+        tenant_id,
+    )
+    .await?;
+    Ok(scalar::apply_scalar_func(
+        inner_series,
+        scalar_func,
+        &extra_args,
+    ))
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -542,7 +634,11 @@ async fn query_clickhouse(
         // argMax. Map k → step_timestamps[k] (dropping out-of-grid indices). This is
         // exactly what step_align_series would have produced from the raw samples, but
         // computed server-side.
-        Ok(bucketed_rows_to_series(&gauge_rows, &sum_rows, step_timestamps))
+        Ok(bucketed_rows_to_series(
+            &gauge_rows,
+            &sum_rows,
+            step_timestamps,
+        ))
     } else {
         // Return all raw samples for MatrixSelector (range vectors).
         Ok(rows_to_series(&gauge_rows, &sum_rows))
@@ -751,13 +847,14 @@ fn extract_number_literal(expr: &Expr) -> Option<f64> {
 pub fn extract_lookback(expr: &Expr) -> f64 {
     match expr {
         Expr::MatrixSelector(ms) => ms.range.as_secs_f64(),
-        Expr::Call(call) => {
-            call.args.args.iter().map(|a| extract_lookback(a)).fold(0.0_f64, f64::max)
-        }
+        Expr::Call(call) => call
+            .args
+            .args
+            .iter()
+            .map(|a| extract_lookback(a))
+            .fold(0.0_f64, f64::max),
         Expr::Aggregate(agg) => extract_lookback(&agg.expr),
-        Expr::Binary(bin) => {
-            extract_lookback(&bin.lhs).max(extract_lookback(&bin.rhs))
-        }
+        Expr::Binary(bin) => extract_lookback(&bin.lhs).max(extract_lookback(&bin.rhs)),
         Expr::Unary(u) => extract_lookback(&u.expr),
         Expr::Paren(p) => extract_lookback(&p.expr),
         _ => prom_lookback_secs(), // default 5m staleness (RUSH_PROM_LOOKBACK_SECS)
@@ -845,13 +942,19 @@ mod tests {
                             .map(|(_, v)| (t, *v))
                     })
                     .collect();
-                TimeSeries { labels: ts.labels, samples }
+                TimeSeries {
+                    labels: ts.labels,
+                    samples,
+                }
             })
             .collect()
     }
 
     fn series_with(samples: Vec<(f64, f64)>) -> Vec<TimeSeries> {
-        vec![TimeSeries { labels: BTreeMap::new(), samples }]
+        vec![TimeSeries {
+            labels: BTreeMap::new(),
+            samples,
+        }]
     }
 
     fn assert_align_matches_reference(samples: Vec<(f64, f64)>, steps: &[f64], lookback: f64) {
@@ -914,7 +1017,13 @@ mod tests {
 
     // ── rows_to_series ──
 
-    fn sample(metric: &str, service: &str, attrs: &[(&str, &str)], ts_ms: i64, value: f64) -> MetricSample {
+    fn sample(
+        metric: &str,
+        service: &str,
+        attrs: &[(&str, &str)],
+        ts_ms: i64,
+        value: f64,
+    ) -> MetricSample {
         MetricSample {
             metric_name: metric.to_string(),
             service_name: service.to_string(),
@@ -1056,7 +1165,10 @@ mod tests {
 
         let got_samples = got.first().map(|s| s.samples.clone()).unwrap_or_default();
         let want_samples = want.first().map(|s| s.samples.clone()).unwrap_or_default();
-        assert_eq!(got_samples, want_samples, "grid_start={grid_start} grid_step={grid_step}");
+        assert_eq!(
+            got_samples, want_samples,
+            "grid_start={grid_start} grid_step={grid_step}"
+        );
     }
 
     #[test]

@@ -16,9 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use object_store::{ObjectStore, PutPayload};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as OsPath;
+use object_store::{ObjectStore, PutPayload};
 
 use crate::spool::SpoolFull;
 
@@ -50,7 +50,9 @@ impl ObjectStoreSpool {
             .with_access_key_id(access_key)
             .with_secret_access_key(secret_key);
         if !endpoint.is_empty() {
-            b = b.with_endpoint(endpoint).with_allow_http(endpoint.starts_with("http://"));
+            b = b
+                .with_endpoint(endpoint)
+                .with_allow_http(endpoint.starts_with("http://"));
         }
         // Path-style addressing for MinIO/S3-compatibles.
         b = b.with_virtual_hosted_style_request(false);
@@ -59,7 +61,11 @@ impl ObjectStoreSpool {
     }
 
     /// Construct over any `ObjectStore` (S3/MinIO in prod, `InMemory` in tests).
-    pub async fn open(store: Arc<dyn ObjectStore>, prefix: &str, max_bytes: u64) -> anyhow::Result<Self> {
+    pub async fn open(
+        store: Arc<dyn ObjectStore>,
+        prefix: &str,
+        max_bytes: u64,
+    ) -> anyhow::Result<Self> {
         let prefix = if prefix.is_empty() {
             "ingest/".to_string()
         } else if prefix.ends_with('/') {
@@ -107,7 +113,10 @@ impl ObjectStoreSpool {
         if self.bytes.load(Ordering::Relaxed) + rec_len > self.max_bytes {
             return Err(SpoolFull);
         }
-        let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let key = OsPath::from(format!("{}{:013}-{:08}.batch", self.prefix, millis, seq));
 
@@ -116,7 +125,11 @@ impl ObjectStoreSpool {
         body.push(b'\n');
         body.extend_from_slice(payload);
 
-        match self.store.put(&key, PutPayload::from_bytes(Bytes::from(body))).await {
+        match self
+            .store
+            .put(&key, PutPayload::from_bytes(Bytes::from(body)))
+            .await
+        {
             Ok(_) => {
                 self.bytes.fetch_add(rec_len, Ordering::Relaxed);
                 self.count.fetch_add(1, Ordering::Relaxed);
@@ -135,23 +148,36 @@ impl ObjectStoreSpool {
         loop {
             let metas = match self.list_sorted().await {
                 Ok(m) => m,
-                Err(e) => { tracing::warn!(error = %e, "object-store buffer: list failed"); return None; }
+                Err(e) => {
+                    tracing::warn!(error = %e, "object-store buffer: list failed");
+                    return None;
+                }
             };
             let (key, size) = metas.into_iter().next()?;
             let data = match self.store.get(&key).await {
                 Ok(r) => match r.bytes().await {
                     Ok(b) => b,
-                    Err(e) => { tracing::warn!(error = %e, key = %key, "buffer: get bytes failed"); return None; }
+                    Err(e) => {
+                        tracing::warn!(error = %e, key = %key, "buffer: get bytes failed");
+                        return None;
+                    }
                 },
-                Err(e) => { tracing::warn!(error = %e, key = %key, "buffer: get failed"); return None; }
+                Err(e) => {
+                    tracing::warn!(error = %e, key = %key, "buffer: get failed");
+                    return None;
+                }
             };
             match split_record(&data) {
                 Some((table, payload)) => return Some((key, vec![(table, payload)])),
                 None => {
                     tracing::error!(key = %key, "object-store buffer: corrupt object — discarding");
                     let _ = self.store.delete(&key).await;
-                    self.bytes.fetch_sub(size.min(self.bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
-                    self.count.fetch_sub(self.count.load(Ordering::Relaxed).min(1), Ordering::Relaxed);
+                    self.bytes.fetch_sub(
+                        size.min(self.bytes.load(Ordering::Relaxed)),
+                        Ordering::Relaxed,
+                    );
+                    self.count
+                        .fetch_sub(self.count.load(Ordering::Relaxed).min(1), Ordering::Relaxed);
                     continue; // try the next object
                 }
             }
@@ -167,22 +193,37 @@ impl ObjectStoreSpool {
             tracing::warn!(error = %e, key = %key, "object-store buffer: delete failed");
             return;
         }
-        self.count.fetch_sub(self.count.load(Ordering::Relaxed).min(1), Ordering::Relaxed);
+        self.count
+            .fetch_sub(self.count.load(Ordering::Relaxed).min(1), Ordering::Relaxed);
         self.committed.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn total_bytes(&self) -> u64 { self.bytes.load(Ordering::Relaxed) }
-    pub fn segment_count(&self) -> usize { self.count.load(Ordering::Relaxed) }
-    pub fn max_bytes(&self) -> u64 { self.max_bytes }
-    pub fn committed_total(&self) -> u64 { self.committed.load(Ordering::Relaxed) }
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    pub fn segment_count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+    pub fn committed_total(&self) -> u64 {
+        self.committed.load(Ordering::Relaxed)
+    }
 
     /// Age (seconds) of the oldest pending object, parsed from its `{millis}-{seq}.batch` key.
     pub async fn oldest_age_secs(&self) -> Option<u64> {
         let metas = self.list_sorted().await.ok()?;
         let (key, _) = metas.into_iter().next()?;
         let fname = key.as_ref().rsplit('/').next().unwrap_or("");
-        let ms = fname.split('-').next().and_then(|s| s.parse::<u64>().ok())?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let ms = fname
+            .split('-')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         Some(now.saturating_sub(ms) / 1000)
     }
 }
@@ -199,11 +240,15 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
 
-    fn store() -> Arc<dyn ObjectStore> { Arc::new(InMemory::new()) }
+    fn store() -> Arc<dyn ObjectStore> {
+        Arc::new(InMemory::new())
+    }
 
     #[tokio::test]
     async fn append_drain_commit_roundtrip() {
-        let s = ObjectStoreSpool::open(store(), "ingest", 1_000_000).await.unwrap();
+        let s = ObjectStoreSpool::open(store(), "ingest", 1_000_000)
+            .await
+            .unwrap();
         s.append("logs", b"alpha").await.unwrap();
         s.append("spans", b"beta").await.unwrap();
         assert_eq!(s.segment_count(), 2);
@@ -234,11 +279,15 @@ mod tests {
     async fn open_seeds_from_existing() {
         let st = store();
         {
-            let s = ObjectStoreSpool::open(st.clone(), "ingest", 1_000_000).await.unwrap();
+            let s = ObjectStoreSpool::open(st.clone(), "ingest", 1_000_000)
+                .await
+                .unwrap();
             s.append("logs", b"x").await.unwrap();
         }
         // Re-open over the same store → must see the leftover object.
-        let s2 = ObjectStoreSpool::open(st, "ingest", 1_000_000).await.unwrap();
+        let s2 = ObjectStoreSpool::open(st, "ingest", 1_000_000)
+            .await
+            .unwrap();
         assert_eq!(s2.segment_count(), 1);
         assert!(s2.next_batch().await.is_some());
     }

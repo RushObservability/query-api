@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use crate::clickhouse_config::ConfigDb;
 use crate::models::query::{Filter, FilterOp};
-use crate::query_builder::{build_where_clause, build_metrics_where_clause, QueryClauses};
+use crate::query_builder::{QueryClauses, build_metrics_where_clause, build_where_clause};
 use clickhouse::Client;
+use std::sync::Arc;
 
 /// Max SLOs evaluated concurrently per tick (bounds parallel CH data queries).
 const ENGINE_CONCURRENCY: usize = 6;
@@ -62,9 +62,11 @@ async fn eval_trace_availability(
         clauses_predicate(&total_clauses),
         base.to_sql(),
     );
-    let row = ch.query(&sql)
+    let row = ch
+        .query(&sql)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<BadTotalRow>().await?;
+        .fetch_one::<BadTotalRow>()
+        .await?;
     Ok((row.bad as i64, row.total as i64))
 }
 
@@ -83,9 +85,11 @@ async fn eval_trace_latency(
         "SELECT countIf(duration_ns > {threshold_ns}) as bad, count() as total FROM spans {}",
         total_clauses.to_sql(),
     );
-    let row = ch.query(&sql)
+    let row = ch
+        .query(&sql)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<BadTotalRow>().await?;
+        .fetch_one::<BadTotalRow>()
+        .await?;
     Ok((row.bad as i64, row.total as i64))
 }
 
@@ -137,9 +141,11 @@ async fn eval_metric_availability(
         clauses_predicate(&total_clauses),
         base.to_sql(),
     );
-    let row = ch.query(&sql)
+    let row = ch
+        .query(&sql)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<SumBadTotalRow>().await?;
+        .fetch_one::<SumBadTotalRow>()
+        .await?;
     Ok((row.bad as i64, row.total as i64))
 }
 
@@ -168,9 +174,11 @@ async fn eval_metric_latency(
          FROM metrics_histogram {}",
         clauses.to_sql(),
     );
-    let row = ch.query(&sql)
+    let row = ch
+        .query(&sql)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<HistTotalFastRow>().await?;
+        .fetch_one::<HistTotalFastRow>()
+        .await?;
 
     let total_count = row.total as i64;
     let fast_count = row.fast as i64;
@@ -196,10 +204,10 @@ async fn eval_metric_threshold(
     // "good" condition based on threshold_op (what good means)
     // Violating = NOT good
     let violating_op = match threshold_op {
-        "lt" => format!("Value >= {threshold_value}"),   // good = Value < threshold
-        "lte" => format!("Value > {threshold_value}"),   // good = Value <= threshold
-        "gt" => format!("Value <= {threshold_value}"),   // good = Value > threshold
-        "gte" => format!("Value < {threshold_value}"),   // good = Value >= threshold
+        "lt" => format!("Value >= {threshold_value}"), // good = Value < threshold
+        "lte" => format!("Value > {threshold_value}"), // good = Value <= threshold
+        "gt" => format!("Value <= {threshold_value}"), // good = Value > threshold
+        "gte" => format!("Value < {threshold_value}"), // good = Value >= threshold
         _ => format!("Value >= {threshold_value}"),
     };
 
@@ -207,9 +215,11 @@ async fn eval_metric_threshold(
         "SELECT countIf({violating_op}) as bad, count() as total FROM metrics_gauge {}",
         clauses.to_sql(),
     );
-    let row = ch.query(&sql)
+    let row = ch
+        .query(&sql)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<BadTotalRow>().await?;
+        .fetch_one::<BadTotalRow>()
+        .await?;
     Ok((row.bad as i64, row.total as i64))
 }
 
@@ -228,22 +238,26 @@ async fn write_slo_metrics(
     now_nanos: i64,
 ) {
     let escaped_name = crate::query_builder::escape_string_literal(&slo_name);
-    let attrs = format!(
-        "{{'slo.id': '{slo_id}', 'slo.name': '{escaped_name}'}}"
-    );
+    let attrs = format!("{{'slo.id': '{slo_id}', 'slo.name': '{escaped_name}'}}");
     let metrics = [
         ("rush_slo_current", current_pct),
-        ("rush_slo_error_budget_remaining", error_budget_remaining * 100.0),
+        (
+            "rush_slo_error_budget_remaining",
+            error_budget_remaining * 100.0,
+        ),
         ("rush_slo_error_count", error_count as f64),
         ("rush_slo_total_count", total_count as f64),
         ("rush_slo_compliant", if compliant { 1.0 } else { 0.0 }),
     ];
-    let values: Vec<String> = metrics.iter().map(|(name, val)| {
-        format!(
-            "({{}}, '', '', '', {{}}, 0, '', 'wide-slo-engine', '{name}', '', '', {attrs}, \
+    let values: Vec<String> = metrics
+        .iter()
+        .map(|(name, val)| {
+            format!(
+                "({{}}, '', '', '', {{}}, 0, '', 'wide-slo-engine', '{name}', '', '', {attrs}, \
              {now_nanos}, {now_nanos}, {val}, 0, [], [], [], [], [])"
-        )
-    }).collect();
+            )
+        })
+        .collect();
     let sql = format!(
         "INSERT INTO metrics_gauge \
          (ResourceAttributes, ResourceSchemaUrl, ScopeName, ScopeVersion, ScopeAttributes, \
@@ -258,7 +272,11 @@ async fn write_slo_metrics(
     }
 }
 
-pub fn spawn_slo_engine(config_db: Arc<ConfigDb>, ch: Client, self_metrics: Arc<crate::self_metrics::SelfMetrics>) {
+pub fn spawn_slo_engine(
+    config_db: Arc<ConfigDb>,
+    ch: Client,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
         let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
@@ -312,19 +330,30 @@ async fn eval_slos(
         .collect();
 
     let now_str_ref = now_str.as_str();
-    let outcomes: Vec<(String, bool)> = futures_util::stream::iter(jobs.into_iter().map(|(slo, should_flush)| async move {
-        let persisted = match eval_one_slo(config_db, ch, http_client, &slo, now, now_str_ref, should_flush).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("slo {}: evaluation error: {e}", slo.id);
-                false
-            }
-        };
-        (slo.id, persisted)
-    }))
-    .buffer_unordered(ENGINE_CONCURRENCY)
-    .collect()
-    .await;
+    let outcomes: Vec<(String, bool)> =
+        futures_util::stream::iter(jobs.into_iter().map(|(slo, should_flush)| async move {
+            let persisted = match eval_one_slo(
+                config_db,
+                ch,
+                http_client,
+                &slo,
+                now,
+                now_str_ref,
+                should_flush,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("slo {}: evaluation error: {e}", slo.id);
+                    false
+                }
+            };
+            (slo.id, persisted)
+        }))
+        .buffer_unordered(ENGINE_CONCURRENCY)
+        .collect()
+        .await;
 
     for (id, persisted) in outcomes {
         eval_state.record(id, now, persisted);
@@ -342,11 +371,15 @@ async fn persist_no_data(
     should_flush: bool,
 ) -> anyhow::Result<bool> {
     if slo.state != "no_data" {
-        config_db.update_slo_state(&slo.id, &slo.tenant_id, "no_data", 0.0, 0, 0, now_str, None).await?;
+        config_db
+            .update_slo_state(&slo.id, &slo.tenant_id, "no_data", 0.0, 0, 0, now_str, None)
+            .await?;
         return Ok(true);
     }
     if should_flush {
-        config_db.persist_slo_eval(slo, "no_data", 0.0, 0, 0, now_str).await?;
+        config_db
+            .persist_slo_eval(slo, "no_data", 0.0, 0, 0, now_str)
+            .await?;
         return Ok(true);
     }
     Ok(false)
@@ -416,14 +449,30 @@ async fn eval_one_slo(
     // Evaluate based on (slo_type, indicator_type) — each is a single scan.
     let eval_result = match (slo.slo_type.as_str(), slo.indicator_type.as_str()) {
         ("trace", "availability") => {
-            eval_trace_availability(ch, &common_filters, &error_filters, &total_filters, &from, now_str).await
+            eval_trace_availability(
+                ch,
+                &common_filters,
+                &error_filters,
+                &total_filters,
+                &from,
+                now_str,
+            )
+            .await
         }
         ("trace", "latency") => {
             let threshold_ns = (slo.threshold_ms.unwrap_or(0.0) * 1_000_000.0) as i64;
             eval_trace_latency(ch, &total_filters, threshold_ns, &from, now_str).await
         }
         ("metric", "availability") => {
-            eval_metric_availability(ch, &common_filters, &error_filters, &total_filters, &from, now_str).await
+            eval_metric_availability(
+                ch,
+                &common_filters,
+                &error_filters,
+                &total_filters,
+                &from,
+                now_str,
+            )
+            .await
         }
         ("metric", "latency") => {
             let threshold_ms = slo.threshold_ms.unwrap_or(0.0);
@@ -432,10 +481,23 @@ async fn eval_one_slo(
         ("metric", "threshold") => {
             let threshold_value = slo.threshold_value.unwrap_or(0.0);
             let threshold_op = slo.threshold_op.as_deref().unwrap_or("lt");
-            eval_metric_threshold(ch, &total_filters, threshold_value, threshold_op, &from, now_str).await
+            eval_metric_threshold(
+                ch,
+                &total_filters,
+                threshold_value,
+                threshold_op,
+                &from,
+                now_str,
+            )
+            .await
         }
         _ => {
-            tracing::warn!("slo {}: unsupported type/indicator: {}/{}", slo.id, slo.slo_type, slo.indicator_type);
+            tracing::warn!(
+                "slo {}: unsupported type/indicator: {}/{}",
+                slo.id,
+                slo.slo_type,
+                slo.indicator_type
+            );
             return persist_no_data(config_db, slo, now_str, should_flush).await;
         }
     };
@@ -463,7 +525,11 @@ async fn eval_one_slo(
         } else {
             (error_budget - consumed) / error_budget
         };
-        let state = if remaining > 0.0 { "compliant" } else { "breaching" };
+        let state = if remaining > 0.0 {
+            "compliant"
+        } else {
+            "breaching"
+        };
         (state, remaining)
     };
 
@@ -486,30 +552,44 @@ async fn eval_one_slo(
             error_budget_remaining * 100.0,
         );
 
-        config_db.create_slo_event(
-            &event_id,
-            &slo.id,
-            &slo.tenant_id,
-            new_state,
-            error_count,
-            total_count,
-            error_budget_remaining,
-            &message,
-        ).await?;
+        config_db
+            .create_slo_event(
+                &event_id,
+                &slo.id,
+                &slo.tenant_id,
+                new_state,
+                error_count,
+                total_count,
+                error_budget_remaining,
+                &message,
+            )
+            .await?;
 
-        let breached_at = if new_state == "breaching" { Some(now_str) } else { None };
-        config_db.update_slo_state(
-            &slo.id, &slo.tenant_id, new_state, error_budget_remaining,
-            error_count, total_count, now_str, breached_at,
-        ).await?;
+        let breached_at = if new_state == "breaching" {
+            Some(now_str)
+        } else {
+            None
+        };
+        config_db
+            .update_slo_state(
+                &slo.id,
+                &slo.tenant_id,
+                new_state,
+                error_budget_remaining,
+                error_count,
+                total_count,
+                now_str,
+                breached_at,
+            )
+            .await?;
 
         // Send notifications
-        let channel_ids: Vec<String> = serde_json::from_str(&slo.notification_channel_ids)
-            .unwrap_or_default();
+        let channel_ids: Vec<String> =
+            serde_json::from_str(&slo.notification_channel_ids).unwrap_or_default();
         for channel_id in &channel_ids {
             if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
-                let config: serde_json::Value = serde_json::from_str(&channel.config)
-                    .unwrap_or(serde_json::json!({}));
+                let config: serde_json::Value =
+                    serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
                 if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
                     let payload = match channel.channel_type.as_str() {
                         "slack" => serde_json::json!({ "text": message }),
@@ -523,7 +603,11 @@ async fn eval_one_slo(
                         }),
                     };
                     if let Err(e) = crate::outbound::post_json(url, &payload).await {
-                        tracing::warn!("slo {}: notification to {} failed: {e}", slo.id, channel.name);
+                        tracing::warn!(
+                            "slo {}: notification to {} failed: {e}",
+                            slo.id,
+                            channel.name
+                        );
                     }
                 }
             }
@@ -537,10 +621,16 @@ async fn eval_one_slo(
         // flushes the persisted budget/counts lag by up to EVAL_FLUSH_EVERY
         // evals; the gauge metrics below are still written every eval, so
         // graphs stay fresh.
-        config_db.persist_slo_eval(
-            slo, new_state, error_budget_remaining,
-            error_count, total_count, now_str,
-        ).await?;
+        config_db
+            .persist_slo_eval(
+                slo,
+                new_state,
+                error_budget_remaining,
+                error_count,
+                total_count,
+                now_str,
+            )
+            .await?;
         persisted = true;
     } else {
         persisted = false;
@@ -554,12 +644,17 @@ async fn eval_one_slo(
     };
     let now_nanos = now.timestamp_nanos_opt().unwrap_or(0);
     write_slo_metrics(
-        ch, &slo.id, &slo.name,
-        current_pct, error_budget_remaining,
-        error_count, total_count,
+        ch,
+        &slo.id,
+        &slo.name,
+        current_pct,
+        error_budget_remaining,
+        error_count,
+        total_count,
         new_state == "compliant",
         now_nanos,
-    ).await;
+    )
+    .await;
 
     Ok(persisted)
 }
@@ -578,13 +673,25 @@ mod tests {
 
     #[test]
     fn clauses_predicate_combines_prewhere_and_where() {
-        let c = QueryClauses { prewhere: "a = 1".into(), where_clause: "b = 2".into() };
+        let c = QueryClauses {
+            prewhere: "a = 1".into(),
+            where_clause: "b = 2".into(),
+        };
         assert_eq!(clauses_predicate(&c), "((a = 1) AND (b = 2))");
-        let p = QueryClauses { prewhere: "a = 1".into(), where_clause: String::new() };
+        let p = QueryClauses {
+            prewhere: "a = 1".into(),
+            where_clause: String::new(),
+        };
         assert_eq!(clauses_predicate(&p), "(a = 1)");
-        let w = QueryClauses { prewhere: String::new(), where_clause: "b = 2".into() };
+        let w = QueryClauses {
+            prewhere: String::new(),
+            where_clause: "b = 2".into(),
+        };
         assert_eq!(clauses_predicate(&w), "(b = 2)");
-        let e = QueryClauses { prewhere: String::new(), where_clause: String::new() };
+        let e = QueryClauses {
+            prewhere: String::new(),
+            where_clause: String::new(),
+        };
         assert_eq!(clauses_predicate(&e), "1");
     }
 
@@ -598,8 +705,18 @@ mod tests {
         let base = build_where_clause(&common, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
         let err_clauses = build_where_clause(&err, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
         let pred = clauses_predicate(&err_clauses);
-        assert!(pred.contains("'ERROR'"), "error predicate must include error condition: {pred}");
-        assert!(pred.contains("payments"), "error predicate restates common filter: {pred}");
-        assert!(base.to_sql().contains("payments"), "base scan pruned by service: {}", base.to_sql());
+        assert!(
+            pred.contains("'ERROR'"),
+            "error predicate must include error condition: {pred}"
+        );
+        assert!(
+            pred.contains("payments"),
+            "error predicate restates common filter: {pred}"
+        );
+        assert!(
+            base.to_sql().contains("payments"),
+            "base scan pruned by service: {}",
+            base.to_sql()
+        );
     }
 }

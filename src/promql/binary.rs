@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use super::types::TimeSeries;
 use promql_parser::parser::token::{self, TokenType};
 use promql_parser::parser::{BinModifier, LabelModifier, VectorMatchCardinality};
-use super::types::TimeSeries;
+use std::collections::BTreeMap;
 
 /// Apply a binary operation between two sets of time series.
 /// Handles arithmetic (+, -, *, /, %, ^), comparison (==, !=, <, >, <=, >=),
@@ -86,7 +86,10 @@ fn apply_vector_scalar(
                 .samples
                 .iter()
                 .filter_map(|&(t, v)| {
-                    let s = scalar_map.get(&ordered_float(t)).copied().unwrap_or(f64::NAN);
+                    let s = scalar_map
+                        .get(&ordered_float(t))
+                        .copied()
+                        .unwrap_or(f64::NAN);
                     let (l, r) = if scalar_on_lhs { (s, v) } else { (v, s) };
                     eval_binary_op(op, l, r, return_bool).map(|result| (t, result))
                 })
@@ -334,23 +337,51 @@ fn ordered_float(f: f64) -> i64 {
 fn eval_binary_op(op: TokenType, l: f64, r: f64, return_bool: bool) -> Option<f64> {
     let id = op.id();
     // Arithmetic
-    if id == token::T_ADD { return Some(l + r); }
-    if id == token::T_SUB { return Some(l - r); }
-    if id == token::T_MUL { return Some(l * r); }
+    if id == token::T_ADD {
+        return Some(l + r);
+    }
+    if id == token::T_SUB {
+        return Some(l - r);
+    }
+    if id == token::T_MUL {
+        return Some(l * r);
+    }
     if id == token::T_DIV {
-        return if r == 0.0 { Some(f64::NAN) } else { Some(l / r) };
+        return if r == 0.0 {
+            Some(f64::NAN)
+        } else {
+            Some(l / r)
+        };
     }
     if id == token::T_MOD {
-        return if r == 0.0 { Some(f64::NAN) } else { Some(l % r) };
+        return if r == 0.0 {
+            Some(f64::NAN)
+        } else {
+            Some(l % r)
+        };
     }
-    if id == token::T_POW { return Some(l.powf(r)); }
+    if id == token::T_POW {
+        return Some(l.powf(r));
+    }
     // Comparison
-    if id == token::T_EQLC { return comparison_op(l == r, l, return_bool); }
-    if id == token::T_NEQ { return comparison_op(l != r, l, return_bool); }
-    if id == token::T_LSS { return comparison_op(l < r, l, return_bool); }
-    if id == token::T_GTR { return comparison_op(l > r, l, return_bool); }
-    if id == token::T_LTE { return comparison_op(l <= r, l, return_bool); }
-    if id == token::T_GTE { return comparison_op(l >= r, l, return_bool); }
+    if id == token::T_EQLC {
+        return comparison_op(l == r, l, return_bool);
+    }
+    if id == token::T_NEQ {
+        return comparison_op(l != r, l, return_bool);
+    }
+    if id == token::T_LSS {
+        return comparison_op(l < r, l, return_bool);
+    }
+    if id == token::T_GTR {
+        return comparison_op(l > r, l, return_bool);
+    }
+    if id == token::T_LTE {
+        return comparison_op(l <= r, l, return_bool);
+    }
+    if id == token::T_GTE {
+        return comparison_op(l >= r, l, return_bool);
+    }
     None
 }
 

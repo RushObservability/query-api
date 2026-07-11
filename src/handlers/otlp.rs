@@ -14,11 +14,11 @@
 ///   application/json        → 415 Unsupported Media Type (OTLP JSON not supported)
 ///   Missing / other         → attempt protobuf decode; 400 on failure
 use axum::{
+    Extension,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Extension,
 };
 use prost::Message;
 use serde::Deserialize;
@@ -27,17 +27,17 @@ use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
 use crate::models::ingest::{
-    ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, SummaryRow, SumRow, TraceInsertRow,
+    ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, SumRow, SummaryRow, TraceInsertRow,
 };
 
 // ─── Re-export the proto types we need ───────────────────────────────────────
 
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
-use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
 use opentelemetry_proto::tonic::metrics::v1::exemplar;
+use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -91,13 +91,21 @@ async fn decode_proto<T: Message + Default + Send + 'static>(
         // the blocking pool. `Bytes` is cheap to move across threads.
         tokio::task::spawn_blocking(move || decode_proto_sync::<T>(gzip, &body))
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode task failed: {e}")))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("decode task failed: {e}"),
+                )
+            })?
     } else {
         decode_proto_sync::<T>(gzip, &body)
     }
 }
 
-fn decode_proto_sync<T: Message + Default>(gzip: bool, body: &[u8]) -> Result<T, (StatusCode, String)> {
+fn decode_proto_sync<T: Message + Default>(
+    gzip: bool,
+    body: &[u8],
+) -> Result<T, (StatusCode, String)> {
     let decoded: std::borrow::Cow<[u8]> = if gzip {
         use std::io::Read;
         // Read at most MAX_OTLP_BODY+1 so an over-large inflation is detected and
@@ -106,11 +114,19 @@ fn decode_proto_sync<T: Message + Default>(gzip: bool, body: &[u8]) -> Result<T,
         flate2::read::GzDecoder::new(body)
             .take(MAX_OTLP_BODY as u64 + 1)
             .read_to_end(&mut out)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("gzip decompress failed: {e}")))?;
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("gzip decompress failed: {e}"),
+                )
+            })?;
         if out.len() > MAX_OTLP_BODY {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("decompressed OTLP body exceeds {} byte limit", MAX_OTLP_BODY),
+                format!(
+                    "decompressed OTLP body exceeds {} byte limit",
+                    MAX_OTLP_BODY
+                ),
             ));
         }
         std::borrow::Cow::Owned(out)
@@ -118,8 +134,12 @@ fn decode_proto_sync<T: Message + Default>(gzip: bool, body: &[u8]) -> Result<T,
         std::borrow::Cow::Borrowed(body)
     };
 
-    T::decode(decoded.as_ref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("protobuf decode failed: {e}")))
+    T::decode(decoded.as_ref()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("protobuf decode failed: {e}"),
+        )
+    })
 }
 
 /// Convert an OTLP AnyValue to a String for storage as a span/log attribute value.
@@ -141,7 +161,11 @@ fn any_value_to_string(v: &AnyValue) -> String {
                 .values
                 .iter()
                 .map(|kv| {
-                    let val = kv.value.as_ref().map(any_value_to_string).unwrap_or_default();
+                    let val = kv
+                        .value
+                        .as_ref()
+                        .map(any_value_to_string)
+                        .unwrap_or_default();
                     format!("{}={}", kv.key, val)
                 })
                 .collect();
@@ -155,7 +179,11 @@ fn any_value_to_string(v: &AnyValue) -> String {
 fn kv_to_attrs(kvs: &[KeyValue]) -> Vec<(String, String)> {
     kvs.iter()
         .map(|kv| {
-            let val = kv.value.as_ref().map(any_value_to_string).unwrap_or_default();
+            let val = kv
+                .value
+                .as_ref()
+                .map(any_value_to_string)
+                .unwrap_or_default();
             (kv.key.clone(), val)
         })
         .collect()
@@ -264,7 +292,9 @@ pub async fn ingest_otlp_traces(
         // service.name/schema_url strings ONCE, behind Arc, then hand cheap Arc
         // clones to every span row instead of re-allocating per span.
         let resource_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
-            resource.map(|r| kv_to_attrs(&r.attributes)).unwrap_or_default(),
+            resource
+                .map(|r| kv_to_attrs(&r.attributes))
+                .unwrap_or_default(),
         );
         let service_name: std::sync::Arc<str> = resource
             .map(|r| resource_service_name(r))
@@ -274,8 +304,10 @@ pub async fn ingest_otlp_traces(
 
         for ss in &rs.scope_spans {
             let scope = ss.scope.as_ref();
-            let scope_name: std::sync::Arc<str> = scope.map(|s| s.name.as_str()).unwrap_or("").into();
-            let scope_version: std::sync::Arc<str> = scope.map(|s| s.version.as_str()).unwrap_or("").into();
+            let scope_name: std::sync::Arc<str> =
+                scope.map(|s| s.name.as_str()).unwrap_or("").into();
+            let scope_version: std::sync::Arc<str> =
+                scope.map(|s| s.version.as_str()).unwrap_or("").into();
             let scope_schema_url = ss.schema_url.clone();
 
             for span in &ss.spans {
@@ -301,8 +333,7 @@ pub async fn ingest_otlp_traces(
                 let status_code = status
                     .map(|s| status_code_name(s.code))
                     .unwrap_or("STATUS_CODE_UNSET");
-                let status_message =
-                    status.map(|s| s.message.clone()).unwrap_or_default();
+                let status_message = status.map(|s| s.message.clone()).unwrap_or_default();
 
                 // Events
                 let mut events_timestamp = Vec::with_capacity(span.events.len());
@@ -332,13 +363,20 @@ pub async fn ingest_otlp_traces(
                 let mut all_span_attrs = span_attrs;
                 if let Some(scope) = ss.scope.as_ref() {
                     for kv in &scope.attributes {
-                        let val = kv.value.as_ref().map(any_value_to_string).unwrap_or_default();
+                        let val = kv
+                            .value
+                            .as_ref()
+                            .map(any_value_to_string)
+                            .unwrap_or_default();
                         all_span_attrs.push((format!("scope.{}", kv.key), val));
                     }
                 }
                 // Stash schema URLs in span attrs so nothing is lost
                 if !resource_schema_url.is_empty() {
-                    all_span_attrs.push(("resource.schema_url".to_string(), resource_schema_url.clone()));
+                    all_span_attrs.push((
+                        "resource.schema_url".to_string(),
+                        resource_schema_url.clone(),
+                    ));
                 }
                 if !scope_schema_url.is_empty() {
                     all_span_attrs.push(("scope.schema_url".to_string(), scope_schema_url.clone()));
@@ -380,8 +418,10 @@ pub async fn ingest_otlp_traces(
     let count = rows.len();
     // Reshape OTel-native rows into wide `spans` rows at ingest (the former spans_mv
     // transform) and write directly to the single `spans` table — no spans_raw copy.
-    let wide: Vec<crate::models::trace::WideEvent> =
-        rows.into_iter().map(crate::models::trace::WideEvent::from).collect();
+    let wide: Vec<crate::models::trace::WideEvent> = rows
+        .into_iter()
+        .map(crate::models::trace::WideEvent::from)
+        .collect();
     crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Spans(wide))
         .await
         .map_err(map_write_err)?;
@@ -415,9 +455,7 @@ pub async fn ingest_otlp_logs(
 
     let mut rows: Vec<LogInsertRow> = Vec::new();
 
-    let now_ns = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0);
+    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
     // Arc refactor: tenant_id is shared across the whole batch — allocate once.
     let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
@@ -427,7 +465,9 @@ pub async fn ingest_otlp_logs(
         // Per-resource shared data behind Arc (allocated once, cheaply cloned
         // into each log row).
         let resource_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
-            resource.map(|r| kv_to_attrs(&r.attributes)).unwrap_or_default(),
+            resource
+                .map(|r| kv_to_attrs(&r.attributes))
+                .unwrap_or_default(),
         );
         let service_name = resource
             .map(|r| resource_service_name(r))
@@ -436,10 +476,14 @@ pub async fn ingest_otlp_logs(
 
         for sl in &rl.scope_logs {
             let scope = sl.scope.as_ref();
-            let scope_name: std::sync::Arc<str> = scope.map(|s| s.name.as_str()).unwrap_or("").into();
-            let scope_version: std::sync::Arc<str> = scope.map(|s| s.version.as_str()).unwrap_or("").into();
+            let scope_name: std::sync::Arc<str> =
+                scope.map(|s| s.name.as_str()).unwrap_or("").into();
+            let scope_version: std::sync::Arc<str> =
+                scope.map(|s| s.version.as_str()).unwrap_or("").into();
             let scope_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
-                scope.map(|s| kv_to_attrs(&s.attributes)).unwrap_or_default(),
+                scope
+                    .map(|s| kv_to_attrs(&s.attributes))
+                    .unwrap_or_default(),
             );
             let scope_schema_url: std::sync::Arc<str> = sl.schema_url.as_str().into();
 
@@ -537,7 +581,9 @@ pub async fn ingest_otlp_metrics(
     for rm in &req.resource_metrics {
         let resource = rm.resource.as_ref();
         let resource_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
-            resource.map(|r| kv_to_attrs(&r.attributes)).unwrap_or_default(),
+            resource
+                .map(|r| kv_to_attrs(&r.attributes))
+                .unwrap_or_default(),
         );
         let service_name: std::sync::Arc<str> = resource
             .map(|r| resource_service_name(r))
@@ -547,14 +593,16 @@ pub async fn ingest_otlp_metrics(
 
         for sm in &rm.scope_metrics {
             let scope = sm.scope.as_ref();
-            let scope_name: std::sync::Arc<str> = scope.map(|s| s.name.as_str()).unwrap_or("").into();
-            let scope_version: std::sync::Arc<str> = scope.map(|s| s.version.as_str()).unwrap_or("").into();
+            let scope_name: std::sync::Arc<str> =
+                scope.map(|s| s.name.as_str()).unwrap_or("").into();
+            let scope_version: std::sync::Arc<str> =
+                scope.map(|s| s.version.as_str()).unwrap_or("").into();
             let scope_attributes: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
-                scope.map(|s| kv_to_attrs(&s.attributes)).unwrap_or_default(),
+                scope
+                    .map(|s| kv_to_attrs(&s.attributes))
+                    .unwrap_or_default(),
             );
-            let scope_dropped = scope
-                .map(|s| s.dropped_attributes_count)
-                .unwrap_or(0);
+            let scope_dropped = scope.map(|s| s.dropped_attributes_count).unwrap_or(0);
             let scope_schema_url: std::sync::Arc<str> = sm.schema_url.as_str().into();
 
             for metric in &sm.metrics {
@@ -779,39 +827,77 @@ pub async fn ingest_otlp_metrics(
     // Write each non-empty type batch concurrently.
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Gauge(gauge_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Gauge(gauge_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Sum(sum_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Sum(sum_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let histogram_fut = async {
         if !histogram_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Histogram(histogram_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Histogram(histogram_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let exp_histogram_fut = async {
         if !exp_histogram_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::ExpHistogram(exp_histogram_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::ExpHistogram(exp_histogram_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let summary_fut = async {
         if !summary_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Summary(summary_rows)).await.map_err(map_write_err)?;
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Summary(summary_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
 
     let (r1, r2, r3, r4, r5) = tokio::join!(
-        gauge_fut, sum_fut, histogram_fut, exp_histogram_fut, summary_fut
+        gauge_fut,
+        sum_fut,
+        histogram_fut,
+        exp_histogram_fut,
+        summary_fut
     );
-    r1?; r2?; r3?; r4?; r5?;
+    r1?;
+    r2?;
+    r3?;
+    r4?;
+    r5?;
 
     state
         .usage_accumulator
@@ -909,18 +995,16 @@ pub async fn ingest_vector_logs(
     // framing config. Handle all three.
     let first_non_ws = body.iter().find(|b| !b.is_ascii_whitespace()).copied();
     let entries: Vec<VectorLogEntry> = if first_non_ws == Some(b'[') {
-        serde_json::from_slice(&body).map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("invalid JSON array: {e}"))
-        })?
+        serde_json::from_slice(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON array: {e}")))?
     } else {
         // Stream of concatenated/NDJSON objects (also covers a single object).
         let mut out = Vec::new();
-        let mut stream =
-            serde_json::Deserializer::from_slice(&body).into_iter::<VectorLogEntry>();
+        let mut stream = serde_json::Deserializer::from_slice(&body).into_iter::<VectorLogEntry>();
         for item in &mut stream {
-            out.push(item.map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("invalid JSON object: {e}"))
-            })?);
+            out.push(
+                item.map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON object: {e}")))?,
+            );
         }
         out
     };
@@ -940,8 +1024,13 @@ pub async fn ingest_vector_logs(
     let rows: Vec<LogInsertRow> = entries
         .into_iter()
         .map(|e| {
-            let ts = if e.timestamp != 0 { e.timestamp } else { now_ns };
-            let resource_attributes = std::sync::Arc::new(json_obj_to_attrs(&e.resource_attributes));
+            let ts = if e.timestamp != 0 {
+                e.timestamp
+            } else {
+                now_ns
+            };
+            let resource_attributes =
+                std::sync::Arc::new(json_obj_to_attrs(&e.resource_attributes));
             let log_attributes = json_obj_to_attrs(&e.log_attributes);
             LogInsertRow {
                 tenant_id: tenant_arc.clone(),

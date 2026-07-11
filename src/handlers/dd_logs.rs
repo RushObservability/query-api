@@ -1,18 +1,17 @@
 use axum::{
+    Extension, Json,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
-    Extension,
 };
 use serde::Deserialize;
 
+use super::dd_common::{dd_status_to_severity, decompress_body, parse_dd_tags, validate_api_key};
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
 use crate::models::ingest::LogInsertRow;
-use super::dd_common::{validate_api_key, decompress_body, parse_dd_tags, dd_status_to_severity};
 
 /// A single Datadog log entry from the JSON payload.
 #[derive(Debug, Deserialize)]
@@ -33,7 +32,6 @@ struct DdLogEntry {
     #[serde(default)]
     timestamp: Option<i64>,
 }
-
 
 /// POST /datadog/v1/input — Datadog log intake endpoint.
 ///
@@ -58,7 +56,10 @@ pub async fn ingest_logs_with_tenant(
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !state.config_db.is_tenant_enabled(&tenant_override).await {
-        return Err((StatusCode::BAD_REQUEST, format!("tenant '{}' not found or disabled", tenant_override)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("tenant '{}' not found or disabled", tenant_override),
+        ));
     }
     ingest_logs_inner(state, tenant_override, headers, body).await
 }
@@ -75,13 +76,11 @@ async fn ingest_logs_inner(
 
     // The DD agent sends either a JSON array or a single object
     let entries: Vec<DdLogEntry> = if raw.first() == Some(&b'[') {
-        serde_json::from_slice(&raw).map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("invalid JSON array: {e}"))
-        })?
+        serde_json::from_slice(&raw)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON array: {e}")))?
     } else {
-        let single: DdLogEntry = serde_json::from_slice(&raw).map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}"))
-        })?;
+        let single: DdLogEntry = serde_json::from_slice(&raw)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
         vec![single]
     };
 
@@ -105,13 +104,20 @@ async fn ingest_logs_inner(
         // over the DD agent's status field (which is often just stderr=error).
         let (severity_text, severity_number) = {
             let body = entry.message.as_str();
-            if body.contains(" ERROR ") || body.contains(" error ") || body.contains("\\bERROR\\b") {
+            if body.contains(" ERROR ") || body.contains(" error ") || body.contains("\\bERROR\\b")
+            {
                 ("ERROR".into(), 17u8)
-            } else if body.contains(" WARN ") || body.contains(" WARNING ") || body.contains(" warn ") {
+            } else if body.contains(" WARN ")
+                || body.contains(" WARNING ")
+                || body.contains(" warn ")
+            {
                 ("WARN".into(), 13u8)
             } else if body.contains(" DEBUG ") || body.contains(" debug ") {
                 ("DEBUG".into(), 5u8)
-            } else if body.contains(" FATAL ") || body.contains(" fatal ") || body.contains(" CRITICAL ") {
+            } else if body.contains(" FATAL ")
+                || body.contains(" fatal ")
+                || body.contains(" CRITICAL ")
+            {
                 ("FATAL".into(), 21u8)
             } else if body.contains(" INFO ") || body.contains(" info ") {
                 ("INFO".into(), 9u8)
@@ -128,7 +134,7 @@ async fn ingest_logs_inner(
             Some(ms) if ms > 1_000_000_000_000_000 => ms, // already nanoseconds
             Some(ms) if ms > 1_000_000_000_000 => ms * 1_000_000, // microseconds
             Some(ms) if ms > 1_000_000_000 => ms * 1_000_000, // milliseconds
-            Some(s) => s * 1_000_000_000, // seconds
+            Some(s) => s * 1_000_000_000,                 // seconds
             None => now_ns,
         };
 
@@ -173,13 +179,20 @@ async fn ingest_logs_inner(
     }
 
     let count = rows.len() as u64;
-    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows)).await.map_err(|e| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
-    })?;
+    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        })?;
 
     // Record usage for per-tenant ingest metering
-    state.usage_accumulator.record(&tenant_id, "logs", count, raw.len() as u64);
+    state
+        .usage_accumulator
+        .record(&tenant_id, "logs", count, raw.len() as u64);
 
     tracing::debug!(
         signal = "logs",

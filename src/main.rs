@@ -4,10 +4,10 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use axum::http::{HeaderValue, header};
+use axum::response::IntoResponse;
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{extract::Request, middleware::Next, response::Response};
-use axum::response::IntoResponse;
-use axum::http::{HeaderValue, header};
 use clickhouse::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,31 +16,37 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use rush_api::AppState;
+use rush_api::TenantContext;
 use rush_api::alert_engine;
 use rush_api::anomaly_engine;
-use rush_api::config::RushConfig;
+use rush_api::ch_writer::ChWriter;
 use rush_api::clickhouse_config::ConfigDb;
+use rush_api::config::RushConfig;
 use rush_api::handlers;
 use rush_api::migrations;
 use rush_api::monitor_engine;
 use rush_api::retention_enforcer;
 use rush_api::siem_engine;
 use rush_api::slo_engine;
+use rush_api::spool::{IngestBuffer, Spool};
 use rush_api::stats_engine;
 use rush_api::usage_accumulator::UsageAccumulator;
 use rush_api::usage_tracker;
-use rush_api::ch_writer::ChWriter;
-use rush_api::spool::{IngestBuffer, Spool};
-use rush_api::AppState;
-use rush_api::TenantContext;
 
 /// Middleware that adds security response headers to every response.
 async fn security_headers_middleware(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS,     HeaderValue::from_static("nosniff"));
-    headers.insert(header::X_FRAME_OPTIONS,            HeaderValue::from_static("DENY"));
-    headers.insert(header::REFERRER_POLICY,            HeaderValue::from_static("strict-origin-when-cross-origin"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
     headers.insert(
         header::HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
@@ -50,7 +56,7 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
         HeaderValue::from_static(
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
              img-src 'self' data:; font-src 'self'; connect-src 'self'; \
-             object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
+             object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
         ),
     );
     resp
@@ -103,7 +109,11 @@ async fn http_metrics_middleware(
     };
     sm.inc_counter(
         "rush_http_requests_total",
-        &[("route", route.as_str()), ("method", method.as_str()), ("status_class", status_class)],
+        &[
+            ("route", route.as_str()),
+            ("method", method.as_str()),
+            ("status_class", status_class),
+        ],
         1,
     );
     sm.observe_histogram(
@@ -120,7 +130,10 @@ async fn http_metrics_middleware(
 async fn metrics_handler(State(state): State<AppState>) -> Response {
     let body = state.self_metrics.render_prometheus();
     (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
         .into_response()
@@ -153,7 +166,11 @@ async fn tenant_middleware(
             let tenant = rest[..slash].to_string();
             if !tenant.is_empty() {
                 let new_path = &rest[slash..]; // begins with '/'
-                let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+                let query = req
+                    .uri()
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default();
                 if let Ok(uri) = format!("{new_path}{query}").parse() {
                     *req.uri_mut() = uri;
                     url_tenant = Some(tenant);
@@ -183,9 +200,8 @@ async fn tenant_middleware(
         .or(url_tenant);
     let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
 
-    let tenant_id = resolve_tenant_from_headers(
-        &state, auth_header, dd_key, rush_tenant, session_token,
-    ).await;
+    let tenant_id =
+        resolve_tenant_from_headers(&state, auth_header, dd_key, rush_tenant, session_token).await;
     req.extensions_mut().insert(TenantContext { tenant_id });
     next.run(req).await
 }
@@ -235,11 +251,16 @@ async fn resolve_tenant_inner(
 
             match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
                 Ok(Some(tid)) => {
-                    state.api_key_cache.insert(key_hash, (tid.clone(), std::time::Instant::now()));
+                    state
+                        .api_key_cache
+                        .insert(key_hash, (tid.clone(), std::time::Instant::now()));
                     return tid;
                 }
                 Ok(None) => {
-                    tracing::debug!(method = "api_key", "tenant resolution: key not found, falling through");
+                    tracing::debug!(
+                        method = "api_key",
+                        "tenant resolution: key not found, falling through"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, method = "api_key", "tenant resolution failed");
@@ -266,11 +287,16 @@ async fn resolve_tenant_inner(
 
             match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
                 Ok(Some(tid)) => {
-                    state.api_key_cache.insert(key_hash, (tid.clone(), std::time::Instant::now()));
+                    state
+                        .api_key_cache
+                        .insert(key_hash, (tid.clone(), std::time::Instant::now()));
                     return tid;
                 }
                 Ok(None) => {
-                    tracing::debug!(method = "dd_api_key", "tenant resolution: DD key not found, falling through");
+                    tracing::debug!(
+                        method = "dd_api_key",
+                        "tenant resolution: DD key not found, falling through"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, method = "dd_api_key", "tenant resolution failed");
@@ -372,8 +398,9 @@ use axum::extract::State;
 /// the caller can fall back to disk.
 async fn build_object_store_buffer(max_bytes: u64) -> anyhow::Result<IngestBuffer> {
     let endpoint = std::env::var("RUSH_BUFFER_S3_ENDPOINT").unwrap_or_default();
-    let bucket = std::env::var("RUSH_BUFFER_S3_BUCKET")
-        .map_err(|_| anyhow::anyhow!("RUSH_BUFFER_S3_BUCKET is required for object_store backend"))?;
+    let bucket = std::env::var("RUSH_BUFFER_S3_BUCKET").map_err(|_| {
+        anyhow::anyhow!("RUSH_BUFFER_S3_BUCKET is required for object_store backend")
+    })?;
     let prefix = std::env::var("RUSH_BUFFER_S3_PREFIX").unwrap_or_else(|_| "ingest/".to_string());
     let region = std::env::var("RUSH_BUFFER_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let access = std::env::var("RUSH_BUFFER_S3_ACCESS_KEY")
@@ -414,9 +441,7 @@ async fn main() -> anyhow::Result<()> {
                 .init();
         }
         _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
         }
     }
 
@@ -435,7 +460,13 @@ async fn main() -> anyhow::Result<()> {
     let wide_config = RushConfig::load(&wide_config_path)?;
 
     // Run schema migrations (CREATE TABLE etc.) — blocks until tables exist.
-    migrations::run(&clickhouse_url, &clickhouse_user, &clickhouse_password, &wide_config).await?;
+    migrations::run(
+        &clickhouse_url,
+        &clickhouse_user,
+        &clickhouse_password,
+        &wide_config,
+    )
+    .await?;
 
     // Spawn TTL + storage policy maintenance in the background so the API
     // starts serving immediately instead of blocking on ALTER TABLE mutations.
@@ -475,9 +506,8 @@ async fn main() -> anyhow::Result<()> {
         migrations::apply_row_policies(&ch).await;
     }
 
-    let config_db = Arc::new(
-        ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?
-    );
+    let config_db =
+        Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
     config_db.ensure_default_tenant().await?;
     // Reserve the `_audit` tenant (seeded disabled) so it's never an ingest target.
     config_db.ensure_audit_tenant().await?;
@@ -488,7 +518,12 @@ async fn main() -> anyhow::Result<()> {
         let rd = &wide_config.retention.defaults;
         let default_days = rd.metrics_days.max(rd.traces_days).max(rd.logs_days) as i32;
         config_db
-            .ensure_global_retention(default_days, rd.logs_days as i32, rd.metrics_days as i32, rd.traces_days as i32)
+            .ensure_global_retention(
+                default_days,
+                rd.logs_days as i32,
+                rd.metrics_days as i32,
+                rd.traces_days as i32,
+            )
             .await?;
     }
     config_db.ensure_default_admin().await?;
@@ -505,8 +540,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(587),
         user: std::env::var("RUSH_SMTP_USER").ok(),
         pass: std::env::var("RUSH_SMTP_PASS").ok(),
-        from: std::env::var("RUSH_SMTP_FROM")
-            .unwrap_or_else(|_| "wide@localhost".to_string()),
+        from: std::env::var("RUSH_SMTP_FROM").unwrap_or_else(|_| "wide@localhost".to_string()),
     };
 
     // Ingest-buffer drain controls (Phase 3):
@@ -541,56 +575,79 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(true)
     };
     if !drain_only {
-    // Legacy alert-rules engine retired — Monitors (monitor_engine) is the single
-    // alerting system. The alert_engine module is kept only for the shared
-    // notification infrastructure (SmtpConfig, send_channel_notification) that
-    // Monitors and the anomaly engine use; the rule-evaluation loop no longer runs.
-    if engine_enabled("RUSH_RUN_SLO_ENGINE") {
-        slo_engine::spawn_slo_engine(config_db.clone(), ch.clone(), self_metrics.clone());
-    } else {
-        tracing::info!("in-process slo engine disabled (RUSH_RUN_SLO_ENGINE=false); expecting a dedicated slo-engine deployment");
-    }
+        // Legacy alert-rules engine retired — Monitors (monitor_engine) is the single
+        // alerting system. The alert_engine module is kept only for the shared
+        // notification infrastructure (SmtpConfig, send_channel_notification) that
+        // Monitors and the anomaly engine use; the rule-evaluation loop no longer runs.
+        if engine_enabled("RUSH_RUN_SLO_ENGINE") {
+            slo_engine::spawn_slo_engine(config_db.clone(), ch.clone(), self_metrics.clone());
+        } else {
+            tracing::info!(
+                "in-process slo engine disabled (RUSH_RUN_SLO_ENGINE=false); expecting a dedicated slo-engine deployment"
+            );
+        }
 
-    // Anomaly detection engine — evaluates anomaly rules, persists events, and
-    // sends notifications. Queries Prometheus-source rules against the API's own
-    // /prom endpoint (RUSH_PROM_BASE_URL, defaulting to this server).
-    //
-    // Runs in-process by default (single-binary / local dev). In Kubernetes the
-    // chart runs a dedicated `anomaly_engine` Deployment, so it sets
-    // RUSH_RUN_ANOMALY_ENGINE=false on the API to avoid double-evaluating rules
-    // and sending duplicate notifications.
-    let run_anomaly_in_process = std::env::var("RUSH_RUN_ANOMALY_ENGINE")
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
-        .unwrap_or(true);
-    if run_anomaly_in_process {
-        let prom_base_url = std::env::var("RUSH_PROM_BASE_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
-        anomaly_engine::spawn_anomaly_engine(config_db.clone(), ch.clone(), smtp_config.clone(), prom_base_url, self_metrics.clone());
-    } else {
-        tracing::info!("in-process anomaly engine disabled (RUSH_RUN_ANOMALY_ENGINE=false); expecting a dedicated anomaly-engine deployment");
-    }
-    retention_enforcer::spawn_retention_enforcer(ch.clone(), wide_config.clone(), config_db.clone(), self_metrics.clone());
-    // stats_engine is spawned after the ingest buffer is built (it emits buffer metrics).
+        // Anomaly detection engine — evaluates anomaly rules, persists events, and
+        // sends notifications. Queries Prometheus-source rules against the API's own
+        // /prom endpoint (RUSH_PROM_BASE_URL, defaulting to this server).
+        //
+        // Runs in-process by default (single-binary / local dev). In Kubernetes the
+        // chart runs a dedicated `anomaly_engine` Deployment, so it sets
+        // RUSH_RUN_ANOMALY_ENGINE=false on the API to avoid double-evaluating rules
+        // and sending duplicate notifications.
+        let run_anomaly_in_process = std::env::var("RUSH_RUN_ANOMALY_ENGINE")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+            .unwrap_or(true);
+        if run_anomaly_in_process {
+            let prom_base_url = std::env::var("RUSH_PROM_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string());
+            anomaly_engine::spawn_anomaly_engine(
+                config_db.clone(),
+                ch.clone(),
+                smtp_config.clone(),
+                prom_base_url,
+                self_metrics.clone(),
+            );
+        } else {
+            tracing::info!(
+                "in-process anomaly engine disabled (RUSH_RUN_ANOMALY_ENGINE=false); expecting a dedicated anomaly-engine deployment"
+            );
+        }
+        retention_enforcer::spawn_retention_enforcer(
+            ch.clone(),
+            wide_config.clone(),
+            config_db.clone(),
+            self_metrics.clone(),
+        );
+        // stats_engine is spawned after the ingest buffer is built (it emits buffer metrics).
 
-    // Spawn the Datadog-style monitor engine (v2 alerting)
-    if engine_enabled("RUSH_RUN_MONITOR_ENGINE") {
-        monitor_engine::spawn(ch.clone(), config_db.clone(), smtp_config, self_metrics.clone());
-    } else {
-        tracing::info!("in-process monitor engine disabled (RUSH_RUN_MONITOR_ENGINE=false); expecting a dedicated monitor-engine deployment");
-    }
+        // Spawn the Datadog-style monitor engine (v2 alerting)
+        if engine_enabled("RUSH_RUN_MONITOR_ENGINE") {
+            monitor_engine::spawn(
+                ch.clone(),
+                config_db.clone(),
+                smtp_config,
+                self_metrics.clone(),
+            );
+        } else {
+            tracing::info!(
+                "in-process monitor engine disabled (RUSH_RUN_MONITOR_ENGINE=false); expecting a dedicated monitor-engine deployment"
+            );
+        }
 
-    // Seed built-in SIEM detection rules and spawn the SIEM detection engine
-    config_db.ensure_default_detection_rules().await?;
-    if engine_enabled("RUSH_RUN_SIEM_ENGINE") {
-        siem_engine::spawn(ch.clone(), config_db.clone(), self_metrics.clone());
-    } else {
-        tracing::info!("in-process siem engine disabled (RUSH_RUN_SIEM_ENGINE=false); expecting a dedicated siem-engine deployment");
-    }
+        // Seed built-in SIEM detection rules and spawn the SIEM detection engine
+        config_db.ensure_default_detection_rules().await?;
+        if engine_enabled("RUSH_RUN_SIEM_ENGINE") {
+            siem_engine::spawn(ch.clone(), config_db.clone(), self_metrics.clone());
+        } else {
+            tracing::info!(
+                "in-process siem engine disabled (RUSH_RUN_SIEM_ENGINE=false); expecting a dedicated siem-engine deployment"
+            );
+        }
     } // end `if !drain_only` (background engines)
 
     // ── Durable write path: spool + writer ──
-    let spool_dir = std::env::var("RUSH_SPOOL_DIR")
-        .unwrap_or_else(|_| "./data/spool".to_string());
+    let spool_dir = std::env::var("RUSH_SPOOL_DIR").unwrap_or_else(|_| "./data/spool".to_string());
     let spool_max_bytes: u64 = std::env::var("RUSH_SPOOL_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -608,12 +665,14 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::error!(error = %e, "object_store buffer backend failed to init — falling back to disk");
-                let spool = Spool::open(&spool_dir, spool_max_bytes).expect("failed to open spool directory");
+                let spool = Spool::open(&spool_dir, spool_max_bytes)
+                    .expect("failed to open spool directory");
                 std::sync::Arc::new(IngestBuffer::Disk(spool))
             }
         }
     } else {
-        let spool = Spool::open(&spool_dir, spool_max_bytes).expect("failed to open spool directory");
+        let spool =
+            Spool::open(&spool_dir, spool_max_bytes).expect("failed to open spool directory");
         std::sync::Arc::new(IngestBuffer::Disk(spool))
     };
     let writer = ChWriter::new(ch.clone(), buffer);
@@ -650,7 +709,9 @@ async fn main() -> anyhow::Result<()> {
     // Metric firewall: load compiled rules now, then refresh periodically so
     // changes (incl. from other replicas) propagate to the ingest hot path.
     if let Ok(fw) = config_db.compiled_metric_firewall().await {
-        if let Ok(mut g) = writer.firewall.write() { *g = Arc::new(fw); }
+        if let Ok(mut g) = writer.firewall.write() {
+            *g = Arc::new(fw);
+        }
     }
     {
         let fw_handle = writer.firewall.clone();
@@ -660,7 +721,9 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tick.tick().await;
                 if let Ok(fw) = cdb.compiled_metric_firewall().await {
-                    if let Ok(mut g) = fw_handle.write() { *g = Arc::new(fw); }
+                    if let Ok(mut g) = fw_handle.write() {
+                        *g = Arc::new(fw);
+                    }
                 }
             }
         });
@@ -685,9 +748,11 @@ async fn main() -> anyhow::Result<()> {
                 interval.tick().await;
                 // Hard cap: if oversized (e.g. IP flood), evict aggressively.
                 if limiter_clone.len() > 100_000 {
-                    limiter_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(5));
+                    limiter_clone
+                        .retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(5));
                 } else {
-                    limiter_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+                    limiter_clone
+                        .retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
                 }
             }
         });
@@ -705,9 +770,11 @@ async fn main() -> anyhow::Result<()> {
                 interval.tick().await;
                 // Hard cap: more keys than any real deployment should have.
                 if cache_clone.len() > 50_000 {
-                    cache_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(10));
+                    cache_clone
+                        .retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(10));
                 } else {
-                    cache_clone.retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
+                    cache_clone
+                        .retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
                 }
             }
         });
@@ -767,6 +834,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/bubbleup", post(handlers::bubbleup::bubbleup))
         // Log endpoints
         .route("/api/v1/logs", post(handlers::logs::query_logs))
+        .route("/api/v1/logs/detail", post(handlers::logs::get_log_detail))
         .route("/api/v1/logs/count", post(handlers::logs::count_logs))
         .route("/api/v1/logs/histogram", post(handlers::logs::log_histogram))
         .route("/api/v1/logs/group", post(handlers::logs::group_logs))
@@ -1355,7 +1423,10 @@ async fn main() -> anyhow::Result<()> {
     // *after* routing, so applying tenant_middleware there can't affect the match.
     let app = Router::new()
         .fallback_service(inner)
-        .layer(axum::middleware::from_fn_with_state(state.clone(), tenant_middleware));
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenant_middleware,
+        ));
     let shutdown_writer = state.writer.clone();
 
     let port: u16 = std::env::var("RUSH_PORT")
@@ -1375,7 +1446,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     // L3: Warn when RUSH_BASE_URL is unset — SAML/OIDC redirect URIs derived from Host header.
-    if std::env::var("RUSH_BASE_URL").map(|s| s.is_empty()).unwrap_or(true) {
+    if std::env::var("RUSH_BASE_URL")
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
         tracing::warn!(
             "RUSH_BASE_URL is not set. SAML ACS and OIDC redirect URIs will be derived from \
              the Host request header, which can be spoofed. Set RUSH_BASE_URL to your \

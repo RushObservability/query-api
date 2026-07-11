@@ -1,16 +1,10 @@
-use axum::{
-    Json,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Extension,
-};
+use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::TenantContext;
 use crate::models::query::{Filter, FilterOp};
-use crate::query_builder::{format_value, format_array_value, resolve_field};
+use crate::query_builder::{format_array_value, format_value, resolve_field};
 
 // ── Request types ──
 
@@ -222,7 +216,10 @@ fn comparison_conditions(
 ) -> Result<(String, String), (StatusCode, String)> {
     if let (Some(min), Some(max)) = (req.selection_min_duration_ns, req.selection_max_duration_ns) {
         if min > max {
-            return Err((StatusCode::BAD_REQUEST, "selection minimum duration must not exceed maximum duration".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "selection minimum duration must not exceed maximum duration".into(),
+            ));
         }
     }
     if req.signal != "spans"
@@ -230,7 +227,10 @@ fn comparison_conditions(
             || req.selection_max_duration_ns.is_some()
             || req.selection_errors_only)
     {
-        return Err((StatusCode::BAD_REQUEST, "duration/error cohort filters are supported only for spans".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "duration/error cohort filters are supported only for spans".into(),
+        ));
     }
 
     let mut cohort_parts = Vec::new();
@@ -289,21 +289,27 @@ pub async fn bubbleup(
     let base_from = crate::query_builder::escape_string_literal(&req.baseline.from);
     let base_to = crate::query_builder::escape_string_literal(&req.baseline.to);
 
-    let earliest = if sel_from < base_from { &sel_from } else { &base_from };
+    let earliest = if sel_from < base_from {
+        &sel_from
+    } else {
+        &base_from
+    };
     let latest = if sel_to > base_to { &sel_to } else { &base_to };
 
     let additional_filters = build_filter_conditions(&req.filters, &req.signal);
 
-    let (selection_condition, baseline_condition) = comparison_conditions(
-        &req, ts_col, &sel_from, &sel_to, &base_from, &base_to,
-    )?;
+    let (selection_condition, baseline_condition) =
+        comparison_conditions(&req, ts_col, &sel_from, &sel_to, &base_from, &base_to)?;
 
     // A user `Body LIKE` filter (logs signal) is backed by the `idx_body_text` text
     // index, which an explicit PREWHERE on tenant/time would defeat (CH reads the whole
     // index instead of pruning granules). When such a filter is present, fold the scope
     // into a single WHERE and let `optimize_move_to_prewhere` re-derive the prewhere.
     // Pure-PK filters keep the explicit PREWHERE (the efficient granule-skipping path).
-    let has_like = req.filters.iter().any(|f| matches!(f.op, FilterOp::Like | FilterOp::NotLike));
+    let has_like = req
+        .filters
+        .iter()
+        .any(|f| matches!(f.op, FilterOp::Like | FilterOp::NotLike));
     let scan_clause = if has_like {
         format!(
             "WHERE tenant_id = '{escaped_tenant}' \
@@ -353,7 +359,10 @@ pub async fn bubbleup(
             .take(dimensions.len() - 1)
             .map(|dim| format!("grouping({dim}) = 0, toString({dim})"))
             .collect();
-        args.push(format!("toString({})", dimensions.last().expect("non-empty dimensions")));
+        args.push(format!(
+            "toString({})",
+            dimensions.last().expect("non-empty dimensions")
+        ));
         format!("multiIf({})", args.join(", "))
     };
     let grouping_sets = dimensions
@@ -396,7 +405,8 @@ pub async fn bubbleup(
     })?;
 
     // Bucket rows back into per-dimension lists (rows arrive ordered by dim_idx).
-    let mut per_dim_rows: Vec<Vec<DimensionRow>> = (0..dimensions.len()).map(|_| Vec::new()).collect();
+    let mut per_dim_rows: Vec<Vec<DimensionRow>> =
+        (0..dimensions.len()).map(|_| Vec::new()).collect();
     for row in dimension_rows {
         let idx = row.dim_idx as usize;
         if idx < per_dim_rows.len() {
@@ -436,7 +446,11 @@ pub async fn bubbleup(
             .collect();
 
         // Sort by lift descending (most over-represented first).
-        values.sort_by(|a, b| b.lift.partial_cmp(&a.lift).unwrap_or(std::cmp::Ordering::Equal));
+        values.sort_by(|a, b| {
+            b.lift
+                .partial_cmp(&a.lift)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         dim_comparisons.push(DimensionComparison {
             name: friendly_dimension_name(dim_name).to_string(),
@@ -468,11 +482,21 @@ mod tests {
 
     fn request(signal: &str) -> BubbleUpRequest {
         BubbleUpRequest {
-            selection: TimeWindow { from: "2026-01-01T00:05:00Z".into(), to: "2026-01-01T00:06:00Z".into() },
-            baseline: TimeWindow { from: "2026-01-01T00:00:00Z".into(), to: "2026-01-01T00:10:00Z".into() },
-            signal: signal.into(), filters: vec![], top_k: None,
-            selection_min_duration_ns: None, selection_max_duration_ns: None,
-            selection_errors_only: false, exclude_selection_from_baseline: false,
+            selection: TimeWindow {
+                from: "2026-01-01T00:05:00Z".into(),
+                to: "2026-01-01T00:06:00Z".into(),
+            },
+            baseline: TimeWindow {
+                from: "2026-01-01T00:00:00Z".into(),
+                to: "2026-01-01T00:10:00Z".into(),
+            },
+            signal: signal.into(),
+            filters: vec![],
+            top_k: None,
+            selection_min_duration_ns: None,
+            selection_max_duration_ns: None,
+            selection_errors_only: false,
+            exclude_selection_from_baseline: false,
         }
     }
 
@@ -483,7 +507,15 @@ mod tests {
         req.selection_max_duration_ns = Some(2_000_000_000);
         req.selection_errors_only = true;
         req.exclude_selection_from_baseline = true;
-        let (selection, baseline) = comparison_conditions(&req, "timestamp", "sel-from", "sel-to", "base-from", "base-to").unwrap();
+        let (selection, baseline) = comparison_conditions(
+            &req,
+            "timestamp",
+            "sel-from",
+            "sel-to",
+            "base-from",
+            "base-to",
+        )
+        .unwrap();
         assert!(selection.contains("duration_ns >= 100000000"));
         assert!(selection.contains("duration_ns <= 2000000000"));
         assert!(selection.contains("status = 'ERROR' OR http_status_code >= 500"));
@@ -495,7 +527,15 @@ mod tests {
     #[test]
     fn legacy_comparison_keeps_full_baseline_when_exclusion_is_off() {
         let req = request("logs");
-        let (_, baseline) = comparison_conditions(&req, "Timestamp", "sel-from", "sel-to", "base-from", "base-to").unwrap();
+        let (_, baseline) = comparison_conditions(
+            &req,
+            "Timestamp",
+            "sel-from",
+            "sel-to",
+            "base-from",
+            "base-to",
+        )
+        .unwrap();
         assert!(!baseline.contains("NOT"));
         assert!(baseline.contains("base-from"));
     }

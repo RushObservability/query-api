@@ -33,7 +33,12 @@ async fn f(query: &str, expected: f64) {
     let series = evaluate_range_query(&ch, query, START, END, STEP, "default")
         .await
         .unwrap_or_else(|e| panic!("query `{query}` failed: {e}"));
-    assert_eq!(series.len(), 1, "query `{query}`: expected 1 series, got {}", series.len());
+    assert_eq!(
+        series.len(),
+        1,
+        "query `{query}`: expected 1 series, got {}",
+        series.len()
+    );
     assert!(
         series[0].labels.is_empty(),
         "query `{query}`: expected empty labels, got {:?}",

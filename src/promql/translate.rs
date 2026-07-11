@@ -1,5 +1,5 @@
-use promql_parser::parser::token::{self, TokenType};
 use super::types::{AggOp, RangeFunc, ScalarFunc};
+use promql_parser::parser::token::{self, TokenType};
 
 /// Map a function name (from promql-parser `Call.func.name`) to our internal RangeFunc.
 pub fn to_range_func(name: &str) -> Option<RangeFunc> {
@@ -66,18 +66,42 @@ pub fn to_scalar_func(name: &str) -> Option<ScalarFunc> {
 /// Map a promql-parser aggregation TokenType to our internal AggOp.
 pub fn to_agg_op(tt: TokenType) -> Result<AggOp, String> {
     let t = tt.id();
-    if t == token::T_SUM { return Ok(AggOp::Sum); }
-    if t == token::T_AVG { return Ok(AggOp::Avg); }
-    if t == token::T_MIN { return Ok(AggOp::Min); }
-    if t == token::T_MAX { return Ok(AggOp::Max); }
-    if t == token::T_COUNT { return Ok(AggOp::Count); }
-    if t == token::T_STDDEV { return Ok(AggOp::Stddev); }
-    if t == token::T_STDVAR { return Ok(AggOp::Stdvar); }
-    if t == token::T_QUANTILE { return Ok(AggOp::Quantile); }
-    if t == token::T_TOPK { return Ok(AggOp::Topk); }
-    if t == token::T_BOTTOMK { return Ok(AggOp::Bottomk); }
-    if t == token::T_GROUP { return Ok(AggOp::Group); }
-    if t == token::T_COUNT_VALUES { return Ok(AggOp::CountValues); }
+    if t == token::T_SUM {
+        return Ok(AggOp::Sum);
+    }
+    if t == token::T_AVG {
+        return Ok(AggOp::Avg);
+    }
+    if t == token::T_MIN {
+        return Ok(AggOp::Min);
+    }
+    if t == token::T_MAX {
+        return Ok(AggOp::Max);
+    }
+    if t == token::T_COUNT {
+        return Ok(AggOp::Count);
+    }
+    if t == token::T_STDDEV {
+        return Ok(AggOp::Stddev);
+    }
+    if t == token::T_STDVAR {
+        return Ok(AggOp::Stdvar);
+    }
+    if t == token::T_QUANTILE {
+        return Ok(AggOp::Quantile);
+    }
+    if t == token::T_TOPK {
+        return Ok(AggOp::Topk);
+    }
+    if t == token::T_BOTTOMK {
+        return Ok(AggOp::Bottomk);
+    }
+    if t == token::T_GROUP {
+        return Ok(AggOp::Group);
+    }
+    if t == token::T_COUNT_VALUES {
+        return Ok(AggOp::CountValues);
+    }
     Err(format!("unsupported aggregation token: {tt:?}"))
 }
 

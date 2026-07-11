@@ -63,17 +63,54 @@ fn ar(group: &str, version: &str, kind: &str, plural: &str) -> ApiResource {
 }
 
 fn kustomization_ar() -> ApiResource {
-    ar("kustomize.toolkit.fluxcd.io", "v1", "Kustomization", "kustomizations")
+    ar(
+        "kustomize.toolkit.fluxcd.io",
+        "v1",
+        "Kustomization",
+        "kustomizations",
+    )
 }
 fn helmrelease_ar() -> ApiResource {
-    ar("helm.toolkit.fluxcd.io", "v2", "HelmRelease", "helmreleases")
+    ar(
+        "helm.toolkit.fluxcd.io",
+        "v2",
+        "HelmRelease",
+        "helmreleases",
+    )
 }
 fn source_ars() -> Vec<(&'static str, ApiResource)> {
     vec![
-        ("GitRepository", ar("source.toolkit.fluxcd.io", "v1", "GitRepository", "gitrepositories")),
-        ("OCIRepository", ar("source.toolkit.fluxcd.io", "v1beta2", "OCIRepository", "ocirepositories")),
-        ("HelmRepository", ar("source.toolkit.fluxcd.io", "v1", "HelmRepository", "helmrepositories")),
-        ("Bucket", ar("source.toolkit.fluxcd.io", "v1", "Bucket", "buckets")),
+        (
+            "GitRepository",
+            ar(
+                "source.toolkit.fluxcd.io",
+                "v1",
+                "GitRepository",
+                "gitrepositories",
+            ),
+        ),
+        (
+            "OCIRepository",
+            ar(
+                "source.toolkit.fluxcd.io",
+                "v1beta2",
+                "OCIRepository",
+                "ocirepositories",
+            ),
+        ),
+        (
+            "HelmRepository",
+            ar(
+                "source.toolkit.fluxcd.io",
+                "v1",
+                "HelmRepository",
+                "helmrepositories",
+            ),
+        ),
+        (
+            "Bucket",
+            ar("source.toolkit.fluxcd.io", "v1", "Bucket", "buckets"),
+        ),
     ]
 }
 
@@ -89,14 +126,31 @@ fn ready_condition(status: &Value) -> (String, String, String, String) {
             .or_else(|| arr.first());
         if let Some(c) = ready {
             return (
-                c.get("status").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
-                c.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                c.get("lastTransitionTime").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                c.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                c.get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                c.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                c.get("lastTransitionTime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                c.get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             );
         }
     }
-    ("Unknown".into(), String::new(), String::new(), String::new())
+    (
+        "Unknown".into(),
+        String::new(),
+        String::new(),
+        String::new(),
+    )
 }
 
 fn is_reconciling(status: &Value) -> bool {
@@ -115,12 +169,19 @@ fn is_reconciling(status: &Value) -> bool {
 fn source_ref(spec: &Value) -> String {
     // Kustomization/HelmRelease point at a source via spec.sourceRef; HelmRelease
     // may instead use spec.chart.spec.sourceRef or spec.chartRef.
-    let r = spec.get("sourceRef").or_else(|| spec.pointer("/chart/spec/sourceRef")).or_else(|| spec.get("chartRef"));
+    let r = spec
+        .get("sourceRef")
+        .or_else(|| spec.pointer("/chart/spec/sourceRef"))
+        .or_else(|| spec.get("chartRef"));
     if let Some(r) = r {
         let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if !name.is_empty() {
-            return if kind.is_empty() { name.to_string() } else { format!("{kind}/{name}") };
+            return if kind.is_empty() {
+                name.to_string()
+            } else {
+                format!("{kind}/{name}")
+            };
         }
     }
     String::new()
@@ -253,7 +314,12 @@ pub async fn get_resource(
             .into_iter()
             .find(|(k, _)| *k == other)
             .map(|(_, ar)| ar)
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Unknown Flux kind '{kind}'")))?,
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Unknown Flux kind '{kind}'"),
+                )
+            })?,
     };
 
     // Resource is identified by name across namespaces — fetch by listing on a
@@ -262,7 +328,12 @@ pub async fn get_resource(
     let obj = api
         .list(&ListParams::default().fields(&format!("metadata.name={name}")))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get {kind} '{name}': {e}")))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get {kind} '{name}': {e}"),
+            )
+        })?
         .items
         .into_iter()
         .next()

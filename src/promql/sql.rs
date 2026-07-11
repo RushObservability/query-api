@@ -7,7 +7,10 @@ pub fn matchers_to_sql(matchers: &[Matcher]) -> Vec<String> {
         let col = match m.name.as_str() {
             "__name__" => "MetricName".to_string(),
             "service_name" | "job" => "ServiceName".to_string(),
-            _ => format!("Attributes['{}']", crate::query_builder::escape_string_literal(&m.name)),
+            _ => format!(
+                "Attributes['{}']",
+                crate::query_builder::escape_string_literal(&m.name)
+            ),
         };
 
         let escaped = crate::query_builder::escape_string_literal(&m.value);

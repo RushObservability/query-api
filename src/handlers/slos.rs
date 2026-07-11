@@ -23,7 +23,8 @@ pub async fn list_slos(
     require_auth(&state, &headers).await?;
     let slos = state
         .config_db
-        .list_slos(&tenant.tenant_id).await
+        .list_slos(&tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<SloResponse> = slos.into_iter().map(SloResponse::from).collect();
     Ok(Json(serde_json::json!({ "slos": responses })))
@@ -37,35 +38,63 @@ pub async fn create_slo(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_write(&state, &headers).await?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid slo_type: {}", req.slo_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid slo_type: {}", req.slo_type),
+        ));
     }
     if !VALID_INDICATOR_TYPES.contains(&req.indicator_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid indicator_type: {}", req.indicator_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid indicator_type: {}", req.indicator_type),
+        ));
     }
     if !VALID_WINDOWS.contains(&req.window_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid window_type: {}", req.window_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid window_type: {}", req.window_type),
+        ));
     }
     if req.target_percentage <= 0.0 || req.target_percentage > 100.0 {
-        return Err((StatusCode::BAD_REQUEST, "target_percentage must be between 0 and 100".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "target_percentage must be between 0 and 100".to_string(),
+        ));
     }
     // Latency requires threshold_ms > 0
     if req.indicator_type == "latency" {
         match req.threshold_ms {
             Some(ms) if ms > 0.0 => {}
-            _ => return Err((StatusCode::BAD_REQUEST, "latency indicator requires threshold_ms > 0".to_string())),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "latency indicator requires threshold_ms > 0".to_string(),
+                ));
+            }
         }
     }
     // Threshold requires threshold_value + valid threshold_op and must be metric type
     if req.indicator_type == "threshold" {
         if req.slo_type != "metric" {
-            return Err((StatusCode::BAD_REQUEST, "threshold indicator is only valid for metric slo_type".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "threshold indicator is only valid for metric slo_type".to_string(),
+            ));
         }
         if req.threshold_value.is_none() {
-            return Err((StatusCode::BAD_REQUEST, "threshold indicator requires threshold_value".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "threshold indicator requires threshold_value".to_string(),
+            ));
         }
         match &req.threshold_op {
             Some(op) if VALID_THRESHOLD_OPS.contains(&op.as_str()) => {}
-            _ => return Err((StatusCode::BAD_REQUEST, "threshold indicator requires threshold_op (lt, lte, gt, gte)".to_string())),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "threshold indicator requires threshold_op (lt, lte, gt, gte)".to_string(),
+                ));
+            }
         }
     }
 
@@ -110,14 +139,21 @@ pub async fn create_slo(
             &total_filters,
             req.eval_interval_secs,
             &channel_ids,
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let slo = state
         .config_db
-        .get_slo(&id, &tenant.tenant_id).await
+        .get_slo(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created slo".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read created slo".to_string(),
+            )
+        })?;
 
     // AUDIT: SLO created.
     state.audit.log(
@@ -142,12 +178,14 @@ pub async fn get_slo(
     require_auth(&state, &headers).await?;
     let slo = state
         .config_db
-        .get_slo(&id, &tenant.tenant_id).await
+        .get_slo(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "slo not found".to_string()))?;
     let events = state
         .config_db
-        .list_slo_events(&id, &tenant.tenant_id, 20).await
+        .list_slo_events(&id, &tenant.tenant_id, 20)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -165,33 +203,61 @@ pub async fn update_slo(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_write(&state, &headers).await?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid slo_type: {}", req.slo_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid slo_type: {}", req.slo_type),
+        ));
     }
     if !VALID_INDICATOR_TYPES.contains(&req.indicator_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid indicator_type: {}", req.indicator_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid indicator_type: {}", req.indicator_type),
+        ));
     }
     if !VALID_WINDOWS.contains(&req.window_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid window_type: {}", req.window_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid window_type: {}", req.window_type),
+        ));
     }
     if req.target_percentage <= 0.0 || req.target_percentage > 100.0 {
-        return Err((StatusCode::BAD_REQUEST, "target_percentage must be between 0 and 100".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "target_percentage must be between 0 and 100".to_string(),
+        ));
     }
     if req.indicator_type == "latency" {
         match req.threshold_ms {
             Some(ms) if ms > 0.0 => {}
-            _ => return Err((StatusCode::BAD_REQUEST, "latency indicator requires threshold_ms > 0".to_string())),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "latency indicator requires threshold_ms > 0".to_string(),
+                ));
+            }
         }
     }
     if req.indicator_type == "threshold" {
         if req.slo_type != "metric" {
-            return Err((StatusCode::BAD_REQUEST, "threshold indicator is only valid for metric slo_type".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "threshold indicator is only valid for metric slo_type".to_string(),
+            ));
         }
         if req.threshold_value.is_none() {
-            return Err((StatusCode::BAD_REQUEST, "threshold indicator requires threshold_value".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "threshold indicator requires threshold_value".to_string(),
+            ));
         }
         match &req.threshold_op {
             Some(op) if VALID_THRESHOLD_OPS.contains(&op.as_str()) => {}
-            _ => return Err((StatusCode::BAD_REQUEST, "threshold indicator requires threshold_op (lt, lte, gt, gte)".to_string())),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "threshold indicator requires threshold_op (lt, lte, gt, gte)".to_string(),
+                ));
+            }
         }
     }
 
@@ -232,7 +298,8 @@ pub async fn update_slo(
             &total_filters,
             req.eval_interval_secs,
             &channel_ids,
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "slo not found".to_string()));
@@ -240,9 +307,15 @@ pub async fn update_slo(
 
     let slo = state
         .config_db
-        .get_slo(&id, &tenant.tenant_id).await
+        .get_slo(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read slo".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read slo".to_string(),
+            )
+        })?;
 
     // AUDIT: SLO updated.
     state.audit.log(
@@ -267,21 +340,25 @@ pub async fn delete_slo(
     let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_slo(&id, &tenant.tenant_id).await
+        .delete_slo(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "slo not found".to_string()));
     }
 
     // AUDIT: SLO deleted.
-    state.audit.log(
-        crate::audit::AuditEvent::new("slo.delete", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(tenant.tenant_id.clone())
-            .resource("slo", id.clone())
-            .description("slo deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("slo.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("slo", id.clone())
+                .description("slo deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -295,7 +372,8 @@ pub async fn list_slo_events(
     require_auth(&state, &headers).await?;
     let events = state
         .config_db
-        .list_slo_events(&id, &tenant.tenant_id, 100).await
+        .list_slo_events(&id, &tenant.tenant_id, 100)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }

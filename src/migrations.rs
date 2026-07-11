@@ -8,7 +8,6 @@ use crate::config::RushConfig;
 const MIGRATIONS: &[&str] = &[
     // ── Database ──
     "CREATE DATABASE IF NOT EXISTS observability",
-
     // ── OTel traces ──
     // NOTE: `spans_raw` (the OTel-native landing table) and its `spans_mv` transform are
     // GONE. query-api now reshapes OTel spans into the wide `spans` row in Rust at ingest
@@ -56,7 +55,6 @@ PARTITION BY toDate(timestamp)
 ORDER BY (tenant_id, timestamp, service_name, trace_id, span_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── Drop the legacy spans_raw landing table + its transform MV ──
     // Spans are now ingested directly into `spans` (the transform moved to Rust). Drop the
     // MV before the table (the MV depends on it). No-ops on a fresh install; on existing
@@ -64,7 +62,6 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     // `spans` CREATE above and before the `spans_by_trace`/`services` MVs below.
     "DROP VIEW IF EXISTS observability.spans_mv",
     "DROP TABLE IF EXISTS observability.spans_raw SYNC",
-
     // ── MV: trace index for fast trace-id lookups (v2: tenant-scoped) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.spans_by_trace
 ENGINE = MergeTree()
@@ -75,7 +72,6 @@ AS SELECT
     http_method, http_path, http_status_code,
     duration_ns, status, timestamp
 FROM observability.spans",
-
     // ── MV: service catalog (v2: tenant-scoped) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.services
 ENGINE = ReplacingMergeTree(last_seen)
@@ -86,7 +82,6 @@ AS SELECT
     count() AS request_count
 FROM observability.spans
 GROUP BY tenant_id, service_name, http_path, http_method",
-
     // ── Gauge metrics (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_gauge
 (
@@ -125,7 +120,6 @@ PARTITION BY toDate(TimeUnix)
 ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── Sum metrics (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_sum
 (
@@ -166,7 +160,6 @@ PARTITION BY toDate(TimeUnix)
 ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── Histogram metrics (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_histogram
 (
@@ -212,7 +205,6 @@ PARTITION BY toDate(TimeUnix)
 ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── Exponential Histogram metrics (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_exp_histogram
 (
@@ -262,7 +254,6 @@ PARTITION BY toDate(TimeUnix)
 ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── Summary metrics (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_summary
 (
@@ -298,7 +289,6 @@ PARTITION BY toDate(TimeUnix)
 ORDER BY (tenant_id, MetricName, ServiceName, TimeUnix)
 TTL toDateTime(TimeUnix) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── OTel Logs (v2: multi-tenant with SIEM materialized columns) ──
     r"CREATE TABLE IF NOT EXISTS observability.logs
 (
@@ -344,8 +334,12 @@ PARTITION BY TimestampDate
 PRIMARY KEY (tenant_id, TimestampDate, TimestampTime, ServiceName, SeverityText)
 ORDER BY (tenant_id, TimestampDate, TimestampTime, ServiceName, SeverityText, Timestamp)
 TTL TimestampDate + toIntervalDay(30)
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1,
+    enable_block_number_column = 1, enable_block_offset_column = 1",
+    // Persist original insert coordinates so slim list rows can lazy-load full
+    // attributes after background part merges. Metadata-only and idempotent.
+    "ALTER TABLE observability.logs MODIFY SETTING \
+        enable_block_number_column = 1, enable_block_offset_column = 1",
     // ── Signal usage tracking (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.signal_usage
 (
@@ -360,7 +354,6 @@ ENGINE = ReplacingMergeTree(last_queried_at)
 ORDER BY (tenant_id, signal_type, signal_name, source)
 TTL toDateTime(last_queried_at) + INTERVAL 90 DAY DELETE
 SETTINGS index_granularity = 8192",
-
     // ── RUM (Real User Monitoring) events (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.rum
 (
@@ -410,7 +403,6 @@ PRIMARY KEY (tenant_id, AppName, EventType, TimestampTime)
 ORDER BY (tenant_id, AppName, EventType, TimestampTime, PagePath, Timestamp)
 TTL toDateTime(Timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── Session replay chunks (rrweb DOM snapshot + mutation events) ──
     r"CREATE TABLE IF NOT EXISTS observability.rum_replay
 (
@@ -425,7 +417,6 @@ ENGINE = MergeTree
 ORDER BY (tenant_id, session_id, chunk_idx)
 TTL toDateTime(chunk_ts) + INTERVAL 7 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
-
     // ── Tenant usage metering (per-tenant ingest volume tracking) ──
     r"CREATE TABLE IF NOT EXISTS observability.tenant_usage
 (
@@ -439,7 +430,6 @@ ENGINE = SummingMergeTree()
 ORDER BY (tenant_id, signal, bucket)
 TTL bucket + INTERVAL 400 DAY DELETE
 SETTINGS index_granularity = 8192",
-
     // ════════════════════════════════════════════════════════════════════
     // Metric rollups (1m + 1h pre-aggregation for gauge + sum)
     //
@@ -498,7 +488,6 @@ PARTITION BY toDate(bucket)
 ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
 TTL toDateTime(bucket) + INTERVAL 365 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
-
     // ── Gauge 1-hour rollup target ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_gauge_1h
 (
@@ -520,7 +509,6 @@ PARTITION BY toDate(bucket)
 ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
 TTL toDateTime(bucket) + INTERVAL 730 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
-
     // ── Sum 1-minute rollup target ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_sum_1m
 (
@@ -541,7 +529,6 @@ PARTITION BY toDate(bucket)
 ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
 TTL toDateTime(bucket) + INTERVAL 365 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
-
     // ── Sum 1-hour rollup target ──
     r"CREATE TABLE IF NOT EXISTS observability.metrics_sum_1h
 (
@@ -562,7 +549,6 @@ PARTITION BY toDate(bucket)
 ORDER BY (tenant_id, MetricName, ServiceName, Attributes, bucket)
 TTL toDateTime(bucket) + INTERVAL 730 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = 'tiered'",
-
     // ── MV: metrics_gauge → metrics_gauge_1m ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_gauge_1m_mv
 TO observability.metrics_gauge_1m
@@ -578,7 +564,6 @@ AS SELECT
     countState() AS cnt_state
 FROM observability.metrics_gauge
 GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
-
     // ── MV: metrics_gauge → metrics_gauge_1h (from raw, not cascaded) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_gauge_1h_mv
 TO observability.metrics_gauge_1h
@@ -594,7 +579,6 @@ AS SELECT
     countState() AS cnt_state
 FROM observability.metrics_gauge
 GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
-
     // ── MV: metrics_sum → metrics_sum_1m ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_sum_1m_mv
 TO observability.metrics_sum_1m
@@ -609,7 +593,6 @@ AS SELECT
     countState() AS cnt_state
 FROM observability.metrics_sum
 GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
-
     // ── MV: metrics_sum → metrics_sum_1h (from raw, not cascaded) ──
     r"CREATE MATERIALIZED VIEW IF NOT EXISTS observability.metrics_sum_1h_mv
 TO observability.metrics_sum_1h
@@ -624,7 +607,6 @@ AS SELECT
     countState() AS cnt_state
 FROM observability.metrics_sum
 GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
-
 ];
 
 /// Row-level security policies for tenant isolation (defense-in-depth).
@@ -655,7 +637,10 @@ const ROW_POLICY_TABLES: &[&str] = &[
 /// Create row policies on all tenant-scoped tables. Only safe to call when
 /// ClickHouse supports the `rush_tenant_id` custom setting.
 pub async fn apply_row_policies(client: &Client) {
-    tracing::info!("applying row-level security policies ({} tables)", ROW_POLICY_TABLES.len());
+    tracing::info!(
+        "applying row-level security policies ({} tables)",
+        ROW_POLICY_TABLES.len()
+    );
     for table in ROW_POLICY_TABLES {
         let sql = format!(
             "CREATE ROW POLICY IF NOT EXISTS tenant_isolation ON observability.{table} \
@@ -673,13 +658,21 @@ pub async fn apply_row_policies(client: &Client) {
 /// Connects **without** a default database so that `CREATE DATABASE` succeeds
 /// even on a fresh instance. Every statement uses `IF NOT EXISTS` so this is
 /// safe to call on every startup.
-pub async fn run(url: &str, user: &str, password: &str, _config: &RushConfig) -> anyhow::Result<()> {
+pub async fn run(
+    url: &str,
+    user: &str,
+    password: &str,
+    _config: &RushConfig,
+) -> anyhow::Result<()> {
     let client = Client::default()
         .with_url(url)
         .with_user(user)
         .with_password(password);
 
-    tracing::info!("running clickhouse migrations ({} statements)", MIGRATIONS.len());
+    tracing::info!(
+        "running clickhouse migrations ({} statements)",
+        MIGRATIONS.len()
+    );
 
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let preview: String = sql.chars().take(80).collect();
@@ -814,7 +807,11 @@ async fn backfill_rollups(client: &Client) -> anyhow::Result<()> {
             "toStartOfHour(now64(9))"
         };
 
-        let avg_col = if is_gauge { "avgState(Value) AS avg_state,\n    " } else { "" };
+        let avg_col = if is_gauge {
+            "avgState(Value) AS avg_state,\n    "
+        } else {
+            ""
+        };
         // Column order MUST match the target table definition exactly.
         let select_cols = if is_gauge {
             format!(
@@ -891,16 +888,25 @@ pub fn spawn_maintenance(url: String, user: String, password: String, config: Ru
 /// index — turning every free-text query into a full scan.
 async fn apply_skip_indexes(client: &Client) {
     #[derive(clickhouse::Row, serde::Deserialize)]
-    struct IndexRow { count: u64 }
+    struct IndexRow {
+        count: u64,
+    }
     #[derive(clickhouse::Row, serde::Deserialize)]
-    struct VerRow { v: String }
+    struct VerRow {
+        v: String,
+    }
 
     async fn index_exists(client: &Client, table: &str, name: &str) -> bool {
         let sql = format!(
             "SELECT count() as count FROM system.data_skipping_indices \
              WHERE database = 'observability' AND table = '{table}' AND name = '{name}'"
         );
-        client.query(&sql).fetch_one::<IndexRow>().await.map(|r| r.count > 0).unwrap_or(false)
+        client
+            .query(&sql)
+            .fetch_one::<IndexRow>()
+            .await
+            .map(|r| r.count > 0)
+            .unwrap_or(false)
     }
 
     // Full type string of an existing skip index (e.g. `text(tokenizer = ngrams(4))`),
@@ -910,11 +916,20 @@ async fn apply_skip_indexes(client: &Client) {
             "SELECT type_full AS v FROM system.data_skipping_indices \
              WHERE database = 'observability' AND table = '{table}' AND name = '{name}' LIMIT 1"
         );
-        client.query(&sql).fetch_one::<VerRow>().await.ok().map(|r| r.v)
+        client
+            .query(&sql)
+            .fetch_one::<VerRow>()
+            .await
+            .ok()
+            .map(|r| r.v)
     }
 
     // Native `text` indexes are GA in 26.2+. Be conservative on parse failure.
-    let text_supported = match client.query("SELECT version() AS v").fetch_one::<VerRow>().await {
+    let text_supported = match client
+        .query("SELECT version() AS v")
+        .fetch_one::<VerRow>()
+        .await
+    {
         Ok(r) => {
             let mut parts = r.v.split('.');
             let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -984,7 +999,9 @@ async fn apply_skip_indexes(client: &Client) {
                     tracing::info!(table = p.table, index = want_name, current = %tf,
                         "rebuilding stale search index with current tokenizer");
                     let drop_ddl = format!(
-                        "ALTER TABLE observability.{} DROP INDEX IF EXISTS {}", p.table, want_name);
+                        "ALTER TABLE observability.{} DROP INDEX IF EXISTS {}",
+                        p.table, want_name
+                    );
                     if let Err(e) = client.query(&drop_ddl).execute().await {
                         tracing::warn!(table = p.table, index = want_name, error = %e,
                             "failed to drop stale search index — leaving it in place");
@@ -1001,7 +1018,10 @@ async fn apply_skip_indexes(client: &Client) {
                     "failed to create search index — leaving existing indexes intact");
                 continue; // do NOT drop anything if we couldn't create the replacement
             }
-            let materialize = format!("ALTER TABLE observability.{} MATERIALIZE INDEX {}", p.table, want_name);
+            let materialize = format!(
+                "ALTER TABLE observability.{} MATERIALIZE INDEX {}",
+                p.table, want_name
+            );
             if let Err(e) = client.query(&materialize).execute().await {
                 tracing::warn!(table = p.table, index = want_name, error = %e, "failed to materialize search index");
             }
@@ -1009,10 +1029,19 @@ async fn apply_skip_indexes(client: &Client) {
 
         // 2. Desired index is present — now it's safe to drop superseded ones.
         for name in drops {
-            if *name == want_name { continue; }
+            if *name == want_name {
+                continue;
+            }
             if index_exists(client, p.table, name).await {
-                tracing::info!(table = p.table, index = name, "dropping superseded search index");
-                let drop_ddl = format!("ALTER TABLE observability.{} DROP INDEX IF EXISTS {}", p.table, name);
+                tracing::info!(
+                    table = p.table,
+                    index = name,
+                    "dropping superseded search index"
+                );
+                let drop_ddl = format!(
+                    "ALTER TABLE observability.{} DROP INDEX IF EXISTS {}",
+                    p.table, name
+                );
                 if let Err(e) = client.query(&drop_ddl).execute().await {
                     tracing::warn!(table = p.table, index = name, error = %e, "failed to drop superseded index");
                 }
@@ -1026,11 +1055,18 @@ async fn apply_skip_indexes(client: &Client) {
         //    (~3.7 GiB across the whole table), so it covers all retained data — no windowing.
         //    On the non-text path the loop above already created idx_body_ngram as `want`.
         if text_supported && !index_exists(client, p.table, p.ngram_name).await {
-            tracing::info!(table = p.table, index = p.ngram_name, "creating substring (ngrambf_v1) index");
+            tracing::info!(
+                table = p.table,
+                index = p.ngram_name,
+                "creating substring (ngrambf_v1) index"
+            );
             if let Err(e) = client.query(p.ngram_ddl).execute().await {
                 tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "failed to create substring index");
             } else {
-                let materialize = format!("ALTER TABLE observability.{} MATERIALIZE INDEX {}", p.table, p.ngram_name);
+                let materialize = format!(
+                    "ALTER TABLE observability.{} MATERIALIZE INDEX {}",
+                    p.table, p.ngram_name
+                );
                 if let Err(e) = client.query(&materialize).execute().await {
                     tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "failed to materialize substring index");
                 }
@@ -1041,7 +1077,12 @@ async fn apply_skip_indexes(client: &Client) {
     // Spans no longer carry a full-text search index. Drop any pre-existing spans search
     // indexes so existing deployments reclaim the storage (the text index was ~66% of the
     // spans table); fresh installs never create them.
-    for name in ["idx_search_text", "idx_search_blob", "idx_attributes_ngram", "idx_event_attributes_ngram"] {
+    for name in [
+        "idx_search_text",
+        "idx_search_blob",
+        "idx_attributes_ngram",
+        "idx_event_attributes_ngram",
+    ] {
         if index_exists(client, "spans", name).await {
             tracing::info!(index = name, "dropping obsolete spans full-text index");
             let drop_ddl = format!("ALTER TABLE observability.spans DROP INDEX IF EXISTS {name}");
@@ -1118,7 +1159,11 @@ pub async fn apply_retention_ttls(
         ("metrics_gauge", "toDateTime(TimeUnix)", metrics_days),
         ("metrics_sum", "toDateTime(TimeUnix)", metrics_days),
         ("metrics_histogram", "toDateTime(TimeUnix)", metrics_days),
-        ("metrics_exp_histogram", "toDateTime(TimeUnix)", metrics_days),
+        (
+            "metrics_exp_histogram",
+            "toDateTime(TimeUnix)",
+            metrics_days,
+        ),
         ("metrics_summary", "toDateTime(TimeUnix)", metrics_days),
         // Rollups keyed on `bucket` (a DateTime64), not TimeUnix.
         ("metrics_gauge_1m", "toDateTime(bucket)", rollup_1m_days),
@@ -1174,22 +1219,49 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
     // (table, timestamp_expr, move_after_days)
     let specs: &[(&str, &str, u32)] = &[
         // Metrics
-        ("metrics_gauge", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("metrics_sum", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("metrics_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("metrics_exp_histogram", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
-        ("metrics_summary", "toDateTime(TimeUnix)", tiering.metrics_move_after_days),
+        (
+            "metrics_gauge",
+            "toDateTime(TimeUnix)",
+            tiering.metrics_move_after_days,
+        ),
+        (
+            "metrics_sum",
+            "toDateTime(TimeUnix)",
+            tiering.metrics_move_after_days,
+        ),
+        (
+            "metrics_histogram",
+            "toDateTime(TimeUnix)",
+            tiering.metrics_move_after_days,
+        ),
+        (
+            "metrics_exp_histogram",
+            "toDateTime(TimeUnix)",
+            tiering.metrics_move_after_days,
+        ),
+        (
+            "metrics_summary",
+            "toDateTime(TimeUnix)",
+            tiering.metrics_move_after_days,
+        ),
         // Traces / spans
-        ("spans", "toDateTime(timestamp)", tiering.traces_move_after_days),
+        (
+            "spans",
+            "toDateTime(timestamp)",
+            tiering.traces_move_after_days,
+        ),
         // Logs
-        ("logs", "toDateTime(Timestamp)", tiering.logs_move_after_days),
+        (
+            "logs",
+            "toDateTime(Timestamp)",
+            tiering.logs_move_after_days,
+        ),
     ];
 
     for (table, ts_expr, move_days) in specs {
         // Always assign the tiered policy so the cold volume is available
-        let policy_sql = format!(
-            "ALTER TABLE observability.{table} MODIFY SETTING storage_policy = 'tiered'"
-        );
+        let policy_sql =
+            format!("ALTER TABLE observability.{table} MODIFY SETTING storage_policy = 'tiered'");
         if let Err(e) = client.query(&policy_sql).execute().await {
             tracing::warn!("could not set tiered storage on {table} (non-fatal): {e}");
             continue; // no point setting TTL MOVE if the policy didn't apply

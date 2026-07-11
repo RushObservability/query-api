@@ -448,9 +448,15 @@ pub struct SummaryRow {
 macro_rules! impl_metric_row {
     ($t:ty) => {
         impl crate::metric_firewall::MetricRow for $t {
-            fn fw_metric_name(&self) -> &str { &self.metric_name }
-            fn fw_attributes(&self) -> &[(String, String)] { &self.attributes }
-            fn fw_attributes_mut(&mut self) -> &mut Vec<(String, String)> { &mut self.attributes }
+            fn fw_metric_name(&self) -> &str {
+                &self.metric_name
+            }
+            fn fw_attributes(&self) -> &[(String, String)] {
+                &self.attributes
+            }
+            fn fw_attributes_mut(&mut self) -> &mut Vec<(String, String)> {
+                &mut self.attributes
+            }
         }
     };
 }

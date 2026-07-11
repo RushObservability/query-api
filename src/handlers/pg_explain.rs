@@ -5,11 +5,10 @@
 //! `EXPLAIN (FORMAT JSON)`, and posts the result (`/result`); the UI polls `/{id}`.
 //! Tenant is resolved by the global middleware (UI session OR collector Bearer key).
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension,
 };
 use serde::Deserialize;
 
@@ -58,7 +57,12 @@ pub async fn submit(
         .config_db
         .create_explain_job(&tenant.tenant_id, body.server.trim(), body.query.trim())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to create job: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create job: {e}"),
+            )
+        })?;
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
@@ -87,8 +91,14 @@ pub async fn poll(
     Extension(tenant): Extension<TenantContext>,
     Query(p): Query<PollParams>,
 ) -> Response {
-    match state.config_db.claim_pending_explain_job(&tenant.tenant_id, &p.server).await {
-        Ok(Some((id, query))) => Json(serde_json::json!({ "id": id, "query": query })).into_response(),
+    match state
+        .config_db
+        .claim_pending_explain_job(&tenant.tenant_id, &p.server)
+        .await
+    {
+        Ok(Some((id, query))) => {
+            Json(serde_json::json!({ "id": id, "query": query })).into_response()
+        }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }

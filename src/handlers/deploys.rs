@@ -16,19 +16,34 @@ pub async fn create_deploy(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
     if req.service_name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "service_name must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "service_name must not be empty".to_string(),
+        ));
     }
     if req.service_name.len() > 255 {
-        return Err((StatusCode::BAD_REQUEST, "service_name must not exceed 255 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "service_name must not exceed 255 characters".to_string(),
+        ));
     }
     if req.version.len() > 100 {
-        return Err((StatusCode::BAD_REQUEST, "version must not exceed 100 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "version must not exceed 100 characters".to_string(),
+        ));
     }
     if req.commit_sha.len() > 100 {
-        return Err((StatusCode::BAD_REQUEST, "commit_sha must not exceed 100 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "commit_sha must not exceed 100 characters".to_string(),
+        ));
     }
     if req.description.len() > 1024 {
-        return Err((StatusCode::BAD_REQUEST, "description must not exceed 1024 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "description must not exceed 1024 characters".to_string(),
+        ));
     }
     let id = uuid::Uuid::new_v4().to_string();
     state
@@ -41,7 +56,8 @@ pub async fn create_deploy(
             &req.description,
             &req.environment,
             &req.deployed_by,
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
@@ -57,7 +73,8 @@ pub async fn list_deploys(
             query.service_name.as_deref(),
             query.from.as_deref(),
             query.to.as_deref(),
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "deploys": markers })))
 }

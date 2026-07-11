@@ -23,21 +23,40 @@ pub struct SignalFlags {
     pub rum: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl Default for SignalFlags {
     fn default() -> Self {
-        SignalFlags { logs: true, apm: true, metrics: true, rum: true }
+        SignalFlags {
+            logs: true,
+            apm: true,
+            metrics: true,
+            rum: true,
+        }
     }
 }
 
 /// Resolve the effective signal flags for a tenant id (defaulting each to true).
 async fn resolve_signal_flags(state: &AppState, tenant_id: &str) -> SignalFlags {
     SignalFlags {
-        logs: state.config_db.tenant_signal_enabled(tenant_id, "logs").await,
-        apm: state.config_db.tenant_signal_enabled(tenant_id, "apm").await,
-        metrics: state.config_db.tenant_signal_enabled(tenant_id, "metrics").await,
-        rum: state.config_db.tenant_signal_enabled(tenant_id, "rum").await,
+        logs: state
+            .config_db
+            .tenant_signal_enabled(tenant_id, "logs")
+            .await,
+        apm: state
+            .config_db
+            .tenant_signal_enabled(tenant_id, "apm")
+            .await,
+        metrics: state
+            .config_db
+            .tenant_signal_enabled(tenant_id, "metrics")
+            .await,
+        rum: state
+            .config_db
+            .tenant_signal_enabled(tenant_id, "rum")
+            .await,
     }
 }
 
@@ -72,10 +91,7 @@ pub struct TenantResponse {
 
 impl TenantResponse {
     /// Build a response, resolving the tenant's signal flags from config.
-    async fn build(
-        state: &AppState,
-        row: (String, String, bool, bool, String),
-    ) -> TenantResponse {
+    async fn build(state: &AppState, row: (String, String, bool, bool, String)) -> TenantResponse {
         let signals = resolve_signal_flags(state, &row.0).await;
         TenantResponse {
             id: row.0,
@@ -96,8 +112,12 @@ pub async fn list_tenants(
 
     let rows: Vec<(String, String, bool, bool, String)> = state
         .config_db
-        .list_tenants().await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .list_tenants()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .into_iter()
         // The reserved `_audit` tenant is not a user-facing tenant — never show
         // it in the switcher (it's disabled and locked down anyway).
@@ -114,8 +134,12 @@ pub async fn list_tenants(
         // Non-admins see only tenants accessible via their groups
         let (_, _, accessible_ids) = state
             .config_db
-            .resolve_user_permissions(&caller.0).await
-            .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+            .resolve_user_permissions(&caller.0)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            })?;
 
         tracing::info!(user_id = %caller.0, username = %caller.1, accessible_tenant_ids = ?accessible_ids, "list_tenants: non-admin user");
 
@@ -140,12 +164,18 @@ pub async fn create_tenant(
     let caller = require_admin(&state, &headers).await?;
     let name = req.name.trim().to_string();
     if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not be empty".to_string(),
+        ));
     }
     // `_audit` is reserved for the tamper-evident audit log — refuse to let an
     // admin create a normal tenant under that name/id (case-insensitive).
     if name.eq_ignore_ascii_case(crate::audit::AUDIT_TENANT) {
-        return Err((StatusCode::BAD_REQUEST, "tenant name '_audit' is reserved".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "tenant name '_audit' is reserved".to_string(),
+        ));
     }
 
     // Tenant names must be unique: telemetry rows and the X-Rush-Tenant header
@@ -153,20 +183,32 @@ pub async fn create_tenant(
     // Case-insensitive to avoid "Test" vs "test" confusion. ClickHouse has no
     // transactions, so a concurrent create could still race past this check —
     // acceptable for an admin-only config endpoint.
-    let existing = state
-        .config_db
-        .list_tenants().await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
-    if existing.iter().any(|(_, n, ..)| n.eq_ignore_ascii_case(&name)) {
-        return Err((StatusCode::CONFLICT, format!("a tenant named \"{name}\" already exists")));
+    let existing = state.config_db.list_tenants().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    })?;
+    if existing
+        .iter()
+        .any(|(_, n, ..)| n.eq_ignore_ascii_case(&name))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("a tenant named \"{name}\" already exists"),
+        ));
     }
 
     let id = Uuid::new_v4().to_string();
 
     state
         .config_db
-        .create_tenant(&id, &name).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .create_tenant(&id, &name)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     // Persist any explicitly-disabled signals. Default is enabled, so we only
     // need to write the ones turned off (writing enabled rows is harmless too).
@@ -180,16 +222,26 @@ pub async fn create_tenant(
             if !enabled {
                 state
                     .config_db
-                    .set_tenant_signal(&id, signal, false).await
-                    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
+                    .set_tenant_signal(&id, signal, false)
+                    .await
+                    .map_err(|_| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal error".to_string(),
+                        )
+                    })?;
             }
         }
     }
 
     let tenant = state
         .config_db
-        .get_tenant(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_tenant(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -198,15 +250,18 @@ pub async fn create_tenant(
         })?;
 
     // AUDIT: tenant creation. Target tenant is the affected resource.
-    state.audit.log(
-        crate::audit::AuditEvent::new("tenant.create", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(id.clone())
-            .resource("tenant", id.clone())
-            .changes(serde_json::json!({ "name": name }).to_string())
-            .description("tenant created")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("tenant.create", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(id.clone())
+                .resource("tenant", id.clone())
+                .changes(serde_json::json!({ "name": name }).to_string())
+                .description("tenant created")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok((
         StatusCode::CREATED,
@@ -223,8 +278,12 @@ pub async fn toggle_tenant(
     let caller = require_admin(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_tenant_enabled(&id, req.enabled).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .set_tenant_enabled(&id, req.enabled)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
@@ -232,20 +291,27 @@ pub async fn toggle_tenant(
 
     let tenant = state
         .config_db
-        .get_tenant(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_tenant(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     // AUDIT: tenant enable/disable.
-    state.audit.log(
-        crate::audit::AuditEvent::new("tenant.toggle", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(id.clone())
-            .resource("tenant", id.clone())
-            .changes(serde_json::json!({ "enabled": req.enabled }).to_string())
-            .description("tenant enabled state changed")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("tenant.toggle", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(id.clone())
+                .resource("tenant", id.clone())
+                .changes(serde_json::json!({ "enabled": req.enabled }).to_string())
+                .description("tenant enabled state changed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(TenantResponse::build(&state, tenant).await))
 }
@@ -263,24 +329,27 @@ pub async fn delete_tenant(
         ));
     }
 
-    let deleted = state
-        .config_db
-        .delete_tenant(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+    let deleted = state.config_db.delete_tenant(&id).await.map_err(|e| {
+        tracing::error!(error = %e, "internal error");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+    })?;
 
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
     }
 
     // AUDIT: tenant deletion.
-    state.audit.log(
-        crate::audit::AuditEvent::new("tenant.delete", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(id.clone())
-            .resource("tenant", id.clone())
-            .description("tenant deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("tenant.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(id.clone())
+                .resource("tenant", id.clone())
+                .description("tenant deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -294,8 +363,12 @@ pub async fn set_auth_required(
     let caller = require_admin(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_tenant_auth_required(&id, req.auth_required).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .set_tenant_auth_required(&id, req.auth_required)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
@@ -303,20 +376,27 @@ pub async fn set_auth_required(
 
     let tenant = state
         .config_db
-        .get_tenant(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_tenant(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     // AUDIT: tenant auth-required setting change.
-    state.audit.log(
-        crate::audit::AuditEvent::new("tenant.auth_required_change", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(id.clone())
-            .resource("tenant", id.clone())
-            .changes(serde_json::json!({ "auth_required": req.auth_required }).to_string())
-            .description("tenant auth_required changed")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("tenant.auth_required_change", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(id.clone())
+                .resource("tenant", id.clone())
+                .changes(serde_json::json!({ "auth_required": req.auth_required }).to_string())
+                .description("tenant auth_required changed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(TenantResponse::build(&state, tenant).await))
 }
@@ -353,7 +433,10 @@ pub struct SetSignalsRequest {
 /// zeros if the query fails — visibility is non-critical.
 async fn dropped_counts(state: &AppState, tenant_id: &str) -> DroppedCounts {
     #[derive(clickhouse::Row, serde::Deserialize)]
-    struct Row { signal: String, events: u64 }
+    struct Row {
+        signal: String,
+        events: u64,
+    }
     let escaped = crate::query_builder::escape_string_literal(tenant_id);
     let sql = format!(
         "SELECT signal, sum(events_count) AS events \
@@ -393,8 +476,14 @@ pub async fn get_tenant_signals(
     // Verify tenant exists.
     state
         .config_db
-        .get_tenant(&id).await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?
+        .get_tenant(&id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     let signals = resolve_signal_flags(&state, &id).await;
@@ -413,8 +502,14 @@ pub async fn set_tenant_signals(
     // Verify tenant exists.
     state
         .config_db
-        .get_tenant(&id).await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?
+        .get_tenant(&id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
 
     for (signal, maybe_enabled) in [
@@ -426,23 +521,35 @@ pub async fn set_tenant_signals(
         if let Some(enabled) = maybe_enabled {
             state
                 .config_db
-                .set_tenant_signal(&id, signal, enabled).await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string()))?;
+                .set_tenant_signal(&id, signal, enabled)
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal error".to_string(),
+                    )
+                })?;
         }
     }
 
     // AUDIT: per-tenant signal enable/disable change.
-    state.audit.log(
-        crate::audit::AuditEvent::new("tenant.signals_change", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(id.clone())
-            .resource("tenant", id.clone())
-            .changes(serde_json::json!({
-                "logs": req.logs, "apm": req.apm, "metrics": req.metrics, "rum": req.rum
-            }).to_string())
-            .description("tenant signal flags changed")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("tenant.signals_change", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(id.clone())
+                .resource("tenant", id.clone())
+                .changes(
+                    serde_json::json!({
+                        "logs": req.logs, "apm": req.apm, "metrics": req.metrics, "rum": req.rum
+                    })
+                    .to_string(),
+                )
+                .description("tenant signal flags changed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     let signals = resolve_signal_flags(&state, &id).await;
     let dropped = dropped_counts(&state, &id).await;

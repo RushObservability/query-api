@@ -115,9 +115,15 @@ mod tests {
         // 1 hour → raw
         assert_eq!(select_window_source(t0, t0 + 3600.0), Source::Raw);
         // exactly 6h → raw (boundary inclusive)
-        assert_eq!(select_window_source(t0, t0 + RAW_MAX_SPAN_SECS), Source::Raw);
+        assert_eq!(
+            select_window_source(t0, t0 + RAW_MAX_SPAN_SECS),
+            Source::Raw
+        );
         // 12h → 1m
-        assert_eq!(select_window_source(t0, t0 + 12.0 * 3600.0), Source::Rollup1m);
+        assert_eq!(
+            select_window_source(t0, t0 + 12.0 * 3600.0),
+            Source::Rollup1m
+        );
         // exactly 2 days → 1m (boundary inclusive)
         assert_eq!(
             select_window_source(t0, t0 + ONE_MIN_MAX_SPAN_SECS),

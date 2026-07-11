@@ -1,10 +1,10 @@
 pub mod alert;
-pub mod ingest;
 pub mod anomaly;
 pub mod custom_skills;
 pub mod dashboard;
 pub mod deploy;
 pub mod detection;
+pub mod ingest;
 pub mod log;
 pub mod metrics;
 pub mod monitor;

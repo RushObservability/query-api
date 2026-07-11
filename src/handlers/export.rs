@@ -4,7 +4,7 @@
 //! admin-configurable `export_max_rows` setting (default 1000) instead.
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use clickhouse::query::RowCursor;
@@ -45,7 +45,11 @@ pub async fn read_export_max_rows(state: &AppState) -> u64 {
 /// Resolve the effective row limit for an export request given the configured cap.
 /// A missing/zero requested limit means "use the cap".
 pub fn effective_limit(requested: u64, cap: u64) -> u64 {
-    if requested == 0 { cap } else { requested.min(cap) }
+    if requested == 0 {
+        cap
+    } else {
+        requested.min(cap)
+    }
 }
 
 /// Escape a single CSV field (RFC 4180): quote if it contains comma/quote/newline.
@@ -77,7 +81,13 @@ pub fn file_response(body: String, content_type: &'static str, filename: &str) -
 }
 
 /// Leading `#`-comment lines describing the exported query, for CSV files.
-pub fn csv_query_preamble(signal: &str, from: &str, to: &str, search: Option<&str>, query_text: Option<&str>) -> String {
+pub fn csv_query_preamble(
+    signal: &str,
+    from: &str,
+    to: &str,
+    search: Option<&str>,
+    query_text: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Rush export — signal: {signal}\n"));
     out.push_str(&format!("# time range: {from} .. {to}\n"));
@@ -91,7 +101,10 @@ pub fn csv_query_preamble(signal: &str, from: &str, to: &str, search: Option<&st
             out.push_str(&format!("# search: {}\n", s.replace('\n', " ")));
         }
     }
-    out.push_str(&format!("# exported_at: {}\n", chrono::Utc::now().to_rfc3339()));
+    out.push_str(&format!(
+        "# exported_at: {}\n",
+        chrono::Utc::now().to_rfc3339()
+    ));
     out
 }
 
@@ -156,7 +169,10 @@ where
             Err(e) => {
                 st.done = true;
                 Some((
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )),
                     st,
                 ))
             }

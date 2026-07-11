@@ -42,12 +42,12 @@ pub(crate) async fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
-    let token = extract_session_cookie(headers).ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, "not authenticated".to_string())
-    })?;
+    let token = extract_session_cookie(headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
     state
         .config_db
-        .get_session_user(&token).await
+        .get_session_user(&token)
+        .await
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -98,10 +98,10 @@ pub async fn list_users(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    let rows = state
-        .config_db
-        .list_users().await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+    let rows = state.config_db.list_users().await.map_err(|e| {
+        tracing::error!(error = %e, "internal error");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+    })?;
 
     let users: Vec<UserResponse> = rows.into_iter().map(user_response).collect();
 
@@ -118,28 +118,47 @@ pub async fn create_user(
 
     let username = req.username.trim().to_string();
     if username.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "username must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "username must not be empty".to_string(),
+        ));
     }
     if username.len() > 100 {
-        return Err((StatusCode::BAD_REQUEST, "username must not exceed 100 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "username must not exceed 100 characters".to_string(),
+        ));
     }
     let password = req.password.clone();
     if password.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "password must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "password must not be empty".to_string(),
+        ));
     }
     if password.len() > 1024 {
-        return Err((StatusCode::BAD_REQUEST, "password must not exceed 1024 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "password must not exceed 1024 characters".to_string(),
+        ));
     }
 
     let display_name = req.display_name.as_deref().unwrap_or("").to_string();
     if display_name.len() > 255 {
-        return Err((StatusCode::BAD_REQUEST, "display_name must not exceed 255 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "display_name must not exceed 255 characters".to_string(),
+        ));
     }
 
     let id = state
         .config_db
-        .create_user(&username, &password, &display_name).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .create_user(&username, &password, &display_name)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     // New users default to the viewers group
     let _ = state
@@ -148,8 +167,12 @@ pub async fn create_user(
 
     let row = state
         .config_db
-        .get_user(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_user(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -165,15 +188,21 @@ pub async fn create_user(
     );
 
     // AUDIT: user creation. Never log the password — only username/display_name/id.
-    state.audit.log(
-        crate::audit::AuditEvent::new("user.create", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("user", id.clone())
-            .changes(serde_json::json!({ "username": username, "display_name": display_name }).to_string())
-            .description("user created")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("user.create", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("user", id.clone())
+                .changes(
+                    serde_json::json!({ "username": username, "display_name": display_name })
+                        .to_string(),
+                )
+                .description("user created")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok((StatusCode::CREATED, Json(user_response(row))))
 }
@@ -189,8 +218,12 @@ pub async fn delete_user(
     // Refuse to delete the user named "admin"
     let username = state
         .config_db
-        .get_username(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_username(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
 
     if username == "admin" {
@@ -200,10 +233,10 @@ pub async fn delete_user(
         ));
     }
 
-    let deleted = state
-        .config_db
-        .delete_user(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+    let deleted = state.config_db.delete_user(&id).await.map_err(|e| {
+        tracing::error!(error = %e, "internal error");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+    })?;
 
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
@@ -217,15 +250,18 @@ pub async fn delete_user(
     );
 
     // AUDIT: user deletion.
-    state.audit.log(
-        crate::audit::AuditEvent::new("user.delete", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("user", id.clone())
-            .changes(serde_json::json!({ "username": username }).to_string())
-            .description("user deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("user.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("user", id.clone())
+                .changes(serde_json::json!({ "username": username }).to_string())
+                .description("user deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -248,42 +284,63 @@ pub async fn change_password(
     }
 
     if req.password.len() < 12 {
-        return Err((StatusCode::BAD_REQUEST, "password must be at least 12 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "password must be at least 12 characters".to_string(),
+        ));
     }
 
     // Non-admin users must supply their current password to change it.
     if caller.4 != "admin" {
         let current = req.current_password.as_deref().unwrap_or("");
         if current.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "current_password is required".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "current_password is required".to_string(),
+            ));
         }
-        if state.config_db.authenticate(&caller.1, current).await.is_none() {
-            return Err((StatusCode::FORBIDDEN, "current password is incorrect".to_string()));
+        if state
+            .config_db
+            .authenticate(&caller.1, current)
+            .await
+            .is_none()
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "current password is incorrect".to_string(),
+            ));
         }
     }
 
     let updated = state
         .config_db
-        .change_password(&id, &req.password).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .change_password(&id, &req.password)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
     }
 
     // AUDIT: password change. NEVER log the password value.
-    state.audit.log(
-        crate::audit::AuditEvent::new("user.password_change", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("user", id.clone())
-            .description(if caller.4 == "admin" && caller.0 != id {
-                "password reset by admin"
-            } else {
-                "password changed"
-            })
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("user.password_change", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("user", id.clone())
+                .description(if caller.4 == "admin" && caller.0 != id {
+                    "password reset by admin"
+                } else {
+                    "password changed"
+                })
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -299,8 +356,12 @@ pub async fn toggle_user(
 
     let updated = state
         .config_db
-        .set_user_enabled(&id, req.enabled).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .set_user_enabled(&id, req.enabled)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
@@ -308,20 +369,27 @@ pub async fn toggle_user(
 
     let row = state
         .config_db
-        .get_user(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_user(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
 
     // AUDIT: user enable/disable.
-    state.audit.log(
-        crate::audit::AuditEvent::new("user.update", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("user", id.clone())
-            .changes(serde_json::json!({ "enabled": req.enabled }).to_string())
-            .description("user enabled state changed")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("user.update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("user", id.clone())
+                .changes(serde_json::json!({ "enabled": req.enabled }).to_string())
+                .description("user enabled state changed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(user_response(row)))
 }

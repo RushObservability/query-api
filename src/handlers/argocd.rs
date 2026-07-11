@@ -3,9 +3,9 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use kube::{Api, Client, api::ListParams};
 use kube::api::DynamicObject;
 use kube::discovery::ApiResource;
+use kube::{Api, Client, api::ListParams};
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -28,7 +28,8 @@ async fn check_argocd_enabled(state: &AppState) -> Result<(), (StatusCode, Strin
     // Enabled if either the setting is true OR the ARGOCD_NAMESPACE env var is set (helm chart)
     let setting_enabled = state
         .config_db
-        .get_setting("argocd_enabled").await
+        .get_setting("argocd_enabled")
+        .await
         .ok()
         .flatten()
         .map(|v| v == "true")
@@ -50,7 +51,8 @@ async fn argocd_namespace(state: &AppState) -> String {
     }
     state
         .config_db
-        .get_setting("argocd_namespace").await
+        .get_setting("argocd_namespace")
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "argocd".to_string())
@@ -121,23 +123,26 @@ fn extract_source(spec: &Value) -> (String, String, String, String) {
 /// Extract sync revision — handles both .status.sync.revision and .status.sync.revisions[]
 fn extract_sync_revision(sync: &Value) -> String {
     if let Some(rev) = jstr(&sync["revision"]) {
-        if !rev.is_empty() { return rev; }
+        if !rev.is_empty() {
+            return rev;
+        }
     }
     if let Some(revisions) = sync["revisions"].as_array() {
-        let revs: Vec<&str> = revisions.iter().filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).collect();
-        if !revs.is_empty() { return revs.join(", "); }
+        let revs: Vec<&str> = revisions
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !revs.is_empty() {
+            return revs.join(", ");
+        }
     }
     String::new()
 }
 
 fn summarise_app(obj: &DynamicObject) -> Value {
     let data = &obj.data;
-    let name = obj
-        .metadata
-        .name
-        .as_deref()
-        .unwrap_or_default()
-        .to_string();
+    let name = obj.metadata.name.as_deref().unwrap_or_default().to_string();
 
     let status = &data["status"];
     let spec = &data["spec"];
@@ -198,10 +203,12 @@ pub async fn list_applications(
     let client = get_kube_client().await?;
 
     let apps: Api<DynamicObject> = Api::namespaced_with(client, &namespace, &application_ar());
-    let list = apps
-        .list(&ListParams::default())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list ArgoCD applications: {e}")))?;
+    let list = apps.list(&ListParams::default()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list ArgoCD applications: {e}"),
+        )
+    })?;
 
     let items: Vec<Value> = list.items.iter().map(summarise_app).collect();
     Ok(Json(json!({ "applications": items })))
@@ -242,10 +249,7 @@ pub async fn get_application(
     let operation_state = &status["operationState"];
 
     // Conditions
-    let conditions = status["conditions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let conditions = status["conditions"].as_array().cloned().unwrap_or_default();
 
     // Resources - filter to unhealthy only for brevity
     let resources: Vec<&Value> = status["resources"]
@@ -264,30 +268,39 @@ pub async fn get_application(
     let history: Vec<Value> = status["history"]
         .as_array()
         .map(|arr| {
-            arr.iter().rev().take(10).map(|h| {
-                // Get revision: try .revision first, then .revisions[]
-                let revision = if let Some(rev) = jstr(&h["revision"]) {
-                    rev
-                } else if let Some(revs) = h["revisions"].as_array() {
-                    revs.iter().filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ")
-                } else {
-                    String::new()
-                };
-                // Get source repo: try .source.repoURL, then .sources[0].repoURL
-                let source_repo = jstr(&h["source"]["repoURL"])
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        h["sources"].as_array().and_then(|srcs| {
-                            srcs.iter().find_map(|s| jstr(&s["repoURL"]).filter(|r| !r.is_empty()))
+            arr.iter()
+                .rev()
+                .take(10)
+                .map(|h| {
+                    // Get revision: try .revision first, then .revisions[]
+                    let revision = if let Some(rev) = jstr(&h["revision"]) {
+                        rev
+                    } else if let Some(revs) = h["revisions"].as_array() {
+                        revs.iter()
+                            .filter_map(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else {
+                        String::new()
+                    };
+                    // Get source repo: try .source.repoURL, then .sources[0].repoURL
+                    let source_repo = jstr(&h["source"]["repoURL"])
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            h["sources"].as_array().and_then(|srcs| {
+                                srcs.iter()
+                                    .find_map(|s| jstr(&s["repoURL"]).filter(|r| !r.is_empty()))
+                            })
                         })
+                        .unwrap_or_default();
+                    json!({
+                        "revision": revision,
+                        "deployed_at": jstr(&h["deployedAt"]).unwrap_or_default(),
+                        "source_repo": source_repo,
                     })
-                    .unwrap_or_default();
-                json!({
-                    "revision": revision,
-                    "deployed_at": jstr(&h["deployedAt"]).unwrap_or_default(),
-                    "source_repo": source_repo,
                 })
-            }).collect()
+                .collect()
         })
         .unwrap_or_default();
 
@@ -298,13 +311,17 @@ pub async fn get_application(
     let sources: Vec<Value> = spec["sources"]
         .as_array()
         .map(|arr| {
-            arr.iter().map(|s| json!({
-                "repo": jstr(&s["repoURL"]).unwrap_or_default(),
-                "path": jstr(&s["path"]).unwrap_or_default(),
-                "chart": jstr(&s["chart"]).unwrap_or_default(),
-                "target_revision": jstr(&s["targetRevision"]).unwrap_or_default(),
-                "ref": jstr(&s["ref"]).unwrap_or_default(),
-            })).collect()
+            arr.iter()
+                .map(|s| {
+                    json!({
+                        "repo": jstr(&s["repoURL"]).unwrap_or_default(),
+                        "path": jstr(&s["path"]).unwrap_or_default(),
+                        "chart": jstr(&s["chart"]).unwrap_or_default(),
+                        "target_revision": jstr(&s["targetRevision"]).unwrap_or_default(),
+                        "ref": jstr(&s["ref"]).unwrap_or_default(),
+                    })
+                })
+                .collect()
         })
         .unwrap_or_default();
 
@@ -351,22 +368,19 @@ pub async fn list_applicationsets(
 
     let appsets: Api<DynamicObject> =
         Api::namespaced_with(client, &namespace, &applicationset_ar());
-    let list = appsets
-        .list(&ListParams::default())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list ApplicationSets: {e}")))?;
+    let list = appsets.list(&ListParams::default()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list ApplicationSets: {e}"),
+        )
+    })?;
 
     let items: Vec<Value> = list
         .items
         .iter()
         .map(|obj| {
             let data = &obj.data;
-            let name = obj
-                .metadata
-                .name
-                .as_deref()
-                .unwrap_or_default()
-                .to_string();
+            let name = obj.metadata.name.as_deref().unwrap_or_default().to_string();
 
             // Generator types: each key under spec.generators[]
             let generators: Vec<String> = data["spec"]["generators"]

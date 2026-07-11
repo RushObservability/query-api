@@ -1,9 +1,8 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Extension,
 };
 use serde::{Deserialize, Serialize};
 

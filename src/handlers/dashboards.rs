@@ -25,7 +25,13 @@ async fn resolve_caller(
         }
     }
     // Unauthenticated: treat as anonymous user with viewer-only access
-    ("".to_string(), "".to_string(), "".to_string(), tenant.tenant_id.clone(), "viewer".to_string())
+    (
+        "".to_string(),
+        "".to_string(),
+        "".to_string(),
+        tenant.tenant_id.clone(),
+        "viewer".to_string(),
+    )
 }
 
 pub async fn list_dashboards(
@@ -37,7 +43,8 @@ pub async fn list_dashboards(
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let dashboards = state
         .config_db
-        .list_dashboards(&tenant.tenant_id, &user_id).await
+        .list_dashboards(&tenant.tenant_id, &user_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "dashboards": dashboards })))
 }
@@ -52,47 +59,82 @@ pub async fn create_dashboard(
     let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     if req.name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "name must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not be empty".to_string(),
+        ));
     }
     if req.name.len() > 255 {
-        return Err((StatusCode::BAD_REQUEST, "name must not exceed 255 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must not exceed 255 characters".to_string(),
+        ));
     }
     if req.description.len() > 1024 {
-        return Err((StatusCode::BAD_REQUEST, "description must not exceed 1024 characters".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "description must not exceed 1024 characters".to_string(),
+        ));
     }
 
     // Validate visibility
     let visibility = match req.visibility.as_str() {
         "private" | "tenant" | "global" => &req.visibility,
-        _ => return Err((StatusCode::BAD_REQUEST, format!("invalid visibility: {}", req.visibility))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid visibility: {}", req.visibility),
+            ));
+        }
     };
 
-    let tags_json = serde_json::to_string(&req.tags)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let tags_json =
+        serde_json::to_string(&req.tags).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let vars_json = serde_json::to_string(&req.variables)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let id = uuid::Uuid::new_v4().to_string();
     state
         .config_db
-        .create_dashboard(&id, &req.name, &req.description, &tenant.tenant_id, &user_id, visibility, &tags_json, &vars_json).await
+        .create_dashboard(
+            &id,
+            &req.name,
+            &req.description,
+            &tenant.tenant_id,
+            &user_id,
+            visibility,
+            &tags_json,
+            &vars_json,
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let dashboard = state
         .config_db
-        .get_dashboard(&id, &tenant.tenant_id, &user_id).await
+        .get_dashboard(&id, &tenant.tenant_id, &user_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created dashboard".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read created dashboard".to_string(),
+            )
+        })?;
 
     // AUDIT: dashboard created.
-    state.audit.log(
-        crate::audit::AuditEvent::new("dashboard.create", "user")
-            .actor(user_id.clone(), username.clone())
-            .tenant(tenant.tenant_id.clone())
-            .resource("dashboard", id.clone())
-            .changes(serde_json::json!({ "name": req.name, "visibility": visibility }).to_string())
-            .description("dashboard created")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("dashboard.create", "user")
+                .actor(user_id.clone(), username.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("dashboard", id.clone())
+                .changes(
+                    serde_json::json!({ "name": req.name, "visibility": visibility }).to_string(),
+                )
+                .description("dashboard created")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok((StatusCode::CREATED, Json(dashboard)))
 }
@@ -107,14 +149,17 @@ pub async fn get_dashboard(
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let dashboard = state
         .config_db
-        .get_dashboard(&id, &tenant.tenant_id, &user_id).await
+        .get_dashboard(&id, &tenant.tenant_id, &user_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
     let widgets = state
         .config_db
-        .list_widgets(&id).await
+        .list_widgets(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let widget_responses: Vec<WidgetResponse> = widgets.into_iter().map(WidgetResponse::from).collect();
+    let widget_responses: Vec<WidgetResponse> =
+        widgets.into_iter().map(WidgetResponse::from).collect();
     Ok(Json(DashboardWithWidgets {
         dashboard,
         widgets: widget_responses,
@@ -131,34 +176,57 @@ pub async fn update_dashboard(
     require_write(&state, &headers).await?;
     let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
 
-    let tags_json = serde_json::to_string(&req.tags)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let tags_json =
+        serde_json::to_string(&req.tags).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let vars_json = serde_json::to_string(&req.variables)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let updated = state
         .config_db
-        .update_dashboard(&id, &req.name, &req.description, &req.visibility, &tags_json, &vars_json, &tenant.tenant_id, &user_id, &role).await
+        .update_dashboard(
+            &id,
+            &req.name,
+            &req.description,
+            &req.visibility,
+            &tags_json,
+            &vars_json,
+            &tenant.tenant_id,
+            &user_id,
+            &role,
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "dashboard not found".to_string()));
     }
     let dashboard = state
         .config_db
-        .get_dashboard(&id, &tenant.tenant_id, &user_id).await
+        .get_dashboard(&id, &tenant.tenant_id, &user_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read dashboard".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read dashboard".to_string(),
+            )
+        })?;
 
     // AUDIT: dashboard updated.
-    state.audit.log(
-        crate::audit::AuditEvent::new("dashboard.update", "user")
-            .actor(user_id.clone(), username.clone())
-            .tenant(tenant.tenant_id.clone())
-            .resource("dashboard", id.clone())
-            .changes(serde_json::json!({ "name": req.name, "visibility": req.visibility }).to_string())
-            .description("dashboard updated")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("dashboard.update", "user")
+                .actor(user_id.clone(), username.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("dashboard", id.clone())
+                .changes(
+                    serde_json::json!({ "name": req.name, "visibility": req.visibility })
+                        .to_string(),
+                )
+                .description("dashboard updated")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(dashboard))
 }
@@ -173,21 +241,25 @@ pub async fn delete_dashboard(
     let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
     let deleted = state
         .config_db
-        .delete_dashboard(&id, &tenant.tenant_id, &user_id, &role).await
+        .delete_dashboard(&id, &tenant.tenant_id, &user_id, &role)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "dashboard not found".to_string()));
     }
 
     // AUDIT: dashboard deleted.
-    state.audit.log(
-        crate::audit::AuditEvent::new("dashboard.delete", "user")
-            .actor(user_id.clone(), username.clone())
-            .tenant(tenant.tenant_id.clone())
-            .resource("dashboard", id.clone())
-            .description("dashboard deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("dashboard.delete", "user")
+                .actor(user_id.clone(), username.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("dashboard", id.clone())
+                .description("dashboard deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -207,13 +279,17 @@ pub async fn create_widget(
     // Verify dashboard exists and user has visibility
     state
         .config_db
-        .get_dashboard(&dashboard_id, &tenant.tenant_id, &user_id).await
+        .get_dashboard(&dashboard_id, &tenant.tenant_id, &user_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
 
     let valid_types = ["timeseries", "bar", "table", "counter"];
     if !valid_types.contains(&req.widget_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid widget_type: {}", req.widget_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid widget_type: {}", req.widget_type),
+        ));
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -226,18 +302,30 @@ pub async fn create_widget(
 
     state
         .config_db
-        .create_widget(&id, &dashboard_id, &req.title, &req.widget_type, &query_config, &position, &display_config).await
+        .create_widget(
+            &id,
+            &dashboard_id,
+            &req.title,
+            &req.widget_type,
+            &query_config,
+            &position,
+            &display_config,
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Read back the created widget
     let widgets = state
         .config_db
-        .list_widgets(&dashboard_id).await
+        .list_widgets(&dashboard_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let widget = widgets
-        .into_iter()
-        .find(|w| w.id == id)
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created widget".to_string()))?;
+    let widget = widgets.into_iter().find(|w| w.id == id).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read created widget".to_string(),
+        )
+    })?;
 
     Ok((StatusCode::CREATED, Json(WidgetResponse::from(widget))))
 }
@@ -251,7 +339,10 @@ pub async fn update_widget(
     require_write(&state, &headers).await?;
     let valid_types = ["timeseries", "bar", "table", "counter"];
     if !valid_types.contains(&req.widget_type.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid widget_type: {}", req.widget_type)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid widget_type: {}", req.widget_type),
+        ));
     }
 
     let query_config = serde_json::to_string(&req.query_config)
@@ -263,7 +354,16 @@ pub async fn update_widget(
 
     let updated = state
         .config_db
-        .update_widget(&widget_id, &dashboard_id, &req.title, &req.widget_type, &query_config, &position, &display_config).await
+        .update_widget(
+            &widget_id,
+            &dashboard_id,
+            &req.title,
+            &req.widget_type,
+            &query_config,
+            &position,
+            &display_config,
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "widget not found".to_string()));
@@ -271,12 +371,18 @@ pub async fn update_widget(
 
     let widgets = state
         .config_db
-        .list_widgets(&dashboard_id).await
+        .list_widgets(&dashboard_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let widget = widgets
         .into_iter()
         .find(|w| w.id == widget_id)
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read widget".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read widget".to_string(),
+            )
+        })?;
 
     Ok(Json(WidgetResponse::from(widget)))
 }
@@ -289,7 +395,8 @@ pub async fn delete_widget(
     require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_widget(&widget_id, &dashboard_id).await
+        .delete_widget(&widget_id, &dashboard_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "widget not found".to_string()));
@@ -309,7 +416,8 @@ pub async fn export_dashboard(
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let export = state
         .config_db
-        .export_dashboard(&id, &tenant.tenant_id, &user_id).await
+        .export_dashboard(&id, &tenant.tenant_id, &user_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
     Ok(Json(export))
@@ -325,7 +433,8 @@ pub async fn import_dashboard(
     let (user_id, _, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
     let dashboard = state
         .config_db
-        .import_dashboard(&req, &tenant.tenant_id, &user_id, &role).await
+        .import_dashboard(&req, &tenant.tenant_id, &user_id, &role)
+        .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok((StatusCode::CREATED, Json(dashboard)))
 }
@@ -339,7 +448,8 @@ pub async fn list_dashboard_templates(
     require_auth(&state, &headers).await?;
     let templates = state
         .config_db
-        .list_dashboard_templates().await
+        .list_dashboard_templates()
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "templates": templates })))
 }
@@ -356,12 +466,15 @@ pub async fn create_from_template(
 
     let template = state
         .config_db
-        .get_dashboard_template(&template_id).await
+        .get_dashboard_template(&template_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "template not found".to_string()))?;
 
     // Parse template_json to get widgets
-    let widgets_val = template.template_json.get("widgets")
+    let widgets_val = template
+        .template_json
+        .get("widgets")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
@@ -372,17 +485,28 @@ pub async fn create_from_template(
         .collect();
 
     // Templates may pre-wire template variables (e.g. a $service dropdown).
-    let vars = template.template_json.get("variables")
+    let vars = template
+        .template_json
+        .get("variables")
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
         .unwrap_or_else(|| "[]".to_string());
 
     // Create dashboard
     let dash_id = uuid::Uuid::new_v4().to_string();
-    let tags = serde_json::to_string(&template.tags)
-        .unwrap_or_else(|_| "[]".to_string());
+    let tags = serde_json::to_string(&template.tags).unwrap_or_else(|_| "[]".to_string());
     state
         .config_db
-        .create_dashboard(&dash_id, &req.name, &template.description, &tenant.tenant_id, &user_id, "tenant", &tags, &vars).await
+        .create_dashboard(
+            &dash_id,
+            &req.name,
+            &template.description,
+            &tenant.tenant_id,
+            &user_id,
+            "tenant",
+            &tags,
+            &vars,
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Create widgets from template
@@ -396,15 +520,22 @@ pub async fn create_from_template(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         state
             .config_db
-            .create_widget(&wid, &dash_id, &w.title, &w.widget_type, &qc, &pos, &dc).await
+            .create_widget(&wid, &dash_id, &w.title, &w.widget_type, &qc, &pos, &dc)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
     let dashboard = state
         .config_db
-        .get_dashboard(&dash_id, &tenant.tenant_id, &user_id).await
+        .get_dashboard(&dash_id, &tenant.tenant_id, &user_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "failed to read created dashboard".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read created dashboard".to_string(),
+            )
+        })?;
 
     Ok((StatusCode::CREATED, Json(dashboard)))
 }

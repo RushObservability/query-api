@@ -29,7 +29,10 @@ pub struct WideEvent {
 
 /// Look up an OTel attribute value by key in a `(key, value)` list.
 fn attr_lookup<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    attrs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 /// Serialize an OTel attribute list to a JSON object string — matches ClickHouse's
@@ -51,18 +54,24 @@ impl From<crate::models::ingest::TraceInsertRow> for WideEvent {
         let a = &r.span_attributes;
         let http_method = attr_lookup(a, "http.method").unwrap_or("").to_string();
         // COALESCE(http.route, http.target, url.path, SpanName) — first non-empty.
-        let http_path = attr_lookup(a, "http.route").filter(|s| !s.is_empty())
+        let http_path = attr_lookup(a, "http.route")
+            .filter(|s| !s.is_empty())
             .or_else(|| attr_lookup(a, "http.target").filter(|s| !s.is_empty()))
             .or_else(|| attr_lookup(a, "url.path").filter(|s| !s.is_empty()))
             .map(str::to_string)
             .unwrap_or_else(|| r.span_name.clone());
         // toUInt16OrZero(COALESCE(http.status_code, http.response.status_code, '0')).
-        let http_status_code = attr_lookup(a, "http.status_code").filter(|s| !s.is_empty())
+        let http_status_code = attr_lookup(a, "http.status_code")
+            .filter(|s| !s.is_empty())
             .or_else(|| attr_lookup(a, "http.response.status_code").filter(|s| !s.is_empty()))
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(0);
         let attributes = attrs_to_json(a);
-        let event_attributes = r.events_attributes.iter().map(|e| attrs_to_json(e)).collect();
+        let event_attributes = r
+            .events_attributes
+            .iter()
+            .map(|e| attrs_to_json(e))
+            .collect();
         WideEvent {
             tenant_id: r.tenant_id.to_string(),
             timestamp: r.timestamp,

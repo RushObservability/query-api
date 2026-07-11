@@ -113,8 +113,12 @@ pub async fn sso_login(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let provider = state
         .config_db
-        .get_enabled_sso_provider().await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_enabled_sso_provider()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -123,10 +127,25 @@ pub async fn sso_login(
         })?;
 
     let (
-        _id, _name, protocol, _enabled,
-        client_id, _client_secret, issuer_url, oidc_scopes,
-        _groups_claim, _email_claim, _first_name_claim, _last_name_claim, _jit, _default_group, _created_at,
-        _saml_meta, saml_idp_sso_url, _saml_cert, saml_sp_entity_id,
+        _id,
+        _name,
+        protocol,
+        _enabled,
+        client_id,
+        _client_secret,
+        issuer_url,
+        oidc_scopes,
+        _groups_claim,
+        _email_claim,
+        _first_name_claim,
+        _last_name_claim,
+        _jit,
+        _default_group,
+        _created_at,
+        _saml_meta,
+        saml_idp_sso_url,
+        _saml_cert,
+        saml_sp_entity_id,
     ) = provider;
 
     match protocol.as_str() {
@@ -146,7 +165,10 @@ pub async fn sso_login(
             resp_headers.insert(
                 header::LOCATION,
                 redirect_url.parse().map_err(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "invalid redirect URL".to_string())
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "invalid redirect URL".to_string(),
+                    )
                 })?,
             );
             Ok((StatusCode::FOUND, resp_headers, "").into_response())
@@ -162,8 +184,14 @@ pub async fn sso_login(
 
             state
                 .config_db
-                .store_sso_state(&csrf_state).await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("state error: {e}")))?;
+                .store_sso_state(&csrf_state)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("state error: {e}"),
+                    )
+                })?;
 
             let scopes_encoded = oidc_scopes
                 .split_whitespace()
@@ -196,18 +224,31 @@ pub async fn sso_callback(
     // 1. Verify CSRF state
     let valid = state
         .config_db
-        .validate_sso_state(&params.state).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("state error: {e}")))?;
+        .validate_sso_state(&params.state)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("state error: {e}"),
+            )
+        })?;
 
     if !valid {
-        return Err((StatusCode::BAD_REQUEST, "invalid or expired state parameter".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid or expired state parameter".to_string(),
+        ));
     }
 
     // 2. Load the enabled SSO provider
     let provider = state
         .config_db
-        .get_enabled_sso_provider().await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_enabled_sso_provider()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -216,10 +257,25 @@ pub async fn sso_callback(
         })?;
 
     let (
-        provider_id, _name, _protocol, _enabled,
-        client_id, client_secret, issuer_url, _oidc_scopes,
-        groups_claim, _email_claim, _first_name_claim, _last_name_claim, jit_provisioning, default_group_id, _created_at,
-        _f13, _f14, _f15, _f16,
+        provider_id,
+        _name,
+        _protocol,
+        _enabled,
+        client_id,
+        client_secret,
+        issuer_url,
+        _oidc_scopes,
+        groups_claim,
+        _email_claim,
+        _first_name_claim,
+        _last_name_claim,
+        jit_provisioning,
+        default_group_id,
+        _created_at,
+        _f13,
+        _f14,
+        _f15,
+        _f16,
     ) = provider;
 
     // 3. Exchange authorization code for tokens
@@ -239,27 +295,45 @@ pub async fn sso_callback(
         ])
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("token exchange failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("token exchange failed: {e}"),
+            )
+        })?;
 
     if !token_res.status().is_success() {
         let body = token_res.text().await.unwrap_or_default();
         tracing::warn!("OIDC token exchange failed: {body}");
-        return Err((StatusCode::BAD_GATEWAY, format!("IdP token exchange failed: {body}")));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("IdP token exchange failed: {body}"),
+        ));
     }
 
-    let token_data: OidcTokenResponse = token_res
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("invalid token response: {e}")))?;
+    let token_data: OidcTokenResponse = token_res.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("invalid token response: {e}"),
+        )
+    })?;
 
     let id_token = token_data.id_token.ok_or_else(|| {
-        (StatusCode::BAD_GATEWAY, "no id_token in response".to_string())
+        (
+            StatusCode::BAD_GATEWAY,
+            "no id_token in response".to_string(),
+        )
     })?;
 
     // 4. Verify the id_token JWT signature against the provider's JWKS and decode claims
-    let claims = verify_and_decode_jwt(&client, &id_token, &issuer_url, &client_id).await.map_err(|e| {
-        (StatusCode::BAD_GATEWAY, format!("id_token verification failed: {e}"))
-    })?;
+    let claims = verify_and_decode_jwt(&client, &id_token, &issuer_url, &client_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("id_token verification failed: {e}"),
+            )
+        })?;
 
     // 5. Extract claims
     let external_id = claims
@@ -309,8 +383,14 @@ pub async fn sso_callback(
     // 7. Map IdP groups to Rush groups
     let mut mapped_group_ids = state
         .config_db
-        .resolve_idp_groups(&idp_groups, &provider_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("group mapping error: {e}")))?;
+        .resolve_idp_groups(&idp_groups, &provider_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("group mapping error: {e}"),
+            )
+        })?;
 
     // If no mappings match, use default_group_id from provider config
     if mapped_group_ids.is_empty() && !default_group_id.is_empty() {
@@ -325,9 +405,14 @@ pub async fn sso_callback(
     // 8. JIT provision: find or create user
     let user_id = match state
         .config_db
-        .find_user_by_external_id(&external_id, "oidc").await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("user lookup error: {e}")))?
-    {
+        .find_user_by_external_id(&external_id, "oidc")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("user lookup error: {e}"),
+            )
+        })? {
         Some(uid) => uid,
         None => {
             if !jit_provisioning {
@@ -338,9 +423,13 @@ pub async fn sso_callback(
             }
             state
                 .config_db
-                .create_sso_user(&username, &display_name, &external_id, "oidc", "default").await
+                .create_sso_user(&username, &display_name, &external_id, "oidc", "default")
+                .await
                 .map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("user creation error: {e}"))
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("user creation error: {e}"),
+                    )
                 })?
         }
     };
@@ -348,16 +437,26 @@ pub async fn sso_callback(
     // 9. Update the user's group memberships with the mapped set
     state
         .config_db
-        .update_user_groups_from_idp(&user_id, &mapped_group_ids).await
+        .update_user_groups_from_idp(&user_id, &mapped_group_ids)
+        .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("group update error: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("group update error: {e}"),
+            )
         })?;
 
     // 10. Create a session (same as local auth)
     let token = state
         .config_db
-        .create_session(&user_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}")))?;
+        .create_session(&user_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("session error: {e}"),
+            )
+        })?;
 
     // 11. Set the rush_session cookie and redirect to /
     let cookie = format!(
@@ -365,14 +464,8 @@ pub async fn sso_callback(
     );
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
-        cookie.parse().unwrap(),
-    );
-    headers.insert(
-        header::LOCATION,
-        "/".parse().unwrap(),
-    );
+    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.insert(header::LOCATION, "/".parse().unwrap());
 
     Ok((StatusCode::FOUND, headers, ""))
 }
@@ -390,8 +483,8 @@ async fn verify_and_decode_jwt(
     if !issuer_url.starts_with("https://") {
         anyhow::bail!("issuer_url must use HTTPS (got: {issuer_url})");
     }
-    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 
     // Parse the JWT header to get `kid` and `alg` — does not verify signature
     let header = jsonwebtoken::decode_header(token)
@@ -400,9 +493,14 @@ async fn verify_and_decode_jwt(
     // Only accept asymmetric algorithms — reject symmetric (HS*) which would require
     // sharing the client_secret as the signing key, an unsafe pattern for OIDC.
     match header.alg {
-        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
-        | Algorithm::PS256 | Algorithm::PS384 | Algorithm::PS512
-        | Algorithm::ES256 | Algorithm::ES384 => {}
+        Algorithm::RS256
+        | Algorithm::RS384
+        | Algorithm::RS512
+        | Algorithm::PS256
+        | Algorithm::PS384
+        | Algorithm::PS512
+        | Algorithm::ES256
+        | Algorithm::ES384 => {}
         alg => anyhow::bail!("JWT algorithm {alg:?} is not accepted for OIDC"),
     }
 
@@ -471,39 +569,56 @@ pub async fn list_sso_providers(
     require_auth(&state, &headers).await?;
     let rows = state
         .config_db
-        .list_sso_providers().await
+        .list_sso_providers()
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let providers: Vec<SsoProviderResponse> = rows
         .into_iter()
-        .map(|(
-            id, name, protocol, enabled,
-            client_id, _secret, issuer_url, oidc_scopes,
-            groups_claim, email_claim, first_name_claim, last_name_claim,
-            jit, default_group_id, created_at,
-            saml_meta, saml_sso, saml_cert, saml_entity,
-        )| {
-            SsoProviderResponse {
+        .map(
+            |(
                 id,
                 name,
                 protocol,
                 enabled,
                 client_id,
+                _secret,
                 issuer_url,
                 oidc_scopes,
                 groups_claim,
                 email_claim,
                 first_name_claim,
                 last_name_claim,
-                jit_provisioning: jit,
+                jit,
                 default_group_id,
                 created_at,
-                saml_idp_metadata_url: saml_meta,
-                saml_idp_sso_url: saml_sso,
-                saml_idp_cert: saml_cert,
-                saml_sp_entity_id: saml_entity,
-            }
-        })
+                saml_meta,
+                saml_sso,
+                saml_cert,
+                saml_entity,
+            )| {
+                SsoProviderResponse {
+                    id,
+                    name,
+                    protocol,
+                    enabled,
+                    client_id,
+                    issuer_url,
+                    oidc_scopes,
+                    groups_claim,
+                    email_claim,
+                    first_name_claim,
+                    last_name_claim,
+                    jit_provisioning: jit,
+                    default_group_id,
+                    created_at,
+                    saml_idp_metadata_url: saml_meta,
+                    saml_idp_sso_url: saml_sso,
+                    saml_idp_cert: saml_cert,
+                    saml_sp_entity_id: saml_entity,
+                }
+            },
+        )
         .collect();
 
     Ok(Json(serde_json::json!({ "providers": providers })))
@@ -525,7 +640,8 @@ pub async fn save_sso_provider(
             // Try to load existing secret
             state
                 .config_db
-                .get_sso_provider(&id).await
+                .get_sso_provider(&id)
+                .await
                 .ok()
                 .flatten()
                 .map(|p| p.5)
@@ -543,15 +659,18 @@ pub async fn save_sso_provider(
             req.client_id.as_deref().unwrap_or(""),
             &client_secret,
             req.issuer_url.as_deref().unwrap_or(""),
-            req.oidc_scopes.as_deref().unwrap_or("openid profile email groups"),
+            req.oidc_scopes
+                .as_deref()
+                .unwrap_or("openid profile email groups"),
             req.groups_claim.as_deref().unwrap_or("groups"),
             req.jit_provisioning.unwrap_or(true),
             req.default_group_id.as_deref().unwrap_or(""),
             req.saml_idp_metadata_url.as_deref().unwrap_or(""),
             req.saml_idp_sso_url.as_deref().unwrap_or(""),
             req.saml_idp_cert.as_deref().unwrap_or(""),
-            req.saml_sp_entity_id.as_deref().unwrap_or("")
-        ).await
+            req.saml_sp_entity_id.as_deref().unwrap_or(""),
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     tracing::info!(
@@ -582,15 +701,21 @@ pub async fn save_sso_provider(
     ).await;
     // Also emit an explicit enable/disable event reflecting the new state.
     if let Some(enabled) = req.enabled {
-        state.audit.log(
-            crate::audit::AuditEvent::new(if enabled { "sso.enable" } else { "sso.disable" }, "user")
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new(
+                    if enabled { "sso.enable" } else { "sso.disable" },
+                    "user",
+                )
                 .actor(caller.0.clone(), caller.1.clone())
                 .tenant(caller.3.clone())
                 .resource("sso_provider", id.clone())
                 .changes(serde_json::json!({ "enabled": enabled }).to_string())
                 .description("sso provider enabled state set")
                 .context(crate::audit::actor_context_from_headers(&headers)),
-        ).await;
+            )
+            .await;
     }
 
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
@@ -605,7 +730,8 @@ pub async fn delete_sso_provider(
     let caller = require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_sso_provider(&id).await
+        .delete_sso_provider(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if deleted {
@@ -616,15 +742,18 @@ pub async fn delete_sso_provider(
             "SSO provider deleted"
         );
         // AUDIT: SSO provider deleted.
-        state.audit.log(
-            crate::audit::AuditEvent::new("sso.config_update", "user")
-                .actor(caller.0.clone(), caller.1.clone())
-                .tenant(caller.3.clone())
-                .resource("sso_provider", id.clone())
-                .changes(serde_json::json!({ "deleted": true }).to_string())
-                .description("sso provider deleted")
-                .context(crate::audit::actor_context_from_headers(&headers)),
-        ).await;
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.config_update", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("sso_provider", id.clone())
+                    .changes(serde_json::json!({ "deleted": true }).to_string())
+                    .description("sso provider deleted")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((StatusCode::NOT_FOUND, "provider not found".to_string()))
@@ -639,20 +768,21 @@ pub async fn list_idp_group_mappings(
     require_admin(&state, &headers).await?;
     let rows = state
         .config_db
-        .list_idp_group_mappings(None).await
+        .list_idp_group_mappings(None)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let mappings: Vec<IdpGroupMappingResponse> = rows
         .into_iter()
-        .map(|(id, idp_group, rush_group_id, provider_id, created_at)| {
-            IdpGroupMappingResponse {
+        .map(
+            |(id, idp_group, rush_group_id, provider_id, created_at)| IdpGroupMappingResponse {
                 id,
                 idp_group,
                 rush_group_id,
                 provider_id,
                 created_at,
-            }
-        })
+            },
+        )
         .collect();
 
     Ok(Json(serde_json::json!({ "mappings": mappings })))
@@ -669,24 +799,31 @@ pub async fn create_idp_group_mapping(
 
     let id = state
         .config_db
-        .create_idp_group_mapping(&req.idp_group, &req.rush_group_id, provider_id).await
+        .create_idp_group_mapping(&req.idp_group, &req.rush_group_id, provider_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     // AUDIT: IdP→group mapping created.
-    state.audit.log(
-        crate::audit::AuditEvent::new("sso.group_mapping_change", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("idp_group_mapping", id.clone())
-            .changes(serde_json::json!({
-                "action": "create",
-                "idp_group": req.idp_group,
-                "rush_group_id": req.rush_group_id,
-                "provider_id": provider_id
-            }).to_string())
-            .description("idp group mapping created")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("sso.group_mapping_change", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("idp_group_mapping", id.clone())
+                .changes(
+                    serde_json::json!({
+                        "action": "create",
+                        "idp_group": req.idp_group,
+                        "rush_group_id": req.rush_group_id,
+                        "provider_id": provider_id
+                    })
+                    .to_string(),
+                )
+                .description("idp group mapping created")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
 }
@@ -702,7 +839,8 @@ pub async fn update_idp_group_mapping(
 
     let prev = state
         .config_db
-        .update_idp_group_mapping(&id, &req.idp_group, &req.rush_group_id).await
+        .update_idp_group_mapping(&id, &req.idp_group, &req.rush_group_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let Some((old_idp_group, old_rush_group_id)) = prev else {
@@ -736,20 +874,24 @@ pub async fn delete_idp_group_mapping(
     let caller = require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_idp_group_mapping(&id).await
+        .delete_idp_group_mapping(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if deleted {
         // AUDIT: IdP→group mapping deleted.
-        state.audit.log(
-            crate::audit::AuditEvent::new("sso.group_mapping_change", "user")
-                .actor(caller.0.clone(), caller.1.clone())
-                .tenant(caller.3.clone())
-                .resource("idp_group_mapping", id.clone())
-                .changes(serde_json::json!({ "action": "delete" }).to_string())
-                .description("idp group mapping deleted")
-                .context(crate::audit::actor_context_from_headers(&headers)),
-        ).await;
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.group_mapping_change", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("idp_group_mapping", id.clone())
+                    .changes(serde_json::json!({ "action": "delete" }).to_string())
+                    .description("idp group mapping deleted")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((StatusCode::NOT_FOUND, "mapping not found".to_string()))
@@ -774,7 +916,10 @@ pub async fn sso_acs(
         .find(|(k, _)| k == "SAMLResponse")
         .map(|(_, v)| v.as_str())
         .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "missing SAMLResponse in POST body".to_string())
+            (
+                StatusCode::BAD_REQUEST,
+                "missing SAMLResponse in POST body".to_string(),
+            )
         })?;
 
     let relay_state_raw = params
@@ -791,17 +936,39 @@ pub async fn sso_acs(
 
     let provider = state
         .config_db
-        .get_enabled_sso_provider().await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_enabled_sso_provider()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "no SSO provider configured".to_string())
+            (
+                StatusCode::BAD_REQUEST,
+                "no SSO provider configured".to_string(),
+            )
         })?;
 
     let (
-        provider_id, _name, _protocol, _enabled,
-        _client_id, _client_secret, _issuer_url, _oidc_scopes,
-        groups_claim, _email_claim, _first_name_claim, _last_name_claim, jit_provisioning, default_group_id, _created_at,
-        _saml_meta, _saml_sso, saml_cert, _saml_entity,
+        provider_id,
+        _name,
+        _protocol,
+        _enabled,
+        _client_id,
+        _client_secret,
+        _issuer_url,
+        _oidc_scopes,
+        groups_claim,
+        _email_claim,
+        _first_name_claim,
+        _last_name_claim,
+        jit_provisioning,
+        default_group_id,
+        _created_at,
+        _saml_meta,
+        _saml_sso,
+        saml_cert,
+        _saml_entity,
     ) = provider;
 
     // Decode the base64 SAMLResponse to raw XML for signature verification
@@ -809,7 +976,12 @@ pub async fn sso_acs(
         &base64::engine::general_purpose::STANDARD,
         saml_response.trim(),
     )
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid base64 in SAMLResponse: {e}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid base64 in SAMLResponse: {e}"),
+        )
+    })?;
     let xml = String::from_utf8_lossy(&xml_bytes);
 
     // If the provider has a certificate configured, verify the XML signature
@@ -843,7 +1015,10 @@ pub async fn sso_acs(
 
     let assertion = saml::parse_saml_response(saml_response, &groups_claim).map_err(|e| {
         tracing::warn!("SAML response parse error: {e}");
-        (StatusCode::BAD_REQUEST, format!("invalid SAML response: {e}"))
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid SAML response: {e}"),
+        )
     })?;
 
     tracing::info!(
@@ -855,8 +1030,14 @@ pub async fn sso_acs(
 
     let mut mapped_group_ids = state
         .config_db
-        .resolve_idp_groups(&assertion.groups, &provider_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("group mapping error: {e}")))?;
+        .resolve_idp_groups(&assertion.groups, &provider_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("group mapping error: {e}"),
+            )
+        })?;
 
     if mapped_group_ids.is_empty() {
         if !default_group_id.is_empty() {
@@ -871,9 +1052,12 @@ pub async fn sso_acs(
 
     let user_id = match state
         .config_db
-        .find_user_by_external_id(external_id, auth_provider).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
-    {
+        .find_user_by_external_id(external_id, auth_provider)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })? {
         Some(uid) => uid,
         None => {
             if !jit_provisioning {
@@ -886,19 +1070,38 @@ pub async fn sso_acs(
             let display = assertion.display_name.as_deref().unwrap_or(email);
             state
                 .config_db
-                .create_sso_user(email, display, external_id, auth_provider, "default").await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("user creation error: {e}")))?
+                .create_sso_user(email, display, external_id, auth_provider, "default")
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("user creation error: {e}"),
+                    )
+                })?
         }
     };
 
     state
         .config_db
-        .update_user_groups_from_idp(&user_id, &mapped_group_ids).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("group update error: {e}")))?;
+        .update_user_groups_from_idp(&user_id, &mapped_group_ids)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("group update error: {e}"),
+            )
+        })?;
 
-    let token = state.config_db.create_session(&user_id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("session error: {e}"))
-    })?;
+    let token = state
+        .config_db
+        .create_session(&user_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("session error: {e}"),
+            )
+        })?;
 
     // AUDIT: successful SSO login (mirrors the local auth.login.success event).
     // Logs identity + provider/groups only — never the assertion, cert, or token.
@@ -906,25 +1109,30 @@ pub async fn sso_acs(
         .email
         .clone()
         .unwrap_or_else(|| assertion.name_id.clone());
-    state.audit.log(
-        crate::audit::AuditEvent::new("auth.login.success", "user")
-            .actor(user_id.clone(), actor_name)
-            .tenant("default".to_string())
-            .outcome("success")
-            .description("user authenticated (SSO/SAML)")
-            .changes(
-                serde_json::json!({
-                    "method": "saml",
-                    "provider_id": provider_id,
-                    "name_id": assertion.name_id,
-                    "groups": mapped_group_ids,
-                })
-                .to_string(),
-            )
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("auth.login.success", "user")
+                .actor(user_id.clone(), actor_name)
+                .tenant("default".to_string())
+                .outcome("success")
+                .description("user authenticated (SSO/SAML)")
+                .changes(
+                    serde_json::json!({
+                        "method": "saml",
+                        "provider_id": provider_id,
+                        "name_id": assertion.name_id,
+                        "groups": mapped_group_ids,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
-    let cookie = format!("__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400");
+    let cookie = format!(
+        "__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
+    );
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
@@ -946,8 +1154,12 @@ pub async fn sso_metadata(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let provider = state
         .config_db
-        .get_enabled_sso_provider().await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .get_enabled_sso_provider()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     let base_url = resolve_base_url(&headers);
     let acs_url = format!("{base_url}/auth/sso/acs");
@@ -971,21 +1183,35 @@ pub async fn sso_status(
 ) -> Result<Json<SsoStatusResponse>, (StatusCode, String)> {
     match state
         .config_db
-        .get_enabled_sso_provider().await
+        .get_enabled_sso_provider()
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
     {
         Some((
-            _id, name, protocol, _enabled,
-            _client_id, _secret, _issuer, _scopes,
-            _claim, _email, _first, _last, _jit, _default, _created,
-            _saml_meta, _saml_sso, _saml_cert, _saml_entity,
-        )) => {
-            Ok(Json(SsoStatusResponse {
-                enabled: true,
-                provider_name: name,
-                protocol,
-            }))
-        }
+            _id,
+            name,
+            protocol,
+            _enabled,
+            _client_id,
+            _secret,
+            _issuer,
+            _scopes,
+            _claim,
+            _email,
+            _first,
+            _last,
+            _jit,
+            _default,
+            _created,
+            _saml_meta,
+            _saml_sso,
+            _saml_cert,
+            _saml_entity,
+        )) => Ok(Json(SsoStatusResponse {
+            enabled: true,
+            provider_name: name,
+            protocol,
+        })),
         None => Ok(Json(SsoStatusResponse {
             enabled: false,
             provider_name: String::new(),
@@ -1018,7 +1244,8 @@ pub async fn create_setup_token(
 
     let token = state
         .config_db
-        .create_setup_token(purpose, created_by, provider, hostname).await
+        .create_setup_token(purpose, created_by, provider, hostname)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let base = if hostname.is_empty() {
@@ -1038,10 +1265,13 @@ pub async fn validate_setup_token(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let (valid, provider) = state
         .config_db
-        .validate_setup_token(&token, "sso_setup").await
+        .validate_setup_token(&token, "sso_setup")
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
-    Ok(Json(serde_json::json!({ "valid": valid, "provider": provider })))
+    Ok(Json(
+        serde_json::json!({ "valid": valid, "provider": provider }),
+    ))
 }
 
 /// POST /api/v1/sso/setup-token/{token}/complete -- Mark a setup token as used
@@ -1053,13 +1283,17 @@ pub async fn complete_setup_token(
     require_auth(&state, &headers).await?;
     let marked = state
         .config_db
-        .mark_setup_token_used(&token).await
+        .mark_setup_token_used(&token)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if marked {
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
-        Err((StatusCode::NOT_FOUND, "token not found or already used".to_string()))
+        Err((
+            StatusCode::NOT_FOUND,
+            "token not found or already used".to_string(),
+        ))
     }
 }
 

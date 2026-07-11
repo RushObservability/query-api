@@ -1,4 +1,4 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse, Extension};
+use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -33,8 +33,8 @@ pub async fn parse_query(
     Extension(_tenant): Extension<TenantContext>,
     Json(req): Json<ParseQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let base_url = std::env::var("LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let base_url =
+        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
     let api_key = match std::env::var("LLM_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => {
@@ -112,13 +112,18 @@ Output: {"filters":[{"field":"service_name","op":"=","value":"api-gateway"},{"fi
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err((StatusCode::BAD_GATEWAY, format!("LLM error {status}: {text}")));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("LLM error {status}: {text}"),
+        ));
     }
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("LLM response parse failed: {e}")))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("LLM response parse failed: {e}"),
+        )
+    })?;
 
     let content = json
         .get("choices")
@@ -136,13 +141,12 @@ Output: {"filters":[{"field":"service_name","op":"=","value":"api-gateway"},{"fi
         .trim_end_matches("```")
         .trim();
 
-    let parsed: ParseQueryResponse = serde_json::from_str(cleaned).unwrap_or_else(|_| {
-        ParseQueryResponse {
+    let parsed: ParseQueryResponse =
+        serde_json::from_str(cleaned).unwrap_or_else(|_| ParseQueryResponse {
             filters: vec![],
             search: req.query.clone(),
             confidence: 0.0,
-        }
-    });
+        });
 
     Ok(Json(parsed))
 }

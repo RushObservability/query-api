@@ -17,13 +17,12 @@
 //!   process.serviceName←service_name, tags←attributes(JSON) + kind/status.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Extension,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use crate::models::trace::WideEvent;
@@ -118,10 +117,16 @@ pub async fn search(
     //    spans satisfies all of them — standard Jaeger search semantics). ──
     let mut conds = vec![format!("tenant_id = '{esc_t}'")];
 
-    if let Some(svc) = p.get("service").filter(|s| !s.is_empty() && s.as_str() != "all") {
+    if let Some(svc) = p
+        .get("service")
+        .filter(|s| !s.is_empty() && s.as_str() != "all")
+    {
         conds.push(format!("service_name = '{}'", escape_string_literal(svc)));
     }
-    if let Some(op) = p.get("operation").filter(|s| !s.is_empty() && s.as_str() != "all") {
+    if let Some(op) = p
+        .get("operation")
+        .filter(|s| !s.is_empty() && s.as_str() != "all")
+    {
         conds.push(format!("span_name = '{}'", escape_string_literal(op)));
     }
 
@@ -270,9 +275,7 @@ pub async fn get_trace(
 }
 
 /// GET /jaeger/api/dependencies — stub (no precomputed dependency graph).
-pub async fn dependencies(
-    Extension(_tenant): Extension<TenantContext>,
-) -> impl IntoResponse {
+pub async fn dependencies(Extension(_tenant): Extension<TenantContext>) -> impl IntoResponse {
     envelope(Vec::<Value>::new())
 }
 
@@ -311,9 +314,10 @@ fn build_jaeger_trace(trace_id: &str, spans: Vec<WideEvent>) -> Value {
                     let (ty, val) = match v {
                         Value::String(s) => ("string", Value::String(s)),
                         Value::Bool(b) => ("bool", Value::Bool(b)),
-                        Value::Number(n) => {
-                            (if n.is_f64() { "float64" } else { "int64" }, Value::Number(n))
-                        }
+                        Value::Number(n) => (
+                            if n.is_f64() { "float64" } else { "int64" },
+                            Value::Number(n),
+                        ),
                         other => ("string", Value::String(other.to_string())),
                     };
                     tags.push(json!({ "key": k, "type": ty, "value": val }));
@@ -324,7 +328,9 @@ fn build_jaeger_trace(trace_id: &str, spans: Vec<WideEvent>) -> Value {
                 tags.push(json!({ "key": "span.kind", "type": "string", "value": e.kind }));
             }
             if !e.status.is_empty() {
-                tags.push(json!({ "key": "otel.status_code", "type": "string", "value": e.status }));
+                tags.push(
+                    json!({ "key": "otel.status_code", "type": "string", "value": e.status }),
+                );
                 if e.status.to_uppercase().contains("ERROR") {
                     tags.push(json!({ "key": "error", "type": "bool", "value": true }));
                 }

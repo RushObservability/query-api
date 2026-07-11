@@ -42,17 +42,23 @@ pub fn spawn(
         loop {
             let start = Instant::now();
             let mut ok = true;
-            let (evaluated, state_changes) =
-                match run_evaluation_cycle(&ch, &config_db, &http_client, &smtp_config, &smtp_transport, &mut eval_state)
-                    .await
-                {
-                    Ok(stats) => stats,
-                    Err(e) => {
-                        tracing::error!(engine = "monitors", error = %e, "evaluation cycle failed");
-                        ok = false;
-                        (0, 0)
-                    }
-                };
+            let (evaluated, state_changes) = match run_evaluation_cycle(
+                &ch,
+                &config_db,
+                &http_client,
+                &smtp_config,
+                &smtp_transport,
+                &mut eval_state,
+            )
+            .await
+            {
+                Ok(stats) => stats,
+                Err(e) => {
+                    tracing::error!(engine = "monitors", error = %e, "evaluation cycle failed");
+                    ok = false;
+                    (0, 0)
+                }
+            };
             let elapsed_ms = start.elapsed().as_millis() as u64;
             self_metrics.record_engine("monitor_engine", elapsed_ms, ok);
 
@@ -116,7 +122,9 @@ async fn run_evaluation_cycle(
         .into_iter()
         .filter(|monitor| {
             if let Some(ref last_eval) = monitor.last_eval_at {
-                if let Ok(last) = chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%SZ") {
+                if let Ok(last) =
+                    chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%SZ")
+                {
                     let last_utc = last.and_utc();
                     let elapsed = (now - last_utc).num_seconds();
                     if elapsed < monitor.eval_interval_secs {
@@ -136,38 +144,48 @@ async fn run_evaluation_cycle(
     let now_str_ref = now_str.as_str();
     let monitor_states_ref = &monitor_states;
 
-    let outcomes: Vec<(String, u64, bool)> = futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
-        let result = evaluate_monitor(
-            ch,
-            config_db,
-            &monitor,
-            now_str_ref,
-            http_client,
-            smtp_config,
-            smtp_transport,
-            monitor_states_ref,
-            should_flush,
-        )
+    let outcomes: Vec<(String, u64, bool)> =
+        futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
+            let result = evaluate_monitor(
+                ch,
+                config_db,
+                &monitor,
+                now_str_ref,
+                http_client,
+                smtp_config,
+                smtp_transport,
+                monitor_states_ref,
+                should_flush,
+            )
+            .await;
+            let (changes, persisted) = match result {
+                Ok(cp) => cp,
+                Err(e) => {
+                    tracing::warn!(
+                        engine = "monitors",
+                        monitor_id = %monitor.id,
+                        monitor_name = %monitor.name,
+                        error = %e,
+                        "monitor evaluation failed"
+                    );
+                    // On query failure, check no_data handling
+                    handle_no_data(
+                        config_db,
+                        &monitor,
+                        now_str_ref,
+                        http_client,
+                        smtp_config,
+                        smtp_transport,
+                        should_flush,
+                    )
+                    .await
+                }
+            };
+            (monitor.id, changes, persisted)
+        }))
+        .buffer_unordered(ENGINE_CONCURRENCY)
+        .collect()
         .await;
-        let (changes, persisted) = match result {
-            Ok(cp) => cp,
-            Err(e) => {
-                tracing::warn!(
-                    engine = "monitors",
-                    monitor_id = %monitor.id,
-                    monitor_name = %monitor.name,
-                    error = %e,
-                    "monitor evaluation failed"
-                );
-                // On query failure, check no_data handling
-                handle_no_data(config_db, &monitor, now_str_ref, http_client, smtp_config, smtp_transport, should_flush).await
-            }
-        };
-        (monitor.id, changes, persisted)
-    }))
-    .buffer_unordered(ENGINE_CONCURRENCY)
-    .collect()
-    .await;
 
     let mut state_changes: u64 = 0;
     for (id, changes, persisted) in outcomes {
@@ -201,7 +219,17 @@ async fn evaluate_monitor(
         "apm" => query_apm(ch, monitor, has_groups).await?,
         "composite" => {
             // Composite monitors combine other monitor states, not queries
-            return evaluate_composite(config_db, monitor, now_str, http_client, smtp_config, smtp_transport, monitor_states, should_flush).await;
+            return evaluate_composite(
+                config_db,
+                monitor,
+                now_str,
+                http_client,
+                smtp_config,
+                smtp_transport,
+                monitor_states,
+                should_flush,
+            )
+            .await;
         }
         other => {
             tracing::warn!(engine = "monitors", monitor_id = %monitor.id, "unknown monitor type: {other}");
@@ -211,7 +239,16 @@ async fn evaluate_monitor(
 
     if results.is_empty() {
         // No data returned
-        return Ok(handle_no_data(config_db, monitor, now_str, http_client, smtp_config, smtp_transport, should_flush).await);
+        return Ok(handle_no_data(
+            config_db,
+            monitor,
+            now_str,
+            http_client,
+            smtp_config,
+            smtp_transport,
+            should_flush,
+        )
+        .await);
     }
 
     // Evaluate thresholds for each group result
@@ -259,17 +296,19 @@ async fn evaluate_monitor(
             );
 
             let event_id = uuid::Uuid::new_v4().to_string();
-            let _ = config_db.create_monitor_event(
-                &event_id,
-                &monitor.id,
-                &monitor.tenant_id,
-                group_key,
-                current_state,
-                new_state,
-                Some(*value),
-                threshold,
-                &event_msg,
-            ).await;
+            let _ = config_db
+                .create_monitor_event(
+                    &event_id,
+                    &monitor.id,
+                    &monitor.tenant_id,
+                    group_key,
+                    current_state,
+                    new_state,
+                    Some(*value),
+                    threshold,
+                    &event_msg,
+                )
+                .await;
 
             // Fire notifications
             fire_notifications(
@@ -286,7 +325,9 @@ async fn evaluate_monitor(
             .await;
 
             if new_state == "alert" || new_state == "warn" {
-                let _ = config_db.update_monitor_triggered(&monitor.id, now_str).await;
+                let _ = config_db
+                    .update_monitor_triggered(&monitor.id, now_str)
+                    .await;
             }
 
             group_states.insert(group_key.clone(), new_state.to_string());
@@ -299,12 +340,7 @@ async fn evaluate_monitor(
     } else {
         results
             .first()
-            .map(|(gk, _)| {
-                group_states
-                    .get(gk)
-                    .map(|s| s.as_str())
-                    .unwrap_or("ok")
-            })
+            .map(|(gk, _)| group_states.get(gk).map(|s| s.as_str()).unwrap_or("ok"))
             .unwrap_or("ok")
     };
 
@@ -312,8 +348,11 @@ async fn evaluate_monitor(
     // moved) — that path is identical to before. Otherwise just flush
     // last_eval_at on the coarse cadence from the row we already hold.
     if changes > 0 || overall != monitor.state.as_str() {
-        let group_states_json = serde_json::to_string(&group_states).unwrap_or_else(|_| "{}".to_string());
-        config_db.update_monitor_state(&monitor.id, overall, &group_states_json, now_str).await?;
+        let group_states_json =
+            serde_json::to_string(&group_states).unwrap_or_else(|_| "{}".to_string());
+        config_db
+            .update_monitor_state(&monitor.id, overall, &group_states_json, now_str)
+            .await?;
         Ok((changes, true))
     } else if should_flush {
         config_db.persist_monitor_eval(monitor, now_str).await?;
@@ -436,17 +475,19 @@ async fn handle_no_data(
             "Monitor '{}': {} -> {} (no data received)",
             monitor.name, old_state, new_state,
         );
-        let _ = config_db.create_monitor_event(
-            &event_id,
-            &monitor.id,
-            &monitor.tenant_id,
-            "",
-            old_state,
-            new_state,
-            None,
-            None,
-            &event_msg,
-        ).await;
+        let _ = config_db
+            .create_monitor_event(
+                &event_id,
+                &monitor.id,
+                &monitor.tenant_id,
+                "",
+                old_state,
+                new_state,
+                None,
+                None,
+                &event_msg,
+            )
+            .await;
 
         if action == "notify" {
             fire_notifications(
@@ -464,7 +505,9 @@ async fn handle_no_data(
         }
 
         // Transition persists immediately, exactly as before.
-        let _ = config_db.update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str).await;
+        let _ = config_db
+            .update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str)
+            .await;
         (1, true)
     } else if should_flush {
         let _ = config_db.persist_monitor_eval(monitor, now_str).await;
@@ -526,15 +569,17 @@ async fn fire_notifications(
                 }
             };
 
-            let _ = config_db.create_notification_log(
-                channel_id,
-                &monitor.tenant_id,
-                "monitor",
-                &monitor.name,
-                alert_state,
-                status,
-                &error_msg,
-            ).await;
+            let _ = config_db
+                .create_notification_log(
+                    channel_id,
+                    &monitor.tenant_id,
+                    "monitor",
+                    &monitor.name,
+                    alert_state,
+                    status,
+                    &error_msg,
+                )
+                .await;
         }
     }
 }
@@ -558,7 +603,9 @@ async fn evaluate_composite(
 
     if monitor_ids.is_empty() || formula.is_empty() {
         if monitor.state != "no_data" {
-            let _ = config_db.update_monitor_state(&monitor.id, "no_data", "{}", now_str).await;
+            let _ = config_db
+                .update_monitor_state(&monitor.id, "no_data", "{}", now_str)
+                .await;
             return Ok((0, true));
         }
         if should_flush {
@@ -596,17 +643,19 @@ async fn evaluate_composite(
             "Composite monitor '{}': {} -> {} (formula: {})",
             monitor.name, monitor.state, new_state, formula,
         );
-        let _ = config_db.create_monitor_event(
-            &event_id,
-            &monitor.id,
-            &monitor.tenant_id,
-            "",
-            &monitor.state,
-            new_state,
-            None,
-            None,
-            &event_msg,
-        ).await;
+        let _ = config_db
+            .create_monitor_event(
+                &event_id,
+                &monitor.id,
+                &monitor.tenant_id,
+                "",
+                &monitor.state,
+                new_state,
+                None,
+                None,
+                &event_msg,
+            )
+            .await;
 
         fire_notifications(
             config_db,
@@ -622,13 +671,17 @@ async fn evaluate_composite(
         .await;
 
         if new_state == "alert" {
-            let _ = config_db.update_monitor_triggered(&monitor.id, now_str).await;
+            let _ = config_db
+                .update_monitor_triggered(&monitor.id, now_str)
+                .await;
         }
     }
 
     if changes > 0 {
         // Transition persists immediately, exactly as before.
-        let _ = config_db.update_monitor_state(&monitor.id, new_state, "{}", now_str).await;
+        let _ = config_db
+            .update_monitor_state(&monitor.id, new_state, "{}", now_str)
+            .await;
         Ok((changes, true))
     } else if should_flush {
         let _ = config_db.persist_monitor_eval(monitor, now_str).await;
@@ -703,14 +756,8 @@ async fn query_metric(
     };
 
     let mut conditions = vec![
-        format!(
-            "tenant_id = '{}'",
-            escape_ch(&monitor.tenant_id)
-        ),
-        format!(
-            "MetricName = '{}'",
-            escape_ch(&cfg.metric_name)
-        ),
+        format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
+        format!("MetricName = '{}'", escape_ch(&cfg.metric_name)),
         format!(
             "TimeUnix >= now() - INTERVAL {} SECOND",
             monitor.eval_window_secs
@@ -744,13 +791,19 @@ async fn query_metric(
              FROM metrics_gauge WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch.query(&sql).with_option("max_execution_time", "30").fetch_all::<GroupedRow>().await?;
+        let rows = ch
+            .query(&sql)
+            .with_option("max_execution_time", "30")
+            .fetch_all::<GroupedRow>()
+            .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
-        let sql = format!(
-            "SELECT {agg} AS value FROM metrics_gauge WHERE {where_clause}"
-        );
-        let row = ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<ValueRow>().await?;
+        let sql = format!("SELECT {agg} AS value FROM metrics_gauge WHERE {where_clause}");
+        let row = ch
+            .query(&sql)
+            .with_option("max_execution_time", "30")
+            .fetch_one::<ValueRow>()
+            .await?;
         Ok(vec![("".to_string(), row.value)])
     }
 }
@@ -779,11 +832,7 @@ async fn query_metric_promql(
     let mut results: Vec<(String, f64)> = Vec::new();
     for ts in &series {
         // The last sample value is the "current" value for threshold evaluation
-        let value = ts
-            .samples
-            .last()
-            .map(|(_t, v)| *v)
-            .unwrap_or(f64::NAN);
+        let value = ts.samples.last().map(|(_t, v)| *v).unwrap_or(f64::NAN);
 
         if value.is_nan() {
             continue;
@@ -822,10 +871,7 @@ async fn query_log(
     let cfg: LogQueryConfig = serde_json::from_str(&monitor.query_config)?;
 
     let mut conditions = vec![
-        format!(
-            "tenant_id = '{}'",
-            escape_ch(&monitor.tenant_id)
-        ),
+        format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
         format!(
             "Timestamp >= now() - INTERVAL {} SECOND",
             monitor.eval_window_secs
@@ -856,11 +902,7 @@ async fn query_log(
     let where_clause = conditions.join(" AND ");
 
     if has_groups {
-        let group_by_cols: Vec<String> = cfg
-            .group_by
-            .iter()
-            .map(|g| escape_ch(g))
-            .collect();
+        let group_by_cols: Vec<String> = cfg.group_by.iter().map(|g| escape_ch(g)).collect();
         let group_expr = if group_by_cols.is_empty() {
             "'*'".to_string()
         } else {
@@ -872,13 +914,19 @@ async fn query_log(
              FROM logs WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch.query(&sql).with_option("max_execution_time", "30").fetch_all::<GroupedRow>().await?;
+        let rows = ch
+            .query(&sql)
+            .with_option("max_execution_time", "30")
+            .fetch_all::<GroupedRow>()
+            .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
-        let sql = format!(
-            "SELECT count() AS value FROM logs WHERE {where_clause}"
-        );
-        let row = ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<ValueRow>().await?;
+        let sql = format!("SELECT count() AS value FROM logs WHERE {where_clause}");
+        let row = ch
+            .query(&sql)
+            .with_option("max_execution_time", "30")
+            .fetch_one::<ValueRow>()
+            .await?;
         Ok(vec![("".to_string(), row.value)])
     }
 }
@@ -891,14 +939,8 @@ async fn query_apm(
     let cfg: ApmQueryConfig = serde_json::from_str(&monitor.query_config)?;
 
     let mut conditions = vec![
-        format!(
-            "tenant_id = '{}'",
-            escape_ch(&monitor.tenant_id)
-        ),
-        format!(
-            "service_name = '{}'",
-            escape_ch(&cfg.service)
-        ),
+        format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
+        format!("service_name = '{}'", escape_ch(&cfg.service)),
         format!(
             "timestamp >= now() - INTERVAL {} SECOND",
             monitor.eval_window_secs
@@ -907,10 +949,7 @@ async fn query_apm(
 
     if let Some(ref ep) = cfg.endpoint_filter {
         if !ep.is_empty() {
-            conditions.push(format!(
-                "http_path = '{}'",
-                escape_ch(ep),
-            ));
+            conditions.push(format!("http_path = '{}'", escape_ch(ep),));
         }
     }
 
@@ -968,13 +1007,19 @@ async fn query_apm(
              FROM spans WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch.query(&sql).with_option("max_execution_time", "30").fetch_all::<GroupedRow>().await?;
+        let rows = ch
+            .query(&sql)
+            .with_option("max_execution_time", "30")
+            .fetch_all::<GroupedRow>()
+            .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
-        let sql = format!(
-            "SELECT {agg} AS value FROM spans WHERE {where_clause}"
-        );
-        let row = ch.query(&sql).with_option("max_execution_time", "30").fetch_one::<ValueRow>().await?;
+        let sql = format!("SELECT {agg} AS value FROM spans WHERE {where_clause}");
+        let row = ch
+            .query(&sql)
+            .with_option("max_execution_time", "30")
+            .fetch_one::<ValueRow>()
+            .await?;
         Ok(vec![("".to_string(), row.value)])
     }
 }
@@ -1108,17 +1153,18 @@ async fn build_preview_timeseries(
                     escape_ch(&f.value),
                 ));
             }
-            ("metrics_gauge".to_string(), agg.to_string(), conds.join(" AND "))
+            (
+                "metrics_gauge".to_string(),
+                agg.to_string(),
+                conds.join(" AND "),
+            )
         }
         "log" => {
             let cfg: LogQueryConfig = match serde_json::from_str(&monitor.query_config) {
                 Ok(c) => c,
                 Err(_) => return vec![],
             };
-            let mut conds = vec![format!(
-                "tenant_id = '{}'",
-                escape_ch(&monitor.tenant_id)
-            )];
+            let mut conds = vec![format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id))];
             if !cfg.search.is_empty() {
                 for term in cfg.search.split_whitespace() {
                     // lower(Body) LIKE matches the idx_body_text ngrams(4) index;
@@ -1129,9 +1175,17 @@ async fn build_preview_timeseries(
                 }
             }
             for f in &cfg.filters {
-                conds.push(format!("{} = '{}'", escape_ch(&f.field), escape_ch(&f.value)));
+                conds.push(format!(
+                    "{} = '{}'",
+                    escape_ch(&f.field),
+                    escape_ch(&f.value)
+                ));
             }
-            ("logs".to_string(), "count()".to_string(), conds.join(" AND "))
+            (
+                "logs".to_string(),
+                "count()".to_string(),
+                conds.join(" AND "),
+            )
         }
         "apm" => {
             let cfg: ApmQueryConfig = match serde_json::from_str(&monitor.query_config) {
@@ -1216,8 +1270,7 @@ async fn build_preview_timeseries_promql(
                 ts.samples
                     .iter()
                     .map(|(t, v)| {
-                        let dt = chrono::DateTime::from_timestamp(*t as i64, 0)
-                            .unwrap_or_default();
+                        let dt = chrono::DateTime::from_timestamp(*t as i64, 0).unwrap_or_default();
                         TimeseriesPoint {
                             timestamp: dt.format("%Y-%m-%d %H:%M:%S").to_string(),
                             value: *v,
@@ -1283,7 +1336,15 @@ mod tests {
 
         // Alert drops to warn when below critical recovery but above warning
         assert_eq!(
-            evaluate_threshold("alert", 35.0, Some(50.0), Some(40.0), Some(30.0), None, "above"),
+            evaluate_threshold(
+                "alert",
+                35.0,
+                Some(50.0),
+                Some(40.0),
+                Some(30.0),
+                None,
+                "above"
+            ),
             "warn"
         );
     }
@@ -1322,7 +1383,10 @@ mod tests {
         assert_eq!(worst_state(["ok", "ok"].iter().copied()), "ok");
         assert_eq!(worst_state(["ok", "warn"].iter().copied()), "warn");
         assert_eq!(worst_state(["ok", "alert"].iter().copied()), "alert");
-        assert_eq!(worst_state(["warn", "alert", "ok"].iter().copied()), "alert");
+        assert_eq!(
+            worst_state(["warn", "alert", "ok"].iter().copied()),
+            "alert"
+        );
         assert_eq!(worst_state(["ok", "no_data"].iter().copied()), "no_data");
     }
 }

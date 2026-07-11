@@ -6,12 +6,11 @@
 /// Segments are named `seg-<unix_millis>-<seq>.spool`.
 /// The current (open) segment is rotated once it reaches SEGMENT_MAX_BYTES (32 MiB).
 /// On open, existing `*.spool` files are scanned to restore total_bytes.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SEGMENT_MAX_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB per segment
@@ -105,7 +104,10 @@ impl Spool {
             .strip_prefix("seg-")
             .and_then(|r| r.split('-').next())
             .and_then(|s| s.parse::<u64>().ok())?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         Some(now.saturating_sub(ms) / 1000)
     }
 
@@ -148,9 +150,11 @@ impl Spool {
             // Write frame
             let tbl_len = table_bytes.len() as u32;
             let pay_len = payload.len() as u32;
-            file.write_all(&tbl_len.to_le_bytes()).map_err(|_| SpoolFull)?;
+            file.write_all(&tbl_len.to_le_bytes())
+                .map_err(|_| SpoolFull)?;
             file.write_all(table_bytes).map_err(|_| SpoolFull)?;
-            file.write_all(&pay_len.to_le_bytes()).map_err(|_| SpoolFull)?;
+            file.write_all(&pay_len.to_le_bytes())
+                .map_err(|_| SpoolFull)?;
             file.write_all(payload).map_err(|_| SpoolFull)?;
             *size += frame_len as u64;
             g.total_bytes += frame_len as u64;
@@ -394,12 +398,10 @@ impl IngestBuffer {
                 .ok()
                 .flatten()
             }
-            IngestBuffer::ObjectStore(s) => {
-                s.next_batch().await.map(|(key, records)| DrainBatch {
-                    records,
-                    handle: BatchHandle::ObjectStore(key),
-                })
-            }
+            IngestBuffer::ObjectStore(s) => s.next_batch().await.map(|(key, records)| DrainBatch {
+                records,
+                handle: BatchHandle::ObjectStore(key),
+            }),
         }
     }
 

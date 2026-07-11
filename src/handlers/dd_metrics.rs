@@ -1,18 +1,17 @@
 use axum::{
+    Extension, Json,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
-    Extension,
 };
 use serde::Deserialize;
 
+use super::dd_common::{decompress_body, validate_api_key};
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
 use crate::models::ingest::{GaugeRow, SumRow};
-use super::dd_common::{validate_api_key, decompress_body};
 
 // ═══ V1 Series payload ═══
 
@@ -101,7 +100,6 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-
 /// Parse DD tags list into (service_name, attributes).
 fn extract_tags(tags: &[String]) -> (String, Vec<(String, String)>) {
     let mut service_name = String::new();
@@ -179,12 +177,14 @@ pub async fn ingest_v1(
     validate_api_key(&headers)?;
     let raw = decompress_body(&headers, body).await?;
 
-    let payload: V1SeriesPayload = serde_json::from_slice(&raw).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}"))
-    })?;
+    let payload: V1SeriesPayload = serde_json::from_slice(&raw)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
 
     if payload.series.is_empty() {
-        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))));
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "ok"})),
+        ));
     }
 
     // Group by target table
@@ -207,7 +207,9 @@ pub async fn ingest_v1(
         let mut row = template.clone();
         let is_count = series.r#type.to_lowercase() == "count";
         for point in &series.points {
-            if point.len() < 2 { continue; }
+            if point.len() < 2 {
+                continue;
+            }
             row.time_unix = (point[0] as i64) * 1_000_000_000; // seconds → ns
             row.value = point[1];
 
@@ -225,18 +227,29 @@ pub async fn ingest_v1(
 
     // Write gauges and sums in parallel through the durable writer.
     let map_err = |e: WriteError| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Backpressure => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+        ),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                tenant_id,
+                SpoolBatch::Gauge(gauge_rows),
+            )
+            .await
+            .map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows))
+                .await
+                .map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
@@ -245,7 +258,9 @@ pub async fn ingest_v1(
     sum_res?;
 
     // Record usage for per-tenant ingest metering
-    state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
+    state
+        .usage_accumulator
+        .record(tenant_id, "metrics", total as u64, raw.len() as u64);
 
     tracing::debug!(
         signal = "metrics",
@@ -259,7 +274,10 @@ pub async fn ingest_v1(
         "ingested metrics"
     );
 
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "ok"})),
+    ))
 }
 
 /// POST /datadog/api/v2/series — Datadog V2 metrics intake.
@@ -285,15 +303,24 @@ pub async fn ingest_v2(
                 signal = "metrics",
                 endpoint = "v2",
                 bytes = raw.len(),
-                content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none"),
+                content_type = headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("none"),
                 "received non-JSON payload, accepting"
             );
-            return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))));
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"status": "ok"})),
+            ));
         }
     };
 
     if payload.series.is_empty() {
-        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))));
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "ok"})),
+        ));
     }
 
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
@@ -301,7 +328,9 @@ pub async fn ingest_v2(
 
     for series in &payload.series {
         let (svc, attrs) = extract_tags(&series.tags);
-        let host = series.resources.iter()
+        let host = series
+            .resources
+            .iter()
             .find(|r| r.r#type == "host")
             .map(|r| r.name.as_str())
             .unwrap_or("");
@@ -346,18 +375,29 @@ pub async fn ingest_v2(
     let total = gauge_rows.len() + sum_rows.len();
 
     let map_err = |e: WriteError| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+        WriteError::Backpressure => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+        ),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(gauge_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                tenant_id,
+                SpoolBatch::Gauge(gauge_rows),
+            )
+            .await
+            .map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
     let sum_fut = async {
         if !sum_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows)).await.map_err(map_err)?;
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows))
+                .await
+                .map_err(map_err)?;
         }
         Ok::<_, (StatusCode, String)>(())
     };
@@ -366,7 +406,9 @@ pub async fn ingest_v2(
     sum_res?;
 
     // Record usage for per-tenant ingest metering
-    state.usage_accumulator.record(tenant_id, "metrics", total as u64, raw.len() as u64);
+    state
+        .usage_accumulator
+        .record(tenant_id, "metrics", total as u64, raw.len() as u64);
 
     tracing::debug!(
         signal = "metrics",
@@ -378,7 +420,10 @@ pub async fn ingest_v2(
         "ingested metrics"
     );
 
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"status": "ok"}))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "ok"})),
+    ))
 }
 
 /// POST /datadog/api/v1/check_run — Datadog service checks.
@@ -402,7 +447,11 @@ pub async fn check_run(
             match serde_json::from_slice::<ServiceCheck>(&raw) {
                 Ok(c) => vec![c],
                 Err(_) => {
-                    tracing::debug!(signal = "metrics", endpoint = "check_run", "ignoring unparseable payload");
+                    tracing::debug!(
+                        signal = "metrics",
+                        endpoint = "check_run",
+                        "ignoring unparseable payload"
+                    );
                     return Ok(Json(serde_json::json!({"status": "ok"})));
                 }
             }
@@ -415,29 +464,39 @@ pub async fn check_run(
 
     let now_s = chrono::Utc::now().timestamp();
 
-    let rows: Vec<GaugeRow> = checks.iter().map(|check| {
-        let (svc, attrs) = extract_tags(&check.tags);
-        let ts = check.timestamp.unwrap_or(now_s) * 1_000_000_000;
-        let mut row = build_template(
-            svc,
-            format!("dd.check.{}", check.check),
-            String::new(),
-            attrs,
-            &check.host_name,
-            &tenant_arc,
-        );
-        row.time_unix = ts;
-        row.value = check.status as f64;
-        row
-    }).collect();
+    let rows: Vec<GaugeRow> = checks
+        .iter()
+        .map(|check| {
+            let (svc, attrs) = extract_tags(&check.tags);
+            let ts = check.timestamp.unwrap_or(now_s) * 1_000_000_000;
+            let mut row = build_template(
+                svc,
+                format!("dd.check.{}", check.check),
+                String::new(),
+                attrs,
+                &check.host_name,
+                &tenant_arc,
+            );
+            row.time_unix = ts;
+            row.value = check.status as f64;
+            row
+        })
+        .collect();
 
-    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows)).await.map_err(|e| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
-    })?;
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        })?;
 
     // Record usage for per-tenant ingest metering
-    state.usage_accumulator.record(tenant_id, "metrics", checks.len() as u64, raw.len() as u64);
+    state
+        .usage_accumulator
+        .record(tenant_id, "metrics", checks.len() as u64, raw.len() as u64);
 
     tracing::debug!(
         signal = "metrics",

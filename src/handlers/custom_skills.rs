@@ -75,10 +75,7 @@ fn validate_skill_fields(
 
     // reserved names
     if RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name)) {
-        return Err(format!(
-            "name '{}' is reserved and cannot be used",
-            name
-        ));
+        return Err(format!("name '{}' is reserved and cannot be used", name));
     }
 
     // title length
@@ -127,10 +124,10 @@ fn validate_skill_fields(
 pub async fn list_custom_skills(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let skills = state
-        .config_db
-        .list_custom_skills().await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+    let skills = state.config_db.list_custom_skills().await.map_err(|e| {
+        tracing::error!(error = %e, "internal error");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+    })?;
     Ok(Json(serde_json::json!({ "skills": skills })))
 }
 
@@ -140,8 +137,12 @@ pub async fn get_custom_skill(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let skill = state
         .config_db
-        .get_custom_skill(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_custom_skill(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
     Ok(Json(skill))
 }
@@ -164,8 +165,12 @@ pub async fn create_custom_skill(
     // Uniqueness on name (friendlier than the raw SQLite constraint error)
     let existing = state
         .config_db
-        .get_custom_skill_by_name(&req.name).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .get_custom_skill_by_name(&req.name)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
     if existing.is_some() {
         return Err((
             StatusCode::CONFLICT,
@@ -175,8 +180,12 @@ pub async fn create_custom_skill(
 
     let created = state
         .config_db
-        .create_custom_skill(&req, "").await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .create_custom_skill(&req, "")
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
 
     // AUDIT: custom skill created. Skill content is not logged (only name/title).
     state.audit.log(
@@ -202,8 +211,12 @@ pub async fn update_custom_skill(
     // Fetch the existing skill so we can validate against its immutable name.
     let existing = state
         .config_db
-        .get_custom_skill(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .get_custom_skill(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
 
     validate_skill_fields(
@@ -217,8 +230,12 @@ pub async fn update_custom_skill(
 
     let updated = state
         .config_db
-        .update_custom_skill(&id, &req).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?
+        .update_custom_skill(&id, &req)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "custom skill not found".to_string()))?;
 
     // AUDIT: custom skill updated. Skill content is not logged.
@@ -243,21 +260,28 @@ pub async fn delete_custom_skill(
     let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_custom_skill(&id).await
-        .map_err(|e| { tracing::error!(error = %e, "internal error"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) })?;
+        .delete_custom_skill(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "custom skill not found".to_string()));
     }
 
     // AUDIT: custom skill deleted.
-    state.audit.log(
-        crate::audit::AuditEvent::new("skill.delete", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("custom_skill", id.clone())
-            .description("custom skill deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("skill.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("custom_skill", id.clone())
+                .description("custom skill deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

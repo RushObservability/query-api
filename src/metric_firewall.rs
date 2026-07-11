@@ -163,9 +163,18 @@ impl MetricFirewall {
             if !r.enabled {
                 continue;
             }
-            let Some(metric) = Matcher::build(&r.metric_pattern, r.metric_regex) else { continue };
-            let label_key = if r.match_label_key.is_empty() { None } else { Some(r.match_label_key.clone()) };
-            let Some(label_value) = Matcher::build(&r.match_label_value, r.match_label_value_regex) else { continue };
+            let Some(metric) = Matcher::build(&r.metric_pattern, r.metric_regex) else {
+                continue;
+            };
+            let label_key = if r.match_label_key.is_empty() {
+                None
+            } else {
+                Some(r.match_label_key.clone())
+            };
+            let Some(label_value) = Matcher::build(&r.match_label_value, r.match_label_value_regex)
+            else {
+                continue;
+            };
 
             let action = match r.action.as_str() {
                 "allow" => {
@@ -173,7 +182,9 @@ impl MetricFirewall {
                     // silently neuter every block rule — refuse it (the API also
                     // rejects this; guard here for rows written by other paths).
                     if matches!(metric, Matcher::Any) && label_key.is_none() {
-                        tracing::warn!("metric firewall: allow rule has no match criteria, skipping");
+                        tracing::warn!(
+                            "metric firewall: allow rule has no match criteria, skipping"
+                        );
                         continue;
                     }
                     CompiledAction::Allow
@@ -182,7 +193,9 @@ impl MetricFirewall {
                     // A drop-label rule needs a non-empty drop pattern, otherwise it
                     // would strip every label — refuse that (require an explicit key).
                     if r.drop_label_pattern.is_empty() {
-                        tracing::warn!("metric firewall: drop_label rule has empty label pattern, skipping");
+                        tracing::warn!(
+                            "metric firewall: drop_label rule has empty label pattern, skipping"
+                        );
                         continue;
                     }
                     match Matcher::build(&r.drop_label_pattern, r.drop_label_regex) {
@@ -194,7 +207,12 @@ impl MetricFirewall {
                 _ => CompiledAction::Block,
             };
 
-            let rule = CompiledRule { action, metric, label_key, label_value };
+            let rule = CompiledRule {
+                action,
+                metric,
+                label_key,
+                label_value,
+            };
             match &rule.action {
                 CompiledAction::Allow => fw.allow.push(rule),
                 CompiledAction::Block => fw.block.push(rule),
@@ -222,8 +240,14 @@ impl MetricFirewall {
             // allow rule cannot be blocked (labels may still be stripped below).
             if !self.block.is_empty() {
                 let allowed = !self.allow.is_empty()
-                    && self.allow.matches(row.fw_metric_name(), row.fw_attributes());
-                if !allowed && self.block.matches(row.fw_metric_name(), row.fw_attributes()) {
+                    && self
+                        .allow
+                        .matches(row.fw_metric_name(), row.fw_attributes());
+                if !allowed
+                    && self
+                        .block
+                        .matches(row.fw_metric_name(), row.fw_attributes())
+                {
                     return false; // drop the whole datapoint
                 }
             }
@@ -244,28 +268,66 @@ impl MetricFirewall {
 mod tests {
     use super::*;
 
-    struct Row { name: String, attrs: Vec<(String, String)> }
+    struct Row {
+        name: String,
+        attrs: Vec<(String, String)>,
+    }
     impl MetricRow for Row {
-        fn fw_metric_name(&self) -> &str { &self.name }
-        fn fw_attributes(&self) -> &[(String, String)] { &self.attrs }
-        fn fw_attributes_mut(&mut self) -> &mut Vec<(String, String)> { &mut self.attrs }
+        fn fw_metric_name(&self) -> &str {
+            &self.name
+        }
+        fn fw_attributes(&self) -> &[(String, String)] {
+            &self.attrs
+        }
+        fn fw_attributes_mut(&mut self) -> &mut Vec<(String, String)> {
+            &mut self.attrs
+        }
     }
     fn row(name: &str, attrs: &[(&str, &str)]) -> Row {
-        Row { name: name.into(), attrs: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+        Row {
+            name: name.into(),
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
     }
-    fn raw(action: &str, mp: &str, mre: bool, lk: &str, lv: &str, lvre: bool, dl: &str, dlre: bool) -> RawRule {
+    fn raw(
+        action: &str,
+        mp: &str,
+        mre: bool,
+        lk: &str,
+        lv: &str,
+        lvre: bool,
+        dl: &str,
+        dlre: bool,
+    ) -> RawRule {
         RawRule {
-            enabled: true, action: action.into(),
-            metric_pattern: mp.into(), metric_regex: mre,
-            match_label_key: lk.into(), match_label_value: lv.into(), match_label_value_regex: lvre,
-            drop_label_pattern: dl.into(), drop_label_regex: dlre,
+            enabled: true,
+            action: action.into(),
+            metric_pattern: mp.into(),
+            metric_regex: mre,
+            match_label_key: lk.into(),
+            match_label_value: lv.into(),
+            match_label_value_regex: lvre,
+            drop_label_pattern: dl.into(),
+            drop_label_regex: dlre,
         }
     }
 
     #[test]
     fn block_by_metric_literal_and_regex() {
         let fw = MetricFirewall::compile(&[
-            raw("block", "go_gc_duration_seconds", false, "", "", false, "", false),
+            raw(
+                "block",
+                "go_gc_duration_seconds",
+                false,
+                "",
+                "",
+                false,
+                "",
+                false,
+            ),
             raw("block", "^node_.*", true, "", "", false, "", false),
         ]);
         let mut rows = vec![
@@ -282,7 +344,16 @@ mod tests {
     #[test]
     fn block_by_label_value_regex() {
         // Block any series with env label matching dev/staging
-        let fw = MetricFirewall::compile(&[raw("block", "", false, "env", "^(dev|staging)$", true, "", false)]);
+        let fw = MetricFirewall::compile(&[raw(
+            "block",
+            "",
+            false,
+            "env",
+            "^(dev|staging)$",
+            true,
+            "",
+            false,
+        )]);
         let mut rows = vec![
             row("m", &[("env", "prod")]),
             row("m", &[("env", "dev")]),
@@ -296,14 +367,29 @@ mod tests {
     #[test]
     fn drop_labels_by_regex_scoped_to_metric() {
         // On http_* metrics, strip any label whose key starts with "tmp_"
-        let fw = MetricFirewall::compile(&[raw("drop_label", "^http_.*", true, "", "", false, "^tmp_.*", true)]);
+        let fw = MetricFirewall::compile(&[raw(
+            "drop_label",
+            "^http_.*",
+            true,
+            "",
+            "",
+            false,
+            "^tmp_.*",
+            true,
+        )]);
         let mut rows = vec![
-            row("http_requests_total", &[("method", "GET"), ("tmp_debug", "1"), ("tmp_id", "x")]),
+            row(
+                "http_requests_total",
+                &[("method", "GET"), ("tmp_debug", "1"), ("tmp_id", "x")],
+            ),
             row("cpu", &[("tmp_debug", "1")]), // not http_* → untouched
         ];
         let dropped = fw.apply(&mut rows);
         assert_eq!(dropped, 0); // drop_label never removes datapoints
-        assert_eq!(rows[0].attrs, vec![("method".to_string(), "GET".to_string())]);
+        assert_eq!(
+            rows[0].attrs,
+            vec![("method".to_string(), "GET".to_string())]
+        );
         assert_eq!(rows[1].attrs.len(), 1); // untouched
     }
 
@@ -325,7 +411,7 @@ mod tests {
             raw("allow", "", false, "team", "core", false, "", false),
         ]);
         let mut rows = vec![
-            row("http_requests_total", &[]),          // allowed by metric
+            row("http_requests_total", &[]),              // allowed by metric
             row("node_cpu_seconds", &[("team", "core")]), // allowed by label
             row("node_cpu_seconds", &[("team", "web")]),  // blocked
             row("go_goroutines", &[]),                    // blocked
@@ -343,16 +429,23 @@ mod tests {
             raw("block", "^http_.*", true, "", "", false, "", false),
             raw("drop_label", "", false, "", "", false, "^tmp_.*", true),
         ]);
-        let mut rows = vec![row("http_requests_total", &[("method", "GET"), ("tmp_debug", "1")])];
+        let mut rows = vec![row(
+            "http_requests_total",
+            &[("method", "GET"), ("tmp_debug", "1")],
+        )];
         assert_eq!(fw.apply(&mut rows), 0); // allow beats block
         assert_eq!(rows.len(), 1);
         // ...but drop_label still applied to the allowed series.
-        assert_eq!(rows[0].attrs, vec![("method".to_string(), "GET".to_string())]);
+        assert_eq!(
+            rows[0].attrs,
+            vec![("method".to_string(), "GET".to_string())]
+        );
     }
 
     #[test]
     fn allow_without_block_changes_nothing() {
-        let fw = MetricFirewall::compile(&[raw("allow", "^http_.*", true, "", "", false, "", false)]);
+        let fw =
+            MetricFirewall::compile(&[raw("allow", "^http_.*", true, "", "", false, "", false)]);
         let mut rows = vec![row("http_requests_total", &[]), row("node_cpu", &[])];
         assert_eq!(fw.apply(&mut rows), 0);
         assert_eq!(rows.len(), 2);

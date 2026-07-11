@@ -1,20 +1,19 @@
 use axum::{
+    Extension, Json,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
-    Extension,
 };
 use prost::Message;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use super::dd_common::{decompress_body, validate_api_key};
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
 use crate::models::ingest::TraceInsertRow;
-use super::dd_common::{validate_api_key, decompress_body};
 
 // ═══ DD Agent protobuf types (AgentPayload) ═══
 // The DD agent v1 trace writer sends protobuf-encoded AgentPayload
@@ -118,7 +117,6 @@ struct DdSpan {
     span_type: String,
 }
 
-
 /// Convert a 64-bit DD trace/span ID to a hex string.
 fn id_to_hex(id: u64, width: usize) -> String {
     format!("{:0>width$x}", id, width = width)
@@ -129,7 +127,9 @@ fn dd_type_to_span_kind(span_type: &str) -> &'static str {
     match span_type {
         "web" | "http" => "SPAN_KIND_SERVER",
         "client" | "dns" | "grpc" => "SPAN_KIND_CLIENT",
-        "db" | "cache" | "memcached" | "redis" | "sql" | "cassandra" | "elasticsearch" => "SPAN_KIND_CLIENT",
+        "db" | "cache" | "memcached" | "redis" | "sql" | "cassandra" | "elasticsearch" => {
+            "SPAN_KIND_CLIENT"
+        }
         "worker" | "consumer" => "SPAN_KIND_CONSUMER",
         "producer" => "SPAN_KIND_PRODUCER",
         _ => "SPAN_KIND_INTERNAL",
@@ -153,7 +153,11 @@ fn convert_span(
     };
 
     let span_kind = dd_type_to_span_kind(&span.span_type);
-    let status_code = if span.error != 0 { "STATUS_CODE_ERROR" } else { "STATUS_CODE_OK" };
+    let status_code = if span.error != 0 {
+        "STATUS_CODE_ERROR"
+    } else {
+        "STATUS_CODE_OK"
+    };
     let status_message = span.meta.get("error.message").cloned().unwrap_or_default();
 
     // Build resource attributes (OTEL standard keys for the MV to extract)
@@ -173,7 +177,9 @@ fn convert_span(
     }
 
     // Build span attributes from DD meta + metrics + resource
-    let mut span_attrs: Vec<(String, String)> = span.meta.iter()
+    let mut span_attrs: Vec<(String, String)> = span
+        .meta
+        .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     for (k, v) in &span.metrics {
@@ -231,7 +237,10 @@ pub async fn ingest_v04(
 
     // Decode msgpack: Vec<Vec<DdSpan>> (array of traces, each trace is array of spans)
     let traces: Vec<Vec<DdSpan>> = rmp_serde::from_slice(&raw).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("msgpack decode failed: {e}"))
+        (
+            StatusCode::BAD_REQUEST,
+            format!("msgpack decode failed: {e}"),
+        )
     })?;
 
     let span_count: usize = traces.iter().map(|t| t.len()).sum();
@@ -241,21 +250,39 @@ pub async fn ingest_v04(
 
     // Arc refactor: tenant_id is shared across every span — allocate once.
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
-    let rows: Vec<TraceInsertRow> = traces.iter().flat_map(|trace| {
-        trace.iter().map(|span| {
-            let env = span.meta.get("env").cloned().unwrap_or_default();
-            let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-            convert_span(span, &env, &hostname, &tenant_arc)
+    let rows: Vec<TraceInsertRow> = traces
+        .iter()
+        .flat_map(|trace| {
+            trace.iter().map(|span| {
+                let env = span.meta.get("env").cloned().unwrap_or_default();
+                let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
+                convert_span(span, &env, &hostname, &tenant_arc)
+            })
         })
-    }).collect();
+        .collect();
 
-    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
-        WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+    crate::handlers::ingest_gate::write_gated(
+        &state,
+        tenant_id,
+        SpoolBatch::Spans(
+            rows.into_iter()
+                .map(crate::models::trace::WideEvent::from)
+                .collect(),
+        ),
+    )
+    .await
+    .map_err(|e| match e {
+        WriteError::Backpressure => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+        ),
         WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
     })?;
 
     // Record usage for per-tenant ingest metering
-    state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
+    state
+        .usage_accumulator
+        .record(tenant_id, "traces", span_count as u64, raw.len() as u64);
 
     tracing::debug!(
         signal = "traces",
@@ -299,7 +326,10 @@ pub async fn ingest_agent(
     let raw = decompress_body(&headers, body).await?;
 
     // Log content-type for debugging
-    let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none");
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none");
     tracing::debug!(
         endpoint = "v0.2",
         bytes = raw.len(),
@@ -307,103 +337,134 @@ pub async fn ingest_agent(
         "datadog traces payload received"
     );
 
-
     // Try protobuf AgentPayload first
     match AgentPayload::decode(raw.as_slice()) {
         Err(e) => {
             tracing::debug!(error = %e, endpoint = "v0.2", "protobuf decode failed, trying msgpack");
         }
         Ok(payload) => {
-        let env = payload.env.clone();
-        let hostname = payload.host_name.clone();
-        // The chunk/span sums exist only for this debug line — don't pay for
-        // them per request unless debug logging is actually enabled.
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let tp_count = payload.tracer_payloads.len();
-            let chunk_count: usize = payload.tracer_payloads.iter()
-                .map(|tp| tp.chunks.len() + tp.traces.len()).sum();
-            let total_spans: usize = payload.tracer_payloads.iter()
-                .flat_map(|tp| tp.chunks.iter().chain(tp.traces.iter()))
-                .map(|c| c.spans.len())
-                .sum();
-            tracing::debug!(
-                endpoint = "v0.2",
-                host = %hostname,
-                env = %env,
-                tracer_payloads = tp_count,
-                chunks = chunk_count,
-                spans = total_spans,
-                "protobuf payload decoded"
-            );
-        }
-        let mut span_count = 0usize;
-        // Collect all spans from the protobuf payload
-        let mut all_spans: Vec<DdSpan> = Vec::new();
-        for tp in &payload.tracer_payloads {
-            let tp_hostname = if tp.hostname.is_empty() { &hostname } else { &tp.hostname };
-            // DD agent uses both tag 5 (chunks) and tag 6 (traces/deprecated) for TraceChunks
-            let all_chunks = tp.chunks.iter().chain(tp.traces.iter());
-            for chunk in all_chunks {
-                for pb_span in &chunk.spans {
-                    span_count += 1;
-                    all_spans.push(DdSpan {
-                        service: pb_span.service.clone(),
-                        name: pb_span.name.clone(),
-                        resource: pb_span.resource.clone(),
-                        trace_id: pb_span.trace_id,
-                        span_id: pb_span.span_id,
-                        parent_id: pb_span.parent_id,
-                        start: pb_span.start,
-                        duration: pb_span.duration,
-                        error: pb_span.error,
-                        meta: pb_span.meta.clone(),
-                        metrics: pb_span.metrics.clone(),
-                        span_type: pb_span.r#type.clone(),
-                    });
-                    // Inject env/hostname into meta if not present
-                    if let Some(span) = all_spans.last_mut() {
-                        if !env.is_empty() && !span.meta.contains_key("env") {
-                            span.meta.insert("env".to_string(), env.clone());
-                        }
-                        if !tp_hostname.is_empty() && !span.meta.contains_key("_dd.hostname") {
-                            span.meta.insert("_dd.hostname".to_string(), tp_hostname.clone());
-                        }
-                        if !tp.app_version.is_empty() && !span.meta.contains_key("version") {
-                            span.meta.insert("version".to_string(), tp.app_version.clone());
+            let env = payload.env.clone();
+            let hostname = payload.host_name.clone();
+            // The chunk/span sums exist only for this debug line — don't pay for
+            // them per request unless debug logging is actually enabled.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let tp_count = payload.tracer_payloads.len();
+                let chunk_count: usize = payload
+                    .tracer_payloads
+                    .iter()
+                    .map(|tp| tp.chunks.len() + tp.traces.len())
+                    .sum();
+                let total_spans: usize = payload
+                    .tracer_payloads
+                    .iter()
+                    .flat_map(|tp| tp.chunks.iter().chain(tp.traces.iter()))
+                    .map(|c| c.spans.len())
+                    .sum();
+                tracing::debug!(
+                    endpoint = "v0.2",
+                    host = %hostname,
+                    env = %env,
+                    tracer_payloads = tp_count,
+                    chunks = chunk_count,
+                    spans = total_spans,
+                    "protobuf payload decoded"
+                );
+            }
+            let mut span_count = 0usize;
+            // Collect all spans from the protobuf payload
+            let mut all_spans: Vec<DdSpan> = Vec::new();
+            for tp in &payload.tracer_payloads {
+                let tp_hostname = if tp.hostname.is_empty() {
+                    &hostname
+                } else {
+                    &tp.hostname
+                };
+                // DD agent uses both tag 5 (chunks) and tag 6 (traces/deprecated) for TraceChunks
+                let all_chunks = tp.chunks.iter().chain(tp.traces.iter());
+                for chunk in all_chunks {
+                    for pb_span in &chunk.spans {
+                        span_count += 1;
+                        all_spans.push(DdSpan {
+                            service: pb_span.service.clone(),
+                            name: pb_span.name.clone(),
+                            resource: pb_span.resource.clone(),
+                            trace_id: pb_span.trace_id,
+                            span_id: pb_span.span_id,
+                            parent_id: pb_span.parent_id,
+                            start: pb_span.start,
+                            duration: pb_span.duration,
+                            error: pb_span.error,
+                            meta: pb_span.meta.clone(),
+                            metrics: pb_span.metrics.clone(),
+                            span_type: pb_span.r#type.clone(),
+                        });
+                        // Inject env/hostname into meta if not present
+                        if let Some(span) = all_spans.last_mut() {
+                            if !env.is_empty() && !span.meta.contains_key("env") {
+                                span.meta.insert("env".to_string(), env.clone());
+                            }
+                            if !tp_hostname.is_empty() && !span.meta.contains_key("_dd.hostname") {
+                                span.meta
+                                    .insert("_dd.hostname".to_string(), tp_hostname.clone());
+                            }
+                            if !tp.app_version.is_empty() && !span.meta.contains_key("version") {
+                                span.meta
+                                    .insert("version".to_string(), tp.app_version.clone());
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if span_count == 0 {
+            if span_count == 0 {
+                return Ok(Json(serde_json::json!({"rate_by_service": {}})));
+            }
+
+            let rows: Vec<TraceInsertRow> = all_spans
+                .iter()
+                .map(|span| {
+                    let span_env = span.meta.get("env").cloned().unwrap_or_default();
+                    let span_host = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
+                    convert_span(span, &span_env, &span_host, &tenant_arc)
+                })
+                .collect();
+
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                tenant_id,
+                SpoolBatch::Spans(
+                    rows.into_iter()
+                        .map(crate::models::trace::WideEvent::from)
+                        .collect(),
+                ),
+            )
+            .await
+            .map_err(|e| match e {
+                WriteError::Backpressure => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+                ),
+                WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+            })?;
+
+            // Record usage for per-tenant ingest metering (protobuf path)
+            state.usage_accumulator.record(
+                tenant_id,
+                "traces",
+                span_count as u64,
+                raw.len() as u64,
+            );
+
+            tracing::debug!(
+                signal = "traces",
+                tenant_id = %tenant_id,
+                spans_count = span_count,
+                source = "datadog",
+                endpoint = "v0.2",
+                encoding = "protobuf",
+                "ingested spans"
+            );
             return Ok(Json(serde_json::json!({"rate_by_service": {}})));
-        }
-
-        let rows: Vec<TraceInsertRow> = all_spans.iter().map(|span| {
-            let span_env = span.meta.get("env").cloned().unwrap_or_default();
-            let span_host = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-            convert_span(span, &span_env, &span_host, &tenant_arc)
-        }).collect();
-
-        crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
-            WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
-            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
-        })?;
-
-        // Record usage for per-tenant ingest metering (protobuf path)
-        state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
-
-        tracing::debug!(
-            signal = "traces",
-            tenant_id = %tenant_id,
-            spans_count = span_count,
-            source = "datadog",
-            endpoint = "v0.2",
-            encoding = "protobuf",
-            "ingested spans"
-        );
-        return Ok(Json(serde_json::json!({"rate_by_service": {}})));
         }
     }
 
@@ -415,21 +476,42 @@ pub async fn ingest_agent(
                 return Ok(Json(serde_json::json!({"rate_by_service": {}})));
             }
 
-            let rows: Vec<TraceInsertRow> = traces.iter().flat_map(|trace| {
-                trace.iter().map(|span| {
-                    let env = span.meta.get("env").cloned().unwrap_or_default();
-                    let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-                    convert_span(span, &env, &hostname, &tenant_arc)
+            let rows: Vec<TraceInsertRow> = traces
+                .iter()
+                .flat_map(|trace| {
+                    trace.iter().map(|span| {
+                        let env = span.meta.get("env").cloned().unwrap_or_default();
+                        let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
+                        convert_span(span, &env, &hostname, &tenant_arc)
+                    })
                 })
-            }).collect();
+                .collect();
 
-            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(rows.into_iter().map(crate::models::trace::WideEvent::from).collect())).await.map_err(|e| match e {
-                WriteError::Backpressure => (StatusCode::TOO_MANY_REQUESTS, "ingest backpressure: clickhouse unavailable, spool full".to_string()),
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                tenant_id,
+                SpoolBatch::Spans(
+                    rows.into_iter()
+                        .map(crate::models::trace::WideEvent::from)
+                        .collect(),
+                ),
+            )
+            .await
+            .map_err(|e| match e {
+                WriteError::Backpressure => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+                ),
                 WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
             })?;
 
             // Record usage for per-tenant ingest metering (msgpack fallback path)
-            state.usage_accumulator.record(tenant_id, "traces", span_count as u64, raw.len() as u64);
+            state.usage_accumulator.record(
+                tenant_id,
+                "traces",
+                span_count as u64,
+                raw.len() as u64,
+            );
 
             tracing::debug!(
                 signal = "traces",

@@ -1,9 +1,9 @@
 use axum::{
+    Json,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 
 use crate::AppState;
@@ -31,16 +31,28 @@ const MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 /// Compressed bodies are inflated on the blocking pool — decompression is
 /// synchronous CPU work that would otherwise stall a tokio worker for the
 /// duration (tens to hundreds of ms on large agent payloads).
-pub async fn decompress_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
+pub async fn decompress_body(
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Vec<u8>, (StatusCode, String)> {
     let encoding = headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if encoding.contains("gzip") || encoding.contains("deflate") || encoding.contains("zstd") || encoding.contains("zstandard") {
+    if encoding.contains("gzip")
+        || encoding.contains("deflate")
+        || encoding.contains("zstd")
+        || encoding.contains("zstandard")
+    {
         tokio::task::spawn_blocking(move || decompress_body_sync(&encoding, body))
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decompress task failed: {e}")))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("decompress task failed: {e}"),
+                )
+            })?
     } else {
         Ok(body.to_vec())
     }
@@ -51,31 +63,55 @@ fn decompress_body_sync(encoding: &str, body: Bytes) -> Result<Vec<u8>, (StatusC
         use std::io::Read;
         let decoder = flate2::read::GzDecoder::new(body.as_ref());
         let mut out = Vec::new();
-        decoder.take(MAX_DECOMPRESSED_BYTES).read_to_end(&mut out).map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("gzip decompression failed: {e}"))
-        })?;
+        decoder
+            .take(MAX_DECOMPRESSED_BYTES)
+            .read_to_end(&mut out)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("gzip decompression failed: {e}"),
+                )
+            })?;
         if out.len() as u64 >= MAX_DECOMPRESSED_BYTES {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "decompressed body exceeds 32 MB limit".into(),
+            ));
         }
         Ok(out)
     } else if encoding.contains("deflate") {
         use std::io::Read;
         let decoder = flate2::read::DeflateDecoder::new(body.as_ref());
         let mut out = Vec::new();
-        decoder.take(MAX_DECOMPRESSED_BYTES).read_to_end(&mut out).map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("deflate decompression failed: {e}"))
-        })?;
+        decoder
+            .take(MAX_DECOMPRESSED_BYTES)
+            .read_to_end(&mut out)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("deflate decompression failed: {e}"),
+                )
+            })?;
         if out.len() as u64 >= MAX_DECOMPRESSED_BYTES {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "decompressed body exceeds 32 MB limit".into(),
+            ));
         }
         Ok(out)
     } else {
         // zstd / zstandard (only reachable for these encodings via the async wrapper)
         let out = zstd::decode_all(body.as_ref()).map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("zstd decompression failed: {e}"))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("zstd decompression failed: {e}"),
+            )
         })?;
         if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, "decompressed body exceeds 32 MB limit".into()));
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "decompressed body exceeds 32 MB limit".into(),
+            ));
         }
         Ok(out)
     }

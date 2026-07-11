@@ -78,7 +78,8 @@ impl From<Slo> for SloResponse {
             error_filters: serde_json::from_str(&s.error_filters).unwrap_or(serde_json::json!([])),
             total_filters: serde_json::from_str(&s.total_filters).unwrap_or(serde_json::json!([])),
             eval_interval_secs: s.eval_interval_secs,
-            notification_channel_ids: serde_json::from_str(&s.notification_channel_ids).unwrap_or(serde_json::json!([])),
+            notification_channel_ids: serde_json::from_str(&s.notification_channel_ids)
+                .unwrap_or(serde_json::json!([])),
             state: s.state,
             error_budget_remaining: s.error_budget_remaining,
             error_count: s.error_count,

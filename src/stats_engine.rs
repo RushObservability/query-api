@@ -1,7 +1,7 @@
+use crate::self_metrics::{MetricKind, SelfMetrics};
+use crate::spool::IngestBuffer;
 use clickhouse::Client;
 use std::sync::Arc;
-use crate::spool::IngestBuffer;
-use crate::self_metrics::{MetricKind, SelfMetrics};
 
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct CountRow {
@@ -43,7 +43,11 @@ pub fn spawn_stats_engine(ch: Client, buffer: Arc<IngestBuffer>, self_metrics: A
     });
 }
 
-async fn collect_and_write(ch: &Client, buffer: &IngestBuffer, self_metrics: &SelfMetrics) -> anyhow::Result<()> {
+async fn collect_and_write(
+    ch: &Client,
+    buffer: &IngestBuffer,
+    self_metrics: &SelfMetrics,
+) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     let now_nanos = now.timestamp_nanos_opt().unwrap_or(0);
     let one_hour_ago = (now - chrono::Duration::hours(1))
@@ -85,40 +89,48 @@ async fn collect_and_write(ch: &Client, buffer: &IngestBuffer, self_metrics: &Se
         buf_oldest,
     ) = tokio::join!(
         query_count(ch, &q_spans),
-        query_bytes(ch,
+        query_bytes(
+            ch,
             "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans' AND active"
         ),
         query_count(ch, &q_logs),
         query_count(ch, &q_gauge),
         query_count(ch, &q_sum),
         query_count(ch, &q_hist),
-        query_count(ch,
+        query_count(
+            ch,
             "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR"
         ),
-        query_bytes(ch,
+        query_bytes(
+            ch,
             "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND active"
         ),
-        query_count(ch,
+        query_count(
+            ch,
             "SELECT sum(rows) as count FROM system.parts WHERE database = 'observability' AND active"
         ),
         // Tiered storage breakdown: data bytes on local disk vs object store.
         // Classified by joining each part's disk to system.disks.type, matching
         // the on-demand /stats endpoint. Object store = any non-Local disk.
-        query_bytes(ch,
+        query_bytes(
+            ch,
             "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
              LEFT JOIN system.disks d ON p.disk_name = d.name \
              WHERE p.database = 'observability' AND p.active AND d.type = 'Local'"
         ),
-        query_bytes(ch,
+        query_bytes(
+            ch,
             "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
              LEFT JOIN system.disks d ON p.disk_name = d.name \
              WHERE p.database = 'observability' AND p.active AND d.type != 'Local'"
         ),
         // Local disk capacity (headroom) from system.disks.
-        query_bytes(ch,
+        query_bytes(
+            ch,
             "SELECT sum(free_space) as total FROM system.disks WHERE type = 'Local'"
         ),
-        query_bytes(ch,
+        query_bytes(
+            ch,
             "SELECT sum(total_space) as total FROM system.disks WHERE type = 'Local'"
         ),
         // Ingest buffer (durable spool) replay lag.
@@ -129,11 +141,23 @@ async fn collect_and_write(ch: &Client, buffer: &IngestBuffer, self_metrics: &Se
 
     // ── Write all metrics ──
     let metrics: Vec<(&str, f64)> = vec![
-        ("rush_stats_ingest_buffer_pending_bytes", buffer.total_bytes() as f64),
-        ("rush_stats_ingest_buffer_pending_count", buffer.segment_count() as f64),
-        ("rush_stats_ingest_buffer_oldest_age_secs", buf_oldest as f64),
+        (
+            "rush_stats_ingest_buffer_pending_bytes",
+            buffer.total_bytes() as f64,
+        ),
+        (
+            "rush_stats_ingest_buffer_pending_count",
+            buffer.segment_count() as f64,
+        ),
+        (
+            "rush_stats_ingest_buffer_oldest_age_secs",
+            buf_oldest as f64,
+        ),
         // Cumulative counter — drain rate = rate(rush_stats_ingest_buffer_committed_total).
-        ("rush_stats_ingest_buffer_committed_total", buffer.committed_total() as f64),
+        (
+            "rush_stats_ingest_buffer_committed_total",
+            buffer.committed_total() as f64,
+        ),
         ("rush_stats_span_events_total", span_total as f64),
         ("rush_stats_span_events_bytes", span_bytes as f64),
         ("rush_stats_logs_total", log_total as f64),
@@ -143,18 +167,30 @@ async fn collect_and_write(ch: &Client, buffer: &IngestBuffer, self_metrics: &Se
         ("rush_stats_storage_rows", storage_rows as f64),
         // Tiered storage: where the data physically lives.
         ("rush_stats_storage_local_bytes", storage_local_bytes as f64),
-        ("rush_stats_storage_object_store_bytes", storage_object_store_bytes as f64),
+        (
+            "rush_stats_storage_object_store_bytes",
+            storage_object_store_bytes as f64,
+        ),
         // Local disk capacity, for headroom / move-pressure monitoring.
-        ("rush_stats_disk_local_free_bytes", disk_local_free_bytes as f64),
-        ("rush_stats_disk_local_total_bytes", disk_local_total_bytes as f64),
+        (
+            "rush_stats_disk_local_free_bytes",
+            disk_local_free_bytes as f64,
+        ),
+        (
+            "rush_stats_disk_local_total_bytes",
+            disk_local_total_bytes as f64,
+        ),
     ];
 
-    let values: Vec<String> = metrics.iter().map(|(name, val)| {
-        format!(
-            "({{}}, '', '', '', {{}}, 0, '', 'wide-stats-engine', '{name}', '', '', {{}}, \
+    let values: Vec<String> = metrics
+        .iter()
+        .map(|(name, val)| {
+            format!(
+                "({{}}, '', '', '', {{}}, 0, '', 'wide-stats-engine', '{name}', '', '', {{}}, \
              {now_nanos}, {now_nanos}, {val}, 0, [], [], [], [], [])"
-        )
-    }).collect();
+            )
+        })
+        .collect();
 
     let sql = format!(
         "INSERT INTO metrics_gauge \
@@ -174,7 +210,11 @@ async fn collect_and_write(ch: &Client, buffer: &IngestBuffer, self_metrics: &Se
 
     // ── Ingest spool gauges into SelfMetrics (group B; set from the tick, not the hot path) ──
     self_metrics.set_gauge("rush_ingest_spool_bytes", &[], buffer.total_bytes() as f64);
-    self_metrics.set_gauge("rush_ingest_spool_segments", &[], buffer.segment_count() as f64);
+    self_metrics.set_gauge(
+        "rush_ingest_spool_segments",
+        &[],
+        buffer.segment_count() as f64,
+    );
     self_metrics.set_gauge("rush_ingest_spool_oldest_age_secs", &[], buf_oldest as f64);
 
     // ── ClickHouse health gauges (group D) into both SelfMetrics and metrics_gauge ──
@@ -199,23 +239,49 @@ async fn collect_ch_health(ch: &Client, self_metrics: &SelfMetrics) {
     // deserialized into f64 yields garbage — wrap all integer aggregates in toFloat64().
     let probes: [(&str, &str); 9] = [
         // Max parts in any single partition — the classic "too many parts" early warning.
-        ("rush_ch_max_part_count_for_partition",
-         "SELECT toFloat64(max(c)) AS v FROM (SELECT count() AS c FROM system.parts WHERE database='observability' AND active GROUP BY table, partition)"),
+        (
+            "rush_ch_max_part_count_for_partition",
+            "SELECT toFloat64(max(c)) AS v FROM (SELECT count() AS c FROM system.parts WHERE database='observability' AND active GROUP BY table, partition)",
+        ),
         // Active background merges / mutations right now.
-        ("rush_ch_active_merges", "SELECT toFloat64(count()) AS v FROM system.merges"),
-        ("rush_ch_active_mutations", "SELECT toFloat64(count()) AS v FROM system.mutations WHERE is_done = 0"),
+        (
+            "rush_ch_active_merges",
+            "SELECT toFloat64(count()) AS v FROM system.merges",
+        ),
+        (
+            "rush_ch_active_mutations",
+            "SELECT toFloat64(count()) AS v FROM system.mutations WHERE is_done = 0",
+        ),
         // Longest currently-running merge, seconds.
-        ("rush_ch_longest_running_merge_secs", "SELECT toFloat64(max(elapsed)) AS v FROM system.merges"),
+        (
+            "rush_ch_longest_running_merge_secs",
+            "SELECT toFloat64(max(elapsed)) AS v FROM system.merges",
+        ),
         // Insert pressure — instantaneous current values from system.metrics.
-        ("rush_ch_delayed_inserts", "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'DelayedInserts'"),
+        (
+            "rush_ch_delayed_inserts",
+            "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'DelayedInserts'",
+        ),
         // Cumulative rejected inserts (event counter).
-        ("rush_ch_rejected_inserts", "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'RejectedInserts'"),
+        (
+            "rush_ch_rejected_inserts",
+            "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'RejectedInserts'",
+        ),
         // Server resident memory.
-        ("rush_ch_memory_resident_bytes", "SELECT toFloat64(value) AS v FROM system.asynchronous_metrics WHERE metric = 'MemoryResident'"),
+        (
+            "rush_ch_memory_resident_bytes",
+            "SELECT toFloat64(value) AS v FROM system.asynchronous_metrics WHERE metric = 'MemoryResident'",
+        ),
         // Cumulative failed queries (event counter).
-        ("rush_ch_failed_query_total", "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'FailedQuery'"),
+        (
+            "rush_ch_failed_query_total",
+            "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'FailedQuery'",
+        ),
         // Background merges+mutations pool occupancy.
-        ("rush_ch_background_pool_task", "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'BackgroundMergesAndMutationsPoolTask'"),
+        (
+            "rush_ch_background_pool_task",
+            "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'BackgroundMergesAndMutationsPoolTask'",
+        ),
     ];
 
     for (name, sql) in probes {
@@ -223,7 +289,10 @@ async fn collect_ch_health(ch: &Client, self_metrics: &SelfMetrics) {
             Ok(Some(row)) => self_metrics.set_gauge(name, &[], row.v),
             Ok(None) => {
                 // No matching row (metric absent on this CH version) — skip gracefully.
-                tracing::debug!(metric = name, "stats engine: ch health metric unavailable (no row)");
+                tracing::debug!(
+                    metric = name,
+                    "stats engine: ch health metric unavailable (no row)"
+                );
             }
             Err(e) => {
                 // Query failed (e.g. table/column not present on this CH version) — skip.
@@ -316,11 +385,19 @@ fn escape_sql(s: &str) -> String {
 }
 
 async fn query_count(ch: &Client, sql: &str) -> u64 {
-    ch.query(sql).fetch_one::<CountRow>().await.map(|r| r.count).unwrap_or(0)
+    ch.query(sql)
+        .fetch_one::<CountRow>()
+        .await
+        .map(|r| r.count)
+        .unwrap_or(0)
 }
 
 async fn query_bytes(ch: &Client, sql: &str) -> u64 {
-    ch.query(sql).fetch_one::<BytesRow>().await.map(|r| r.total).unwrap_or(0)
+    ch.query(sql)
+        .fetch_one::<BytesRow>()
+        .await
+        .map(|r| r.total)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -330,14 +407,16 @@ mod tests {
     #[test]
     fn ch_map_literal_render() {
         assert_eq!(labels_to_ch_map(&[]), "{}");
-        let labels: Vec<(&'static str, String)> =
-            vec![("engine", "stats_engine".to_string())];
+        let labels: Vec<(&'static str, String)> = vec![("engine", "stats_engine".to_string())];
         assert_eq!(labels_to_ch_map(&labels), "{'engine':'stats_engine'}");
         let multi: Vec<(&'static str, String)> = vec![
             ("method", "POST".to_string()),
             ("route", "/api/v1/query".to_string()),
         ];
-        assert_eq!(labels_to_ch_map(&multi), "{'method':'POST','route':'/api/v1/query'}");
+        assert_eq!(
+            labels_to_ch_map(&multi),
+            "{'method':'POST','route':'/api/v1/query'}"
+        );
     }
 
     #[test]

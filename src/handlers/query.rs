@@ -1,9 +1,8 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Extension,
 };
 
 use crate::AppState;
@@ -13,7 +12,7 @@ use crate::models::query::{
     TimeseriesBucket, TimeseriesRequest,
 };
 use crate::models::trace::WideEvent;
-use crate::query_builder::{resolve_field, build_where_clause_with_search};
+use crate::query_builder::{build_where_clause_with_search, resolve_field};
 
 /// Execute a structured query against spans.
 pub async fn execute_query(
@@ -27,7 +26,10 @@ pub async fn execute_query(
     // Input validation
     if let Some(ref s) = req.search {
         if s.len() > 512 {
-            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "search query too long (max 512 chars)".into(),
+            ));
         }
     }
     // Deep OFFSET pagination materializes and discards full wide rows server-side, so
@@ -36,8 +38,13 @@ pub async fn execute_query(
     let limit = req.limit.min(1000);
 
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
-    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
-        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
+    let clauses = build_where_clause_with_search(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+    )
+    .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     // ── Additive pagination mode ──
     // Keyset (cursor) pagination is opt-in: when the client sends a `cursor`, page via a
@@ -46,7 +53,10 @@ pub async fn execute_query(
     // so deep pages don't scan+discard rows. A malformed/garbage cursor decodes to None
     // and falls back to the offset path (non-fatal). When `cursor` is absent the SQL is
     // byte-identical to the original offset query — existing callers see no change.
-    let keyset = req.cursor.as_deref().and_then(crate::query_builder::KeysetCursor::decode);
+    let keyset = req
+        .cursor
+        .as_deref()
+        .and_then(crate::query_builder::KeysetCursor::decode);
 
     // Slim projection is opt-in via `columns: "list"`: select only the ~10 columns the
     // Explore table renders. Default (absent/other) returns the full wide `SELECT *`.
@@ -86,7 +96,8 @@ pub async fn execute_query(
     // `next_cursor` from the last row's (timestamp, span_id).
     let (rows_json, next_cursor) = if slim {
         let (rows_result, count_result) = tokio::join!(
-            crate::tenant_query(&state.ch, &sql, tenant_id).fetch_all::<crate::models::trace::SlimEvent>(),
+            crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch_all::<crate::models::trace::SlimEvent>(),
             crate::tenant_query(&state.ch, &count_sql, tenant_id).fetch_one::<CountRow>(),
         );
         let rows = rows_result.map_err(|e| {
@@ -95,10 +106,13 @@ pub async fn execute_query(
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
-        let next = rows.last().map(|r| crate::query_builder::KeysetCursor {
-            timestamp: r.timestamp,
-            span_id: r.span_id.clone(),
-        }.encode());
+        let next = rows.last().map(|r| {
+            crate::query_builder::KeysetCursor {
+                timestamp: r.timestamp,
+                span_id: r.span_id.clone(),
+            }
+            .encode()
+        });
         emit_usage_and_log(&state, &req, total, rows.len(), start);
         (serde_json::json!({ "rows": rows, "total": total }), next)
     } else {
@@ -112,10 +126,13 @@ pub async fn execute_query(
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
-        let next = rows.last().map(|r| crate::query_builder::KeysetCursor {
-            timestamp: r.timestamp,
-            span_id: r.span_id.clone(),
-        }.encode());
+        let next = rows.last().map(|r| {
+            crate::query_builder::KeysetCursor {
+                timestamp: r.timestamp,
+                span_id: r.span_id.clone(),
+            }
+            .encode()
+        });
         emit_usage_and_log(&state, &req, total, rows.len(), start);
         (serde_json::json!({ "rows": rows, "total": total }), next)
     };
@@ -138,8 +155,15 @@ fn emit_usage_and_log(
     start: std::time::Instant,
 ) {
     if total > 0 {
-        let filter_pairs: Vec<(String, String)> = req.filters.iter()
-            .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+        let filter_pairs: Vec<(String, String)> = req
+            .filters
+            .iter()
+            .map(|f| {
+                (
+                    f.field.clone(),
+                    f.value.as_str().unwrap_or_default().to_string(),
+                )
+            })
             .collect();
         let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
         state.usage.track_many(signals, "span", "explore");
@@ -197,7 +221,10 @@ pub async fn export_query(
 
     if let Some(ref s) = req.search {
         if s.len() > 512 {
-            return Err((StatusCode::BAD_REQUEST, "search query too long (max 512 chars)".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "search query too long (max 512 chars)".into(),
+            ));
         }
     }
 
@@ -208,7 +235,10 @@ pub async fn export_query(
     // has_search boolean and the row cap.
     {
         let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
-            Some(tok) => state.config_db.get_session_user(&tok).await
+            Some(tok) => state
+                .config_db
+                .get_session_user(&tok)
+                .await
                 .map(|c| (c.0, c.1))
                 .unwrap_or_default(),
             None => (String::new(), String::new()),
@@ -230,8 +260,13 @@ pub async fn export_query(
     }
 
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
-    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
-        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
+    let clauses = build_where_clause_with_search(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+    )
+    .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
     let sql = format!(
         "SELECT * FROM spans {} ORDER BY timestamp DESC LIMIT {limit}",
         clauses.to_sql(),
@@ -244,8 +279,11 @@ pub async fn export_query(
             // for rationale). Byte-identical CSV output to the prior fetch_all path;
             // peak memory is one row regardless of the configured row cap.
             let mut prelude = export::csv_query_preamble(
-                "spans", &req.time_range.from, &req.time_range.to,
-                req.search.as_deref(), req.query_text.as_deref(),
+                "spans",
+                &req.time_range.from,
+                &req.time_range.to,
+                req.search.as_deref(),
+                req.query_text.as_deref(),
             );
             prelude.push_str("Timestamp,Service,Method,Resource,Status,DurationMs,TraceId\n");
 
@@ -274,7 +312,12 @@ pub async fn export_query(
                     export::csv_field(&r.trace_id),
                 )
             };
-            Ok(export::stream_csv_response(cursor, prelude, fmt_row, &format!("rush-spans-{unix}.csv")))
+            Ok(export::stream_csv_response(
+                cursor,
+                prelude,
+                fmt_row,
+                &format!("rush-spans-{unix}.csv"),
+            ))
         }
         export::ExportFormat::Json => {
             // JSON export stays buffered (to_string_pretty envelope can't stream
@@ -297,7 +340,11 @@ pub async fn export_query(
                 "rows": rows,
             });
             let s = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
-            Ok(export::file_response(s, "application/json; charset=utf-8", &format!("rush-spans-{unix}.json")))
+            Ok(export::file_response(
+                s,
+                "application/json; charset=utf-8",
+                &format!("rush-spans-{unix}.json"),
+            ))
         }
     }
 }
@@ -310,14 +357,23 @@ pub async fn count_query(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
-    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
-        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
+    let clauses = build_where_clause_with_search(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+    )
+    .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     // The interval is client-supplied: clamp so (range / interval) <= 2000 buckets
     // (a 1s interval over 30d would otherwise be ~2.6M GROUP BY buckets).
     let interval = crate::query_builder::clamp_bucket_interval(
-        &req.interval, &req.time_range.from, &req.time_range.to, 2000,
-    ).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        &req.interval,
+        &req.time_range.from,
+        &req.time_range.to,
+        2000,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let interval_fn = match interval {
         "1s" => "toStartOfSecond(timestamp)",
         "10s" => "toStartOfTenSeconds(timestamp)",
@@ -343,10 +399,7 @@ pub async fn count_query(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "traces", handler = "count_query", "query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "query failed".into(),
-            )
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     Ok(Json(buckets))
@@ -375,8 +428,13 @@ pub async fn group_query(
 
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
-    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
-        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
+    let clauses = build_where_clause_with_search(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+    )
+    .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     let group_cols: Vec<String> = req
         .group_by
@@ -411,10 +469,7 @@ pub async fn group_query(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "traces", handler = "group_query", "query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "query failed".into(),
-            )
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
 
     let json_rows: Vec<serde_json::Value> = rows
@@ -438,14 +493,23 @@ pub async fn timeseries_query(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
-    let clauses = build_where_clause_with_search(&req.filters, &req.time_range.from, &req.time_range.to, req.search.as_deref())
-        .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
+    let clauses = build_where_clause_with_search(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+    )
+    .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     // The interval is client-supplied: clamp so (range / interval) <= 2000 buckets
     // (a 1s interval over 30d would otherwise be ~2.6M GROUP BY buckets). Mirrors count_query.
     let interval = crate::query_builder::clamp_bucket_interval(
-        &req.interval, &req.time_range.from, &req.time_range.to, 2000,
-    ).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        &req.interval,
+        &req.time_range.from,
+        &req.time_range.to,
+        2000,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let interval_fn = match interval {
         "1s" => "toStartOfSecond(timestamp)",
         "10s" => "toStartOfTenSeconds(timestamp)",
@@ -485,14 +549,23 @@ pub async fn timeseries_query(
 
         // Only track usage if results returned
         if !buckets.is_empty() {
-            let filter_pairs: Vec<(String, String)> = req.filters.iter()
-                .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+            let filter_pairs: Vec<(String, String)> = req
+                .filters
+                .iter()
+                .map(|f| {
+                    (
+                        f.field.clone(),
+                        f.value.as_str().unwrap_or_default().to_string(),
+                    )
+                })
                 .collect();
             let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
             state.usage.track_many(signals, "span", "explore");
         }
 
-        Ok(Json(serde_json::json!({ "buckets": buckets, "grouped": true })))
+        Ok(Json(
+            serde_json::json!({ "buckets": buckets, "grouped": true }),
+        ))
     } else {
         let sql = format!(
             "SELECT \
@@ -519,13 +592,22 @@ pub async fn timeseries_query(
 
         // Only track usage if results returned
         if !buckets.is_empty() {
-            let filter_pairs: Vec<(String, String)> = req.filters.iter()
-                .map(|f| (f.field.clone(), f.value.as_str().unwrap_or_default().to_string()))
+            let filter_pairs: Vec<(String, String)> = req
+                .filters
+                .iter()
+                .map(|f| {
+                    (
+                        f.field.clone(),
+                        f.value.as_str().unwrap_or_default().to_string(),
+                    )
+                })
                 .collect();
             let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
             state.usage.track_many(signals, "span", "explore");
         }
 
-        Ok(Json(serde_json::json!({ "buckets": buckets, "grouped": false })))
+        Ok(Json(
+            serde_json::json!({ "buckets": buckets, "grouped": false }),
+        ))
     }
 }

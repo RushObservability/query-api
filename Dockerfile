@@ -18,7 +18,9 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 COPY --from=builder /app/target/release/rush-api /usr/local/bin/rush-api
 COPY --from=builder /app/target/release/rush-anomaly-engine /usr/local/bin/anomaly_engine
 
-USER appuser
+# Use the numeric IDs created above so Kubernetes can verify runAsNonRoot without
+# needing to resolve the image's passwd entry during admission.
+USER 999:999
 EXPOSE 8080
 
 CMD ["rush-api"]

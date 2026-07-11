@@ -1,6 +1,5 @@
 use axum::{
-    Extension,
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -31,7 +30,8 @@ pub async fn list_monitors(
     require_auth(&state, &headers).await?;
     let monitors = state
         .config_db
-        .list_monitors(&tenant.tenant_id).await
+        .list_monitors(&tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let responses: Vec<MonitorResponse> = monitors.into_iter().map(MonitorResponse::from).collect();
     Ok(Json(serde_json::json!({ "monitors": responses })))
@@ -100,8 +100,8 @@ pub async fn create_monitor(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let notification_channels = serde_json::to_string(&req.notification_channels)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let tags = serde_json::to_string(&req.tags)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let tags =
+        serde_json::to_string(&req.tags).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let composite_monitor_ids = serde_json::to_string(&req.composite_monitor_ids)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
@@ -133,12 +133,14 @@ pub async fn create_monitor(
             &req.composite_formula,
             &composite_monitor_ids,
             &req.created_by,
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let monitor = state
         .config_db
-        .get_monitor(&id, &tenant.tenant_id).await
+        .get_monitor(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -171,13 +173,15 @@ pub async fn get_monitor(
     require_auth(&state, &headers).await?;
     let monitor = state
         .config_db
-        .get_monitor(&id, &tenant.tenant_id).await
+        .get_monitor(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "monitor not found".to_string()))?;
 
     let events = state
         .config_db
-        .list_monitor_events(&id, 20).await
+        .list_monitor_events(&id, 20)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -244,8 +248,8 @@ pub async fn update_monitor(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let notification_channels = serde_json::to_string(&req.notification_channels)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let tags = serde_json::to_string(&req.tags)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let tags =
+        serde_json::to_string(&req.tags).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let composite_monitor_ids = serde_json::to_string(&req.composite_monitor_ids)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
@@ -276,7 +280,8 @@ pub async fn update_monitor(
             req.enabled,
             &req.composite_formula,
             &composite_monitor_ids,
-        ).await
+        )
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if !updated {
@@ -285,7 +290,8 @@ pub async fn update_monitor(
 
     let monitor = state
         .config_db
-        .get_monitor(&id, &tenant.tenant_id).await
+        .get_monitor(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
             (
@@ -318,21 +324,25 @@ pub async fn delete_monitor(
     let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_monitor(&id, &tenant.tenant_id).await
+        .delete_monitor(&id, &tenant.tenant_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
     }
 
     // AUDIT: monitor deleted.
-    state.audit.log(
-        crate::audit::AuditEvent::new("monitor.delete", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(tenant.tenant_id.clone())
-            .resource("monitor", id.clone())
-            .description("monitor deleted")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("monitor.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("monitor", id.clone())
+                .description("monitor deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -347,7 +357,8 @@ pub async fn list_monitor_events(
     require_auth(&state, &headers).await?;
     let events = state
         .config_db
-        .list_monitor_events(&id, params.limit).await
+        .list_monitor_events(&id, params.limit)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }
@@ -360,8 +371,7 @@ pub async fn preview_monitor(
     Json(req): Json<PreviewMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let group_by: Vec<String> =
-        serde_json::from_value(req.group_by.clone()).unwrap_or_default();
+    let group_by: Vec<String> = serde_json::from_value(req.group_by.clone()).unwrap_or_default();
 
     let result = monitor_engine::preview_query(
         &state.ch,
@@ -391,7 +401,8 @@ pub async fn mute_monitor(
     require_write(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_monitor_enabled(&id, &tenant.tenant_id, false).await
+        .set_monitor_enabled(&id, &tenant.tenant_id, false)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
@@ -409,7 +420,8 @@ pub async fn unmute_monitor(
     require_write(&state, &headers).await?;
     let updated = state
         .config_db
-        .set_monitor_enabled(&id, &tenant.tenant_id, true).await
+        .set_monitor_enabled(&id, &tenant.tenant_id, true)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
@@ -432,12 +444,18 @@ fn validate_query_config(
                 .map(|t| t == "promql")
                 .unwrap_or(false);
             if is_promql {
-                if config.get("expr").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false) {
+                if config
+                    .get("expr")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+                {
                     // Valid PromQL config: has a non-empty expression
                 } else {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        "promql metric monitor query_config requires a non-empty 'expr' field".to_string(),
+                        "promql metric monitor query_config requires a non-empty 'expr' field"
+                            .to_string(),
                     ));
                 }
             } else if config.get("metric_name").and_then(|v| v.as_str()).is_none() {
@@ -754,7 +772,10 @@ pub async fn suggest(
             }
 
             // Check eval_window
-            if let Some(window) = req.query_config.get("eval_window_secs").and_then(|v| v.as_i64())
+            if let Some(window) = req
+                .query_config
+                .get("eval_window_secs")
+                .and_then(|v| v.as_i64())
             {
                 if window <= 60 {
                     suggestions.push(Suggestion {

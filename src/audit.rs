@@ -248,7 +248,10 @@ impl AuditLogger {
         AuditLogger {
             ch,
             secret: secret.into_bytes(),
-            state: Mutex::new(ChainState { last_seq, last_hash }),
+            state: Mutex::new(ChainState {
+                last_seq,
+                last_hash,
+            }),
         }
     }
 
@@ -291,9 +294,7 @@ impl AuditLogger {
         let mut row = AuditRow {
             id: uuid::Uuid::new_v4().to_string(),
             seq,
-            timestamp: chrono::Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or(0),
+            timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             tenant_id: ev.tenant_id,
             actor_id: ev.actor_id,
             actor_name: ev.actor_name,
