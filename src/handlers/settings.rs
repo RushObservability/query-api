@@ -149,7 +149,7 @@ pub async fn create_api_key(
 
 /// GET /api/v1/features — public, no auth required.
 /// Returns which optional integrations are enabled so the UI can hide/show nav items.
-pub async fn get_features(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_features(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let argocd_enabled = std::env::var("ARGOCD_NAMESPACE").is_ok()
         || state
             .config_db
@@ -194,14 +194,18 @@ pub async fn get_features(State(state): State<AppState>) -> impl IntoResponse {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-    let sre_agent_enabled = state
-        .config_db
-        .get_setting("sre_agent_enabled")
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    // This route remains public because it is only a UI hint. The authenticated
+    // SRE proxy independently enforces the same policy using the server-trusted
+    // caller tenant, so spoofing this header cannot grant access.
+    let feature_tenant = headers
+        .get("x-rush-tenant")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default");
+    let sre_agent_enabled = matches!(
+        sre_agent_access_decision(&state, feature_tenant).await,
+        SreAgentAccessDecision::Allowed
+    );
 
     let export_max_rows = crate::handlers::export::read_export_max_rows(&state).await;
 
@@ -535,6 +539,8 @@ pub async fn set_export_max_rows(
 /// stay in sync with sre-agent's LoopBudget (which re-clamps defensively).
 const SRE_AGENT_DEFAULT_MAX_TOOL_STEPS: u64 = 40;
 const SRE_AGENT_DEFAULT_MAX_LLM_CALLS: u64 = 55;
+const SRE_AGENT_TENANT_MODE_ALL: &str = "all";
+const SRE_AGENT_TENANT_MODE_SELECTED: &str = "selected";
 /// Common OpenAI models offered as a combo-box suggestion list in the UI. The field is
 /// free-text, so any model name (incl. non-OpenAI when LLM_BASE_URL is changed) still works.
 const SRE_AGENT_MODEL_SUGGESTIONS: &[&str] = &[
@@ -620,6 +626,79 @@ fn resolve_default_model(default: &str, allowed: &[AllowedModel]) -> String {
     default.to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SreAgentAccessDecision {
+    Allowed,
+    Disabled,
+    TenantDenied,
+}
+
+fn parse_allowed_tenants(raw: &str) -> Vec<String> {
+    let mut tenants = serde_json::from_str::<Vec<String>>(raw).unwrap_or_default();
+    tenants = tenants
+        .into_iter()
+        .map(|tenant| tenant.trim().to_string())
+        .filter(|tenant| !tenant.is_empty())
+        .collect();
+    tenants.sort();
+    tenants.dedup();
+    tenants
+}
+
+fn parse_sre_agent_tenant_policy(raw: &str) -> (String, Vec<String>) {
+    let value = serde_json::from_str::<serde_json::Value>(raw).unwrap_or_default();
+    let mode = value
+        .get("mode")
+        .and_then(|mode| mode.as_str())
+        .filter(|mode| *mode == SRE_AGENT_TENANT_MODE_SELECTED)
+        .unwrap_or(SRE_AGENT_TENANT_MODE_ALL)
+        .to_string();
+    let allowed = value
+        .get("allowed_tenants")
+        .map(|allowed| parse_allowed_tenants(&allowed.to_string()))
+        .unwrap_or_default();
+    (mode, allowed)
+}
+
+fn evaluate_sre_agent_access(
+    enabled: bool,
+    tenant_mode: &str,
+    allowed_tenants: &[String],
+    tenant: &str,
+) -> SreAgentAccessDecision {
+    if !enabled {
+        return SreAgentAccessDecision::Disabled;
+    }
+    if tenant_mode != SRE_AGENT_TENANT_MODE_SELECTED {
+        return SreAgentAccessDecision::Allowed;
+    }
+    if allowed_tenants.iter().any(|allowed| allowed == tenant) {
+        SreAgentAccessDecision::Allowed
+    } else {
+        SreAgentAccessDecision::TenantDenied
+    }
+}
+
+/// Resolve the effective runtime policy. Any settings read failure fails closed.
+pub async fn sre_agent_access_decision(state: &AppState, tenant: &str) -> SreAgentAccessDecision {
+    let enabled = match state.config_db.get_setting("sre_agent_enabled").await {
+        Ok(value) => value.map(|value| value == "true").unwrap_or(false),
+        Err(error) => {
+            tracing::error!(%error, "failed to read sre_agent_enabled");
+            return SreAgentAccessDecision::Disabled;
+        }
+    };
+    let (tenant_mode, allowed_tenants) =
+        match state.config_db.get_setting("sre_agent_tenant_access").await {
+            Ok(value) => parse_sre_agent_tenant_policy(value.as_deref().unwrap_or("{}")),
+            Err(error) => {
+                tracing::error!(%error, "failed to read sre_agent_tenant_access");
+                return SreAgentAccessDecision::Disabled;
+            }
+        };
+    evaluate_sre_agent_access(enabled, &tenant_mode, &allowed_tenants, tenant)
+}
+
 /// GET /api/v1/settings/sre-agent — admin only.
 /// Current investigation budget (defaults when unset).
 pub async fn get_sre_agent_settings(
@@ -673,8 +752,18 @@ pub async fn get_sre_agent_settings(
         .flatten()
         .unwrap_or_default();
     let allowed_models = parse_allowed_models(&allowed_raw);
+    let (tenant_mode, allowed_tenants) = state
+        .config_db
+        .get_setting("sre_agent_tenant_access")
+        .await
+        .ok()
+        .flatten()
+        .map(|raw| parse_sre_agent_tenant_policy(&raw))
+        .unwrap_or_else(|| (SRE_AGENT_TENANT_MODE_ALL.to_string(), Vec::new()));
     Ok(Json(serde_json::json!({
         "enabled": enabled,
+        "tenant_mode": tenant_mode,
+        "allowed_tenants": allowed_tenants,
         "model": model,
         "allowed_models": allowed_models,
         "model_suggestions": SRE_AGENT_MODEL_SUGGESTIONS,
@@ -835,14 +924,158 @@ pub async fn set_sre_agent_settings(
         audit_setting("sre_agent_allowed_models", serde_json::json!(model_ids)).await;
     }
 
+    // Optional tenant access policy. Both fields are required together so an
+    // interrupted/partial client request cannot silently broaden access.
+    let tenant_mode_value = body.get("tenant_mode");
+    let allowed_tenants_value = body.get("allowed_tenants");
+    if tenant_mode_value.is_some() || allowed_tenants_value.is_some() {
+        let previous_policy = state
+            .config_db
+            .get_setting("sre_agent_tenant_access")
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to read existing sre-agent tenant policy");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save tenant policy".to_string(),
+                )
+            })?
+            .map(|raw| parse_sre_agent_tenant_policy(&raw))
+            .unwrap_or_else(|| (SRE_AGENT_TENANT_MODE_ALL.to_string(), Vec::new()));
+        let tenant_mode = tenant_mode_value
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid 'tenant_mode' (expected all|selected)".to_string(),
+                )
+            })?;
+        if tenant_mode != SRE_AGENT_TENANT_MODE_ALL && tenant_mode != SRE_AGENT_TENANT_MODE_SELECTED
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "invalid 'tenant_mode' (expected all|selected)".to_string(),
+            ));
+        }
+        let allowed_values = allowed_tenants_value
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid 'allowed_tenants' (expected an array)".to_string(),
+                )
+            })?;
+        if allowed_values.len() > 500 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "allowed_tenants exceeds the 500 tenant limit".to_string(),
+            ));
+        }
+        let mut allowed_tenants = Vec::with_capacity(allowed_values.len());
+        for value in allowed_values {
+            let tenant = value.as_str().unwrap_or("").trim();
+            if tenant.is_empty() || tenant.len() > 128 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "allowed_tenants contains an invalid tenant name".to_string(),
+                ));
+            }
+            if !allowed_tenants
+                .iter()
+                .any(|existing: &String| existing == tenant)
+            {
+                allowed_tenants.push(tenant.to_string());
+            }
+        }
+        let known_tenants = state.config_db.list_tenants().await.map_err(|error| {
+            tracing::error!(%error, "failed to validate sre-agent tenant policy");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to validate tenant policy".to_string(),
+            )
+        })?;
+        let unknown: Vec<&String> = allowed_tenants
+            .iter()
+            .filter(|tenant| {
+                !known_tenants
+                    .iter()
+                    .any(|(_, name, _, _, _)| name == tenant.as_str())
+            })
+            .collect();
+        if !unknown.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "allowed_tenants contains an unknown tenant".to_string(),
+            ));
+        }
+        allowed_tenants.sort();
+        let serialized = serde_json::to_string(&serde_json::json!({
+            "mode": tenant_mode,
+            "allowed_tenants": allowed_tenants,
+        }))
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save tenant policy".to_string(),
+            )
+        })?;
+        state
+            .config_db
+            .set_setting("sre_agent_tenant_access", &serialized)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to save sre_agent_tenant_access");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save tenant policy".to_string(),
+                )
+            })?;
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("settings.update", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("setting", "sre_agent_tenant_access")
+                    .changes(
+                        serde_json::json!({
+                            "key": "sre_agent_tenant_access",
+                            "before": {
+                                "tenant_mode": previous_policy.0,
+                                "allowed_tenants": previous_policy.1,
+                            },
+                            "after": {
+                                "tenant_mode": tenant_mode,
+                                "allowed_tenants": allowed_tenants,
+                            },
+                        })
+                        .to_string(),
+                    )
+                    .description("sre-agent tenant access policy updated")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+    }
+
     // model/reasoning/policy-only update (no toggle, no budget) — done.
     if (body.get("model").is_some()
         || body.get("reasoning_effort").is_some()
-        || body.get("allowed_models").is_some())
+        || body.get("allowed_models").is_some()
+        || body.get("tenant_mode").is_some()
+        || body.get("allowed_tenants").is_some())
         && body.get("enabled").is_none()
         && body.get("max_tool_steps").is_none()
         && body.get("max_llm_calls").is_none()
     {
+        if let (Some(tenant_mode), Some(allowed_tenants)) =
+            (body.get("tenant_mode"), body.get("allowed_tenants"))
+        {
+            return Ok(Json(serde_json::json!({
+                "ok": true,
+                "tenant_mode": tenant_mode,
+                "allowed_tenants": allowed_tenants,
+            })));
+        }
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
 
@@ -936,7 +1169,19 @@ pub async fn get_sre_agent_options(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let caller = require_auth(&state, &headers).await?;
+    match sre_agent_access_decision(&state, &caller.3).await {
+        SreAgentAccessDecision::Allowed => {}
+        SreAgentAccessDecision::Disabled => {
+            return Err((StatusCode::FORBIDDEN, "SRE agent is disabled".to_string()));
+        }
+        SreAgentAccessDecision::TenantDenied => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "SRE agent is not enabled for this tenant".to_string(),
+            ));
+        }
+    }
     let allowed_raw = state
         .config_db
         .get_setting("sre_agent_allowed_models")
@@ -1036,6 +1281,63 @@ fn is_chat_model(id: &str) -> bool {
     .iter()
     .any(|x| m.contains(x));
     chatty && !excluded
+}
+
+#[cfg(test)]
+mod sre_agent_access_tests {
+    use super::{
+        SreAgentAccessDecision, evaluate_sre_agent_access, parse_allowed_tenants,
+        parse_sre_agent_tenant_policy,
+    };
+
+    #[test]
+    fn disabled_agent_denies_every_tenant() {
+        assert_eq!(
+            evaluate_sre_agent_access(false, "all", &[], "default"),
+            SreAgentAccessDecision::Disabled
+        );
+    }
+
+    #[test]
+    fn all_mode_preserves_existing_behavior() {
+        assert_eq!(
+            evaluate_sre_agent_access(true, "all", &[], "any-tenant"),
+            SreAgentAccessDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn selected_mode_only_allows_exact_tenant_names() {
+        let allowed = vec!["default".to_string(), "production".to_string()];
+        assert_eq!(
+            evaluate_sre_agent_access(true, "selected", &allowed, "production"),
+            SreAgentAccessDecision::Allowed
+        );
+        assert_eq!(
+            evaluate_sre_agent_access(true, "selected", &allowed, "staging"),
+            SreAgentAccessDecision::TenantDenied
+        );
+    }
+
+    #[test]
+    fn tenant_parser_trims_and_deduplicates() {
+        assert_eq!(
+            parse_allowed_tenants(r#"[" production ","default","production",""]"#),
+            vec!["default".to_string(), "production".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_policy_defaults_to_all_tenants() {
+        assert_eq!(
+            parse_sre_agent_tenant_policy("{}"),
+            ("all".to_string(), Vec::new())
+        );
+        assert_eq!(
+            parse_sre_agent_tenant_policy(r#"{"mode":"bogus","allowed_tenants":["a"]}"#),
+            ("all".to_string(), vec!["a".to_string()])
+        );
+    }
 }
 
 pub async fn delete_api_key(

@@ -486,6 +486,30 @@ impl ConfigDb {
                 is_deleted     UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (service_name)",
+            // Tenant-safe replacement for the original service-links table. The
+            // old table keyed only by service_name, so ClickHouse merges could
+            // collapse identically named services belonging to different tenants.
+            "CREATE TABLE IF NOT EXISTS config_service_links_v2 (
+                tenant_id             String DEFAULT 'default',
+                service_name          String,
+                github_repo           String,
+                github_installation_id UInt64 DEFAULT 0,
+                default_branch        String DEFAULT 'main',
+                root_path             String DEFAULT '',
+                updated_at            String DEFAULT toString(now()),
+                version               UInt64,
+                is_deleted            UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, service_name)",
+            // Preserve pre-tenancy links for the default tenant. The anti-join
+            // makes this idempotent across process restarts.
+            "INSERT INTO config_service_links_v2
+             SELECT 'default', service_name, github_repo, 0, default_branch, root_path,
+                    updated_at, version, is_deleted
+             FROM config_service_links FINAL
+             WHERE service_name NOT IN (
+                 SELECT service_name FROM config_service_links_v2 FINAL WHERE tenant_id = 'default'
+             )",
             // ── Dashboards ────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_dashboards (
                 id          String,
@@ -5001,24 +5025,30 @@ impl ConfigDb {
 
     pub async fn list_service_links(
         &self,
+        tenant_id: &str,
     ) -> anyhow::Result<Vec<crate::models::service_link::ServiceLink>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
+            tenant_id: String,
             service_name: String,
             github_repo: String,
+            github_installation_id: u64,
             default_branch: String,
             root_path: String,
             updated_at: String,
         }
         let rows = self.client
-            .query("SELECT service_name, github_repo, default_branch, root_path, updated_at FROM config_service_links FINAL WHERE is_deleted = 0 ORDER BY service_name ASC")
+            .query("SELECT tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY service_name ASC")
+            .bind(tenant_id)
             .fetch_all::<Row>()
             .await?;
         Ok(rows
             .into_iter()
             .map(|r| crate::models::service_link::ServiceLink {
+                tenant_id: r.tenant_id,
                 service_name: r.service_name,
                 github_repo: r.github_repo,
+                github_installation_id: r.github_installation_id,
                 default_branch: r.default_branch,
                 root_path: r.root_path,
                 updated_at: r.updated_at,
@@ -5028,25 +5058,31 @@ impl ConfigDb {
 
     pub async fn get_service_link(
         &self,
+        tenant_id: &str,
         service_name: &str,
     ) -> anyhow::Result<Option<crate::models::service_link::ServiceLink>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
+            tenant_id: String,
             service_name: String,
             github_repo: String,
+            github_installation_id: u64,
             default_branch: String,
             root_path: String,
             updated_at: String,
         }
         let result = self.client
-            .query("SELECT service_name, github_repo, default_branch, root_path, updated_at FROM config_service_links FINAL WHERE service_name = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND service_name = ? AND is_deleted = 0 LIMIT 1")
+            .bind(tenant_id)
             .bind(service_name)
             .fetch_one::<Row>()
             .await;
         match result {
             Ok(r) => Ok(Some(crate::models::service_link::ServiceLink {
+                tenant_id: r.tenant_id,
                 service_name: r.service_name,
                 github_repo: r.github_repo,
+                github_installation_id: r.github_installation_id,
                 default_branch: r.default_branch,
                 root_path: r.root_path,
                 updated_at: r.updated_at,
@@ -5058,30 +5094,36 @@ impl ConfigDb {
 
     pub async fn upsert_service_link(
         &self,
+        tenant_id: &str,
         service_name: &str,
         github_repo: &str,
+        github_installation_id: u64,
         default_branch: &str,
         root_path: &str,
     ) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_service_links (service_name, github_repo, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0)")
-            .bind(service_name).bind(github_repo).bind(default_branch).bind(root_path).bind(&now).bind(ver)
+            .query("INSERT INTO config_service_links_v2 (tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(tenant_id).bind(service_name).bind(github_repo).bind(github_installation_id).bind(default_branch).bind(root_path).bind(&now).bind(ver)
             .execute().await?;
         Ok(())
     }
 
-    pub async fn delete_service_link(&self, service_name: &str) -> anyhow::Result<bool> {
-        let existing = match self.get_service_link(service_name).await? {
+    pub async fn delete_service_link(
+        &self,
+        tenant_id: &str,
+        service_name: &str,
+    ) -> anyhow::Result<bool> {
+        let existing = match self.get_service_link(tenant_id, service_name).await? {
             Some(r) => r,
             None => return Ok(false),
         };
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_service_links (service_name, github_repo, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 1)")
-            .bind(service_name).bind(&existing.github_repo).bind(&existing.default_branch).bind(&existing.root_path).bind(&now).bind(ver)
+            .query("INSERT INTO config_service_links_v2 (tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(tenant_id).bind(service_name).bind(&existing.github_repo).bind(existing.github_installation_id).bind(&existing.default_branch).bind(&existing.root_path).bind(&now).bind(ver)
             .execute().await?;
         Ok(true)
     }

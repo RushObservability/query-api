@@ -34,6 +34,7 @@ pub mod parse_query;
 pub mod pg_explain;
 pub mod query;
 pub mod remote_write;
+pub mod repository_access;
 pub mod retention;
 pub mod rum;
 pub mod service_links;

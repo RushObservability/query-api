@@ -1081,6 +1081,11 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/service-links/{service_name}",
             delete(handlers::service_links::delete_service_link),
         )
+        // Internal-only audit sink for source-code reads performed by sre-agent.
+        .route(
+            "/api/v1/internal/repository-access-audit",
+            post(handlers::repository_access::audit_repository_access),
+        )
         // Feature flags (public — no auth)
         .route("/api/v1/features", get(handlers::settings::get_features))
         .route("/api/v1/license", get(handlers::license::get_license))
