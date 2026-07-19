@@ -211,12 +211,11 @@ async fn evaluate_monitor(
 ) -> anyhow::Result<(u64, bool)> {
     let group_by: Vec<String> = serde_json::from_str(&monitor.group_by).unwrap_or_default();
     let has_groups = !group_by.is_empty();
-
     // Build and execute query
     let results = match monitor.monitor_type.as_str() {
-        "metric" => query_metric(ch, monitor, has_groups).await?,
-        "log" => query_log(ch, monitor, has_groups).await?,
-        "apm" => query_apm(ch, monitor, has_groups).await?,
+        "metric" => query_metric(ch, monitor, &group_by).await?,
+        "log" => query_log(ch, monitor, &group_by).await?,
+        "apm" => query_apm(ch, monitor, &group_by).await?,
         "composite" => {
             // Composite monitors combine other monitor states, not queries
             return evaluate_composite(
@@ -721,10 +720,152 @@ fn escape_ch(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+const MAX_GROUP_BY_FIELDS: usize = 5;
+
+/// Resolve a public log field name to a fixed ClickHouse expression.
+///
+/// Monitor fields are API input, so they must never be copied into SQL as identifiers.
+/// Keep this mapping in sync with the static `log_field` autocomplete response.
+fn log_field_expr(field: &str) -> Option<&'static str> {
+    match field {
+        "service_name" | "ServiceName" => Some("ServiceName"),
+        "severity" | "severity_text" | "SeverityText" => Some("SeverityText"),
+        "severity_number" | "SeverityNumber" => Some("SeverityNumber"),
+        "body" | "Body" => Some("Body"),
+        "trace_id" | "TraceId" => Some("TraceId"),
+        "span_id" | "SpanId" => Some("SpanId"),
+        "scope_name" | "ScopeName" => Some("ScopeName"),
+        "mat_k8s_namespace" => Some("mat_k8s_namespace"),
+        "mat_k8s_pod" => Some("mat_k8s_pod"),
+        "mat_k8s_container" => Some("mat_k8s_container"),
+        "mat_k8s_deployment" => Some("mat_k8s_deployment"),
+        "mat_k8s_node" => Some("mat_k8s_node"),
+        "mat_level" => Some("mat_level"),
+        "mat_component" => Some("mat_component"),
+        "mat_environment" => Some("mat_environment"),
+        _ => None,
+    }
+}
+
+/// Resolve a public APM grouping name to a fixed ClickHouse expression.
+fn apm_group_expr(field: &str) -> Option<&'static str> {
+    match field {
+        "service" | "service_name" => Some("service_name"),
+        "endpoint" | "http_path" => Some("http_path"),
+        "method" | "http_method" => Some("http_method"),
+        "status_code" | "http_status_code" => Some("http_status_code"),
+        "status" => Some("status"),
+        "span_name" => Some("span_name"),
+        "kind" | "span_kind" => Some("kind"),
+        _ => None,
+    }
+}
+
+fn is_valid_metric_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 128
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'/'))
+}
+
+fn group_expression(
+    fields: &[String],
+    resolver: fn(&str) -> Option<&'static str>,
+) -> anyhow::Result<String> {
+    let expressions = fields
+        .iter()
+        .map(|field| {
+            resolver(field)
+                .map(|expr| format!("toString({expr})"))
+                .ok_or_else(|| anyhow::anyhow!("unsupported group_by field '{field}'"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(if expressions.is_empty() {
+        "'*'".to_string()
+    } else {
+        expressions.join(" || ':' || ")
+    })
+}
+
+/// Validate all query fields that can influence SQL construction.
+/// Called by create, update, and preview handlers; the query functions also resolve
+/// fields independently so malformed legacy rows fail closed during evaluation.
+pub(crate) fn validate_query_fields(
+    monitor_type: &str,
+    config: &serde_json::Value,
+    group_by: &[String],
+) -> Result<(), String> {
+    if group_by.len() > MAX_GROUP_BY_FIELDS {
+        return Err(format!(
+            "group_by supports at most {MAX_GROUP_BY_FIELDS} fields"
+        ));
+    }
+
+    match monitor_type {
+        "metric" => {
+            let is_expression = config
+                .get("expr")
+                .or_else(|| config.get("expression"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty());
+            if !is_expression {
+                let cfg: MetricQueryConfig = serde_json::from_value(config.clone())
+                    .map_err(|error| format!("invalid metric query_config: {error}"))?;
+                let valid_aggregations = ["avg", "sum", "max", "min", "count"];
+                if !valid_aggregations.contains(&cfg.aggregation.as_str()) {
+                    return Err(format!("invalid metric aggregation '{}'", cfg.aggregation));
+                }
+                for filter in &cfg.filters {
+                    if !is_valid_metric_label(&filter.key) {
+                        return Err(format!("invalid metric filter label '{}'", filter.key));
+                    }
+                }
+            }
+            for field in group_by {
+                if !is_valid_metric_label(field) {
+                    return Err(format!("invalid metric group_by label '{field}'"));
+                }
+            }
+        }
+        "log" => {
+            let cfg: LogQueryConfig = serde_json::from_value(config.clone())
+                .map_err(|error| format!("invalid log query_config: {error}"))?;
+            for filter in &cfg.filters {
+                if log_field_expr(&filter.field).is_none() {
+                    return Err(format!("unsupported log filter field '{}'", filter.field));
+                }
+                if !matches!(filter.op.as_str(), "=" | "!=" | "LIKE" | "like") {
+                    return Err(format!("unsupported log filter operator '{}'", filter.op));
+                }
+            }
+            for field in group_by {
+                if log_field_expr(field).is_none() {
+                    return Err(format!("unsupported log group_by field '{field}'"));
+                }
+            }
+        }
+        "apm" => {
+            serde_json::from_value::<ApmQueryConfig>(config.clone())
+                .map_err(|error| format!("invalid apm query_config: {error}"))?;
+            for field in group_by {
+                if apm_group_expr(field).is_none() {
+                    return Err(format!("unsupported apm group_by field '{field}'"));
+                }
+            }
+        }
+        "composite" => {}
+        _ => return Err(format!("invalid monitor type: {monitor_type}")),
+    }
+
+    Ok(())
+}
+
 async fn query_metric(
     ch: &Client,
     monitor: &Monitor,
-    has_groups: bool,
+    group_by: &[String],
 ) -> anyhow::Result<Vec<(String, f64)>> {
     // Check if this is a PromQL-style expression
     let config_value: serde_json::Value = serde_json::from_str(&monitor.query_config)?;
@@ -774,9 +915,8 @@ async fn query_metric(
 
     let where_clause = conditions.join(" AND ");
 
-    if has_groups {
-        let group_by_cols: Vec<String> = cfg
-            .group_by
+    if !group_by.is_empty() {
+        let group_by_cols: Vec<String> = group_by
             .iter()
             .map(|g| format!("ResourceAttributes['{}']", escape_ch(g)))
             .collect();
@@ -866,7 +1006,7 @@ async fn query_metric_promql(
 async fn query_log(
     ch: &Client,
     monitor: &Monitor,
-    has_groups: bool,
+    group_by: &[String],
 ) -> anyhow::Result<Vec<(String, f64)>> {
     let cfg: LogQueryConfig = serde_json::from_str(&monitor.query_config)?;
 
@@ -889,25 +1029,40 @@ async fn query_log(
         }
     }
 
+    if !cfg.service.is_empty() {
+        conditions.push(format!("ServiceName = '{}'", escape_ch(&cfg.service)));
+    }
+    if !cfg.severities.is_empty() {
+        let severities = cfg
+            .severities
+            .iter()
+            .map(|severity| format!("'{}'", escape_ch(severity)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conditions.push(format!("SeverityText IN ({severities})"));
+    }
+
     for f in &cfg.filters {
-        let field = escape_ch(&f.field);
+        let field = log_field_expr(&f.field)
+            .ok_or_else(|| anyhow::anyhow!("unsupported log filter field '{}'", f.field))?;
         let value = escape_ch(&f.value);
         match f.op.as_str() {
             "!=" => conditions.push(format!("{field} != '{value}'")),
             "LIKE" | "like" => conditions.push(format!("{field} LIKE '%{value}%'")),
-            _ => conditions.push(format!("{field} = '{value}'")),
+            "=" => conditions.push(format!("{field} = '{value}'")),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "unsupported log filter operator '{}'",
+                    f.op
+                ));
+            }
         }
     }
 
     let where_clause = conditions.join(" AND ");
 
-    if has_groups {
-        let group_by_cols: Vec<String> = cfg.group_by.iter().map(|g| escape_ch(g)).collect();
-        let group_expr = if group_by_cols.is_empty() {
-            "'*'".to_string()
-        } else {
-            group_by_cols.join(" || ':' || ")
-        };
+    if !group_by.is_empty() {
+        let group_expr = group_expression(group_by, log_field_expr)?;
 
         let sql = format!(
             "SELECT ({group_expr}) AS group_key, count() AS value \
@@ -934,7 +1089,7 @@ async fn query_log(
 async fn query_apm(
     ch: &Client,
     monitor: &Monitor,
-    has_groups: bool,
+    group_by: &[String],
 ) -> anyhow::Result<Vec<(String, f64)>> {
     let cfg: ApmQueryConfig = serde_json::from_str(&monitor.query_config)?;
 
@@ -984,23 +1139,8 @@ async fn query_apm(
         agg_expr
     };
 
-    if has_groups {
-        let group_by_cols: Vec<String> = cfg
-            .group_by
-            .iter()
-            .map(|g| {
-                if g == "endpoint" || g == "http_path" {
-                    "http_path".to_string()
-                } else {
-                    escape_ch(g)
-                }
-            })
-            .collect();
-        let group_expr = if group_by_cols.is_empty() {
-            "'*'".to_string()
-        } else {
-            group_by_cols.join(" || ':' || ")
-        };
+    if !group_by.is_empty() {
+        let group_expr = group_expression(group_by, apm_group_expr)?;
 
         let sql = format!(
             "SELECT ({group_expr}) AS group_key, {agg} AS value \
@@ -1069,11 +1209,10 @@ pub async fn preview_query(
         updated_at: String::new(),
     };
 
-    let has_groups = !group_by.is_empty();
     let results = match monitor_type {
-        "metric" => query_metric(ch, &temp_monitor, has_groups).await?,
-        "log" => query_log(ch, &temp_monitor, has_groups).await?,
-        "apm" => query_apm(ch, &temp_monitor, has_groups).await?,
+        "metric" => query_metric(ch, &temp_monitor, group_by).await?,
+        "log" => query_log(ch, &temp_monitor, group_by).await?,
+        "apm" => query_apm(ch, &temp_monitor, group_by).await?,
         _ => vec![],
     };
 
@@ -1174,12 +1313,41 @@ async fn build_preview_timeseries(
                     conds.push(format!("lower(Body) LIKE '%{inner}%'"));
                 }
             }
+            if !cfg.service.is_empty() {
+                conds.push(format!("ServiceName = '{}'", escape_ch(&cfg.service)));
+            }
+            if !cfg.severities.is_empty() {
+                let severities = cfg
+                    .severities
+                    .iter()
+                    .map(|severity| format!("'{}'", escape_ch(severity)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conds.push(format!("SeverityText IN ({severities})"));
+            }
             for f in &cfg.filters {
-                conds.push(format!(
-                    "{} = '{}'",
-                    escape_ch(&f.field),
-                    escape_ch(&f.value)
-                ));
+                let Some(field) = log_field_expr(&f.field) else {
+                    tracing::warn!(
+                        engine = "monitors",
+                        field = %f.field,
+                        "rejecting unsupported log filter field in preview"
+                    );
+                    return vec![];
+                };
+                let value = escape_ch(&f.value);
+                match f.op.as_str() {
+                    "=" => conds.push(format!("{field} = '{value}'")),
+                    "!=" => conds.push(format!("{field} != '{value}'")),
+                    "LIKE" | "like" => conds.push(format!("{field} LIKE '%{value}%'")),
+                    _ => {
+                        tracing::warn!(
+                            engine = "monitors",
+                            operator = %f.op,
+                            "rejecting unsupported log filter operator in preview"
+                        );
+                        return vec![];
+                    }
+                }
             }
             (
                 "logs".to_string(),
@@ -1388,5 +1556,88 @@ mod tests {
             "alert"
         );
         assert_eq!(worst_state(["ok", "no_data"].iter().copied()), "no_data");
+    }
+
+    #[test]
+    fn monitor_log_fields_resolve_to_fixed_expressions() {
+        assert_eq!(log_field_expr("service_name"), Some("ServiceName"));
+        assert_eq!(log_field_expr("SeverityText"), Some("SeverityText"));
+        assert_eq!(log_field_expr("trace_id"), Some("TraceId"));
+        assert_eq!(log_field_expr("Body) OR 1 = 1 --"), None);
+
+        let groups = vec!["ServiceName".to_string(), "SeverityText".to_string()];
+        assert_eq!(
+            group_expression(&groups, log_field_expr).unwrap(),
+            "toString(ServiceName) || ':' || toString(SeverityText)"
+        );
+    }
+
+    #[test]
+    fn monitor_apm_groups_use_an_allowlist() {
+        assert_eq!(apm_group_expr("endpoint"), Some("http_path"));
+        assert_eq!(apm_group_expr("http_status_code"), Some("http_status_code"));
+        assert_eq!(apm_group_expr("tenant_id"), None);
+        assert_eq!(apm_group_expr("http_path, sleep(10)"), None);
+    }
+
+    #[test]
+    fn monitor_query_field_validation_rejects_sql_expressions() {
+        let log_config = serde_json::json!({
+            "search": "timeout",
+            "filters": [{
+                "field": "Body) OR 1 = 1 --",
+                "op": "=",
+                "value": "ignored"
+            }]
+        });
+        assert!(
+            validate_query_fields("log", &log_config, &[])
+                .unwrap_err()
+                .contains("unsupported log filter field")
+        );
+
+        let apm_config = serde_json::json!({
+            "service": "gateway",
+            "metric": "error_rate"
+        });
+        assert!(
+            validate_query_fields(
+                "apm",
+                &apm_config,
+                &["http_path) UNION ALL SELECT tenant_id".to_string()]
+            )
+            .unwrap_err()
+            .contains("unsupported apm group_by field")
+        );
+    }
+
+    #[test]
+    fn monitor_query_field_validation_accepts_supported_ui_fields() {
+        let log_config = serde_json::json!({
+            "service": "gateway",
+            "severities": ["ERROR"],
+            "filters": [{"field": "TraceId", "op": "!=", "value": ""}]
+        });
+        assert!(
+            validate_query_fields(
+                "log",
+                &log_config,
+                &["ServiceName".to_string(), "SeverityText".to_string()]
+            )
+            .is_ok()
+        );
+
+        let apm_config = serde_json::json!({
+            "service": "gateway",
+            "metric": "p95_latency"
+        });
+        assert!(
+            validate_query_fields(
+                "apm",
+                &apm_config,
+                &["endpoint".to_string(), "http_method".to_string()]
+            )
+            .is_ok()
+        );
     }
 }

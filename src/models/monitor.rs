@@ -262,9 +262,11 @@ pub struct LogQueryConfig {
     #[serde(default)]
     pub search: String,
     #[serde(default)]
-    pub filters: Vec<LogFilter>,
+    pub service: String,
     #[serde(default)]
-    pub group_by: Vec<String>,
+    pub severities: Vec<String>,
+    #[serde(default)]
+    pub filters: Vec<LogFilter>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -281,8 +283,6 @@ pub struct ApmQueryConfig {
     pub metric: String,
     #[serde(default)]
     pub endpoint_filter: Option<String>,
-    #[serde(default)]
-    pub group_by: Vec<String>,
 }
 
 fn default_true() -> bool {

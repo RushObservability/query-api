@@ -2,6 +2,13 @@ BINARY  := rush-api
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
+# Local development wiring. These values are used only by `make dev` and
+# `make watch`; `make run` sources the production-style `.env` file instead.
+DEV_RUSH_PORT                := 8080
+DEV_CLICKHOUSE_URL           := http://localhost:8123
+DEV_SRE_AGENT_URL            := http://localhost:8081
+DEV_SRE_AGENT_INTERNAL_TOKEN := dev-local-agent-token
+
 .PHONY: build release run run-anomaly dev check test fmt lint clean docker package \
         up up-full down deps logs run-local watch watch-anomaly
 
@@ -13,8 +20,15 @@ deps:                 ## Start ClickHouse in Docker
 	@until curl -sf http://localhost:8123/ping >/dev/null 2>&1; do sleep 1; done
 	@echo "ClickHouse ready on :8123"
 
-run-local: deps       ## Run query-api locally (ClickHouse in Docker)
-	RUST_LOG=rush_api=debug,tower_http=debug cargo run --bin rush-api
+dev: deps            ## Run query-api with local development wiring
+	RUSH_PORT=$(DEV_RUSH_PORT) \
+	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
+	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
+	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
+	RUST_LOG=rush_api=debug,tower_http=debug \
+	cargo run --bin $(BINARY)
+
+run-local: dev        ## Backwards-compatible alias for dev
 
 build:                ## Build debug binary
 	cargo build
@@ -23,18 +37,23 @@ release:              ## Build optimised release binary
 	cargo build --release
 
 run:                  ## Run query-api in debug mode (no dependency start)
-	RUST_LOG=rush_api=debug,tower_http=debug cargo run --bin rush-api
+	@set -e; \
+	test -f .env || { echo "ERROR: query-api/.env is required for make run" >&2; exit 1; }; \
+	set -a; . ./.env; set +a; \
+	RUST_LOG="$${RUST_LOG:-rush_api=info,tower_http=info}" cargo run --bin $(BINARY)
 
 run-anomaly:          ## Run anomaly engine in debug mode
 	RUSH_PROM_BASE_URL=http://localhost:8080 \
 	RUST_LOG=rush_api=debug \
 	cargo run --bin wide-anomaly-engine
 
-dev: run-local        ## Alias for run-local
-
-watch: deps           ## Watch & restart query-api on code changes
+watch:                ## Watch query-api with local development wiring
+	RUSH_PORT=$(DEV_RUSH_PORT) \
+	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
+	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
+	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
 	RUST_LOG=rush_api=debug,tower_http=debug \
-	cargo watch -x 'run --bin rush-api'
+	cargo watch -x 'run --bin $(BINARY)'
 
 watch-anomaly:        ## Watch & restart anomaly engine on code changes
 	RUSH_PROM_BASE_URL=http://localhost:8080 \

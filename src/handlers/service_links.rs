@@ -6,25 +6,12 @@ use axum::{
 };
 
 use crate::AppState;
-use crate::handlers::users::{require_auth, require_write};
+use crate::handlers::users::{require_admin, require_auth};
 use crate::models::service_link::CreateServiceLinkRequest;
 
-fn validate_service_link(req: &CreateServiceLinkRequest) -> Result<(), (StatusCode, String)> {
+fn validate_service_link(req: &CreateServiceLinkRequest) -> Result<String, (StatusCode, String)> {
     let service = req.service_name.trim();
-    let repository = req
-        .github_repo
-        .trim()
-        .trim_end_matches(".git")
-        .strip_prefix("https://github.com/")
-        .unwrap_or(req.github_repo.trim().trim_end_matches(".git"));
-    let repo_parts: Vec<_> = repository.split('/').collect();
-    let valid_repo = repo_parts.len() == 2
-        && repo_parts.iter().all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        });
+    let repository = crate::github_repository_policy::canonical_repository(&req.github_repo).ok();
     let valid_root = !req.root_path.starts_with('/')
         && !req.root_path.split('/').any(|part| part == "..")
         && req.root_path.len() <= 1024;
@@ -32,7 +19,7 @@ fn validate_service_link(req: &CreateServiceLinkRequest) -> Result<(), (StatusCo
         || service.len() > 256
         || service != req.service_name
         || req.github_repo.trim() != req.github_repo
-        || !valid_repo
+        || repository.is_none()
         || req.default_branch.trim().is_empty()
         || req.default_branch.trim() != req.default_branch
         || req.default_branch.len() > 200
@@ -45,7 +32,7 @@ fn validate_service_link(req: &CreateServiceLinkRequest) -> Result<(), (StatusCo
             "invalid service repository link".to_string(),
         ));
     }
-    Ok(())
+    Ok(repository.expect("repository was validated"))
 }
 
 pub async fn list_service_links(
@@ -69,15 +56,48 @@ pub async fn create_service_link(
     headers: HeaderMap,
     Json(req): Json<CreateServiceLinkRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
-    validate_service_link(&req)?;
+    let caller = require_admin(&state, &headers).await?;
+    let repository = validate_service_link(&req)?;
+    let grant = match crate::github_repository_policy::resolve_grant(&caller.3, &repository) {
+        Ok(Some(grant)) => grant,
+        result => {
+            if let Err(error) = result {
+                tracing::error!(error = %error, "GitHub repository policy is invalid or unavailable");
+            }
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("service_link.create", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("service_link", req.service_name.clone())
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({
+                                "service_name": req.service_name,
+                                "github_repo": repository,
+                                "reason": "repository_not_approved"
+                            })
+                            .to_string(),
+                        )
+                        .description("service link rejected by tenant repository policy")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::FORBIDDEN,
+                "repository is not approved for this tenant".to_string(),
+            ));
+        }
+    };
     state
         .config_db
         .upsert_service_link(
             &caller.3,
             &req.service_name,
-            &req.github_repo,
-            req.github_installation_id,
+            &grant.repository,
+            grant.installation_id,
+            grant.repository_id,
             &req.default_branch,
             &req.root_path,
         )
@@ -113,8 +133,9 @@ pub async fn create_service_link(
                 .changes(
                     serde_json::json!({
                         "service_name": req.service_name,
-                        "github_repo": req.github_repo,
-                        "github_installation_id": req.github_installation_id,
+                        "github_repo": grant.repository,
+                        "github_installation_id": grant.installation_id,
+                        "github_repository_id": grant.repository_id,
                         "default_branch": req.default_branch,
                         "root_path": req.root_path
                     })
@@ -133,7 +154,7 @@ pub async fn delete_service_link(
     headers: HeaderMap,
     Path(service_name): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_service_link(&caller.3, &service_name)
@@ -170,7 +191,6 @@ mod tests {
         CreateServiceLinkRequest {
             service_name: "gateway".to_string(),
             github_repo: repository.to_string(),
-            github_installation_id: 42,
             default_branch: "main".to_string(),
             root_path: root_path.to_string(),
         }
@@ -187,5 +207,15 @@ mod tests {
         assert!(validate_service_link(&request("https://evil.example/acme/gateway", "")).is_err());
         assert!(validate_service_link(&request("acme/team/gateway", "")).is_err());
         assert!(validate_service_link(&request("acme/gateway", "../secret")).is_err());
+    }
+
+    #[test]
+    fn rejects_client_supplied_github_ids() {
+        let request = serde_json::json!({
+            "service_name": "gateway",
+            "github_repo": "acme/gateway",
+            "github_installation_id": 42
+        });
+        assert!(serde_json::from_value::<CreateServiceLinkRequest>(request).is_err());
     }
 }

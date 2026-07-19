@@ -53,9 +53,8 @@ services:
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
       - SRE_AGENT_PORT=8081
-      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o}
-      - LLM_API_KEY=${LLM_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - RUST_LOG=rush_api=info,tower_http=info
     depends_on:
       clickhouse:

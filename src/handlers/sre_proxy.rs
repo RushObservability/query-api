@@ -61,7 +61,9 @@ fn with_internal_token(request: reqwest::RequestBuilder, token: String) -> reqwe
 }
 
 fn scopes_for_role(role: &str) -> serde_json::Value {
-    if role == "admin" || role == "write" {
+    if role == "admin" {
+        serde_json::json!(["all", "code", "kube_cluster"])
+    } else if role == "write" {
         serde_json::json!(["all", "code"])
     } else {
         serde_json::json!(["all"])
@@ -317,6 +319,9 @@ mod tests {
     fn source_scope_is_limited_to_write_roles() {
         assert_eq!(scopes_for_role("read"), serde_json::json!(["all"]));
         assert_eq!(scopes_for_role("write"), serde_json::json!(["all", "code"]));
-        assert_eq!(scopes_for_role("admin"), serde_json::json!(["all", "code"]));
+        assert_eq!(
+            scopes_for_role("admin"),
+            serde_json::json!(["all", "code", "kube_cluster"])
+        );
     }
 }

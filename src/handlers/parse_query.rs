@@ -26,7 +26,7 @@ pub struct ParseQueryResponse {
 /// POST /api/v1/parse-query
 ///
 /// Accepts a natural-language query string and returns structured filters using an LLM.
-/// Requires LLM_API_KEY to be set; returns 501 otherwise so the frontend can fall back
+/// Requires OPENAI_API_KEY to be set; returns 501 otherwise so the frontend can fall back
 /// to its rule-based parser gracefully.
 pub async fn parse_query(
     State(_state): State<AppState>,
@@ -34,17 +34,17 @@ pub async fn parse_query(
     Json(req): Json<ParseQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let base_url =
-        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
-    let api_key = match std::env::var("LLM_API_KEY") {
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let api_key = match std::env::var("OPENAI_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => {
             return Err((
                 StatusCode::NOT_IMPLEMENTED,
-                "LLM not configured: LLM_API_KEY not set".to_string(),
+                "LLM not configured: OPENAI_API_KEY not set".to_string(),
             ));
         }
     };
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let model = "gpt-4o-mini".to_string();
 
     let system_prompt = r#"You are a query parser for an observability platform. Convert the user's natural language query into structured search filters.
 

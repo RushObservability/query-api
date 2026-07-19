@@ -5,6 +5,7 @@ pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
 pub mod eval_state;
+pub mod github_repository_policy;
 pub mod handlers;
 pub mod license;
 pub mod metric_firewall;

@@ -494,6 +494,7 @@ impl ConfigDb {
                 service_name          String,
                 github_repo           String,
                 github_installation_id UInt64 DEFAULT 0,
+                github_repository_id  UInt64 DEFAULT 0,
                 default_branch        String DEFAULT 'main',
                 root_path             String DEFAULT '',
                 updated_at            String DEFAULT toString(now()),
@@ -501,10 +502,13 @@ impl ConfigDb {
                 is_deleted            UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (tenant_id, service_name)",
+            "ALTER TABLE config_service_links_v2 ADD COLUMN IF NOT EXISTS github_repository_id UInt64 DEFAULT 0 AFTER github_installation_id",
             // Preserve pre-tenancy links for the default tenant. The anti-join
             // makes this idempotent across process restarts.
             "INSERT INTO config_service_links_v2
-             SELECT 'default', service_name, github_repo, 0, default_branch, root_path,
+                 (tenant_id, service_name, github_repo, github_installation_id, github_repository_id,
+                  default_branch, root_path, updated_at, version, is_deleted)
+             SELECT 'default', service_name, github_repo, 0, 0, default_branch, root_path,
                     updated_at, version, is_deleted
              FROM config_service_links FINAL
              WHERE service_name NOT IN (
@@ -935,11 +939,11 @@ impl ConfigDb {
         if existing.is_none() {
             let ver = Self::next_version();
             let now = Self::now_str();
-            // The "default" tenant is the unconditional catch-all that
-            // tenant_middleware falls back to for unauthenticated, header-less
-            // requests, so a lock on it can't be enforced — seed it unlocked
-            // (auth_required=0) to match that reality. User-created tenants
-            // still default to locked (see create_tenant).
+            // Preserve backward compatibility by creating the default tenant
+            // unlocked. Administrators may lock it later; tenant middleware
+            // enforces the final resolved tenant's auth_required policy even for
+            // unauthenticated, header-less fallback requests. User-created
+            // tenants still default to locked (see create_tenant).
             self.client
                 .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 1, 0, ?, ?, 0)")
                 .bind("default")
@@ -1072,12 +1076,13 @@ impl ConfigDb {
     /// Cached tenant flag lookup by name OR id. One query feeds
     /// `is_tenant_enabled`, `is_tenant_auth_required` and `get_tenant_id_by_name`,
     /// which the tenant middleware may call several times per request.
-    /// Negative results (unknown tenant) are cached too.
-    async fn tenant_flags(&self, name_or_id: &str) -> TenantFlags {
+    /// Negative results (unknown tenant) are cached too; storage errors are
+    /// returned and never cached so security callers can fail closed.
+    async fn tenant_flags(&self, name_or_id: &str) -> anyhow::Result<TenantFlags> {
         if let Some(entry) = self.tenant_cache.get(name_or_id) {
             let (flags, at) = entry.value();
             if Self::cache_fresh(*at) {
-                return flags.clone();
+                return Ok(flags.clone());
             }
         }
         #[derive(clickhouse::Row, serde::Deserialize)]
@@ -1095,18 +1100,19 @@ impl ConfigDb {
             .await;
         let flags: TenantFlags = match result {
             Ok(r) => Some((r.id, r.name, r.enabled != 0, r.auth_required != 0)),
-            Err(_) => None,
+            Err(clickhouse::error::Error::RowNotFound) => None,
+            Err(error) => return Err(error.into()),
         };
         self.tenant_cache
             .insert(name_or_id.to_string(), (flags.clone(), Instant::now()));
-        flags
+        Ok(flags)
     }
 
     pub async fn get_tenant_id_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
         // Preserves prior semantics: only enabled tenants resolve by name.
         Ok(self
             .tenant_flags(name)
-            .await
+            .await?
             .filter(|(_, n, enabled, _)| *enabled && n == name)
             .map(|(id, ..)| id))
     }
@@ -1135,6 +1141,8 @@ impl ConfigDb {
     pub async fn is_tenant_enabled(&self, name_or_id: &str) -> bool {
         self.tenant_flags(name_or_id)
             .await
+            .ok()
+            .flatten()
             .map(|(_, _, enabled, _)| enabled)
             .unwrap_or(false)
     }
@@ -1142,8 +1150,23 @@ impl ConfigDb {
     pub async fn is_tenant_auth_required(&self, name_or_id: &str) -> bool {
         self.tenant_flags(name_or_id)
             .await
+            .ok()
+            .flatten()
             .map(|(_, _, _, auth_required)| auth_required)
             .unwrap_or(false)
+    }
+
+    /// Resolve a tenant's authentication policy without collapsing storage
+    /// errors into an unlocked tenant. Security-boundary middleware uses this
+    /// checked variant so policy lookup failures can fail closed.
+    pub async fn tenant_auth_required_checked(
+        &self,
+        name_or_id: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        Ok(self
+            .tenant_flags(name_or_id)
+            .await?
+            .map(|(_, _, _, auth_required)| auth_required))
     }
 
     pub async fn set_tenant_auth_required(
@@ -1290,6 +1313,8 @@ impl ConfigDb {
         let resolved = self
             .tenant_flags(tenant_id_or_name)
             .await
+            .ok()
+            .flatten()
             .map(|(id, ..)| id)
             .unwrap_or_else(|| tenant_id_or_name.to_string());
 
@@ -5033,12 +5058,13 @@ impl ConfigDb {
             service_name: String,
             github_repo: String,
             github_installation_id: u64,
+            github_repository_id: u64,
             default_branch: String,
             root_path: String,
             updated_at: String,
         }
         let rows = self.client
-            .query("SELECT tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY service_name ASC")
+            .query("SELECT tenant_id, service_name, github_repo, github_installation_id, github_repository_id, default_branch, root_path, updated_at FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY service_name ASC")
             .bind(tenant_id)
             .fetch_all::<Row>()
             .await?;
@@ -5049,6 +5075,7 @@ impl ConfigDb {
                 service_name: r.service_name,
                 github_repo: r.github_repo,
                 github_installation_id: r.github_installation_id,
+                github_repository_id: r.github_repository_id,
                 default_branch: r.default_branch,
                 root_path: r.root_path,
                 updated_at: r.updated_at,
@@ -5067,12 +5094,13 @@ impl ConfigDb {
             service_name: String,
             github_repo: String,
             github_installation_id: u64,
+            github_repository_id: u64,
             default_branch: String,
             root_path: String,
             updated_at: String,
         }
         let result = self.client
-            .query("SELECT tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND service_name = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT tenant_id, service_name, github_repo, github_installation_id, github_repository_id, default_branch, root_path, updated_at FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND service_name = ? AND is_deleted = 0 LIMIT 1")
             .bind(tenant_id)
             .bind(service_name)
             .fetch_one::<Row>()
@@ -5083,6 +5111,7 @@ impl ConfigDb {
                 service_name: r.service_name,
                 github_repo: r.github_repo,
                 github_installation_id: r.github_installation_id,
+                github_repository_id: r.github_repository_id,
                 default_branch: r.default_branch,
                 root_path: r.root_path,
                 updated_at: r.updated_at,
@@ -5098,14 +5127,15 @@ impl ConfigDb {
         service_name: &str,
         github_repo: &str,
         github_installation_id: u64,
+        github_repository_id: u64,
         default_branch: &str,
         root_path: &str,
     ) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_service_links_v2 (tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(tenant_id).bind(service_name).bind(github_repo).bind(github_installation_id).bind(default_branch).bind(root_path).bind(&now).bind(ver)
+            .query("INSERT INTO config_service_links_v2 (tenant_id, service_name, github_repo, github_installation_id, github_repository_id, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(tenant_id).bind(service_name).bind(github_repo).bind(github_installation_id).bind(github_repository_id).bind(default_branch).bind(root_path).bind(&now).bind(ver)
             .execute().await?;
         Ok(())
     }
@@ -5122,8 +5152,8 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_service_links_v2 (tenant_id, service_name, github_repo, github_installation_id, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)")
-            .bind(tenant_id).bind(service_name).bind(&existing.github_repo).bind(existing.github_installation_id).bind(&existing.default_branch).bind(&existing.root_path).bind(&now).bind(ver)
+            .query("INSERT INTO config_service_links_v2 (tenant_id, service_name, github_repo, github_installation_id, github_repository_id, default_branch, root_path, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(tenant_id).bind(service_name).bind(&existing.github_repo).bind(existing.github_installation_id).bind(existing.github_repository_id).bind(&existing.default_branch).bind(&existing.root_path).bind(&now).bind(ver)
             .execute().await?;
         Ok(true)
     }

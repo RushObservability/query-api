@@ -82,8 +82,10 @@ pub async fn create_monitor(
         }
     }
 
-    // Validate query_config based on type
-    validate_query_config(&req.monitor_type, &req.query_config)?;
+    let group_by = parse_group_by(&req.group_by)?;
+
+    // Validate query_config and every field that can influence query construction.
+    validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
 
     // Non-composite monitors must have at least a critical threshold
     if req.monitor_type != "composite" && req.critical.is_none() {
@@ -96,8 +98,8 @@ pub async fn create_monitor(
     let id = uuid::Uuid::new_v4().to_string();
     let query_config = serde_json::to_string(&req.query_config)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let group_by = serde_json::to_string(&req.group_by)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let group_by =
+        serde_json::to_string(&group_by).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let notification_channels = serde_json::to_string(&req.notification_channels)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let tags =
@@ -233,7 +235,8 @@ pub async fn update_monitor(
         }
     }
 
-    validate_query_config(&req.monitor_type, &req.query_config)?;
+    let group_by = parse_group_by(&req.group_by)?;
+    validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
 
     if req.monitor_type != "composite" && req.critical.is_none() {
         return Err((
@@ -244,8 +247,8 @@ pub async fn update_monitor(
 
     let query_config = serde_json::to_string(&req.query_config)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let group_by = serde_json::to_string(&req.group_by)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let group_by =
+        serde_json::to_string(&group_by).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let notification_channels = serde_json::to_string(&req.notification_channels)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let tags =
@@ -371,7 +374,8 @@ pub async fn preview_monitor(
     Json(req): Json<PreviewMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let group_by: Vec<String> = serde_json::from_value(req.group_by.clone()).unwrap_or_default();
+    let group_by = parse_group_by(&req.group_by)?;
+    validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
 
     let result = monitor_engine::preview_query(
         &state.ch,
@@ -434,6 +438,7 @@ pub async fn unmute_monitor(
 fn validate_query_config(
     monitor_type: &str,
     config: &serde_json::Value,
+    group_by: &[String],
 ) -> Result<(), (StatusCode, String)> {
     match monitor_type {
         "metric" => {
@@ -442,12 +447,18 @@ fn validate_query_config(
                 .get("type")
                 .and_then(|v| v.as_str())
                 .map(|t| t == "promql")
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || config
+                    .get("expr")
+                    .or_else(|| config.get("expression"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
             if is_promql {
                 if config
                     .get("expr")
+                    .or_else(|| config.get("expression"))
                     .and_then(|v| v.as_str())
-                    .map(|s| !s.is_empty())
+                    .map(|s| !s.trim().is_empty())
                     .unwrap_or(false)
                 {
                     // Valid PromQL config: has a non-empty expression
@@ -477,10 +488,19 @@ fn validate_query_config(
                 .and_then(|v| v.as_array())
                 .map(|a| !a.is_empty())
                 .unwrap_or(false);
-            if !has_search && !has_filters {
+            let has_service = config
+                .get("service")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_severities = config
+                .get("severities")
+                .and_then(|v| v.as_array())
+                .is_some_and(|values| !values.is_empty());
+            if !has_search && !has_filters && !has_service && !has_severities {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "log monitor query_config requires 'search' or 'filters'".to_string(),
+                    "log monitor query_config requires 'search', 'service', 'severities', or 'filters'"
+                        .to_string(),
                 ));
             }
         }
@@ -529,9 +549,27 @@ fn validate_query_config(
             // Composite monitors need a formula and monitor IDs
             // (optional at creation, required for evaluation)
         }
-        _ => {}
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid monitor type: {monitor_type}"),
+            ));
+        }
     }
+
+    monitor_engine::validate_query_fields(monitor_type, config, group_by)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+
     Ok(())
+}
+
+fn parse_group_by(group_by: &serde_json::Value) -> Result<Vec<String>, (StatusCode, String)> {
+    serde_json::from_value(group_by.clone()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "group_by must be an array of field names".to_string(),
+        )
+    })
 }
 
 // ── Autocomplete ──
@@ -836,4 +874,51 @@ pub async fn suggest(
     }
 
     Ok(Json(SuggestResponse { suggestions }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_validation_rejects_malicious_group_fields() {
+        let config = serde_json::json!({
+            "service": "gateway",
+            "metric": "error_rate"
+        });
+        let result = validate_query_config(
+            "apm",
+            &config,
+            &["http_path) UNION ALL SELECT tenant_id".to_string()],
+        );
+
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn monitor_validation_accepts_log_service_filter() {
+        let config = serde_json::json!({
+            "service": "gateway",
+            "severities": ["ERROR"]
+        });
+
+        assert!(validate_query_config("log", &config, &["ServiceName".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn monitor_group_by_must_be_a_string_array() {
+        assert!(parse_group_by(&serde_json::json!(["ServiceName"])).is_ok());
+        assert_eq!(
+            parse_group_by(&serde_json::json!("ServiceName"))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            parse_group_by(&serde_json::json!(["ServiceName", 42]))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

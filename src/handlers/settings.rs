@@ -542,7 +542,7 @@ const SRE_AGENT_DEFAULT_MAX_LLM_CALLS: u64 = 55;
 const SRE_AGENT_TENANT_MODE_ALL: &str = "all";
 const SRE_AGENT_TENANT_MODE_SELECTED: &str = "selected";
 /// Common OpenAI models offered as a combo-box suggestion list in the UI. The field is
-/// free-text, so any model name (incl. non-OpenAI when LLM_BASE_URL is changed) still works.
+/// free-text, so any model name (including non-OpenAI-compatible providers) still works.
 const SRE_AGENT_MODEL_SUGGESTIONS: &[&str] = &[
     "gpt-5",
     "gpt-5-mini",
@@ -728,7 +728,7 @@ pub async fn get_sre_agent_settings(
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
-    // Operator-chosen model (empty = use the agent's LLM_MODEL env default).
+    // Operator-chosen model (empty = use the agent's built-in default).
     let model = state
         .config_db
         .get_setting("sre_agent_model")
@@ -812,7 +812,7 @@ pub async fn set_sre_agent_settings(
         }
     };
 
-    // Optional `model` (free text; empty clears it → agent falls back to its LLM_MODEL env).
+    // Optional `model` (free text; empty clears it → agent falls back to its built-in default).
     // Saved first so it persists even on a toggle-only update.
     if let Some(model_val) = body.get("model") {
         let model = model_val.as_str().unwrap_or("").trim();
@@ -1216,15 +1216,15 @@ pub async fn list_sre_agent_models(
     let fallback = || {
         Json(serde_json::json!({ "models": SRE_AGENT_MODEL_SUGGESTIONS, "source": "suggestions" }))
     };
-    let api_key = ["OPENAI_API_KEY", "OPENAI_KEY", "LLM_API_KEY"]
-        .into_iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()));
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let api_key = match api_key {
         Some(k) => k,
         None => return Ok(fallback()),
     };
     let base_url =
-        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .get(&url)

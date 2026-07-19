@@ -130,14 +130,14 @@ pub async fn analyze_anomaly_event(
 
     // 4. Read LLM config from env
     let base_url =
-        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
-    let api_key = std::env::var("LLM_API_KEY").map_err(|_| {
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "LLM_API_KEY environment variable not set".to_string(),
+            "OPENAI_API_KEY environment variable not set".to_string(),
         )
     })?;
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5".to_string());
+    let model = "gpt-5".to_string();
 
     // 5. Build system prompt
     let system_prompt = "You are an observability expert analyzing anomaly events from a monitoring system. \

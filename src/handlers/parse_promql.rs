@@ -21,7 +21,7 @@ pub struct ParsePromqlResponse {
 /// POST /api/v1/parse-promql
 ///
 /// Accepts a natural-language description and returns a PromQL expression.
-/// Returns 501 if LLM_API_KEY is not configured so the frontend can fall back
+/// Returns 501 if OPENAI_API_KEY is not configured so the frontend can fall back
 /// to its rule-based parser gracefully.
 pub async fn parse_promql(
     State(_state): State<AppState>,
@@ -29,17 +29,17 @@ pub async fn parse_promql(
     Json(req): Json<ParsePromqlRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let base_url =
-        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
-    let api_key = match std::env::var("LLM_API_KEY") {
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let api_key = match std::env::var("OPENAI_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => {
             return Err((
                 StatusCode::NOT_IMPLEMENTED,
-                "LLM not configured: LLM_API_KEY not set".to_string(),
+                "LLM not configured: OPENAI_API_KEY not set".to_string(),
             ));
         }
     };
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let model = "gpt-4o-mini".to_string();
 
     let metric_hint = if req.metric_names.is_empty() {
         String::new()

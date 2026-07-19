@@ -34,6 +34,17 @@ use rush_api::stats_engine;
 use rush_api::usage_accumulator::UsageAccumulator;
 use rush_api::usage_tracker;
 
+/// Result of resolving request credentials to a tenant.
+///
+/// `authenticated` is deliberately kept separate from the tenant name: open
+/// tenants may still be selected without credentials, while locked tenants must
+/// reject that same resolution before the request reaches a handler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TenantResolution {
+    tenant_id: String,
+    authenticated: bool,
+}
+
 /// Middleware that adds security response headers to every response.
 async fn security_headers_middleware(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
@@ -200,9 +211,126 @@ async fn tenant_middleware(
         .or(url_tenant);
     let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
 
-    let tenant_id =
+    let resolution =
         resolve_tenant_from_headers(&state, auth_header, dd_key, rush_tenant, session_token).await;
-    req.extensions_mut().insert(TenantContext { tenant_id });
+    req.extensions_mut().insert(TenantContext {
+        tenant_id: resolution.tenant_id.clone(),
+    });
+    req.extensions_mut().insert(resolution);
+    next.run(req).await
+}
+
+/// Routes that must remain reachable before a tenant-authenticated session
+/// exists. All other routes are subject to the resolved tenant's
+/// `auth_required` policy.
+fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str) -> bool {
+    if method == axum::http::Method::OPTIONS {
+        // CORS preflight never carries credentials. The actual request is still
+        // checked when the browser sends it.
+        return true;
+    }
+
+    let setup_validation_token = path
+        .strip_prefix("/api/v1/sso/setup-token/")
+        .and_then(|rest| rest.strip_suffix("/validate"));
+
+    matches!(
+        path,
+        "/healthz"
+            | "/metrics"
+            | "/api/v1/auth/login"
+            | "/api/v1/auth/logout"
+            | "/api/v1/sso/status"
+            | "/auth/sso/login"
+            | "/auth/sso/callback"
+            | "/auth/sso/acs"
+            | "/auth/sso/metadata"
+    ) || setup_validation_token.is_some_and(|token| !token.is_empty() && !token.contains('/'))
+}
+
+fn should_reject_for_tenant_auth(
+    method: &axum::http::Method,
+    path: &str,
+    auth_required: bool,
+    authenticated: bool,
+) -> bool {
+    auth_required && !authenticated && !allows_unauthenticated_tenant_request(method, path)
+}
+
+/// Enforce `auth_required` after tenant resolution but before the handler.
+///
+/// This is an inner-router middleware so CORS, compression, security headers,
+/// request tracing, and metrics still wrap the 401 response. The outer
+/// `tenant_middleware` must run first because it also rewrites `/t/{tenant}`
+/// paths before routing.
+async fn enforce_tenant_auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(tenant_id) = req
+        .extensions()
+        .get::<TenantContext>()
+        .map(|tenant| tenant.tenant_id.clone())
+    else {
+        tracing::error!("tenant auth middleware ran without TenantContext");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "tenant resolution unavailable",
+        )
+            .into_response();
+    };
+    let authenticated = req
+        .extensions()
+        .get::<TenantResolution>()
+        .map(|resolution| resolution.authenticated)
+        .unwrap_or(false);
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+
+    // Login/SSO/bootstrap and operational probes must remain reachable even if
+    // the config store is temporarily unavailable.
+    if allows_unauthenticated_tenant_request(&method, &path) {
+        return next.run(req).await;
+    }
+
+    let auth_required = match state
+        .config_db
+        .tenant_auth_required_checked(&tenant_id)
+        .await
+    {
+        Ok(Some(required)) => required,
+        Ok(None) => {
+            tracing::error!(tenant_id = %tenant_id, "resolved tenant has no policy record");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "tenant policy unavailable",
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(tenant_id = %tenant_id, %error, "tenant auth policy lookup failed");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "tenant policy unavailable",
+            )
+                .into_response();
+        }
+    };
+
+    if should_reject_for_tenant_auth(&method, &path, auth_required, authenticated) {
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            path = %path,
+            "unauthenticated request rejected for locked tenant"
+        );
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "authentication required for tenant",
+        )
+            .into_response();
+    }
+
     next.run(req).await
 }
 
@@ -212,7 +340,7 @@ async fn resolve_tenant_from_headers(
     dd_key: Option<String>,
     rush_tenant: Option<String>,
     session_token: Option<String>,
-) -> String {
+) -> TenantResolution {
     let resolved =
         resolve_tenant_inner(state, auth_header, dd_key, rush_tenant, session_token).await;
     // FINAL LOCKDOWN SAFETY NET: under no circumstances may the public request
@@ -221,8 +349,14 @@ async fn resolve_tenant_from_headers(
     // are bound to `default`; sessions resolve to a real user tenant), collapse
     // any `_audit` here to `default` so audit data can never be read or written
     // via the normal telemetry tenant scoping.
-    if resolved.eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT) {
-        return "default".to_string();
+    if resolved
+        .tenant_id
+        .eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT)
+    {
+        return TenantResolution {
+            tenant_id: "default".to_string(),
+            authenticated: false,
+        };
     }
     resolved
 }
@@ -233,7 +367,7 @@ async fn resolve_tenant_inner(
     dd_key: Option<String>,
     rush_tenant: Option<String>,
     session_token: Option<String>,
-) -> String {
+) -> TenantResolution {
     // ── Priority 1: Bearer token → fixed to the key's tenant ──
     // API keys are scoped to one tenant (for collectors, CI, Grafana).
     if let Some(val) = auth_header {
@@ -245,7 +379,10 @@ async fn resolve_tenant_inner(
             if let Some(entry) = state.api_key_cache.get(&key_hash) {
                 let (tid, ts) = entry.value();
                 if ts.elapsed() < std::time::Duration::from_secs(60) {
-                    return tid.clone();
+                    return TenantResolution {
+                        tenant_id: tid.clone(),
+                        authenticated: true,
+                    };
                 }
             }
 
@@ -254,7 +391,10 @@ async fn resolve_tenant_inner(
                     state
                         .api_key_cache
                         .insert(key_hash, (tid.clone(), std::time::Instant::now()));
-                    return tid;
+                    return TenantResolution {
+                        tenant_id: tid,
+                        authenticated: true,
+                    };
                 }
                 Ok(None) => {
                     tracing::debug!(
@@ -281,7 +421,10 @@ async fn resolve_tenant_inner(
             if let Some(entry) = state.api_key_cache.get(&key_hash) {
                 let (tid, ts) = entry.value();
                 if ts.elapsed() < std::time::Duration::from_secs(60) {
-                    return tid.clone();
+                    return TenantResolution {
+                        tenant_id: tid.clone(),
+                        authenticated: true,
+                    };
                 }
             }
 
@@ -290,7 +433,10 @@ async fn resolve_tenant_inner(
                     state
                         .api_key_cache
                         .insert(key_hash, (tid.clone(), std::time::Instant::now()));
-                    return tid;
+                    return TenantResolution {
+                        tenant_id: tid,
+                        authenticated: true,
+                    };
                 }
                 Ok(None) => {
                     tracing::debug!(
@@ -338,7 +484,10 @@ async fn resolve_tenant_inner(
                     {
                         if role == "admin" {
                             // Admins can access any enabled tenant
-                            return tenant;
+                            return TenantResolution {
+                                tenant_id: tenant,
+                                authenticated: true,
+                            };
                         }
                         // Non-admins: resolve accessible tenant IDs and check
                         if let Ok((_, _, accessible_ids)) =
@@ -350,7 +499,10 @@ async fn resolve_tenant_inner(
                                 state.config_db.get_tenant_id_by_name(&tenant).await
                             {
                                 if accessible_ids.contains(&tenant_id) {
-                                    return tenant;
+                                    return TenantResolution {
+                                        tenant_id: tenant,
+                                        authenticated: true,
+                                    };
                                 }
                             }
                         }
@@ -362,7 +514,10 @@ async fn resolve_tenant_inner(
                     }
                 } else if !state.config_db.is_tenant_auth_required(&tenant).await {
                     // No session + open tenant: header is enough (for collectors)
-                    return tenant;
+                    return TenantResolution {
+                        tenant_id: tenant,
+                        authenticated: false,
+                    };
                 } else {
                     tracing::debug!(
                         tenant_id = %tenant,
@@ -383,12 +538,18 @@ async fn resolve_tenant_inner(
         if let Some((_user_id, _username, _display_name, tenant_id, _role)) =
             state.config_db.get_session_user(&token).await
         {
-            return tenant_id;
+            return TenantResolution {
+                tenant_id,
+                authenticated: true,
+            };
         }
     }
 
     // ── Priority 4: default ──
-    "default".to_string()
+    TenantResolution {
+        tenant_id: "default".to_string(),
+        authenticated: false,
+    }
 }
 
 use axum::extract::State;
@@ -1359,6 +1520,13 @@ async fn main() -> anyhow::Result<()> {
             );
             (axum::http::StatusCode::NOT_FOUND, "not found")
         })
+        // The outer tenant middleware resolves credentials and rewrites
+        // `/t/{tenant}` before routing. Enforce the resulting tenant policy here
+        // so the CORS/security/metrics layers below still wrap rejected requests.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            enforce_tenant_auth_middleware,
+        ))
         .layer({
             let origins = std::env::var("RUSH_ALLOWED_ORIGINS")
                 .ok()
@@ -1522,5 +1690,84 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tenant_auth_tests {
+    use super::{allows_unauthenticated_tenant_request, should_reject_for_tenant_auth};
+    use axum::http::Method;
+
+    #[test]
+    fn locked_tenant_rejects_unauthenticated_data_requests() {
+        assert!(should_reject_for_tenant_auth(
+            &Method::POST,
+            "/api/v1/query",
+            true,
+            false,
+        ));
+        assert!(should_reject_for_tenant_auth(
+            &Method::POST,
+            "/v1/traces",
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn open_tenant_preserves_backwards_compatible_access() {
+        assert!(!should_reject_for_tenant_auth(
+            &Method::POST,
+            "/api/v1/query",
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn valid_credentials_unlock_a_locked_tenant() {
+        assert!(!should_reject_for_tenant_auth(
+            &Method::POST,
+            "/api/v1/query",
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn bootstrap_and_operational_routes_remain_public() {
+        for (method, path) in [
+            (Method::POST, "/api/v1/auth/login"),
+            (Method::POST, "/api/v1/auth/logout"),
+            (Method::GET, "/api/v1/sso/status"),
+            (Method::GET, "/auth/sso/login"),
+            (Method::GET, "/auth/sso/callback"),
+            (Method::POST, "/auth/sso/acs"),
+            (Method::GET, "/auth/sso/metadata"),
+            (Method::GET, "/api/v1/sso/setup-token/example/validate"),
+            (Method::GET, "/healthz"),
+            (Method::GET, "/metrics"),
+            (Method::OPTIONS, "/api/v1/query"),
+        ] {
+            assert!(
+                allows_unauthenticated_tenant_request(&method, path),
+                "expected {method} {path} to remain public"
+            );
+            assert!(!should_reject_for_tenant_auth(&method, path, true, false,));
+        }
+    }
+
+    #[test]
+    fn authenticated_only_routes_are_not_accidentally_exempted() {
+        for path in [
+            "/api/v1/auth/me",
+            "/api/v1/sso/providers",
+            "/api/v1/sso/setup-token",
+            "/api/v1/sso/setup-token/example/complete",
+            "/api/v1/sso/setup-token/example/complete/validate",
+            "/api/v1/audit",
+        ] {
+            assert!(!allows_unauthenticated_tenant_request(&Method::GET, path));
+        }
     }
 }
