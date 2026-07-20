@@ -7,7 +7,7 @@
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -17,6 +17,8 @@ use crate::{AppState, TenantContext};
 #[derive(Deserialize)]
 pub struct SubmitBody {
     pub server: String,
+    #[serde(default)]
+    pub db: String,
     pub query: String,
 }
 
@@ -43,6 +45,7 @@ fn validate_query(q: &str) -> Result<(), String> {
 pub async fn submit(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Json(body): Json<SubmitBody>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !crate::license::evaluate().has_entitlement("postgres") {
@@ -51,11 +54,15 @@ pub async fn submit(
     if body.server.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "server is required".into()));
     }
+    if body.db.len() > 255 || body.db.chars().any(char::is_control) {
+        return Err((StatusCode::BAD_REQUEST, "invalid database name".into()));
+    }
     validate_query(&body.query).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let query = body.query.trim().trim_end_matches(';').trim();
 
     let id = state
         .config_db
-        .create_explain_job(&tenant.tenant_id, body.server.trim(), body.query.trim())
+        .create_explain_job(&tenant.tenant_id, body.server.trim(), body.db.trim(), query)
         .await
         .map_err(|e| {
             (
@@ -63,17 +70,34 @@ pub async fn submit(
                 format!("failed to create job: {e}"),
             )
         })?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("postgres.explain_submit", "system")
+                .actor("postgres-explain", "PostgreSQL EXPLAIN")
+                .tenant(tenant.tenant_id.clone())
+                .resource("postgres_explain_job", &id)
+                .outcome("success")
+                .changes(serde_json::json!({ "server": body.server, "db": body.db }).to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
 /// GET /api/v1/integrations/postgres/explain/{id} — UI polls for the result.
 pub async fn get_job(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    match state.config_db.get_explain_job(&id).await {
-        Ok(Some((status, plan_json, error))) => Ok(Json(serde_json::json!({
-            "status": status, "plan_json": plan_json, "error": error,
+    match state
+        .config_db
+        .get_explain_job(&tenant.tenant_id, &id)
+        .await
+    {
+        Ok(Some((status, db, plan_json, error))) => Ok(Json(serde_json::json!({
+            "status": status, "db": db, "plan_json": plan_json, "error": error,
         }))),
         Ok(None) => Err((StatusCode::NOT_FOUND, "job not found".into())),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
@@ -89,15 +113,51 @@ pub struct PollParams {
 pub async fn poll(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Query(p): Query<PollParams>,
 ) -> Response {
+    if p.server.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "server is required").into_response();
+    }
+    if let Ok(requeued) = state
+        .config_db
+        .requeue_stale_explain_jobs(&tenant.tenant_id, &p.server)
+        .await
+    {
+        if requeued > 0 {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("postgres.explain_requeue", "system")
+                        .actor("postgres-collector", "PostgreSQL collector")
+                        .tenant(tenant.tenant_id.clone())
+                        .resource("postgres_explain_queue", &p.server)
+                        .outcome("success")
+                        .changes(serde_json::json!({ "requeued": requeued }).to_string())
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+        }
+    }
     match state
         .config_db
         .claim_pending_explain_job(&tenant.tenant_id, &p.server)
         .await
     {
-        Ok(Some((id, query))) => {
-            Json(serde_json::json!({ "id": id, "query": query })).into_response()
+        Ok(Some((id, db, query))) => {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("postgres.explain_claim", "system")
+                        .actor("postgres-collector", "PostgreSQL collector")
+                        .tenant(tenant.tenant_id.clone())
+                        .resource("postgres_explain_job", &id)
+                        .outcome("success")
+                        .changes(serde_json::json!({ "server": p.server, "db": db }).to_string())
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            Json(serde_json::json!({ "id": id, "db": db, "query": query })).into_response()
         }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
@@ -115,13 +175,27 @@ pub struct ResultBody {
 /// POST /api/v1/integrations/postgres/explain/{id}/result — collector posts the plan.
 pub async fn post_result(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<ResultBody>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     state
         .config_db
-        .complete_explain_job(&id, &body.plan_json, &body.error)
+        .complete_explain_job(&tenant.tenant_id, &id, &body.plan_json, &body.error)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("postgres.explain_complete", "system")
+                .actor("postgres-collector", "PostgreSQL collector")
+                .tenant(tenant.tenant_id.clone())
+                .resource("postgres_explain_job", &id)
+                .outcome(if body.error.is_empty() { "success" } else { "failure" })
+                .changes(serde_json::json!({ "has_plan": !body.plan_json.is_empty(), "has_error": !body.error.is_empty() }).to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     Ok(StatusCode::OK)
 }

@@ -81,11 +81,13 @@ pub struct AlertRuleRow {
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct ExplainClaimRow {
     id: String,
+    db: String,
     query: String,
 }
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct ExplainStatusRow {
     status: String,
+    db: String,
     plan_json: String,
     error: String,
 }
@@ -2785,13 +2787,14 @@ impl ConfigDb {
         &self,
         tenant_id: &str,
         server: &str,
+        db: &str,
         query: &str,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Self::now_str();
         self.client
-            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, plan_json, error, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, '', ?, 'pending', '', '', ?, ?, ?, 0)")
-            .bind(&id).bind(tenant_id).bind(server).bind(query).bind(&now).bind(&now).bind(Self::next_version())
+            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, plan_json, error, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'pending', '', '', ?, ?, ?, 0)")
+            .bind(&id).bind(tenant_id).bind(server).bind(db).bind(query).bind(&now).bind(&now).bind(Self::next_version())
             .execute().await?;
         Ok(id)
     }
@@ -2801,32 +2804,66 @@ impl ConfigDb {
         &self,
         tenant_id: &str,
         server: &str,
-    ) -> anyhow::Result<Option<(String, String)>> {
+    ) -> anyhow::Result<Option<(String, String, String)>> {
         let row = self.client
-            .query("SELECT id, query FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
+            .query("SELECT id, db, query FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
             .bind(tenant_id).bind(server)
             .fetch_all::<ExplainClaimRow>().await?
             .into_iter().next();
         if let Some(r) = &row {
             self.client
-                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, 'running', ?, ?, 0)")
-                .bind(&r.id).bind(tenant_id).bind(server).bind(&r.query).bind(Self::now_str()).bind(Self::next_version())
+                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0)")
+                .bind(&r.id).bind(tenant_id).bind(server).bind(&r.db).bind(&r.query).bind(Self::now_str()).bind(Self::next_version())
                 .execute().await?;
         }
-        Ok(row.map(|r| (r.id, r.query)))
+        Ok(row.map(|r| (r.id, r.db, r.query)))
+    }
+
+    /// Requeue jobs whose collector lease expired. Collector-side EXPLAIN is
+    /// bounded, so two minutes is long enough for a slow plan while preventing
+    /// a dead collector from leaving the UI in a permanent running state.
+    pub async fn requeue_stale_explain_jobs(
+        &self,
+        tenant_id: &str,
+        server: &str,
+    ) -> anyhow::Result<u64> {
+        let rows = self
+            .client
+            .query("SELECT id, db, query FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'running' AND is_deleted = 0 AND updated_at < toString(now() - INTERVAL 2 MINUTE) LIMIT 20")
+            .bind(tenant_id)
+            .bind(server)
+            .fetch_all::<ExplainClaimRow>()
+            .await?;
+        let mut count = 0;
+        for row in rows {
+            self.client
+                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 0)")
+                .bind(&row.id)
+                .bind(tenant_id)
+                .bind(server)
+                .bind(&row.db)
+                .bind(&row.query)
+                .bind(Self::now_str())
+                .bind(Self::next_version())
+                .execute()
+                .await?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Complete a job with a plan or an error (sets status done/error).
     pub async fn complete_explain_job(
         &self,
+        tenant_id: &str,
         id: &str,
         plan_json: &str,
         error: &str,
     ) -> anyhow::Result<()> {
         let status = if error.is_empty() { "done" } else { "error" };
         self.client
-            .query("INSERT INTO config_pg_explain_jobs (id, status, plan_json, error, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version())
+            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, status, plan_json, error, updated_at, version, is_deleted) SELECT id, tenant_id, ?, ?, ?, ?, ?, 0 FROM config_pg_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version()).bind(id).bind(tenant_id)
             .execute().await?;
         Ok(())
     }
@@ -2834,14 +2871,15 @@ impl ConfigDb {
     /// Fetch a job's status/result for the UI.
     pub async fn get_explain_job(
         &self,
+        tenant_id: &str,
         id: &str,
-    ) -> anyhow::Result<Option<(String, String, String)>> {
+    ) -> anyhow::Result<Option<(String, String, String, String)>> {
         Ok(self.client
-            .query("SELECT status, plan_json, error FROM config_pg_explain_jobs FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
-            .bind(id)
+            .query("SELECT status, db, plan_json, error FROM config_pg_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(id).bind(tenant_id)
             .fetch_all::<ExplainStatusRow>().await?
             .into_iter().next()
-            .map(|r| (r.status, r.plan_json, r.error)))
+            .map(|r| (r.status, r.db, r.plan_json, r.error)))
     }
 
     // ── Setup token operations ─────────────────────────────────────────────────
@@ -3538,7 +3576,7 @@ impl ConfigDb {
             (
                 "tpl-postgresql-overview",
                 "PostgreSQL",
-                "PostgreSQL health mirroring Datadog/Grafana: connections, throughput, cache/IO, locks & waits, storage, replication, scans, wraparound, query latency.",
+                "PostgreSQL control room: collector freshness, connection pressure, query workload, waits, storage, replication, maintenance, and database health.",
                 "database",
                 serde_json::json!({"widgets":[
                     // ── Connections & throughput ──
@@ -3572,7 +3610,12 @@ impl ConfigDb {
                     w("Replication slot lag (bytes)","timeseries",qc_metrics("max by (slot) (postgresql_replication_slot_lag)"),(6,40,6,4),color("#06b6d4")),
                     // ── Saturation & efficiency ──
                     w("Connections % of max","timeseries",qc_metrics("100 * sum(postgresql_backends) / max(postgresql_max_connections)"),(0,44,6,4),color("#3b82f6")),
-                    w("Commit ratio %","timeseries",qc_metrics("100 * sum(rate(postgresql_commits[5m])) / (sum(rate(postgresql_commits[5m])) + sum(rate(postgresql_rollbacks[5m])))"),(6,44,6,4),color("#22c55e"))
+                    w("Commit ratio %","timeseries",qc_metrics("100 * sum(rate(postgresql_commits[5m])) / (sum(rate(postgresql_commits[5m])) + sum(rate(postgresql_rollbacks[5m])))"),(6,44,6,4),color("#22c55e")),
+                    // ── Collector and diagnosis ──
+                    w("Collector signal age","timeseries",qc_metrics("max by (signal) (postgresql_collector_signal_age)"),(0,48,6,4),color("#64748b")),
+                    w("Oldest transaction","timeseries",qc_metrics("max(postgresql_oldest_transaction_age)"),(6,48,6,4),color("#ef4444")),
+                    w("Query DB time","timeseries",qc_metrics("sum by (queryid) (postgresql_query_total_time)"),(0,52,6,4),color("#3b82f6")),
+                    w("Dead row ratio %","timeseries",qc_metrics("max(postgresql_table_dead_ratio)"),(6,52,6,4),color("#f59e0b"))
                 ]}),
             ),
             // Rush platform self-usage: how operators exercise the system. All series come

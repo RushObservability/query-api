@@ -6,6 +6,7 @@ use axum::{
 };
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::AppState;
 use crate::TenantContext;
@@ -175,6 +176,323 @@ pub async fn service_graph(
     })?;
 
     Ok(Json(ServiceGraph { nodes, edges }))
+}
+
+// ═══ Application vs database time ═══
+// This is deliberately a trace-level breakdown rather than a sum of all span
+// durations. A request's server span is wall-clock time; child spans overlap
+// with it and must not be added on top. Database time is capped at the request
+// duration so parallel database calls do not make the composition exceed 100%.
+
+#[derive(Debug, Deserialize)]
+pub struct TimeBreakdownParams {
+    #[serde(default = "default_minutes")]
+    pub minutes: u64,
+    pub service: String,
+    #[serde(default = "default_breakdown_interval")]
+    pub interval: String,
+}
+
+fn default_breakdown_interval() -> String {
+    "1m".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Row)]
+pub struct TimeBreakdownTotals {
+    pub request_count: u64,
+    pub wall_time_ms: f64,
+    pub application_time_ms: f64,
+    pub database_time_ms: f64,
+    pub database_call_time_ms: f64,
+    pub database_calls: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Row)]
+pub struct DatabaseTimeRow {
+    pub system: String,
+    pub target: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub p95_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceTimeBreakdownResponse {
+    pub service_name: String,
+    pub minutes: u64,
+    pub request_count: u64,
+    pub wall_time_ms: f64,
+    pub application_time_ms: f64,
+    pub database_time_ms: f64,
+    /// Raw sum of database child-span durations. This can exceed wall time
+    /// when calls run in parallel, so the UI presents it as supporting detail.
+    pub database_call_time_ms: f64,
+    pub database_calls: u64,
+    pub databases: Vec<DatabaseTimeRow>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Row)]
+pub struct ServiceTimeBreakdownBucket {
+    pub bucket: String,
+    pub request_count: u64,
+    /// Average wall-clock time per request in this interval.
+    pub wall_time_ms: f64,
+    /// Average application time per request in this interval.
+    pub application_time_ms: f64,
+    /// Average database wall-clock impact per request in this interval.
+    pub database_time_ms: f64,
+    pub database_calls: u64,
+}
+
+#[derive(Debug, Deserialize, Row)]
+struct ServiceTimeBreakdownServerBucket {
+    pub bucket: String,
+    pub request_count: u64,
+    pub wall_time_ms: f64,
+}
+
+#[derive(Debug, Deserialize, Row)]
+struct ServiceTimeBreakdownDatabaseBucket {
+    pub bucket: String,
+    pub database_call_time_ms: f64,
+    pub database_calls: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceTimeBreakdownTimeseriesResponse {
+    pub service_name: String,
+    pub minutes: u64,
+    pub interval: String,
+    pub buckets: Vec<ServiceTimeBreakdownBucket>,
+}
+
+fn database_span_predicate() -> &'static str {
+    "(JSONExtractString(attributes, 'db.system') != '' \
+        OR JSONExtractString(attributes, 'db.system.name') != '' \
+        OR JSONExtractString(attributes, 'db.operation.name') != '' \
+        OR JSONExtractString(attributes, 'db.operation') != '' \
+        OR JSONExtractString(attributes, 'db.statement') != '' \
+        OR JSONExtractString(attributes, 'db.query.summary') != '')"
+}
+
+/// Return a safe ClickHouse bucket expression and the effective interval token.
+/// Keep the result under 2,000 buckets even if a caller asks for a very fine
+/// interval over the full seven-day API window.
+fn breakdown_interval(minutes: u64, requested: &str) -> (&'static str, u64) {
+    const INTERVALS: [(&str, u64); 11] = [
+        ("1s", 1),
+        ("10s", 10),
+        ("1m", 60),
+        ("2m", 120),
+        ("5m", 300),
+        ("10m", 600),
+        ("15m", 900),
+        ("30m", 1800),
+        ("1h", 3600),
+        ("3h", 10800),
+        ("1d", 86400),
+    ];
+    let requested_secs = INTERVALS
+        .iter()
+        .find(|(token, _)| *token == requested)
+        .map(|(_, secs)| *secs)
+        .unwrap_or(60);
+    let minimum_secs = (minutes.max(1) * 60).div_ceil(2000);
+    let target_secs = requested_secs.max(minimum_secs);
+    let selected = INTERVALS
+        .iter()
+        .find(|(_, secs)| *secs >= target_secs)
+        .copied()
+        .unwrap_or(INTERVALS[INTERVALS.len() - 1]);
+    selected
+}
+
+pub async fn service_time_breakdown(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(params): Query<TimeBreakdownParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_service = crate::query_builder::escape_string_literal(&params.service);
+    let minutes = params.minutes.min(10080); // max 7d
+
+    let db_predicate = database_span_predicate();
+
+    // Roll spans up to one row per trace first. `server_ns` is the preferred
+    // request wall time; the max span is a useful fallback for instrumentations
+    // that omit span kind. `least` caps overlapping DB children to wall time.
+    let totals_sql = format!(
+        "SELECT \
+            count() AS request_count, \
+            sum(request_ns) / 1000000.0 AS wall_time_ms, \
+            sum(request_ns - least(database_child_ns, request_ns)) / 1000000.0 AS application_time_ms, \
+            sum(least(database_child_ns, request_ns)) / 1000000.0 AS database_time_ms, \
+            sum(database_child_ns) / 1000000.0 AS database_call_time_ms, \
+            sum(database_calls) AS database_calls \
+         FROM ( \
+            SELECT \
+                if(server_ns > 0, server_ns, max_span_ns) AS request_ns, \
+                database_child_ns, \
+                database_calls \
+            FROM ( \
+                SELECT \
+                    trace_id, \
+                    max(duration_ns) AS max_span_ns, \
+                    maxIf(duration_ns, kind = 'SPAN_KIND_SERVER') AS server_ns, \
+                    sumIf(duration_ns, {db_predicate}) AS database_child_ns, \
+                    countIf({db_predicate}) AS database_calls \
+                FROM spans \
+                PREWHERE tenant_id = '{escaped_tenant}' \
+                    AND service_name = '{escaped_service}' \
+                    AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+                GROUP BY trace_id \
+            ) \
+         )"
+    );
+
+    let databases_sql = format!(
+        "SELECT \
+            system, \
+            target, \
+            count() AS calls, \
+            sum(duration_ns) / 1000000.0 AS total_ms, \
+            quantile(0.95)(duration_ns) / 1000000.0 AS p95_ms \
+         FROM ( \
+            SELECT \
+                if(JSONExtractString(attributes, 'db.system') != '', JSONExtractString(attributes, 'db.system'), \
+                    if(JSONExtractString(attributes, 'db.system.name') != '', JSONExtractString(attributes, 'db.system.name'), 'database')) AS system, \
+                multiIf( \
+                    JSONExtractString(attributes, 'server.address') != '', JSONExtractString(attributes, 'server.address'), \
+                    JSONExtractString(attributes, 'db.namespace') != '', JSONExtractString(attributes, 'db.namespace'), \
+                    JSONExtractString(attributes, 'db.name') != '', JSONExtractString(attributes, 'db.name'), \
+                    JSONExtractString(attributes, 'db.system') != '', JSONExtractString(attributes, 'db.system'), \
+                    JSONExtractString(attributes, 'db.system.name') != '', JSONExtractString(attributes, 'db.system.name'), \
+                    'database') AS target, \
+                duration_ns \
+            FROM spans \
+            PREWHERE tenant_id = '{escaped_tenant}' \
+                AND service_name = '{escaped_service}' \
+                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+            WHERE {db_predicate} \
+         ) \
+         GROUP BY system, target \
+         ORDER BY total_ms DESC \
+         LIMIT 20"
+    );
+
+    let (totals_result, databases_result) = tokio::join!(
+        crate::tenant_query(&state.ch, &totals_sql, tenant_id).fetch_one::<TimeBreakdownTotals>(),
+        crate::tenant_query(&state.ch, &databases_sql, tenant_id).fetch_all::<DatabaseTimeRow>(),
+    );
+
+    let totals = totals_result.map_err(|e| {
+        tracing::error!(error = %e, handler = "service_time_breakdown", "totals query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
+    let databases = databases_result.map_err(|e| {
+        tracing::error!(error = %e, handler = "service_time_breakdown", "database query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
+
+    Ok(Json(ServiceTimeBreakdownResponse {
+        service_name: params.service,
+        minutes,
+        request_count: totals.request_count,
+        wall_time_ms: totals.wall_time_ms,
+        application_time_ms: totals.application_time_ms,
+        database_time_ms: totals.database_time_ms,
+        database_call_time_ms: totals.database_call_time_ms,
+        database_calls: totals.database_calls,
+        databases,
+    }))
+}
+
+pub async fn service_time_breakdown_timeseries(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(params): Query<TimeBreakdownParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_service = crate::query_builder::escape_string_literal(&params.service);
+    let minutes = params.minutes.min(10080); // max 7d
+    let (interval, bucket_secs) = breakdown_interval(minutes, &params.interval);
+    let db_predicate = database_span_predicate();
+
+    let server_sql = format!(
+        "SELECT \
+            toString(toStartOfInterval(timestamp, INTERVAL {bucket_secs} SECOND)) AS bucket, \
+            count() AS request_count, \
+            avg(duration_ns) / 1000000.0 AS wall_time_ms \
+         FROM spans \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+            AND service_name = '{escaped_service}' \
+            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+         WHERE kind = 'SPAN_KIND_SERVER' \
+         GROUP BY bucket \
+         ORDER BY bucket"
+    );
+
+    let database_sql = format!(
+        "SELECT \
+            toString(toStartOfInterval(timestamp, INTERVAL {bucket_secs} SECOND)) AS bucket, \
+            sum(duration_ns) / 1000000.0 AS database_call_time_ms, \
+            count() AS database_calls \
+         FROM spans \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+            AND service_name = '{escaped_service}' \
+            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+         WHERE {db_predicate} \
+         GROUP BY bucket \
+         ORDER BY bucket"
+    );
+
+    let (server_result, database_result) = tokio::join!(
+        crate::tenant_query(&state.ch, &server_sql, tenant_id)
+            .fetch_all::<ServiceTimeBreakdownServerBucket>(),
+        crate::tenant_query(&state.ch, &database_sql, tenant_id)
+            .fetch_all::<ServiceTimeBreakdownDatabaseBucket>(),
+    );
+
+    let server_buckets = server_result.map_err(|e| {
+        tracing::error!(error = %e, handler = "service_time_breakdown_timeseries", query = "server", "query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
+    let database_buckets = database_result.map_err(|e| {
+        tracing::error!(error = %e, handler = "service_time_breakdown_timeseries", query = "database", "query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
+
+    let database_by_bucket: BTreeMap<_, _> = database_buckets
+        .into_iter()
+        .map(|bucket| (bucket.bucket.clone(), bucket))
+        .collect();
+
+    let buckets = server_buckets
+        .into_iter()
+        .map(|server| {
+            let database = database_by_bucket.get(&server.bucket);
+            let database_time_ms = database
+                .map(|bucket| bucket.database_call_time_ms.min(server.wall_time_ms))
+                .unwrap_or(0.0);
+            ServiceTimeBreakdownBucket {
+                bucket: server.bucket,
+                request_count: server.request_count,
+                wall_time_ms: server.wall_time_ms,
+                application_time_ms: (server.wall_time_ms - database_time_ms).max(0.0),
+                database_time_ms,
+                database_calls: database.map(|bucket| bucket.database_calls).unwrap_or(0),
+            }
+        })
+        .collect();
+
+    Ok(Json(ServiceTimeBreakdownTimeseriesResponse {
+        service_name: params.service,
+        minutes,
+        interval: interval.to_string(),
+        buckets,
+    }))
 }
 
 // ═══ Latency Histogram ═══

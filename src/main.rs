@@ -1003,6 +1003,8 @@ async fn main() -> anyhow::Result<()> {
         // Service catalog
         .route("/api/v1/services", get(handlers::services::list_services))
         .route("/api/v1/services/graph", get(handlers::services::service_graph))
+        .route("/api/v1/services/time-breakdown", get(handlers::services::service_time_breakdown))
+        .route("/api/v1/services/time-breakdown/timeseries", get(handlers::services::service_time_breakdown_timeseries))
         .route("/api/v1/services/latency-histogram", get(handlers::services::service_latency_histogram))
         .route("/api/v1/services/endpoints", get(handlers::services::service_endpoints))
         .route("/api/v1/services/errors", get(handlers::services::service_errors))

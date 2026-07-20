@@ -21,6 +21,7 @@ deps:                 ## Start ClickHouse in Docker
 	@echo "ClickHouse ready on :8123"
 
 dev: deps            ## Run query-api with local development wiring
+	if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; \
 	RUSH_PORT=$(DEV_RUSH_PORT) \
 	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
 	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
@@ -38,6 +39,7 @@ release:              ## Build optimised release binary
 
 run:                  ## Run query-api in debug mode (no dependency start)
 	@set -e; \
+	if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; \
 	test -f .env || { echo "ERROR: query-api/.env is required for make run" >&2; exit 1; }; \
 	set -a; . ./.env; set +a; \
 	RUST_LOG="$${RUST_LOG:-rush_api=info,tower_http=info}" cargo run --bin $(BINARY)
@@ -48,6 +50,7 @@ run-anomaly:          ## Run anomaly engine in debug mode
 	cargo run --bin wide-anomaly-engine
 
 watch:                ## Watch query-api with local development wiring
+	if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; \
 	RUSH_PORT=$(DEV_RUSH_PORT) \
 	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
 	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
