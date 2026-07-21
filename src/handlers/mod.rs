@@ -20,6 +20,7 @@ pub mod groups;
 pub mod health;
 pub mod ingest_buffer;
 pub mod ingest_gate;
+pub mod integrations;
 pub mod jaeger;
 pub mod kubernetes;
 pub mod license;

@@ -53,9 +53,55 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `CLICKHOUSE_URL` | `http://localhost:8123` | database endpoint |
 | `CLICKHOUSE_DATABASE` | `observability` | created on first run |
 | `RUSH_API_KEY_SECRET` | _(empty)_ | HMAC key for API-key hashes — set it in production |
+| `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | stable key used to encrypt integration DSNs |
+| `RUSH_COLLECTOR_MANAGER_ENABLED` | `false` | enable API-managed local collector supervision |
+| `RUSH_POSTGRES_COLLECTOR_BIN` | `../postgres-collector/target/debug/postgres-collector` | managed PostgreSQL collector executable |
+| `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant-scoped API key for managed collector ingest |
 | `RUSH_ALLOWED_ORIGINS` | _(same-origin)_ | CORS allowlist |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
 | `RUST_LOG` | — | e.g. `rush_api=info` |
+
+### Managed integrations
+
+The default build is the community build and does not compile paid collectors.
+Licensed distributions select collector features at build time and still gate
+each collector with the signed `RUSH_LICENSE_KEY` at runtime.
+
+```bash
+# Open-source API
+make build
+
+# Licensed build containing the PostgreSQL collector supervisor
+FEATURES=postgres-collector make build
+
+# Licensed container build; GITHUB_TOKEN is consumed as a BuildKit secret
+GITHUB_TOKEN="$GITHUB_TOKEN" \
+RUSH_POSTGRES_COLLECTOR_VERSION=v0.1.0 \
+FEATURES=postgres-collector make docker
+```
+
+When enabled, set `RUSH_COLLECTOR_MANAGER_ENABLED=true`. The API stores
+integration targets in its config plane, encrypts DSNs with
+`RUSH_INTEGRATION_ENCRYPTION_KEY`, and supervises the collector process. For
+local development the Makefile supplies a development encryption key; use a
+stable secret-manager value in production.
+
+Targets are managed through the admin API:
+
+```text
+GET    /api/v1/integrations/registry
+GET    /api/v1/integrations/postgresql/targets
+POST   /api/v1/integrations/postgresql/targets
+PUT    /api/v1/integrations/postgresql/targets/{id}
+DELETE /api/v1/integrations/postgresql/targets/{id}
+```
+
+The target response never returns the DSN. Target changes are audit logged and
+the collector is reconciled immediately, then periodically. Set
+`RUSH_POSTGRES_COLLECTOR_BIN` when the collector binary is not at the local
+development default, and set `RUSH_COLLECTOR_API_KEY` for locked tenants.
+The private collector release repository is
+`RushObservability/postgresql-collector`.
 
 Static config (retention defaults, storage tiering) lives in `rush.toml`, found via `RUSH_CONFIG`.
 

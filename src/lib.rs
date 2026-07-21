@@ -7,6 +7,7 @@ pub mod config;
 pub mod eval_state;
 pub mod github_repository_policy;
 pub mod handlers;
+pub mod integrations;
 pub mod license;
 pub mod metric_firewall;
 pub mod migrations;
@@ -196,4 +197,7 @@ pub struct AppState {
     /// the ingest path, and engine loops; rendered at the open `GET /metrics` endpoint
     /// and self-ingested into our own metrics tables by the stats engine each tick.
     pub self_metrics: Arc<self_metrics::SelfMetrics>,
+    /// API-managed integration collector supervisor. The community build keeps
+    /// this disabled unless a collector feature and manager setting are present.
+    pub collectors: Arc<integrations::CollectorManager>,
 }

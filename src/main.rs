@@ -961,6 +961,13 @@ async fn main() -> anyhow::Result<()> {
     // hash-chain tail so a restart continues the same chain.
     let audit = std::sync::Arc::new(rush_api::audit::AuditLogger::new(ch.clone()).await);
 
+    // API-managed integration collector supervisor. It is opt-in and feature
+    // gated so the community binary never launches paid collectors.
+    let collectors = std::sync::Arc::new(rush_api::integrations::CollectorManager::new(
+        config_db.clone(),
+    ));
+    collectors.spawn_reconciler();
+
     let state = AppState {
         ch,
         writer,
@@ -972,6 +979,7 @@ async fn main() -> anyhow::Result<()> {
         api_key_cache,
         audit,
         self_metrics,
+        collectors,
     };
 
     let inner = Router::new()
@@ -1252,6 +1260,17 @@ async fn main() -> anyhow::Result<()> {
         // Feature flags (public — no auth)
         .route("/api/v1/features", get(handlers::settings::get_features))
         .route("/api/v1/license", get(handlers::license::get_license))
+        .route("/api/v1/integrations/registry", get(handlers::integrations::registry))
+        .route(
+            "/api/v1/integrations/{integration}/targets",
+            get(handlers::integrations::list_targets)
+                .post(handlers::integrations::create_target),
+        )
+        .route(
+            "/api/v1/integrations/{integration}/targets/{id}",
+            put(handlers::integrations::update_target)
+                .delete(handlers::integrations::delete_target),
+        )
         // Postgres EXPLAIN job queue (UI submit/poll-result; collector poll/post)
         .route("/api/v1/integrations/postgres/explain", post(handlers::pg_explain::submit))
         .route("/api/v1/integrations/postgres/explain/poll", get(handlers::pg_explain::poll))

@@ -4,6 +4,14 @@ version = "0.1.24"
 edition = "2024"
 license-file = "LICENSE"
 
+[features]
+# The community build contains the core API only. Licensed collector support is
+# compiled into explicitly selected distributions and is still entitlement-gated
+# at runtime by RUSH_LICENSE_KEY.
+default = ["oss"]
+oss = []
+postgres-collector = []
+
 [lib]
 name = "rush_api"
 path = "src/lib.rs"
@@ -29,6 +37,7 @@ clickhouse = { version = "0.13", features = ["time", "uuid", "lz4"] }
 # pre-Arc owned types — verified against the clickhouse 0.13 rowbinary codec.
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
 tracing = "0.1"

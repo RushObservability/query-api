@@ -431,6 +431,22 @@ impl ConfigDb {
                 is_deleted UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (key)",
+            // ── API-managed integration targets ────────────────────────────────
+            // DSNs are encrypted by query-api before they are written here.
+            "CREATE TABLE IF NOT EXISTS config_integration_targets (
+                id             String,
+                tenant_id      String,
+                integration    String,
+                name           String,
+                dsn_encrypted  String,
+                environment    String DEFAULT 'production',
+                enabled        UInt8 DEFAULT 1,
+                created_at     String DEFAULT toString(now()),
+                updated_at     String DEFAULT toString(now()),
+                version        UInt64,
+                is_deleted     UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, integration, id)",
             // ── Custom skills ─────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_custom_skills (
                 id            String,
@@ -2776,6 +2792,104 @@ impl ConfigDb {
             .bind(key)
             .bind(value)
             .bind(ver)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    // ── API-managed integration targets ───────────────────────────────────────
+
+    /// Return configured integration targets, decrypting DSNs only inside the
+    /// API process. Callers must never serialize this result directly to users.
+    pub async fn list_integration_target_secrets(
+        &self,
+        tenant_id: &str,
+        integration: &str,
+    ) -> anyhow::Result<Vec<crate::integrations::IntegrationTargetSecret>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            name: String,
+            dsn_encrypted: String,
+            environment: String,
+            enabled: u8,
+        }
+        let rows = self
+            .client
+            .query(
+                "SELECT id, name, dsn_encrypted, environment, enabled
+                 FROM config_integration_targets FINAL
+                 WHERE tenant_id = ? AND integration = ? AND is_deleted = 0
+                 ORDER BY id",
+            )
+            .bind(tenant_id)
+            .bind(integration)
+            .fetch_all::<Row>()
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::integrations::IntegrationTargetSecret {
+                    id: row.id,
+                    name: row.name,
+                    dsn: crate::integrations::decrypt_secret(&row.dsn_encrypted)?,
+                    environment: row.environment,
+                    enabled: row.enabled != 0,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn upsert_integration_target(
+        &self,
+        tenant_id: &str,
+        integration: &str,
+        target: &crate::integrations::IntegrationTargetSecret,
+        encrypted_dsn: &str,
+    ) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        self.client
+            .query(
+                "INSERT INTO config_integration_targets
+                 (id, tenant_id, integration, name, dsn_encrypted, environment, enabled,
+                  created_at, updated_at, version, is_deleted)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            )
+            .bind(&target.id)
+            .bind(tenant_id)
+            .bind(integration)
+            .bind(&target.name)
+            .bind(encrypted_dsn)
+            .bind(&target.environment)
+            .bind(target.enabled)
+            .bind(&now)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_integration_target(
+        &self,
+        tenant_id: &str,
+        integration: &str,
+        target_id: &str,
+    ) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        self.client
+            .query(
+                "INSERT INTO config_integration_targets
+                 (id, tenant_id, integration, name, dsn_encrypted, environment, enabled,
+                  created_at, updated_at, version, is_deleted)
+                 VALUES (?, ?, ?, '', '', '', 0, ?, ?, ?, 1)",
+            )
+            .bind(target_id)
+            .bind(tenant_id)
+            .bind(integration)
+            .bind(&now)
+            .bind(&now)
+            .bind(Self::next_version())
             .execute()
             .await?;
         Ok(())

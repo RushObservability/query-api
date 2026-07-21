@@ -1,6 +1,9 @@
 BINARY  := rush-api
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+FEATURES ?= oss
+CARGO_FEATURES := --no-default-features --features $(FEATURES)
+RUSH_POSTGRES_COLLECTOR_VERSION ?=
 
 # Local development wiring. These values are used only by `make dev` and
 # `make watch`; `make run` sources the production-style `.env` file instead.
@@ -8,8 +11,10 @@ DEV_RUSH_PORT                := 8080
 DEV_CLICKHOUSE_URL           := http://localhost:8123
 DEV_SRE_AGENT_URL            := http://localhost:8081
 DEV_SRE_AGENT_INTERNAL_TOKEN := dev-local-agent-token
+DEV_COLLECTOR_MANAGER        := true
+DEV_INTEGRATION_KEY           := rush-local-integration-key-change-me
 
-.PHONY: build release run run-anomaly dev check test fmt lint clean docker package \
+.PHONY: build release fetch-collector run run-anomaly dev check test fmt lint clean docker package \
         up up-full down deps logs run-local watch watch-anomaly
 
 ## Development — local binary + ClickHouse in Docker
@@ -26,23 +31,35 @@ dev: deps            ## Run query-api with local development wiring
 	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
 	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
 	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
+	RUSH_COLLECTOR_MANAGER_ENABLED=$(DEV_COLLECTOR_MANAGER) \
+	RUSH_INTEGRATION_ENCRYPTION_KEY=$(DEV_INTEGRATION_KEY) \
 	RUST_LOG=rush_api=debug,tower_http=debug \
-	cargo run --bin $(BINARY)
+	cargo run $(CARGO_FEATURES) --bin $(BINARY)
 
 run-local: dev        ## Backwards-compatible alias for dev
 
 build:                ## Build debug binary
-	cargo build
+	cargo build $(CARGO_FEATURES)
 
 release:              ## Build optimised release binary
-	cargo build --release
+	cargo build --release $(CARGO_FEATURES)
+
+fetch-collector:       ## Download and verify a private PostgreSQL collector release
+	@test -n "$(RUSH_POSTGRES_COLLECTOR_VERSION)" || { echo "RUSH_POSTGRES_COLLECTOR_VERSION is required" >&2; exit 1; }
+	@test -n "$${GITHUB_TOKEN:-}" || { echo "GITHUB_TOKEN is required" >&2; exit 1; }
+	RUSH_POSTGRES_COLLECTOR_VERSION=$(RUSH_POSTGRES_COLLECTOR_VERSION) \
+	GITHUB_TOKEN="$${GITHUB_TOKEN}" \
+	DEST_DIR="$${DEST_DIR:-$(CURDIR)/target/managed-collectors}" \
+	./scripts/fetch-collector.sh
 
 run:                  ## Run query-api in debug mode (no dependency start)
 	@set -e; \
 	if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; \
 	test -f .env || { echo "ERROR: query-api/.env is required for make run" >&2; exit 1; }; \
 	set -a; . ./.env; set +a; \
-	RUST_LOG="$${RUST_LOG:-rush_api=info,tower_http=info}" cargo run --bin $(BINARY)
+	RUSH_COLLECTOR_MANAGER_ENABLED="$${RUSH_COLLECTOR_MANAGER_ENABLED:-$(DEV_COLLECTOR_MANAGER)}" \
+	RUSH_INTEGRATION_ENCRYPTION_KEY="$${RUSH_INTEGRATION_ENCRYPTION_KEY:-$(DEV_INTEGRATION_KEY)}" \
+	RUST_LOG="$${RUST_LOG:-rush_api=info,tower_http=info}" cargo run $(CARGO_FEATURES) --bin $(BINARY)
 
 run-anomaly:          ## Run anomaly engine in debug mode
 	RUSH_PROM_BASE_URL=http://localhost:8080 \
@@ -55,8 +72,10 @@ watch:                ## Watch query-api with local development wiring
 	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
 	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
 	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
+	RUSH_COLLECTOR_MANAGER_ENABLED=$(DEV_COLLECTOR_MANAGER) \
+	RUSH_INTEGRATION_ENCRYPTION_KEY=$(DEV_INTEGRATION_KEY) \
 	RUST_LOG=rush_api=debug,tower_http=debug \
-	cargo watch -x 'run --bin $(BINARY)'
+	cargo watch -x 'run $(CARGO_FEATURES) --bin $(BINARY)'
 
 watch-anomaly:        ## Watch & restart anomaly engine on code changes
 	RUSH_PROM_BASE_URL=http://localhost:8080 \
@@ -66,10 +85,10 @@ watch-anomaly:        ## Watch & restart anomaly engine on code changes
 ## Quality
 
 check:                ## Type-check without building
-	cargo check
+	cargo check $(CARGO_FEATURES)
 
 test:                 ## Run tests
-	cargo test
+	cargo test $(CARGO_FEATURES)
 
 fmt:                  ## Format code
 	cargo fmt
@@ -94,7 +113,13 @@ logs:                 ## Tail Docker compose logs
 ## Docker (standalone)
 
 docker:               ## Build Docker image
-	docker build -t $(BINARY):$(VERSION) -t $(BINARY):latest .
+	@if [ "$(FEATURES)" = "oss" ]; then \
+		docker build --build-arg RUSH_FEATURES=$(FEATURES) -t $(BINARY):$(VERSION) -t $(BINARY):latest .; \
+	else \
+		test -n "$${GITHUB_TOKEN:-}" || { echo "GITHUB_TOKEN is required for licensed image builds" >&2; exit 1; }; \
+		test -n "$(RUSH_POSTGRES_COLLECTOR_VERSION)" || { echo "RUSH_POSTGRES_COLLECTOR_VERSION is required for licensed image builds" >&2; exit 1; }; \
+		docker build --build-arg RUSH_FEATURES=$(FEATURES) --build-arg RUSH_POSTGRES_COLLECTOR_VERSION=$(RUSH_POSTGRES_COLLECTOR_VERSION) --secret id=github_token,env=GITHUB_TOKEN -t $(BINARY):$(VERSION) -t $(BINARY):latest .; \
+	fi
 
 docker-run:           ## Run via Docker (connects to host ClickHouse)
 	docker run --rm -p 8080:8080 \
