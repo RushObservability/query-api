@@ -12,10 +12,12 @@ RUSH_POSTGRES_COLLECTOR_VERSION ?=
 LOCAL_COLLECTOR_DIR      ?= ../postgres-collector
 LOCAL_COLLECTOR_MANIFEST := $(LOCAL_COLLECTOR_DIR)/Cargo.toml
 LOCAL_COLLECTOR_BIN      := $(LOCAL_COLLECTOR_DIR)/target/debug/postgres-collector
+LOCAL_COLLECTOR_CONFIG   := $(LOCAL_COLLECTOR_DIR)/config.yaml
 LOCAL_COLLECTOR_AVAILABLE := $(wildcard $(LOCAL_COLLECTOR_MANIFEST))
+LOCAL_COLLECTOR_CONFIG_AVAILABLE := $(wildcard $(LOCAL_COLLECTOR_CONFIG))
 DEV_FEATURES             := $(if $(LOCAL_COLLECTOR_AVAILABLE),postgres-collector,$(FEATURES))
 DEV_CARGO_FEATURES       := --no-default-features --features $(DEV_FEATURES)
-LOCAL_COLLECTOR_ENV      := $(if $(LOCAL_COLLECTOR_AVAILABLE),RUSH_POSTGRES_COLLECTOR_BIN="$(LOCAL_COLLECTOR_BIN)")
+LOCAL_COLLECTOR_ENV      := $(if $(LOCAL_COLLECTOR_AVAILABLE),RUSH_POSTGRES_COLLECTOR_BIN="$(LOCAL_COLLECTOR_BIN)") $(if $(LOCAL_COLLECTOR_CONFIG_AVAILABLE),RUSH_POSTGRES_COLLECTOR_CONFIG="$(LOCAL_COLLECTOR_CONFIG)")
 
 # Local development wiring. These values are used only by `make dev` and
 # `make watch`; `make run` sources the production-style `.env` file instead.
@@ -95,7 +97,7 @@ watch: prepare-local-collector ## Watch query-api and a checked-out collector wi
 	RUSH_INTEGRATION_ENCRYPTION_KEY=$(DEV_INTEGRATION_KEY) \
 	$(LOCAL_COLLECTOR_ENV) \
 	RUST_LOG=rush_api=debug,tower_http=debug \
-	$(if $(LOCAL_COLLECTOR_AVAILABLE),cargo watch -w src -w "$(LOCAL_COLLECTOR_DIR)/src" -w "$(LOCAL_COLLECTOR_MANIFEST)" -s 'cargo build --manifest-path "$(LOCAL_COLLECTOR_MANIFEST)" --bin postgres-collector && cargo run $(DEV_CARGO_FEATURES) --bin $(BINARY)',cargo watch -x 'run $(DEV_CARGO_FEATURES) --bin $(BINARY)')
+	$(if $(LOCAL_COLLECTOR_AVAILABLE),cargo watch -w src -w "$(LOCAL_COLLECTOR_DIR)/src" -w "$(LOCAL_COLLECTOR_MANIFEST)" $(if $(LOCAL_COLLECTOR_CONFIG_AVAILABLE),-w "$(LOCAL_COLLECTOR_CONFIG)") -s 'cargo build --manifest-path "$(LOCAL_COLLECTOR_MANIFEST)" --bin postgres-collector && cargo run $(DEV_CARGO_FEATURES) --bin $(BINARY)',cargo watch -x 'run $(DEV_CARGO_FEATURES) --bin $(BINARY)')
 
 watch-anomaly:        ## Watch & restart anomaly engine on code changes
 	RUSH_PROM_BASE_URL=http://localhost:8080 \

@@ -148,6 +148,7 @@ struct ManagedProcess {
     child: Child,
     fingerprint: String,
     config_path: PathBuf,
+    cleanup_config: bool,
 }
 
 /// Supervises locally spawned collectors. A remote/Kubernetes runner can use
@@ -194,16 +195,37 @@ impl CollectorManager {
             .list_integration_target_secrets(tenant_id, POSTGRES_INTEGRATION)
             .await?;
         let targets: Vec<_> = targets.into_iter().filter(|t| t.enabled).collect();
-        if targets.is_empty() {
+        let bootstrap_config = if targets.is_empty() {
+            std::env::var("RUSH_POSTGRES_COLLECTOR_CONFIG")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+        } else {
+            None
+        };
+        if targets.is_empty() && bootstrap_config.is_none() {
             return self.stop(&key).await;
         }
+        if let Some(path) = &bootstrap_config {
+            if !path.is_file() {
+                self.stop(&key).await?;
+                bail!(
+                    "PostgreSQL collector config not found at {}; set RUSH_POSTGRES_COLLECTOR_CONFIG",
+                    path.display()
+                );
+            }
+        }
 
-        let fingerprint = serde_json::to_string(
-            &targets
-                .iter()
-                .map(|t| (&t.id, &t.name, &t.dsn, &t.environment))
-                .collect::<Vec<_>>(),
-        )?;
+        let fingerprint = if let Some(path) = &bootstrap_config {
+            static_config_fingerprint(path)?
+        } else {
+            serde_json::to_string(
+                &targets
+                    .iter()
+                    .map(|t| (&t.id, &t.name, &t.dsn, &t.environment))
+                    .collect::<Vec<_>>(),
+            )?
+        };
         let mut processes = self.processes.lock().await;
         if let Some(process) = processes.get_mut(&key) {
             if process.fingerprint == fingerprint && process.child.try_wait()?.is_none() {
@@ -211,15 +233,28 @@ impl CollectorManager {
             }
             let _ = process.child.kill().await;
             let _ = process.child.wait().await;
-            let _ = std::fs::remove_file(&process.config_path);
+            if process.cleanup_config {
+                let _ = std::fs::remove_file(&process.config_path);
+            }
             processes.remove(&key);
         }
 
-        let config_path = write_collector_config(tenant_id, &targets)?;
+        let (config_path, cleanup_config) = if targets.is_empty() {
+            // Local development can point at a checked-out collector config.
+            // API-managed targets take precedence whenever one is configured.
+            (
+                bootstrap_config.expect("bootstrap config checked above"),
+                false,
+            )
+        } else {
+            (write_collector_config(tenant_id, &targets)?, true)
+        };
         let binary = std::env::var("RUSH_POSTGRES_COLLECTOR_BIN")
             .unwrap_or_else(|_| "../postgres-collector/target/debug/postgres-collector".into());
         if !Path::new(&binary).exists() {
-            let _ = std::fs::remove_file(&config_path);
+            if cleanup_config {
+                let _ = std::fs::remove_file(&config_path);
+            }
             bail!(
                 "PostgreSQL collector binary not found at {binary}; set RUSH_POSTGRES_COLLECTOR_BIN"
             );
@@ -250,6 +285,7 @@ impl CollectorManager {
                 child,
                 fingerprint,
                 config_path,
+                cleanup_config,
             },
         );
         Ok(())
@@ -260,7 +296,9 @@ impl CollectorManager {
         if let Some(mut process) = processes.remove(key) {
             let _ = process.child.kill().await;
             let _ = process.child.wait().await;
-            let _ = std::fs::remove_file(process.config_path);
+            if process.cleanup_config {
+                let _ = std::fs::remove_file(process.config_path);
+            }
             tracing::info!(collector = %key, "stopped managed collector");
         }
         Ok(())
@@ -283,6 +321,16 @@ impl CollectorManager {
             }
         });
     }
+}
+
+fn static_config_fingerprint(path: &Path) -> Result<String> {
+    let contents = std::fs::read(path)
+        .with_context(|| format!("read PostgreSQL collector config {}", path.display()))?;
+    Ok(format!(
+        "static:{}:{}",
+        path.display(),
+        hex::encode(sha256(&contents))
+    ))
 }
 
 fn write_collector_config(tenant_id: &str, targets: &[IntegrationTargetSecret]) -> Result<PathBuf> {

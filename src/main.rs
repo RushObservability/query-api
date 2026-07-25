@@ -1278,6 +1278,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/integrations/postgres/explain/{id}/result", post(handlers::pg_explain::post_result))
         // Export row cap (admin-only setter; value also exposed via /features)
         .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
+        .route("/api/v1/settings/config", get(handlers::settings::get_runtime_config))
         .route(
             "/api/v1/settings/sre-agent",
             get(handlers::settings::get_sre_agent_settings).put(handlers::settings::set_sre_agent_settings),

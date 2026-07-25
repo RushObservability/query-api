@@ -243,6 +243,143 @@ pub async fn get_features(State(state): State<AppState>, headers: HeaderMap) -> 
     }))
 }
 
+/// GET /api/v1/settings/config — admin-only, redacted runtime configuration.
+///
+/// This is intentionally an allowlist rather than a dump of the process
+/// environment. Secret values never cross the API boundary; the UI only gets
+/// a configured/not-configured state for them.
+pub async fn get_runtime_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_admin(&state, &headers).await?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("settings.config_view", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("settings", "runtime-config")
+                .outcome("success")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    let license = crate::license::evaluate();
+    let manager_enabled = state.collectors.enabled();
+    let target_count = state
+        .config_db
+        .list_integration_target_secrets(&caller.3, crate::integrations::POSTGRES_INTEGRATION)
+        .await
+        .map(|targets| targets.into_iter().filter(|target| target.enabled).count())
+        .unwrap_or(0);
+
+    let integrations = crate::integrations::descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            let licensed = descriptor.compiled && license.has_entitlement(descriptor.entitlement);
+            serde_json::json!({
+                "id": descriptor.id,
+                "name": descriptor.name,
+                "entitlement": descriptor.entitlement,
+                "compiled": descriptor.compiled,
+                "licensed": licensed,
+                "loaded": licensed,
+                "manager_enabled": manager_enabled,
+                "configured_targets": if descriptor.id == crate::integrations::POSTGRES_INTEGRATION { target_count } else { 0 },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut runtime = vec![
+        config_entry("RUSH_PORT", Some("8080"), false, false),
+        config_entry("CLICKHOUSE_URL", Some("http://localhost:8123"), false, true),
+        config_entry("CLICKHOUSE_DATABASE", Some("observability"), false, false),
+        config_entry("RUSH_CONFIG", Some("./rush.toml"), false, false),
+        config_entry("RUSH_ALLOWED_ORIGINS", Some("same-origin"), false, false),
+        config_entry("SRE_AGENT_URL", Some("http://localhost:8081"), false, true),
+        config_entry(
+            "RUSH_COLLECTOR_OTLP_ENDPOINT",
+            Some("http://localhost:8080"),
+            false,
+            true,
+        ),
+        config_entry(
+            "RUSH_COLLECTOR_MANAGER_ENABLED",
+            Some("false"),
+            false,
+            false,
+        ),
+        config_entry("RUSH_POSTGRES_COLLECTOR_BIN", None, false, false),
+        config_entry("RUSH_POSTGRES_COLLECTOR_CONFIG", None, false, false),
+        config_entry("RUSH_COLLECTOR_TENANT", Some("default"), false, false),
+        config_entry("RUSH_SPOOL_DIR", Some("./data/spool"), false, false),
+        config_entry("RUSH_BUFFER_BACKEND", Some("disk"), false, false),
+        config_entry("RUSH_LOG_FORMAT", Some("pretty"), false, false),
+    ];
+    runtime.extend([
+        config_entry("RUSH_LICENSE_KEY", None, true, false),
+        config_entry("RUSH_API_KEY_SECRET", None, true, false),
+        config_entry("RUSH_INTEGRATION_ENCRYPTION_KEY", None, true, false),
+        config_entry("RUSH_AUDIT_HMAC_SECRET", None, true, false),
+        config_entry("RUSH_COLLECTOR_API_KEY", None, true, false),
+        config_entry("RUSH_SRE_AGENT_INTERNAL_TOKEN", None, true, false),
+        config_entry("RUSH_SMTP_PASS", None, true, false),
+        config_entry("RUSH_BUFFER_S3_SECRET_KEY", None, true, false),
+    ]);
+
+    Ok(Json(serde_json::json!({
+        "tenant": caller.3,
+        "runtime": runtime,
+        "license": license,
+        "integrations": integrations,
+    })))
+}
+
+fn config_entry(
+    key: &str,
+    default: Option<&str>,
+    sensitive: bool,
+    endpoint: bool,
+) -> serde_json::Value {
+    let raw = std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let configured = raw.is_some();
+    let value = if sensitive {
+        None
+    } else {
+        raw.as_deref()
+            .map(|value| {
+                if endpoint {
+                    safe_endpoint(value)
+                } else {
+                    value.to_string()
+                }
+            })
+            .or_else(|| default.map(str::to_string))
+    };
+    serde_json::json!({
+        "key": key,
+        "value": value,
+        "configured": configured,
+        "sensitive": sensitive,
+        "source": if configured { "environment" } else { "default" },
+    })
+}
+
+fn safe_endpoint(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("configured");
+            match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+                None => format!("{}://{host}", parsed.scheme()),
+            }
+        }
+        Err(_) => "configured".into(),
+    }
+}
+
 /// GET /api/v1/settings/rum — admin only. Returns { enabled }.
 pub async fn get_rum_setting(
     State(state): State<AppState>,

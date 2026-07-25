@@ -37,6 +37,14 @@ make dev      # ClickHouse in Docker + query-api on :8080
 make watch    # same, but reloads on change
 ```
 
+If `../postgres-collector` is checked out locally, `make dev` and `make watch`
+automatically compile it, enable the PostgreSQL collector feature, and point
+the API's collector supervisor at the debug binary. When that checkout also
+contains `config.yaml` and no API-managed PostgreSQL target exists yet, the
+supervisor uses the local file as a bootstrap configuration. API-managed
+targets take precedence. Use `LOCAL_COLLECTOR_DIR=/path/to/postgresql-collector
+make watch` for a different checkout location.
+
 Or run everything in Docker, or just the database:
 
 ```bash
@@ -56,6 +64,7 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | stable key used to encrypt integration DSNs |
 | `RUSH_COLLECTOR_MANAGER_ENABLED` | `false` | enable API-managed local collector supervision |
 | `RUSH_POSTGRES_COLLECTOR_BIN` | `../postgres-collector/target/debug/postgres-collector` | managed PostgreSQL collector executable |
+| `RUSH_POSTGRES_COLLECTOR_CONFIG` | _(empty)_ | optional bootstrap YAML when no API-managed target exists |
 | `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant-scoped API key for managed collector ingest |
 | `RUSH_ALLOWED_ORIGINS` | _(same-origin)_ | CORS allowlist |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
@@ -63,18 +72,18 @@ Migrations run on startup, so the schema and materialized views are created if t
 
 ### Managed integrations
 
-The default build is the community build and does not compile paid collectors.
-Licensed distributions select collector features at build time and still gate
-each collector with the signed `RUSH_LICENSE_KEY` at runtime.
+The default build is the community build and does not compile optional
+collectors. Collector-enabled distributions select features at build time and
+still gate each collector with the signed `RUSH_LICENSE_KEY` at runtime.
 
 ```bash
 # Open-source API
 make build
 
-# Licensed build containing the PostgreSQL collector supervisor
+# PostgreSQL-enabled build containing the collector supervisor
 FEATURES=postgres-collector make build
 
-# Licensed container build; GITHUB_TOKEN is consumed as a BuildKit secret
+# PostgreSQL-enabled container build; GITHUB_TOKEN is consumed as a BuildKit secret
 GITHUB_TOKEN="$GITHUB_TOKEN" \
 RUSH_POSTGRES_COLLECTOR_VERSION=v0.1.0 \
 FEATURES=postgres-collector make docker
