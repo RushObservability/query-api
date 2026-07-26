@@ -27,6 +27,7 @@ DEV_SRE_AGENT_URL            := http://localhost:8081
 DEV_SRE_AGENT_INTERNAL_TOKEN := dev-local-agent-token
 DEV_COLLECTOR_MANAGER        := true
 DEV_INTEGRATION_KEY           := rush-local-integration-key-change-me
+DEV_ALLOW_PRIVATE_NOTIFICATION_URLS := true
 
 .PHONY: build release fetch-collector prepare-local-collector run run-anomaly dev check test fmt lint clean docker package \
         up up-full down deps logs run-local watch watch-anomaly
@@ -53,6 +54,7 @@ dev: deps prepare-local-collector ## Run query-api with local development wiring
 	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
 	RUSH_COLLECTOR_MANAGER_ENABLED=$(DEV_COLLECTOR_MANAGER) \
 	RUSH_INTEGRATION_ENCRYPTION_KEY=$(DEV_INTEGRATION_KEY) \
+	RUSH_ALLOW_PRIVATE_NOTIFICATION_URLS=$(DEV_ALLOW_PRIVATE_NOTIFICATION_URLS) \
 	$(LOCAL_COLLECTOR_ENV) \
 	RUST_LOG=rush_api=debug,tower_http=debug \
 	cargo run $(DEV_CARGO_FEATURES) --bin $(BINARY)
@@ -95,6 +97,7 @@ watch: prepare-local-collector ## Watch query-api and a checked-out collector wi
 	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
 	RUSH_COLLECTOR_MANAGER_ENABLED=$(DEV_COLLECTOR_MANAGER) \
 	RUSH_INTEGRATION_ENCRYPTION_KEY=$(DEV_INTEGRATION_KEY) \
+	RUSH_ALLOW_PRIVATE_NOTIFICATION_URLS=$(DEV_ALLOW_PRIVATE_NOTIFICATION_URLS) \
 	$(LOCAL_COLLECTOR_ENV) \
 	RUST_LOG=rush_api=debug,tower_http=debug \
 	$(if $(LOCAL_COLLECTOR_AVAILABLE),cargo watch -w src -w "$(LOCAL_COLLECTOR_DIR)/src" -w "$(LOCAL_COLLECTOR_MANIFEST)" $(if $(LOCAL_COLLECTOR_CONFIG_AVAILABLE),-w "$(LOCAL_COLLECTOR_CONFIG)") -s 'cargo build --manifest-path "$(LOCAL_COLLECTOR_MANIFEST)" --bin postgres-collector && cargo run $(DEV_CARGO_FEATURES) --bin $(BINARY)',cargo watch -x 'run $(DEV_CARGO_FEATURES) --bin $(BINARY)')

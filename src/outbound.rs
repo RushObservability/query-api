@@ -35,25 +35,68 @@ fn blocked_address(ip: IpAddr) -> bool {
     }
 }
 
-/// Create a request to a public HTTPS endpoint. The returned client has no
-/// redirects, bounded connect/total timeouts, and a pinned DNS resolution.
-pub async fn public_https_request(method: Method, raw_url: &str) -> Result<RequestBuilder, String> {
+fn allow_private_notification_urls() -> bool {
+    [
+        "RUSH_ALLOW_PRIVATE_NOTIFICATION_URLS",
+        // Keep the original local-dev flag as a compatibility alias.
+        "RUSH_ALLOW_INSECURE_LOCAL_NOTIFICATIONS",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var(name)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Validate a configured notification endpoint without contacting it.
+///
+/// Reachability and DNS pinning belong to the send path. Keeping this check
+/// side-effect free lets users save a channel before its endpoint is online.
+/// HTTP is accepted for internal endpoints; the send path still requires an
+/// explicit private-endpoint flag before it will connect to private or
+/// loopback addresses.
+pub fn validate_notification_url(raw_url: &str) -> Result<(), String> {
     let url = Url::parse(raw_url).map_err(|_| "notification URL is invalid".to_string())?;
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return Err("notification URL must be an HTTPS URL without user credentials".to_string());
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("notification URL must not include user credentials".to_string());
     }
+    url.host_str()
+        .ok_or_else(|| "notification URL must include a host".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("notification URL must use HTTP or HTTPS".to_string());
+    }
+    Ok(())
+}
+
+/// Create a guarded request to a notification endpoint. The returned client
+/// has no redirects, bounded connect/total timeouts, and pinned DNS
+/// resolution. Private/internal targets require explicit configuration.
+pub async fn public_https_request(method: Method, raw_url: &str) -> Result<RequestBuilder, String> {
+    validate_notification_url(raw_url)?;
+    let url = Url::parse(raw_url).map_err(|_| "notification URL is invalid".to_string())?;
     let host = url
         .host_str()
         .ok_or_else(|| "notification URL must include a host".to_string())?
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
+    let allow_private = allow_private_notification_urls();
 
     let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
         .await
         .map_err(|_| "notification host could not be resolved".to_string())?
         .collect();
-    if addresses.is_empty()
-        || addresses
+    if addresses.is_empty() {
+        return Err("notification host could not be resolved".to_string());
+    }
+    if url.scheme() == "http" && !allow_private {
+        return Err(
+            "HTTP notification endpoints require RUSH_ALLOW_PRIVATE_NOTIFICATION_URLS=true"
+                .to_string(),
+        );
+    }
+    if !allow_private
+        && addresses
             .iter()
             .any(|address| blocked_address(address.ip()))
     {

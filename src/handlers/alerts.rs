@@ -455,8 +455,7 @@ async fn validate_channel_config(
                     "channel config missing URL".to_string(),
                 )
             })?;
-        let _ = crate::outbound::public_https_request(reqwest::Method::POST, url)
-            .await
+        crate::outbound::validate_notification_url(url)
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     Ok(())
