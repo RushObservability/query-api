@@ -220,10 +220,18 @@ pub async fn me(
 /// works over plain HTTP (e.g. `kubectl port-forward`, non-TLS internal access),
 /// where browsers refuse to store `Secure`/`__Host-` cookies. `extract_session_cookie`
 /// reads both names.
-fn session_cookie(token: &str, max_age: i64) -> String {
+pub(crate) fn session_cookie(token: &str, max_age: i64) -> String {
+    session_cookie_with_mode(token, max_age, insecure_cookies_enabled())
+}
+
+fn insecure_cookies_enabled() -> bool {
     let insecure = std::env::var("RUSH_INSECURE_COOKIES")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    insecure
+}
+
+fn session_cookie_with_mode(token: &str, max_age: i64, insecure: bool) -> String {
     if insecure {
         format!("rush_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
     } else {
@@ -248,4 +256,27 @@ pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_cookie_with_mode;
+
+    #[test]
+    fn production_session_cookie_is_host_only_and_secure() {
+        let cookie = session_cookie_with_mode("session-token", 86400, false);
+        assert_eq!(
+            cookie,
+            "__Host-rush_session=session-token; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
+        );
+    }
+
+    #[test]
+    fn insecure_mode_is_explicitly_http_compatible_but_still_httponly() {
+        let cookie = session_cookie_with_mode("session-token", 0, true);
+        assert_eq!(
+            cookie,
+            "rush_session=session-token; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+        );
+    }
 }

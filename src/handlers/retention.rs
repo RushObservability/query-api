@@ -283,28 +283,49 @@ pub async fn set_tenant_retention(
                         tracing::error!(error = %e, "internal error");
                         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
                     })?;
+
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("retention.update", "user")
+                            .actor(caller.0.clone(), caller.1.clone())
+                            .tenant(id.clone())
+                            .resource("retention", &id)
+                            .changes(
+                                serde_json::json!({ "signal": signal, "days": days }).to_string(),
+                            )
+                            .description("tenant retention updated")
+                            .context(crate::audit::actor_context_from_headers(&headers)),
+                    )
+                    .await;
             }
             None => {
-                let _ = state.config_db.delete_tenant_retention(&id, signal).await;
+                let deleted = state
+                    .config_db
+                    .delete_tenant_retention(&id, signal)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "internal error");
+                        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+                    })?;
+                if deleted {
+                    state
+                        .audit
+                        .log(
+                            crate::audit::AuditEvent::new("retention.update", "user")
+                                .actor(caller.0.clone(), caller.1.clone())
+                                .tenant(id.clone())
+                                .resource("retention", &id)
+                                .changes(
+                                    serde_json::json!({ "signal": signal, "days": null })
+                                        .to_string(),
+                                )
+                                .description("tenant retention override removed")
+                                .context(crate::audit::actor_context_from_headers(&headers)),
+                        )
+                        .await;
+                }
             }
-        }
-    }
-
-    // AUDIT: per-tenant retention update (one event per provided signal).
-    for (signal, maybe_days) in signals {
-        if let Some(days) = maybe_days {
-            state
-                .audit
-                .log(
-                    crate::audit::AuditEvent::new("retention.update", "user")
-                        .actor(caller.0.clone(), caller.1.clone())
-                        .tenant(id.clone())
-                        .resource("retention", &id)
-                        .changes(serde_json::json!({ "signal": signal, "days": days }).to_string())
-                        .description("tenant retention updated")
-                        .context(crate::audit::actor_context_from_headers(&headers)),
-                )
-                .await;
         }
     }
 

@@ -459,9 +459,7 @@ pub async fn sso_callback(
         })?;
 
     // 11. Set the rush_session cookie and redirect to /
-    let cookie = format!(
-        "__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
-    );
+    let cookie = crate::handlers::auth::session_cookie(&token, 86400);
 
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
@@ -1130,9 +1128,7 @@ pub async fn sso_acs(
         )
         .await;
 
-    let cookie = format!(
-        "__Host-rush_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
-    );
+    let cookie = crate::handlers::auth::session_cookie(&token, 86400);
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
@@ -1236,7 +1232,7 @@ pub async fn create_setup_token(
     headers: HeaderMap,
     Json(req): Json<CreateSetupTokenRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    crate::handlers::users::require_admin(&state, &headers).await?;
+    let caller = crate::handlers::users::require_admin(&state, &headers).await?;
     let purpose = req.purpose.as_deref().unwrap_or("sso_setup");
     let created_by = req.created_by.as_deref().unwrap_or("admin");
     let provider = req.provider.as_deref().unwrap_or("");
@@ -1254,6 +1250,28 @@ pub async fn create_setup_token(
         hostname.to_string()
     };
     let url = format!("{base}/setup/sso?token={token}");
+
+    // The one-time token itself is never written to the audit row. Record only
+    // its purpose and non-secret setup metadata so token creation is traceable.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("sso.setup_token_create", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("sso_setup_token", "one-time")
+                .changes(
+                    serde_json::json!({
+                        "purpose": purpose,
+                        "provider": provider,
+                        "hostname_configured": !hostname.is_empty(),
+                    })
+                    .to_string(),
+                )
+                .description("sso setup token created")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "token": token, "url": url })))
 }
@@ -1280,7 +1298,7 @@ pub async fn complete_setup_token(
     headers: HeaderMap,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let caller = require_auth(&state, &headers).await?;
     let marked = state
         .config_db
         .mark_setup_token_used(&token)
@@ -1288,6 +1306,19 @@ pub async fn complete_setup_token(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     if marked {
+        // Do not log the setup token or any token-derived value.
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.setup_token_complete", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("sso_setup_token", "one-time")
+                    .changes(serde_json::json!({ "used": true }).to_string())
+                    .description("sso setup token completed")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((

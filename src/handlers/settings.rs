@@ -601,6 +601,37 @@ pub async fn set_cloudwatch_setting(
                 "invalid 'enabled' (expected a boolean)".to_string(),
             )
         })?;
+
+    // Validate the optional UI hint before mutating either setting. It is not
+    // a credential, but it is still a persisted setting and must be audited
+    // independently when it changes.
+    let requested_default_tenant = body
+        .get("default_tenant")
+        .map(|value| {
+            let dt = value.as_str().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid 'default_tenant' (expected a string)".to_string(),
+                )
+            })?;
+            let dt = dt.trim();
+            if dt.len() > 128 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "default_tenant too long".to_string(),
+                ));
+            }
+            Ok(dt.to_string())
+        })
+        .transpose()?;
+    let previous_default_tenant = state
+        .config_db
+        .get_setting("cloudwatch_default_tenant")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
     state
         .config_db
         .set_setting("cloudwatch_enabled", if enabled { "true" } else { "false" })
@@ -630,17 +661,10 @@ pub async fn set_cloudwatch_setting(
         )
         .await;
     // Optional default_tenant (UI hint only). Present → persist (empty clears it).
-    if let Some(dt_val) = body.get("default_tenant") {
-        let dt = dt_val.as_str().unwrap_or("").trim();
-        if dt.len() > 128 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "default_tenant too long".to_string(),
-            ));
-        }
+    if let Some(dt) = requested_default_tenant {
         state
             .config_db
-            .set_setting("cloudwatch_default_tenant", dt)
+            .set_setting("cloudwatch_default_tenant", &dt)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to save cloudwatch_default_tenant");
@@ -649,6 +673,26 @@ pub async fn set_cloudwatch_setting(
                     "failed to save setting".to_string(),
                 )
             })?;
+
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("settings.update", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("setting", "cloudwatch_default_tenant")
+                    .changes(
+                        serde_json::json!({
+                            "key": "cloudwatch_default_tenant",
+                            "before": previous_default_tenant,
+                            "after": dt,
+                        })
+                        .to_string(),
+                    )
+                    .description("cloudwatch default tenant updated")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
     }
     let default_tenant = state
         .config_db

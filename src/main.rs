@@ -4,7 +4,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use axum::http::{HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::IntoResponse;
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{extract::ConnectInfo, extract::Request, middleware::Next, response::Response};
@@ -15,6 +15,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+use url::Url;
 
 use rush_api::AppState;
 use rush_api::TenantContext;
@@ -117,6 +118,120 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
         ),
     );
     resp
+}
+
+fn is_state_changing_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+/// Validate the browser origin for requests authenticated by the session
+/// cookie. API keys are not ambient browser credentials and do not need this
+/// check. The explicit allowlist is required for cross-origin local development
+/// (for example, Vite on :5173 talking to the API on :8080); otherwise the
+/// request must match the origin reconstructed from the trusted proxy headers.
+fn request_origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if origin == "null" || origin.is_empty() {
+        return false;
+    }
+
+    let configured_allowlist = std::env::var("RUSH_ALLOWED_ORIGINS").ok();
+    let allowlist: Option<Vec<&str>> = configured_allowlist.as_deref().map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect()
+    });
+    request_origin_allowed_with_allowlist(headers, allowlist.as_deref())
+}
+
+fn request_origin_allowed_with_allowlist(
+    headers: &HeaderMap,
+    configured_allowlist: Option<&[&str]>,
+) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if origin == "null" || origin.is_empty() {
+        return false;
+    }
+    if let Some(allowlist) = configured_allowlist {
+        if !allowlist.is_empty() {
+            return allowlist.iter().any(|allowed| *allowed == origin);
+        }
+    }
+
+    let Some(origin_url) = Url::parse(origin).ok() else {
+        return false;
+    };
+    if !matches!(origin_url.scheme(), "http" | "https")
+        || origin_url.host_str().is_none()
+        || origin_url.path() != "/"
+        || origin_url.query().is_some()
+        || origin_url.fragment().is_some()
+    {
+        return false;
+    }
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim);
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    let Some(host) = host else { return false };
+    let Ok(request_url) = Url::parse(&format!("{scheme}://{host}/")) else {
+        return false;
+    };
+
+    origin_url.scheme() == request_url.scheme()
+        && origin_url.host_str() == request_url.host_str()
+        && origin_url.port_or_known_default() == request_url.port_or_known_default()
+}
+
+/// SameSite=Lax protects normal cross-site form traffic, while this Origin
+/// check covers same-site subdomain attacks and defense-in-depth for browsers
+/// that send cookies on an unsafe request. Login/SSO and API-key traffic are
+/// intentionally outside this cookie-authenticated mutation boundary.
+async fn csrf_protection_middleware(req: Request, next: Next) -> Response {
+    let protected_session = req
+        .extensions()
+        .get::<TenantResolution>()
+        .is_some_and(|resolution| resolution.credential == CredentialKind::Session);
+    if protected_session
+        && is_state_changing_method(req.method())
+        && !request_origin_allowed(req.headers())
+    {
+        tracing::warn!(
+            method = %req.method(),
+            path = %req.uri().path(),
+            "session-authenticated request rejected by origin policy"
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "request origin is not allowed",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Middleware that records API RED self-metrics (`rush_http_*`) for every request.
@@ -1986,6 +2101,7 @@ async fn main() -> anyhow::Result<()> {
             state.clone(),
             enforce_tenant_auth_middleware,
         ))
+        .layer(axum::middleware::from_fn(csrf_protection_middleware))
         .layer({
             let origins = std::env::var("RUSH_ALLOWED_ORIGINS")
                 .ok()
@@ -2160,9 +2276,10 @@ mod tenant_auth_tests {
     use super::{
         CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
         credential_route_denial, explicit_ingest_tenant, ingest_signal_for_route,
+        is_state_changing_method, request_origin_allowed_with_allowlist,
         should_reject_for_tenant_auth,
     };
-    use axum::http::Method;
+    use axum::http::{HeaderMap, HeaderValue, Method, header};
     use rush_api::clickhouse_config::ApiKeyGrant;
 
     const INGEST_ROUTES: &[(&str, &str)] = &[
@@ -2218,6 +2335,57 @@ mod tenant_auth_tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn csrf_only_classifies_mutating_methods_as_state_changing() {
+        assert!(is_state_changing_method(&Method::POST));
+        assert!(is_state_changing_method(&Method::PUT));
+        assert!(is_state_changing_method(&Method::PATCH));
+        assert!(is_state_changing_method(&Method::DELETE));
+        assert!(!is_state_changing_method(&Method::GET));
+        assert!(!is_state_changing_method(&Method::OPTIONS));
+    }
+
+    #[test]
+    fn csrf_accepts_exactly_configured_frontend_origins() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:5173"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:8080"));
+
+        assert!(!request_origin_allowed_with_allowlist(&headers, None));
+        assert!(request_origin_allowed_with_allowlist(
+            &headers,
+            Some(&["http://localhost:5173"]),
+        ));
+    }
+
+    #[test]
+    fn csrf_rejects_null_and_mismatched_origins_by_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("rush.example.com"));
+
+        headers.insert(header::ORIGIN, HeaderValue::from_static("null"));
+        assert!(!request_origin_allowed_with_allowlist(&headers, None));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example.com"),
+        );
+        headers.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        assert!(!request_origin_allowed_with_allowlist(&headers, None));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://rush.example.com"),
+        );
+        assert!(request_origin_allowed_with_allowlist(&headers, None));
     }
 
     #[test]
