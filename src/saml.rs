@@ -160,7 +160,15 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, S
                 }
             }
             Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or_default().to_string();
+                let text = e
+                    .decode()
+                    .ok()
+                    .and_then(|decoded| {
+                        quick_xml::escape::unescape(&decoded)
+                            .ok()
+                            .map(|value| value.into_owned())
+                    })
+                    .unwrap_or_default();
                 if in_name_id {
                     name_id = text;
                 } else if in_status_message {

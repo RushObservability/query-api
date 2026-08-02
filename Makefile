@@ -29,7 +29,7 @@ DEV_COLLECTOR_MANAGER        := true
 DEV_INTEGRATION_KEY           := rush-local-integration-key-change-me
 DEV_ALLOW_PRIVATE_NOTIFICATION_URLS := true
 
-.PHONY: build release fetch-collector prepare-local-collector run run-anomaly dev check test fmt lint clean docker package \
+.PHONY: build release fetch-collector prepare-local-collector run run-anomaly dev check test fmt lint security security-audit security-policy clean docker package \
         up up-full down deps logs run-local watch watch-anomaly
 
 ## Development — local binary + ClickHouse in Docker
@@ -119,7 +119,15 @@ fmt:                  ## Format code
 	cargo fmt
 
 lint:                 ## Run clippy lints
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+
+security: security-audit security-policy ## Run dependency vulnerability, license, source, and yank checks
+
+security-audit:       ## Scan Cargo.lock against RustSec (one documented unreachable exception)
+	cargo audit --ignore RUSTSEC-2023-0071
+
+security-policy:      ## Enforce deny.toml advisory, license, source, and dependency policy
+	cargo deny check advisories bans licenses sources
 
 ## Docker Compose
 

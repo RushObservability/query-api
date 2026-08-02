@@ -358,7 +358,10 @@ fn write_collector_config(tenant_id: &str, targets: &[IntegrationTargetSecret]) 
             },
         );
     }
-    let contents = serde_yaml::to_string(&FileConfig { targets: named })?;
+    // JSON is a YAML 1.2 subset and is accepted by the PostgreSQL collector's
+    // YAML parser. Emitting it with serde_json avoids the unmaintained
+    // serde_yaml dependency while preserving the existing config contract.
+    let contents = serde_json::to_string_pretty(&FileConfig { targets: named })?;
     let path = dir.join(format!("postgres-{tenant_id}.yaml"));
     write_private_file(&path, contents.as_bytes())?;
     Ok(path)
@@ -390,6 +393,6 @@ mod tests {
             .find(|d| d.id == POSTGRES_INTEGRATION)
             .unwrap();
         assert_eq!(postgres.entitlement, POSTGRES_ENTITLEMENT);
-        assert!(!postgres.compiled);
+        assert_eq!(postgres.compiled, cfg!(feature = "postgres-collector"));
     }
 }

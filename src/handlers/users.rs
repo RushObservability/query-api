@@ -161,9 +161,13 @@ pub async fn create_user(
         })?;
 
     // New users default to the viewers group
-    let _ = state
+    if let Err(error) = state
         .config_db
-        .set_user_groups(&id, &["viewers".to_string()]);
+        .set_user_groups(&id, &["viewers".to_string()])
+        .await
+    {
+        tracing::error!(user_id = %id, %error, "failed to assign default user group");
+    }
 
     let row = state
         .config_db
