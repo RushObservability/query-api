@@ -150,15 +150,15 @@ pub async fn usage_summary(
          GROUP BY signal"
     );
 
-    let rows = state
-        .ch
-        .query(&sql)
-        .fetch_all::<SignalUsageRow>()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, handler = "usage_summary", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-        })?;
+    let query = if is_global {
+        state.admin_ch.query(&sql)
+    } else {
+        crate::tenant_query(&state.ch, &sql, tenant_id)
+    };
+    let rows = query.fetch_all::<SignalUsageRow>().await.map_err(|e| {
+        tracing::error!(error = %e, handler = "usage_summary", "query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
 
     let mut signals = HashMap::new();
     let mut total_events = 0u64;
@@ -232,9 +232,7 @@ pub async fn usage_breakdown(
 
     sql.push_str(&format!(" GROUP BY ts, signal ORDER BY ts"));
 
-    let rows = state
-        .ch
-        .query(&sql)
+    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<BreakdownRow>()
         .await
         .map_err(|e| {
@@ -299,7 +297,7 @@ pub async fn usage_tenants(
     );
 
     let rows = state
-        .ch
+        .admin_ch
         .query(&sql)
         .fetch_all::<TenantSignalRow>()
         .await

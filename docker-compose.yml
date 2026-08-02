@@ -27,6 +27,9 @@ services:
       - CLICKHOUSE_DATABASE=observability
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
+      # Local single-tenant compatibility only. Production must configure the
+      # distinct CLICKHOUSE_READ_* principal and verified row policies.
+      - RUSH_ALLOW_INSECURE_TENANT_READS=true
       - RUST_LOG=rush_api=info,tower_http=info
       # jemalloc tuning: run a background thread that returns freed pages to the
       # OS within a few seconds (dirty/muzzy decay), keeping steady-state RSS low.

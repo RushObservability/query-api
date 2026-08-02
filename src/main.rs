@@ -7,7 +7,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use axum::http::{HeaderValue, header};
 use axum::response::IntoResponse;
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{extract::ConnectInfo, extract::Request, middleware::Next, response::Response};
 use clickhouse::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,6 +43,52 @@ use rush_api::usage_tracker;
 struct TenantResolution {
     tenant_id: String,
     authenticated: bool,
+    credential: CredentialKind,
+    api_key: Option<rush_api::clickhouse_config::ApiKeyGrant>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CredentialKind {
+    Anonymous,
+    Session,
+    QueryKey,
+    IngestKey,
+}
+
+impl TenantResolution {
+    fn anonymous(tenant_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            authenticated: false,
+            credential: CredentialKind::Anonymous,
+            api_key: None,
+        }
+    }
+
+    fn session(tenant_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            authenticated: true,
+            credential: CredentialKind::Session,
+            api_key: None,
+        }
+    }
+
+    fn api_key(grant: rush_api::clickhouse_config::ApiKeyGrant) -> Self {
+        let credential = if grant.key_type == "ingest" {
+            CredentialKind::IngestKey
+        } else {
+            // Existing pre-QAPI-SEC-04 keys are deliberately query-only. They
+            // must be replaced before collectors can ingest again.
+            CredentialKind::QueryKey
+        };
+        Self {
+            tenant_id: grant.tenant_id.clone(),
+            authenticated: true,
+            credential,
+            api_key: Some(grant),
+        }
+    }
 }
 
 /// Middleware that adds security response headers to every response.
@@ -95,7 +141,7 @@ async fn http_metrics_middleware(
         .unwrap_or_else(|| "unmatched".to_string());
 
     // Skip self-instrumentation for the scrape + health endpoints.
-    if route == "/metrics" || route == "/healthz" {
+    if route == "/metrics" || route == "/healthz" || route == "/readyz" {
         return next.run(req).await;
     }
 
@@ -158,8 +204,8 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
 /// 2. `rush_session` cookie — resolves a session to its user, then uses
 ///    the user's tenant_id.
 /// 3. `X-Rush-Tenant: <tenant_name_or_id>` header OR a `/t/{tenant}/…` URL
-///    prefix — selects the tenant by name/id. Subject to the same lock rules
-///    (a tenant with auth_required still needs a Bearer key or session). The
+///    prefix — selects the tenant by name/id. Query and ingest routes then
+///    enforce their independent tenant authentication policies. The
 ///    URL form lets external tools (e.g. Grafana datasources) carry the tenant
 ///    in the base URL; the header takes precedence when both are present.
 /// 4. Fall back to the `"default"` tenant (backward compatible).
@@ -189,6 +235,11 @@ async fn tenant_middleware(
             }
         }
     }
+    // Agent-specific path forms keep their route intact but still participate
+    // in the same tenant resolution and key/tenant equality checks.
+    if url_tenant.is_none() {
+        url_tenant = explicit_ingest_tenant(req.uri().path());
+    }
 
     // Extract all header values we need before any await point so the
     // &Request (whose Body is not Send) is not held across awaits.
@@ -197,9 +248,10 @@ async fn tenant_middleware(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
-    let dd_key: Option<String> = req
+    let agent_key: Option<String> = req
         .headers()
         .get("dd-api-key")
+        .or_else(|| req.headers().get("x-amz-firehose-access-key"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
     // Header wins over the URL prefix when both are present.
@@ -212,12 +264,24 @@ async fn tenant_middleware(
     let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
 
     let resolution =
-        resolve_tenant_from_headers(&state, auth_header, dd_key, rush_tenant, session_token).await;
+        resolve_tenant_from_headers(&state, auth_header, agent_key, rush_tenant, session_token)
+            .await;
     req.extensions_mut().insert(TenantContext {
         tenant_id: resolution.tenant_id.clone(),
     });
     req.extensions_mut().insert(resolution);
     next.run(req).await
+}
+
+fn explicit_ingest_tenant(path: &str) -> Option<String> {
+    for prefix in ["/api/v2/logs/t/", "/cloudwatch/firehose/t/"] {
+        if let Some(tenant) = path.strip_prefix(prefix) {
+            if !tenant.is_empty() && !tenant.contains('/') {
+                return Some(tenant.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Routes that must remain reachable before a tenant-authenticated session
@@ -237,6 +301,7 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
     matches!(
         path,
         "/healthz"
+            | "/readyz"
             | "/metrics"
             | "/api/v1/auth/login"
             | "/api/v1/auth/logout"
@@ -257,7 +322,140 @@ fn should_reject_for_tenant_auth(
     auth_required && !authenticated && !allows_unauthenticated_tenant_request(method, path)
 }
 
-/// Enforce `auth_required` after tenant resolution but before the handler.
+fn ingest_signal_for_route(method: &axum::http::Method, path: &str) -> Option<&'static str> {
+    if *method == axum::http::Method::OPTIONS {
+        return None;
+    }
+    if matches!(
+        path,
+        "/v1/logs" | "/api/v1/ingest/logs" | "/datadog/v1/input" | "/api/v2/logs"
+    ) || path.starts_with("/api/v2/logs/t/")
+        || path.starts_with("/cloudwatch/firehose/t/")
+    {
+        return Some("logs");
+    }
+    if matches!(
+        path,
+        "/v1/traces" | "/datadog/api/v0.2/traces" | "/datadog/v0.3/traces" | "/datadog/v0.4/traces"
+    ) {
+        return Some("traces");
+    }
+    if matches!(
+        path,
+        "/v1/metrics"
+            | "/prom/api/v1/write"
+            | "/datadog/api/v1/series"
+            | "/datadog/api/v2/series"
+            | "/datadog/api/v1/check_run"
+    ) {
+        return Some("metrics");
+    }
+    if matches!(path, "/api/v1/rum/ingest" | "/api/v1/rum/replay/ingest") {
+        return Some("rum");
+    }
+    if matches!(
+        path,
+        "/datadog/api/v0.6/stats"
+            | "/datadog/api/v0.2/stats"
+            | "/datadog/api/v1/validate"
+            | "/datadog/api/v1/metadata"
+            | "/datadog/api/v2/host_metadata"
+            | "/datadog/api/v2/events"
+            | "/datadog/api/v1/collector"
+            | "/datadog/intake/"
+            | "/datadog/intake"
+    ) {
+        // Agent handshake/metadata routes do not ingest a telemetry signal,
+        // but are part of the authenticated ingest surface.
+        return Some("control");
+    }
+    None
+}
+
+fn consume_ingest_rate_limit(state: &AppState, key_id: &str, limit: u64) -> bool {
+    let now = std::time::Instant::now();
+    let mut entry = state
+        .ingest_key_limiter
+        .entry(key_id.to_string())
+        .or_insert((0, now));
+    if entry.1.elapsed() >= std::time::Duration::from_secs(60) {
+        *entry = (1, now);
+        return true;
+    }
+    if entry.0 >= limit {
+        return false;
+    }
+    entry.0 += 1;
+    true
+}
+
+fn credential_route_denial(
+    credential: &CredentialKind,
+    ingest_route: bool,
+    ingest_auth_required: bool,
+) -> Option<&'static str> {
+    if ingest_route {
+        match credential {
+            CredentialKind::IngestKey => None,
+            CredentialKind::Anonymous if !ingest_auth_required => None,
+            _ => Some("ingest_key_required"),
+        }
+    } else if *credential == CredentialKind::IngestKey {
+        Some("query_not_allowed")
+    } else {
+        None
+    }
+}
+
+async fn audit_api_key_denial(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    resolution: &TenantResolution,
+    reason: &str,
+    signal: Option<&str>,
+) {
+    let (action, actor_type) = match resolution.credential {
+        CredentialKind::QueryKey | CredentialKind::IngestKey => ("apikey.scope_denied", "api_key"),
+        CredentialKind::Session => ("ingest.auth_denied", "user"),
+        CredentialKind::Anonymous => ("ingest.auth_denied", "anonymous"),
+    };
+    let mut event = rush_api::audit::AuditEvent::new(action, actor_type)
+        .tenant(resolution.tenant_id.clone())
+        .outcome("failure")
+        .metadata(
+            serde_json::json!({
+                "reason": reason,
+                "signal": signal,
+                "credential_type": format!("{:?}", resolution.credential),
+            })
+            .to_string(),
+        )
+        .context(rush_api::audit::actor_context_from_headers(headers));
+    if let Some(grant) = &resolution.api_key {
+        event = event
+            .actor(grant.id.clone(), grant.id.clone())
+            .resource("api_key", grant.id.clone());
+    } else {
+        event = event.resource("tenant", resolution.tenant_id.clone());
+    }
+    state.audit.log(event).await;
+}
+
+async fn same_tenant(state: &AppState, key_tenant: &str, requested: &str) -> bool {
+    if key_tenant == requested {
+        return true;
+    }
+    match state.config_db.get_tenant_id_by_name(requested).await {
+        Ok(Some(id)) if id == key_tenant => true,
+        _ => matches!(
+            state.config_db.get_tenant_id_by_name(key_tenant).await,
+            Ok(Some(id)) if id == requested
+        ),
+    }
+}
+
+/// Enforce independent query and ingest authentication after tenant resolution
+/// but before the handler.
 ///
 /// This is an inner-router middleware so CORS, compression, security headers,
 /// request tracing, and metrics still wrap the 401 response. The outer
@@ -280,11 +478,11 @@ async fn enforce_tenant_auth_middleware(
         )
             .into_response();
     };
-    let authenticated = req
+    let resolution = req
         .extensions()
         .get::<TenantResolution>()
-        .map(|resolution| resolution.authenticated)
-        .unwrap_or(false);
+        .cloned()
+        .unwrap_or_else(|| TenantResolution::anonymous(&tenant_id));
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
@@ -294,7 +492,8 @@ async fn enforce_tenant_auth_middleware(
         return next.run(req).await;
     }
 
-    let auth_required = match state
+    let ingest_signal = ingest_signal_for_route(&method, &path);
+    let stored_auth_required = match state
         .config_db
         .tenant_auth_required_checked(&tenant_id)
         .await
@@ -317,13 +516,154 @@ async fn enforce_tenant_auth_middleware(
                 .into_response();
         }
     };
+    let default_compatibility =
+        tenant_id == "default" && rush_api::api_key_auth::allow_anonymous_default();
+    let auth_required = stored_auth_required && !default_compatibility;
+    let ingest_auth_required = if ingest_signal.is_some() {
+        match state
+            .config_db
+            .tenant_ingest_auth_required_checked(&tenant_id)
+            .await
+        {
+            Ok(Some(required)) => required && !default_compatibility,
+            Ok(None) => {
+                tracing::error!(tenant_id = %tenant_id, "resolved tenant has no ingest policy record");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "tenant ingest policy unavailable",
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(tenant_id = %tenant_id, %error, "tenant ingest auth policy lookup failed");
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "tenant ingest policy unavailable",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        true
+    };
+    let anonymous_ingest = ingest_signal.is_some()
+        && resolution.credential == CredentialKind::Anonymous
+        && !ingest_auth_required;
+    if let Some(reason) = credential_route_denial(
+        &resolution.credential,
+        ingest_signal.is_some(),
+        ingest_auth_required,
+    ) {
+        audit_api_key_denial(&state, req.headers(), &resolution, reason, ingest_signal).await;
+        let message = if reason == "query_not_allowed" {
+            "ingest-only API keys cannot access query or configuration routes"
+        } else {
+            "ingest-only API key required"
+        };
+        return (axum::http::StatusCode::FORBIDDEN, message).into_response();
+    }
 
-    if should_reject_for_tenant_auth(&method, &path, auth_required, authenticated) {
+    if let Some(signal) = ingest_signal {
+        if !anonymous_ingest {
+            let Some(grant) = resolution.api_key.as_ref() else {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "ingest-only API key required",
+                )
+                    .into_response();
+            };
+            if signal != "control" && !grant.signals.iter().any(|allowed| allowed == signal) {
+                audit_api_key_denial(
+                    &state,
+                    req.headers(),
+                    &resolution,
+                    "signal_not_allowed",
+                    Some(signal),
+                )
+                .await;
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "signal not allowed for API key",
+                )
+                    .into_response();
+            }
+            if let Some(requested_tenant) = explicit_ingest_tenant(&path) {
+                if !same_tenant(&state, &grant.tenant_id, &requested_tenant).await {
+                    audit_api_key_denial(
+                        &state,
+                        req.headers(),
+                        &resolution,
+                        "tenant_not_allowed",
+                        Some(signal),
+                    )
+                    .await;
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        "tenant not allowed for API key",
+                    )
+                        .into_response();
+                }
+            }
+            if !grant.source_cidrs.is_empty() {
+                let source_ip = req
+                    .extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|connect| connect.0.ip());
+                if !source_ip.is_some_and(|ip| {
+                    rush_api::api_key_auth::source_allowed(ip, &grant.source_cidrs)
+                }) {
+                    audit_api_key_denial(
+                        &state,
+                        req.headers(),
+                        &resolution,
+                        "source_not_allowed",
+                        Some(signal),
+                    )
+                    .await;
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        "source not allowed for API key",
+                    )
+                        .into_response();
+                }
+            }
+            if !consume_ingest_rate_limit(&state, &grant.id, grant.rate_limit_per_minute) {
+                audit_api_key_denial(
+                    &state,
+                    req.headers(),
+                    &resolution,
+                    "rate_limit_exceeded",
+                    Some(signal),
+                )
+                .await;
+                return (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "ingest API key rate limit exceeded",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if ingest_signal.is_none()
+        && should_reject_for_tenant_auth(&method, &path, auth_required, resolution.authenticated)
+    {
         tracing::warn!(
             tenant_id = %tenant_id,
             path = %path,
             "unauthenticated request rejected for locked tenant"
         );
+        state
+            .audit
+            .log(
+                rush_api::audit::AuditEvent::new("tenant.auth_denied", "anonymous")
+                    .tenant(tenant_id.clone())
+                    .resource("tenant", tenant_id.clone())
+                    .outcome("failure")
+                    .metadata(serde_json::json!({ "path": path }).to_string())
+                    .context(rush_api::audit::actor_context_from_headers(req.headers())),
+            )
+            .await;
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             "authentication required for tenant",
@@ -353,12 +693,36 @@ async fn resolve_tenant_from_headers(
         .tenant_id
         .eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT)
     {
-        return TenantResolution {
-            tenant_id: "default".to_string(),
-            authenticated: false,
-        };
+        return TenantResolution::anonymous("default");
     }
     resolved
+}
+
+async fn resolve_api_key_credential(state: &AppState, key: &str) -> Option<TenantResolution> {
+    if key.is_empty() {
+        return None;
+    }
+    let key_hash = handlers::settings::hash_api_key(key);
+    if let Some(entry) = state.api_key_cache.get(&key_hash) {
+        let (grant, cached_at) = entry.value();
+        if cached_at.elapsed() < std::time::Duration::from_secs(60) {
+            return Some(TenantResolution::api_key(grant.clone()));
+        }
+    }
+
+    match state.config_db.resolve_api_key(&key_hash).await {
+        Ok(Some(grant)) => {
+            state
+                .api_key_cache
+                .insert(key_hash, (grant.clone(), std::time::Instant::now()));
+            Some(TenantResolution::api_key(grant))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, "API key resolution failed");
+            None
+        }
+    }
 }
 
 async fn resolve_tenant_inner(
@@ -373,39 +737,10 @@ async fn resolve_tenant_inner(
     if let Some(val) = auth_header {
         if val.len() > 7 && val[..7].eq_ignore_ascii_case("bearer ") {
             let key = val[7..].trim();
-            let key_hash = handlers::settings::hash_api_key(key);
-
-            // Fast path: check in-memory cache (TTL 60s) before hitting ClickHouse
-            if let Some(entry) = state.api_key_cache.get(&key_hash) {
-                let (tid, ts) = entry.value();
-                if ts.elapsed() < std::time::Duration::from_secs(60) {
-                    return TenantResolution {
-                        tenant_id: tid.clone(),
-                        authenticated: true,
-                    };
-                }
+            if let Some(resolution) = resolve_api_key_credential(state, key).await {
+                return resolution;
             }
-
-            match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
-                Ok(Some(tid)) => {
-                    state
-                        .api_key_cache
-                        .insert(key_hash, (tid.clone(), std::time::Instant::now()));
-                    return TenantResolution {
-                        tenant_id: tid,
-                        authenticated: true,
-                    };
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        method = "api_key",
-                        "tenant resolution: key not found, falling through"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, method = "api_key", "tenant resolution failed");
-                }
-            }
+            tracing::debug!(method = "api_key", "API key not found");
         }
     }
 
@@ -415,39 +750,10 @@ async fn resolve_tenant_inner(
     if let Some(dd_key_val) = dd_key {
         let key = dd_key_val.trim();
         if !key.is_empty() {
-            let key_hash = handlers::settings::hash_api_key(key);
-
-            // Fast path: check in-memory cache (TTL 60s) before hitting ClickHouse
-            if let Some(entry) = state.api_key_cache.get(&key_hash) {
-                let (tid, ts) = entry.value();
-                if ts.elapsed() < std::time::Duration::from_secs(60) {
-                    return TenantResolution {
-                        tenant_id: tid.clone(),
-                        authenticated: true,
-                    };
-                }
+            if let Some(resolution) = resolve_api_key_credential(state, key).await {
+                return resolution;
             }
-
-            match state.config_db.resolve_tenant_for_api_key(&key_hash).await {
-                Ok(Some(tid)) => {
-                    state
-                        .api_key_cache
-                        .insert(key_hash, (tid.clone(), std::time::Instant::now()));
-                    return TenantResolution {
-                        tenant_id: tid,
-                        authenticated: true,
-                    };
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        method = "dd_api_key",
-                        "tenant resolution: DD key not found, falling through"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, method = "dd_api_key", "tenant resolution failed");
-                }
-            }
+            tracing::debug!(method = "agent_api_key", "API key not found");
         }
     }
 
@@ -484,10 +790,7 @@ async fn resolve_tenant_inner(
                     {
                         if role == "admin" {
                             // Admins can access any enabled tenant
-                            return TenantResolution {
-                                tenant_id: tenant,
-                                authenticated: true,
-                            };
+                            return TenantResolution::session(tenant);
                         }
                         // Non-admins: resolve accessible tenant IDs and check
                         if let Ok((_, _, accessible_ids)) =
@@ -499,10 +802,7 @@ async fn resolve_tenant_inner(
                                 state.config_db.get_tenant_id_by_name(&tenant).await
                             {
                                 if accessible_ids.contains(&tenant_id) {
-                                    return TenantResolution {
-                                        tenant_id: tenant,
-                                        authenticated: true,
-                                    };
+                                    return TenantResolution::session(tenant);
                                 }
                             }
                         }
@@ -512,12 +812,16 @@ async fn resolve_tenant_inner(
                         );
                         // Fall through to session default tenant
                     }
-                } else if !state.config_db.is_tenant_auth_required(&tenant).await {
-                    // No session + open tenant: header is enough (for collectors)
-                    return TenantResolution {
-                        tenant_id: tenant,
-                        authenticated: false,
-                    };
+                } else if !state.config_db.is_tenant_auth_required(&tenant).await
+                    || !state
+                        .config_db
+                        .is_tenant_ingest_auth_required(&tenant)
+                        .await
+                {
+                    // An anonymous header may select a tenant that has either
+                    // open queries or open ingestion. The route-specific inner
+                    // policy still rejects access to the other surface.
+                    return TenantResolution::anonymous(tenant);
                 } else {
                     tracing::debug!(
                         tenant_id = %tenant,
@@ -538,18 +842,12 @@ async fn resolve_tenant_inner(
         if let Some((_user_id, _username, _display_name, tenant_id, _role)) =
             state.config_db.get_session_user(&token).await
         {
-            return TenantResolution {
-                tenant_id,
-                authenticated: true,
-            };
+            return TenantResolution::session(tenant_id);
         }
     }
 
     // ── Priority 4: default ──
-    TenantResolution {
-        tenant_id: "default".to_string(),
-        authenticated: false,
-    }
+    TenantResolution::anonymous("default")
 }
 
 use axum::extract::State;
@@ -638,7 +936,7 @@ async fn main() -> anyhow::Result<()> {
         wide_config.clone(),
     );
 
-    let ch = Client::default()
+    let admin_ch = Client::default()
         .with_url(&clickhouse_url)
         .with_database(&clickhouse_db)
         .with_user(&clickhouse_user)
@@ -659,17 +957,102 @@ async fn main() -> anyhow::Result<()> {
         .with_option("wait_for_async_insert", "0")
         .with_compression(clickhouse::Compression::Lz4);
 
-    // Check if ClickHouse supports the rush_tenant_id custom setting for row policy enforcement.
-    // If not (no custom_settings_prefixes configured), row policies are NOT created (they would
-    // break all queries). The API-layer WHERE clause is still the primary enforcement.
-    rush_api::probe_row_policy_support(&ch).await;
-    if rush_api::row_policy_supported() {
-        migrations::apply_row_policies(&ch).await;
+    // Tenant reads use a distinct SELECT-only principal. Startup is fail-closed:
+    // custom-setting support, every strict policy, and read-principal behavior
+    // must verify before HTTP traffic is accepted. Local development may opt in
+    // to the visibly insecure compatibility mode explicitly.
+    let insecure_tenant_reads = std::env::var("RUSH_ALLOW_INSECURE_TENANT_READS")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            )
+        })
+        .unwrap_or(false);
+    let read_user = std::env::var("CLICKHOUSE_READ_USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let read_password = std::env::var("CLICKHOUSE_READ_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+
+    let mut ch = match (&read_user, &read_password) {
+        (Some(user), Some(password)) => Client::default()
+            .with_url(&clickhouse_url)
+            .with_database(&clickhouse_db)
+            .with_user(user)
+            .with_password(password)
+            .with_option("max_execution_time", "30")
+            .with_compression(clickhouse::Compression::Lz4),
+        _ if insecure_tenant_reads => admin_ch.clone(),
+        _ => anyhow::bail!(
+            "CLICKHOUSE_READ_USER and CLICKHOUSE_READ_PASSWORD are required; \
+             local development may explicitly set RUSH_ALLOW_INSECURE_TENANT_READS=true"
+        ),
+    };
+
+    let isolation_result = async {
+        let user = read_user
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("tenant read principal is not configured"))?;
+        if user == clickhouse_user {
+            anyhow::bail!("CLICKHOUSE_READ_USER must differ from CLICKHOUSE_USER");
+        }
+        rush_api::probe_row_policy_support(&admin_ch).await?;
+        migrations::apply_row_policies(&admin_ch, user).await?;
+        migrations::verify_row_policies(&admin_ch, &ch, user).await?;
+        anyhow::Ok(())
+    }
+    .await;
+
+    match isolation_result {
+        Ok(()) => {
+            rush_api::mark_row_policy_enforced();
+            tracing::info!(
+                read_user = read_user.as_deref().unwrap_or(""),
+                "ClickHouse tenant row policies verified and enforcing"
+            );
+        }
+        Err(error) if insecure_tenant_reads => {
+            ch = admin_ch.clone();
+            rush_api::mark_insecure_tenant_read_override();
+            tracing::error!(
+                error = %error,
+                "INSECURE DEVELOPMENT OVERRIDE: tenant row policies are not enforced"
+            );
+        }
+        Err(error) => return Err(error.context("ClickHouse tenant-isolation verification failed")),
     }
 
     let config_db =
         Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
-    config_db.ensure_default_tenant().await?;
+    // Build the audit chain before bootstrap tenant mutation so a newly seeded
+    // default tenant is recorded like every other tenant creation.
+    let audit = std::sync::Arc::new(rush_api::audit::AuditLogger::new(admin_ch.clone()).await);
+    let default_tenant_created = config_db.ensure_default_tenant().await?;
+    if default_tenant_created {
+        let auth_required = rush_api::api_key_auth::default_tenant_auth_required(
+            rush_api::api_key_auth::allow_anonymous_default(),
+        );
+        audit
+            .log(
+                rush_api::audit::AuditEvent::new("tenant.create", "system")
+                    .tenant("default")
+                    .resource("tenant", "default")
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "name": "default",
+                            "enabled": true,
+                            "auth_required": auth_required,
+                            "ingest_auth_required": auth_required,
+                        })
+                        .to_string(),
+                    )
+                    .description("default tenant created during bootstrap"),
+            )
+            .await;
+    }
     // Reserve the `_audit` tenant (seeded disabled) so it's never an ingest target.
     config_db.ensure_audit_tenant().await?;
     // Seed the UI/tenant global-retention store from rushConfig.retention.defaults
@@ -690,6 +1073,33 @@ async fn main() -> anyhow::Result<()> {
     config_db.ensure_default_admin().await?;
     config_db.ensure_default_groups().await?;
     config_db.ensure_default_templates().await?;
+    let tenants = config_db.list_tenants().await?;
+    let anonymous_query_tenants = tenants
+        .iter()
+        .filter(|(_, _, enabled, auth_required, _)| *enabled && !*auth_required)
+        .map(|(_, name, _, _, _)| name.clone())
+        .collect::<Vec<_>>();
+    let mut anonymous_ingest_tenants = Vec::new();
+    for (id, name, enabled, _, _) in &tenants {
+        if *enabled
+            && !config_db
+                .tenant_ingest_auth_required_checked(id)
+                .await?
+                .unwrap_or(true)
+        {
+            anonymous_ingest_tenants.push(name.clone());
+        }
+    }
+    if !anonymous_query_tenants.is_empty() || !anonymous_ingest_tenants.is_empty() {
+        tracing::warn!(
+            query_tenants = ?anonymous_query_tenants,
+            ingest_tenants = ?anonymous_ingest_tenants,
+            "enabled tenants intentionally permit anonymous access; review tenant authentication settings"
+        );
+    }
+    if rush_api::api_key_auth::allow_anonymous_default() {
+        tracing::warn!("INSECURE DEVELOPMENT OVERRIDE: RUSH_ALLOW_ANONYMOUS_DEFAULT is enabled");
+    }
     tracing::info!("config db opened");
 
     // SMTP config for email notifications (optional)
@@ -741,7 +1151,12 @@ async fn main() -> anyhow::Result<()> {
         // notification infrastructure (SmtpConfig, send_channel_notification) that
         // Monitors and the anomaly engine use; the rule-evaluation loop no longer runs.
         if engine_enabled("RUSH_RUN_SLO_ENGINE") {
-            slo_engine::spawn_slo_engine(config_db.clone(), ch.clone(), self_metrics.clone());
+            slo_engine::spawn_slo_engine(
+                config_db.clone(),
+                ch.clone(),
+                admin_ch.clone(),
+                self_metrics.clone(),
+            );
         } else {
             tracing::info!(
                 "in-process slo engine disabled (RUSH_RUN_SLO_ENGINE=false); expecting a dedicated slo-engine deployment"
@@ -765,6 +1180,7 @@ async fn main() -> anyhow::Result<()> {
             anomaly_engine::spawn_anomaly_engine(
                 config_db.clone(),
                 ch.clone(),
+                admin_ch.clone(),
                 smtp_config.clone(),
                 prom_base_url,
                 self_metrics.clone(),
@@ -775,7 +1191,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         retention_enforcer::spawn_retention_enforcer(
-            ch.clone(),
+            admin_ch.clone(),
             wide_config.clone(),
             config_db.clone(),
             self_metrics.clone(),
@@ -836,7 +1252,7 @@ async fn main() -> anyhow::Result<()> {
             Spool::open(&spool_dir, spool_max_bytes).expect("failed to open spool directory");
         std::sync::Arc::new(IngestBuffer::Disk(spool))
     };
-    let writer = ChWriter::new(ch.clone(), buffer);
+    let writer = ChWriter::new(admin_ch.clone(), buffer);
     if drain_only || run_replayer {
         writer.clone().spawn_replayer();
     }
@@ -854,7 +1270,11 @@ async fn main() -> anyhow::Result<()> {
     }
     // Stats engine (emits ingest-buffer depth/age/drain metrics). API process only.
     if !drain_only {
-        stats_engine::spawn_stats_engine(ch.clone(), writer.buffer.clone(), self_metrics.clone());
+        stats_engine::spawn_stats_engine(
+            admin_ch.clone(),
+            writer.buffer.clone(),
+            self_metrics.clone(),
+        );
     }
 
     // Drain-worker-only: this process exists solely to drain the ingest buffer
@@ -891,11 +1311,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Spawn usage tracker (fire-and-forget signal usage tracking)
-    let usage = usage_tracker::spawn(ch.clone());
+    let usage = usage_tracker::spawn(admin_ch.clone());
 
     // Spawn usage accumulator (per-tenant ingest metering)
     let usage_accumulator = UsageAccumulator::new();
-    usage_accumulator.spawn_flusher(ch.clone());
+    usage_accumulator.spawn_flusher(admin_ch.clone());
 
     let login_limiter: std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant)>> =
         std::sync::Arc::new(dashmap::DashMap::new());
@@ -919,7 +1339,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let api_key_cache: std::sync::Arc<dashmap::DashMap<String, (String, std::time::Instant)>> =
+    let api_key_cache: std::sync::Arc<
+        dashmap::DashMap<String, (rush_api::clickhouse_config::ApiKeyGrant, std::time::Instant)>,
+    > = std::sync::Arc::new(dashmap::DashMap::new());
+    let ingest_key_limiter: std::sync::Arc<dashmap::DashMap<String, (u64, std::time::Instant)>> =
         std::sync::Arc::new(dashmap::DashMap::new());
 
     // Spawn background task to evict expired API key cache entries (TTL 60s)
@@ -941,6 +1364,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    {
+        let limiter = ingest_key_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                limiter.retain(|_, (_, started)| {
+                    started.elapsed() < std::time::Duration::from_secs(60)
+                });
+            }
+        });
+    }
+
     // Spawn background task to proactively evict stale suggest cache entries.
     // Without this, entries queried once but never again persist forever.
     tokio::spawn(async move {
@@ -956,11 +1392,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Tamper-evident audit logger. Built after migrations (the audit_events
-    // table exists) and after the `ch` client is constructed; loads the current
-    // hash-chain tail so a restart continues the same chain.
-    let audit = std::sync::Arc::new(rush_api::audit::AuditLogger::new(ch.clone()).await);
-
     // API-managed integration collector supervisor. It is opt-in and feature
     // gated so the community binary never launches paid collectors.
     let collectors = std::sync::Arc::new(rush_api::integrations::CollectorManager::new(
@@ -970,6 +1401,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         ch,
+        admin_ch,
         writer,
         config_db,
         usage,
@@ -977,6 +1409,7 @@ async fn main() -> anyhow::Result<()> {
         config: wide_config,
         login_limiter,
         api_key_cache,
+        ingest_key_limiter,
         audit,
         self_metrics,
         collectors,
@@ -1344,6 +1777,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/tenants/{id}/auth",
             put(handlers::tenants::set_auth_required),
         )
+        .route(
+            "/api/v1/tenants/{id}/ingest-auth",
+            put(handlers::tenants::set_ingest_auth_required),
+        )
         // Per-tenant ingest signal enable/disable (logs / apm / metrics / rum)
         .route(
             "/api/v1/tenants/{id}/signals",
@@ -1471,9 +1908,8 @@ async fn main() -> anyhow::Result<()> {
         // Vector JSON logs
         .route("/api/v1/ingest/logs", post(handlers::otlp::ingest_vector_logs))
         // ═══ AWS CloudWatch Logs Ingestion (Kinesis Data Firehose HTTP endpoint) ═══
-        // Tenant comes from the URL path; an access key is optional (the customer
-        // may set one on the Firehose stream for defense-in-depth, but it is not
-        // required and is not used for tenant routing).
+        // Tenant comes from the URL path and must match the scoped ingest key
+        // supplied in X-Amz-Firehose-Access-Key or Authorization: Bearer.
         .route("/cloudwatch/firehose/t/{tenant}", post(handlers::cloudwatch::ingest_firehose_with_tenant))
         // Trace stats from agent trace writer
         .route("/datadog/api/v0.6/stats", any(handlers::dd_common::stub_ok))
@@ -1530,6 +1966,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/audit/verify", get(handlers::audit::verify_audit))
         // Health
         .route("/healthz", get(handlers::health::healthz))
+        .route("/readyz", get(handlers::health::readyz))
         // System-health self-metrics (Prometheus exposition). OPEN — no auth, like /healthz.
         .route("/metrics", get(metrics_handler))
         // Catch-all for unmatched DD agent paths (debug logging)
@@ -1682,9 +2119,12 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown: on SIGINT/SIGTERM, stop accepting new connections, let
     // in-flight requests finish, then flush any buffered ingest rows so the
     // cross-request batcher never drops in-memory rows on a clean shutdown.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     tracing::info!("graceful shutdown: flushing buffered ingest batches");
     shutdown_writer.flush_all().await;
 
@@ -1717,8 +2157,42 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tenant_auth_tests {
-    use super::{allows_unauthenticated_tenant_request, should_reject_for_tenant_auth};
+    use super::{
+        CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
+        credential_route_denial, explicit_ingest_tenant, ingest_signal_for_route,
+        should_reject_for_tenant_auth,
+    };
     use axum::http::Method;
+    use rush_api::clickhouse_config::ApiKeyGrant;
+
+    const INGEST_ROUTES: &[(&str, &str)] = &[
+        ("/v1/logs", "logs"),
+        ("/api/v1/ingest/logs", "logs"),
+        ("/datadog/v1/input", "logs"),
+        ("/api/v2/logs", "logs"),
+        ("/api/v2/logs/t/acme", "logs"),
+        ("/cloudwatch/firehose/t/acme", "logs"),
+        ("/v1/traces", "traces"),
+        ("/datadog/api/v0.2/traces", "traces"),
+        ("/datadog/v0.3/traces", "traces"),
+        ("/datadog/v0.4/traces", "traces"),
+        ("/v1/metrics", "metrics"),
+        ("/prom/api/v1/write", "metrics"),
+        ("/datadog/api/v1/series", "metrics"),
+        ("/datadog/api/v2/series", "metrics"),
+        ("/datadog/api/v1/check_run", "metrics"),
+        ("/api/v1/rum/ingest", "rum"),
+        ("/api/v1/rum/replay/ingest", "rum"),
+        ("/datadog/api/v0.6/stats", "control"),
+        ("/datadog/api/v0.2/stats", "control"),
+        ("/datadog/api/v1/validate", "control"),
+        ("/datadog/api/v1/metadata", "control"),
+        ("/datadog/api/v2/host_metadata", "control"),
+        ("/datadog/api/v2/events", "control"),
+        ("/datadog/api/v1/collector", "control"),
+        ("/datadog/intake/", "control"),
+        ("/datadog/intake", "control"),
+    ];
 
     #[test]
     fn locked_tenant_rejects_unauthenticated_data_requests() {
@@ -1768,6 +2242,7 @@ mod tenant_auth_tests {
             (Method::GET, "/auth/sso/metadata"),
             (Method::GET, "/api/v1/sso/setup-token/example/validate"),
             (Method::GET, "/healthz"),
+            (Method::GET, "/readyz"),
             (Method::GET, "/metrics"),
             (Method::OPTIONS, "/api/v1/query"),
         ] {
@@ -1791,5 +2266,129 @@ mod tenant_auth_tests {
         ] {
             assert!(!allows_unauthenticated_tenant_request(&Method::GET, path));
         }
+    }
+
+    #[test]
+    fn every_ingest_family_is_classified_by_signal() {
+        for &(path, signal) in INGEST_ROUTES {
+            assert_eq!(
+                ingest_signal_for_route(&Method::POST, path),
+                Some(signal),
+                "incorrect ingest signal for {path}"
+            );
+        }
+        assert_eq!(
+            ingest_signal_for_route(&Method::POST, "/api/v1/query"),
+            None
+        );
+        assert_eq!(
+            ingest_signal_for_route(&Method::GET, "/v1/logs"),
+            Some("logs")
+        );
+        assert_eq!(ingest_signal_for_route(&Method::OPTIONS, "/v1/logs"), None);
+    }
+
+    #[test]
+    fn tenant_in_ingest_path_is_explicit_and_unambiguous() {
+        assert_eq!(
+            explicit_ingest_tenant("/api/v2/logs/t/acme"),
+            Some("acme".to_string())
+        );
+        assert_eq!(
+            explicit_ingest_tenant("/cloudwatch/firehose/t/acme"),
+            Some("acme".to_string())
+        );
+        assert_eq!(explicit_ingest_tenant("/api/v2/logs/t/acme/extra"), None);
+    }
+
+    #[test]
+    fn only_explicit_ingest_keys_receive_ingest_credentials() {
+        let grant = |key_type: &str| ApiKeyGrant {
+            id: "key-id".to_string(),
+            tenant_id: "default".to_string(),
+            key_type: key_type.to_string(),
+            signals: vec!["logs".to_string()],
+            rate_limit_per_minute: 100,
+            source_cidrs: Vec::new(),
+        };
+        assert_eq!(
+            TenantResolution::api_key(grant("ingest")).credential,
+            CredentialKind::IngestKey
+        );
+        assert_eq!(
+            TenantResolution::api_key(grant("query")).credential,
+            CredentialKind::QueryKey
+        );
+        assert_eq!(
+            TenantResolution::api_key(grant("legacy")).credential,
+            CredentialKind::QueryKey
+        );
+    }
+
+    #[test]
+    fn auth_required_ingestion_rejects_anonymous_and_query_credentials() {
+        for &(path, _) in INGEST_ROUTES {
+            assert!(ingest_signal_for_route(&Method::POST, path).is_some());
+            for credential in [
+                CredentialKind::Anonymous,
+                CredentialKind::Session,
+                CredentialKind::QueryKey,
+            ] {
+                assert_eq!(
+                    credential_route_denial(&credential, true, true),
+                    Some("ingest_key_required"),
+                    "{credential:?} unexpectedly authorized for locked ingest route {path}"
+                );
+            }
+            assert_eq!(
+                credential_route_denial(&CredentialKind::IngestKey, true, true),
+                None,
+                "ingest key rejected for locked ingest route {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_auth_ingestion_accepts_anonymous_across_every_ingest_family() {
+        for &(path, _) in INGEST_ROUTES {
+            assert!(ingest_signal_for_route(&Method::POST, path).is_some());
+            assert_eq!(
+                credential_route_denial(&CredentialKind::Anonymous, true, false),
+                None,
+                "anonymous request rejected for open ingest route {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_auth_ingestion_does_not_grant_ingest_scope_to_other_credentials() {
+        for credential in [CredentialKind::Session, CredentialKind::QueryKey] {
+            assert_eq!(
+                credential_route_denial(&credential, true, false),
+                Some("ingest_key_required")
+            );
+        }
+        assert_eq!(
+            credential_route_denial(&CredentialKind::IngestKey, true, false),
+            None
+        );
+        assert_eq!(
+            credential_route_denial(&CredentialKind::IngestKey, false, false),
+            Some("query_not_allowed")
+        );
+    }
+
+    #[test]
+    fn open_ingestion_does_not_open_query_access() {
+        assert_eq!(
+            credential_route_denial(&CredentialKind::Anonymous, true, false),
+            None
+        );
+        assert!(should_reject_for_tenant_auth(
+            &Method::POST,
+            "/api/v1/query",
+            true,
+            false,
+        ));
     }
 }

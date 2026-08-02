@@ -1,9 +1,11 @@
 pub mod alert_engine;
 pub mod anomaly_engine;
+pub mod api_key_auth;
 pub mod audit;
 pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
+pub mod detection_query;
 pub mod eval_state;
 pub mod github_repository_policy;
 pub mod handlers;
@@ -49,9 +51,11 @@ pub struct TenantContext {
     pub tenant_id: String,
 }
 
-/// Tri-state flag for whether ClickHouse accepts the `rush_tenant_id` custom setting.
-/// 0 = untested, 1 = supported, 2 = not supported (graceful fallback).
-static ROW_POLICY_SUPPORTED: AtomicU8 = AtomicU8::new(0);
+/// Process-wide tenant-isolation state.
+///
+/// 0 = not initialized (fail closed), 1 = verified/enforcing,
+/// 2 = explicit insecure development override.
+static TENANT_ISOLATION_STATE: AtomicU8 = AtomicU8::new(0);
 
 /// Per-query ClickHouse memory guardrails, read once from the environment. These
 /// are ClickHouse *server* settings attached to every read via [`tenant_query`]:
@@ -99,9 +103,8 @@ fn query_guards() -> &'static QueryGuards {
     })
 }
 
-/// Probe ClickHouse once at startup to see if custom_settings_prefixes includes 'rush_'.
-/// If not, we skip injecting the per-query setting (row policies stay permissive).
-pub async fn probe_row_policy_support(ch: &Client) {
+/// Verify that ClickHouse accepts the custom setting used by the row policies.
+pub async fn probe_row_policy_support(ch: &Client) -> anyhow::Result<()> {
     #[derive(clickhouse::Row, serde::Deserialize)]
     #[allow(dead_code)]
     struct Probe {
@@ -112,32 +115,44 @@ pub async fn probe_row_policy_support(ch: &Client) {
         .with_option("rush_tenant_id", "probe")
         .fetch_one::<Probe>()
         .await;
-    match result {
-        Ok(_) => {
-            tracing::info!(
-                "ClickHouse accepts rush_tenant_id custom setting — row policies enforcing"
-            );
-            ROW_POLICY_SUPPORTED.store(1, Ordering::Relaxed);
-        }
-        Err(_) => {
-            tracing::warn!(
-                "ClickHouse does not accept rush_tenant_id custom setting — row policies permissive. \
-                 To enable, add custom_settings_prefixes='rush_' to your ClickHouse server config."
-            );
-            ROW_POLICY_SUPPORTED.store(2, Ordering::Relaxed);
-        }
+    result.map(|_| ()).map_err(|error| {
+        anyhow::anyhow!(
+            "ClickHouse rejected rush_tenant_id; configure custom_settings_prefixes='rush_': {error}"
+        )
+    })
+}
+
+/// Mark row-policy enforcement verified after both policy inspection and a
+/// tenant-scoped read-principal probe succeed.
+pub fn mark_row_policy_enforced() {
+    TENANT_ISOLATION_STATE.store(1, Ordering::SeqCst);
+}
+
+/// Enable the explicit development-only compatibility mode. Production Helm
+/// values never set this state.
+pub fn mark_insecure_tenant_read_override() {
+    TENANT_ISOLATION_STATE.store(2, Ordering::SeqCst);
+}
+
+/// Returns true only after row-policy behavior was verified at startup.
+pub fn row_policy_supported() -> bool {
+    TENANT_ISOLATION_STATE.load(Ordering::SeqCst) == 1
+}
+
+pub fn tenant_isolation_ready() -> bool {
+    matches!(TENANT_ISOLATION_STATE.load(Ordering::SeqCst), 1 | 2)
+}
+
+pub fn tenant_isolation_status() -> &'static str {
+    match TENANT_ISOLATION_STATE.load(Ordering::SeqCst) {
+        1 => "enforced",
+        2 => "insecure_development_override",
+        _ => "uninitialized",
     }
 }
 
-/// Returns true if ClickHouse supports the rush_tenant_id custom setting.
-pub fn row_policy_supported() -> bool {
-    ROW_POLICY_SUPPORTED.load(Ordering::Relaxed) == 1
-}
-
-/// Create a ClickHouse query, optionally with the `rush_tenant_id` setting for row policy
-/// enforcement. If ClickHouse doesn't support the custom setting (no `custom_settings_prefixes`
-/// configured), the query runs without it — the API-layer WHERE clause is still the primary
-/// tenant isolation mechanism.
+/// Create a ClickHouse query with the tenant setting used by ClickHouse row
+/// policies. The setting is omitted only in the explicit development override.
 pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
     // Read guardrails: cap result sets so a single pathological query (PromQL over a
     // huge range, export with a wide window, etc.) cannot stream unbounded rows into
@@ -171,16 +186,22 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
         Some(n) => q.with_option("max_threads", n.as_str()),
         None => q,
     };
-    if ROW_POLICY_SUPPORTED.load(Ordering::Relaxed) == 1 {
-        q.with_option("rush_tenant_id", tenant_id)
-    } else {
+    if TENANT_ISOLATION_STATE.load(Ordering::SeqCst) == 2 {
         q
+    } else {
+        // Uninitialized is intentionally fail closed: ClickHouse will reject
+        // this setting when support is absent instead of silently running an
+        // unscoped application query.
+        q.with_option("rush_tenant_id", tenant_id)
     }
 }
 
 #[derive(Clone)]
 pub struct AppState {
+    /// Tenant-scoped, SELECT-only ClickHouse client. All telemetry reads use it.
     pub ch: Client,
+    /// Privileged migration/write client. Never use this for tenant telemetry reads.
+    pub admin_ch: Client,
     /// Durable write path: inserts go through ChWriter which spools to disk on CH failure.
     pub writer: ChWriter,
     pub config_db: Arc<ConfigDb>,
@@ -190,7 +211,9 @@ pub struct AppState {
     /// Per-IP login attempt counter for rate limiting: (attempts, window_start).
     pub login_limiter: Arc<DashMap<String, (u32, Instant)>>,
     /// API key resolution cache: key_hash → (tenant_id, cached_at). TTL 60s.
-    pub api_key_cache: Arc<DashMap<String, (String, Instant)>>,
+    pub api_key_cache: Arc<DashMap<String, (clickhouse_config::ApiKeyGrant, Instant)>>,
+    /// Per ingest-key fixed-window request limiter: key id -> (count, window start).
+    pub ingest_key_limiter: Arc<DashMap<String, (u64, Instant)>>,
     /// Tamper-evident audit log writer (hash-chained, serialized). Shared.
     pub audit: Arc<audit::AuditLogger>,
     /// In-process system-health self-metrics registry. Updated on the HTTP hot path,

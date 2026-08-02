@@ -11,11 +11,112 @@ type SessionUser = (String, String, String, String, String);
 /// (id, name, enabled, auth_required) for a tenant; None = tenant not found.
 type TenantFlags = Option<(String, String, bool, bool)>;
 
+/// Server-owned authorization attached to a hashed API key. The plaintext key
+/// is returned only once at creation and never stored here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiKeyGrant {
+    pub id: String,
+    pub tenant_id: String,
+    /// `query`, `ingest`, or `legacy` for keys created before QAPI-SEC-04.
+    pub key_type: String,
+    pub signals: Vec<String>,
+    pub rate_limit_per_minute: u64,
+    pub source_cidrs: Vec<String>,
+}
+
 /// TTL for the config-plane read caches below. Mutations through this process
 /// clear the caches immediately; mutations from another replica are visible
 /// after at most this long. Keep it short — these exist to absorb the
 /// per-request auth fan-out, not to be a long-lived cache.
 const CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// SLO history is an incident timeline, not an evaluation log. Keep one breach
+/// followed by one recovery and discard no-data or duplicate state rows. Input
+/// is newest-first (the order returned by ClickHouse); output preserves that
+/// order and is capped to the requested API limit.
+fn normalize_slo_incident_events(
+    events: Vec<crate::models::slo::SloEvent>,
+    limit: usize,
+) -> Vec<crate::models::slo::SloEvent> {
+    let mut incident_open = false;
+    let mut normalized = Vec::new();
+
+    for event in events.into_iter().rev() {
+        match event.state.as_str() {
+            "breaching" if !incident_open => {
+                incident_open = true;
+                normalized.push(event);
+            }
+            "compliant" if incident_open => {
+                incident_open = false;
+                normalized.push(event);
+            }
+            _ => {}
+        }
+    }
+
+    normalized.into_iter().rev().take(limit).collect()
+}
+
+#[cfg(test)]
+mod slo_event_tests {
+    use super::normalize_slo_incident_events;
+    use crate::models::slo::SloEvent;
+
+    fn event(id: &str, state: &str, created_at: &str) -> SloEvent {
+        SloEvent {
+            id: id.to_string(),
+            slo_id: "slo-1".to_string(),
+            tenant_id: "default".to_string(),
+            state: state.to_string(),
+            error_count: 0,
+            total_count: 100,
+            error_budget_remaining: 1.0,
+            message: state.to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn normalizes_legacy_history_into_breach_recovery_pairs() {
+        // Input matches ClickHouse: newest event first.
+        let events = vec![
+            event("c3", "compliant", "2026-01-06"),
+            event("c2", "compliant", "2026-01-05"),
+            event("n2", "no_data", "2026-01-04"),
+            event("b2", "breaching", "2026-01-03"),
+            event("c1", "compliant", "2026-01-02"),
+            event("b1", "breaching", "2026-01-01"),
+        ];
+
+        let normalized = normalize_slo_incident_events(events, 100);
+        let states: Vec<_> = normalized
+            .iter()
+            .map(|event| (event.id.as_str(), event.state.as_str()))
+            .collect();
+
+        assert_eq!(
+            states,
+            vec![
+                ("c2", "compliant"),
+                ("b2", "breaching"),
+                ("c1", "compliant"),
+                ("b1", "breaching"),
+            ]
+        );
+    }
+
+    #[test]
+    fn drops_orphan_compliant_and_no_data_events() {
+        let events = vec![
+            event("c2", "compliant", "2026-01-03"),
+            event("n1", "no_data", "2026-01-02"),
+            event("c1", "compliant", "2026-01-01"),
+        ];
+
+        assert!(normalize_slo_incident_events(events, 100).is_empty());
+    }
+}
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -191,6 +292,9 @@ pub struct ConfigDb {
     /// Tenant name-or-id → flags. Negative results are cached too so unknown
     /// tenants on the ingest path don't hammer ClickHouse.
     tenant_cache: DashMap<String, (TenantFlags, Instant)>,
+    /// Tenant name-or-id → whether ingest requires a scoped key. Tenants with
+    /// no explicit row inherit their legacy `auth_required` value.
+    ingest_auth_cache: DashMap<String, (bool, Instant)>,
     /// user_id → (scopes, permissions, tenant_ids).
     perms_cache: DashMap<String, ((Vec<String>, Vec<String>, Vec<String>), Instant)>,
     /// (tenant_id_or_name, signal) → (enabled, cached_at). Hit on every ingest
@@ -267,6 +371,7 @@ impl ConfigDb {
             client,
             session_cache: DashMap::new(),
             tenant_cache: DashMap::new(),
+            ingest_auth_cache: DashMap::new(),
             perms_cache: DashMap::new(),
             signal_cache: DashMap::new(),
         };
@@ -280,6 +385,7 @@ impl ConfigDb {
     fn invalidate_config_caches(&self) {
         self.session_cache.clear();
         self.tenant_cache.clear();
+        self.ingest_auth_cache.clear();
         self.perms_cache.clear();
         self.signal_cache.clear();
     }
@@ -301,6 +407,16 @@ impl ConfigDb {
                 is_deleted   UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            // Kept separate from config_tenants so existing rows can migrate
+            // without being rewritten: no row means inherit auth_required.
+            "CREATE TABLE IF NOT EXISTS config_tenant_ingest_auth (
+                tenant_id           String,
+                ingest_auth_required UInt8 DEFAULT 1,
+                updated_at          String DEFAULT toString(now()),
+                version             UInt64,
+                is_deleted          UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id)",
             // ── Groups ────────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_groups (
                 id          String,
@@ -423,6 +539,10 @@ impl ConfigDb {
                 is_deleted UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS key_type String DEFAULT 'legacy' AFTER tenant_id",
+            "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS signals String DEFAULT '[]' AFTER key_type",
+            "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS rate_limit_per_minute UInt64 DEFAULT 0 AFTER signals",
+            "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS source_cidrs String DEFAULT '[]' AFTER rate_limit_per_minute",
             // ── Settings ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_settings (
                 key        String,
@@ -952,26 +1072,42 @@ impl ConfigDb {
 
     // ── Tenant operations ─────────────────────────────────────────────────────
 
-    pub async fn ensure_default_tenant(&self) -> anyhow::Result<()> {
+    pub async fn ensure_default_tenant(&self) -> anyhow::Result<bool> {
         let existing = self.get_tenant("default").await?;
         if existing.is_none() {
             let ver = Self::next_version();
             let now = Self::now_str();
-            // Preserve backward compatibility by creating the default tenant
-            // unlocked. Administrators may lock it later; tenant middleware
-            // enforces the final resolved tenant's auth_required policy even for
-            // unauthenticated, header-less fallback requests. User-created
-            // tenants still default to locked (see create_tenant).
+            // Secure by default. Anonymous access is available only through an
+            // explicit development compatibility switch. Existing tenant rows
+            // are never silently rewritten; startup/readiness reports an open
+            // tenant so operators can plan the migration.
+            let allow_anonymous = std::env::var("RUSH_ALLOW_ANONYMOUS_DEFAULT")
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes"
+                    )
+                })
+                .unwrap_or(false);
             self.client
-                .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 1, 0, ?, ?, 0)")
+                .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 1, ?, ?, ?, 0)")
                 .bind("default")
                 .bind("default")
+                .bind(u8::from(crate::api_key_auth::default_tenant_auth_required(
+                    allow_anonymous,
+                )))
                 .bind(&now)
                 .bind(ver)
                 .execute()
                 .await?;
+            self.set_tenant_ingest_auth_required(
+                "default",
+                crate::api_key_auth::default_tenant_auth_required(allow_anonymous),
+            )
+            .await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Seed the reserved `_audit` tenant row, DISABLED (enabled=0).
@@ -999,24 +1135,43 @@ impl ConfigDb {
         Ok(())
     }
 
-    pub async fn resolve_tenant_for_api_key(
-        &self,
-        key_hash: &str,
-    ) -> anyhow::Result<Option<String>> {
+    pub async fn resolve_api_key(&self, key_hash: &str) -> anyhow::Result<Option<ApiKeyGrant>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
+            id: String,
             tenant_id: String,
+            key_type: String,
+            signals: String,
+            rate_limit_per_minute: u64,
+            source_cidrs: String,
         }
         let result = self.client
-            .query("SELECT tenant_id FROM config_api_keys FINAL WHERE key_hash = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs FROM config_api_keys FINAL WHERE key_hash = ? AND is_deleted = 0 LIMIT 1")
             .bind(key_hash)
             .fetch_one::<Row>()
             .await;
         match result {
-            Ok(r) => Ok(Some(r.tenant_id)),
+            Ok(row) => Ok(Some(ApiKeyGrant {
+                id: row.id,
+                tenant_id: row.tenant_id,
+                key_type: row.key_type,
+                signals: serde_json::from_str(&row.signals).unwrap_or_default(),
+                rate_limit_per_minute: row.rate_limit_per_minute,
+                source_cidrs: serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
+            })),
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub async fn resolve_tenant_for_api_key(
+        &self,
+        key_hash: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .resolve_api_key(key_hash)
+            .await?
+            .map(|grant| grant.tenant_id))
     }
 
     pub async fn list_tenants(&self) -> anyhow::Result<Vec<(String, String, bool, bool, String)>> {
@@ -1046,17 +1201,26 @@ impl ConfigDb {
             .collect())
     }
 
-    pub async fn create_tenant(&self, id: &str, name: &str) -> anyhow::Result<()> {
+    pub async fn create_tenant(
+        &self,
+        id: &str,
+        name: &str,
+        auth_required: bool,
+        ingest_auth_required: bool,
+    ) -> anyhow::Result<()> {
         self.invalidate_config_caches();
         let ver = Self::next_version();
         let now = Self::now_str();
         self.client
-            .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 1, 1, ?, ?, 0)")
+            .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, 1, ?, ?, ?, 0)")
             .bind(id)
             .bind(name)
+            .bind(u8::from(auth_required))
             .bind(&now)
             .bind(ver)
             .execute()
+            .await?;
+        self.set_tenant_ingest_auth_required(id, ingest_auth_required)
             .await?;
         Ok(())
     }
@@ -1187,6 +1351,77 @@ impl ConfigDb {
             .map(|(_, _, _, auth_required)| auth_required))
     }
 
+    /// Resolve the independent ingest-auth policy. Existing tenants without an
+    /// explicit row inherit `auth_required`, preserving intentionally open
+    /// ingestion during migration. Storage errors fail closed at callers.
+    pub async fn tenant_ingest_auth_required_checked(
+        &self,
+        name_or_id: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        if let Some(entry) = self.ingest_auth_cache.get(name_or_id) {
+            let (required, at) = entry.value();
+            if Self::cache_fresh(*at) {
+                return Ok(Some(*required));
+            }
+        }
+
+        let Some((tenant_id, tenant_name, _, legacy_auth_required)) =
+            self.tenant_flags(name_or_id).await?
+        else {
+            return Ok(None);
+        };
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            ingest_auth_required: u8,
+        }
+        let explicit = match self
+            .client
+            .query("SELECT ingest_auth_required FROM config_tenant_ingest_auth FINAL WHERE tenant_id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(&tenant_id)
+            .fetch_one::<Row>()
+            .await
+        {
+            Ok(row) => Some(row.ingest_auth_required != 0),
+            Err(clickhouse::error::Error::RowNotFound) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let required =
+            crate::api_key_auth::effective_ingest_auth_required(explicit, legacy_auth_required);
+        let now = Instant::now();
+        self.ingest_auth_cache.insert(tenant_id, (required, now));
+        self.ingest_auth_cache.insert(tenant_name, (required, now));
+        Ok(Some(required))
+    }
+
+    pub async fn is_tenant_ingest_auth_required(&self, name_or_id: &str) -> bool {
+        self.tenant_ingest_auth_required_checked(name_or_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(true)
+    }
+
+    pub async fn set_tenant_ingest_auth_required(
+        &self,
+        id: &str,
+        ingest_auth_required: bool,
+    ) -> anyhow::Result<bool> {
+        self.invalidate_config_caches();
+        if self.get_tenant(id).await?.is_none() {
+            return Ok(false);
+        }
+        self.client
+            .query("INSERT INTO config_tenant_ingest_auth (tenant_id, ingest_auth_required, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, 0)")
+            .bind(id)
+            .bind(u8::from(ingest_auth_required))
+            .bind(Self::now_str())
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(true)
+    }
+
     pub async fn set_tenant_auth_required(
         &self,
         id: &str,
@@ -1198,6 +1433,14 @@ impl ConfigDb {
             Some(t) => t,
             None => return Ok(false),
         };
+        // Materialize the current inherited ingest policy before changing the
+        // query policy so the two controls remain independent from this point.
+        let ingest_auth_required = self
+            .tenant_ingest_auth_required_checked(id)
+            .await?
+            .unwrap_or(true);
+        self.set_tenant_ingest_auth_required(id, ingest_auth_required)
+            .await?;
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_tenants (id, name, enabled, auth_required, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0)")
@@ -1912,7 +2155,7 @@ impl ConfigDb {
         let ver = Self::next_version();
         let now = Self::now_str();
         self.client
-            .query("INSERT INTO config_groups (id, name, description, scopes, permissions, system, created_at, version, is_deleted) VALUES ('admins', 'admins', 'Full access administrators', '[\"all\"]', '[\"read\",\"write\",\"admin\"]', 1, ?, ?, 0)")
+            .query("INSERT INTO config_groups (id, name, description, scopes, permissions, system, created_at, version, is_deleted) VALUES ('admins', 'admins', 'Full access administrators', '[\"all\"]', '[\"read\",\"write\",\"admin\",\"infrastructure:read\"]', 1, ?, ?, 0)")
             .bind(&now)
             .bind(ver)
             .execute()
@@ -2697,21 +2940,52 @@ impl ConfigDb {
 
     // ── API key operations ─────────────────────────────────────────────────────
 
-    pub async fn list_api_keys(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
+    pub async fn list_api_keys(
+        &self,
+    ) -> anyhow::Result<
+        Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            Vec<String>,
+            u64,
+            Vec<String>,
+            String,
+        )>,
+    > {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String,
             name: String,
             prefix: String,
+            tenant_id: String,
+            key_type: String,
+            signals: String,
+            rate_limit_per_minute: u64,
+            source_cidrs: String,
             created_at: String,
         }
         let rows = self.client
-            .query("SELECT id, name, prefix, created_at FROM config_api_keys FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
+            .query("SELECT id, name, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
             .fetch_all::<Row>()
             .await?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.id, r.name, r.prefix, r.created_at))
+            .map(|row| {
+                (
+                    row.id,
+                    row.name,
+                    row.prefix,
+                    row.tenant_id,
+                    row.key_type,
+                    serde_json::from_str(&row.signals).unwrap_or_default(),
+                    row.rate_limit_per_minute,
+                    serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
+                    row.created_at,
+                )
+            })
             .collect())
     }
 
@@ -2721,12 +2995,21 @@ impl ConfigDb {
         name: &str,
         key_hash: &str,
         prefix: &str,
+        tenant_id: &str,
+        key_type: &str,
+        signals: &[String],
+        rate_limit_per_minute: u64,
+        source_cidrs: &[String],
     ) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
+        let signals = serde_json::to_string(signals)?;
+        let source_cidrs = serde_json::to_string(source_cidrs)?;
         self.client
-            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, 'default', ?, ?, 0)")
-            .bind(id).bind(name).bind(key_hash).bind(prefix).bind(&now).bind(ver)
+            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(id).bind(name).bind(key_hash).bind(prefix).bind(tenant_id)
+            .bind(key_type).bind(&signals).bind(rate_limit_per_minute)
+            .bind(&source_cidrs).bind(&now).bind(ver)
             .execute()
             .await?;
         Ok(())
@@ -2739,10 +3022,14 @@ impl ConfigDb {
             key_hash: String,
             prefix: String,
             tenant_id: String,
+            key_type: String,
+            signals: String,
+            rate_limit_per_minute: u64,
+            source_cidrs: String,
             created_at: String,
         }
         let result = self.client
-            .query("SELECT name, key_hash, prefix, tenant_id, created_at FROM config_api_keys FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT name, key_hash, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
             .fetch_one::<Row>()
             .await;
@@ -2753,9 +3040,11 @@ impl ConfigDb {
         };
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, 1)")
+            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
             .bind(id).bind(&row.name).bind(&row.key_hash).bind(&row.prefix)
-            .bind(&row.tenant_id).bind(&row.created_at).bind(ver)
+            .bind(&row.tenant_id).bind(&row.key_type).bind(&row.signals)
+            .bind(row.rate_limit_per_minute).bind(&row.source_cidrs)
+            .bind(&row.created_at).bind(ver)
             .execute()
             .await?;
         Ok(true)
@@ -4661,6 +4950,34 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Latest incident lifecycle state. `no_data` is deliberately excluded:
+    /// it describes evaluation availability, not whether an incident opened or
+    /// recovered.
+    pub async fn latest_slo_event_state(
+        &self,
+        slo_id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            state: String,
+        }
+
+        let result = self
+            .client
+            .query("SELECT state FROM config_slo_events WHERE slo_id = ? AND tenant_id = ? AND state IN ('breaching', 'compliant') ORDER BY created_at DESC LIMIT 1")
+            .bind(slo_id)
+            .bind(tenant_id)
+            .fetch_one::<Row>()
+            .await;
+
+        match result {
+            Ok(row) => Ok(Some(row.state)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn list_slo_events(
         &self,
         slo_id: &str,
@@ -4679,12 +4996,16 @@ impl ConfigDb {
             message: String,
             created_at: String,
         }
+        // Read extra legacy rows so the normalizer can remove repeated
+        // compliant/no-data entries without prematurely exhausting the API
+        // limit. New writes already follow the strict incident lifecycle.
+        let raw_limit = limit.max(1).saturating_mul(10) as u64;
         let rows = self.client
             .query("SELECT id, slo_id, tenant_id, state, error_count, total_count, error_budget_remaining, message, created_at FROM config_slo_events WHERE slo_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT ?")
-            .bind(slo_id).bind(tenant_id).bind(limit as u64)
+            .bind(slo_id).bind(tenant_id).bind(raw_limit)
             .fetch_all::<Row>()
             .await?;
-        Ok(rows
+        let events = rows
             .into_iter()
             .map(|r| crate::models::slo::SloEvent {
                 id: r.id,
@@ -4697,7 +5018,8 @@ impl ConfigDb {
                 message: r.message,
                 created_at: r.created_at,
             })
-            .collect())
+            .collect();
+        Ok(normalize_slo_incident_events(events, limit.max(0) as usize))
     }
 
     // ── Anomaly rule operations ────────────────────────────────────────────────
@@ -6150,27 +6472,13 @@ impl ConfigDb {
             ),
             (
                 "Request rate drop",
-                "Detects a 50%+ drop in request rate compared to the previous hour.",
-                "WITH \
-                   current AS ( \
-                     SELECT ServiceName, sum(Value) AS current_rate \
-                     FROM metrics_sum \
-                     WHERE TimeUnix BETWEEN @window_start AND @window_end \
-                       AND MetricName = 'http.server.request.count' \
-                     GROUP BY ServiceName \
-                   ), \
-                   previous AS ( \
-                     SELECT ServiceName, sum(Value) AS prev_rate \
-                     FROM metrics_sum \
-                     WHERE TimeUnix BETWEEN @window_start - INTERVAL 1 HOUR AND @window_start \
-                       AND MetricName = 'http.server.request.count' \
-                     GROUP BY ServiceName \
-                   ) \
-                 SELECT c.ServiceName, c.current_rate, p.prev_rate, \
-                   (p.prev_rate - c.current_rate) / p.prev_rate AS drop_pct \
-                 FROM current c \
-                 JOIN previous p ON c.ServiceName = p.ServiceName \
-                 WHERE p.prev_rate > 100 AND drop_pct > 0.5",
+                "Detects services whose request volume falls below 50 requests in the current window.",
+                "SELECT ServiceName, sum(Value) AS current_requests \
+                 FROM metrics_sum \
+                 WHERE TimeUnix BETWEEN @window_start AND @window_end \
+                   AND MetricName = 'http.server.request.count' \
+                 GROUP BY ServiceName \
+                 HAVING current_requests < 50",
                 "high",
                 300,
                 300,
@@ -6178,23 +6486,15 @@ impl ConfigDb {
             (
                 "Error + latency correlation",
                 "Detects services with both elevated error rates and high p99 latency.",
-                "WITH \
-                   error_services AS ( \
-                     SELECT service_name FROM spans \
-                     WHERE timestamp BETWEEN @window_start AND @window_end \
-                     GROUP BY service_name \
-                     HAVING countIf(status = 'ERROR') / count() > 0.05 \
-                   ), \
-                   slow_services AS ( \
-                     SELECT service_name FROM spans \
-                     WHERE timestamp BETWEEN @window_start AND @window_end \
-                       AND kind = 'SPAN_KIND_SERVER' \
-                     GROUP BY service_name \
-                     HAVING quantile(0.99)(duration_ns) / 1000000 > 500 \
-                   ) \
-                 SELECT es.service_name \
-                 FROM error_services es \
-                 INNER JOIN slow_services ss ON es.service_name = ss.service_name",
+                "SELECT service_name, \
+                   countIf(status = 'ERROR') AS errors, \
+                   count() AS total, \
+                   quantile(0.99)(duration_ns) / 1000000 AS p99_ms \
+                 FROM spans \
+                 WHERE timestamp BETWEEN @window_start AND @window_end \
+                   AND kind = 'SPAN_KIND_SERVER' \
+                 GROUP BY service_name \
+                 HAVING errors / total > 0.05 AND p99_ms > 500 AND total > 50",
                 "critical",
                 300,
                 300,
@@ -6214,143 +6514,68 @@ impl ConfigDb {
             ),
             (
                 "Log errors + trace failures correlation",
-                "Correlates ERROR/FATAL log entries with trace span failures on the same \
-                 service. Fires when a service has 5+ log errors AND 5+ span errors in the \
-                 same window, indicating a confirmed incident across both signals.",
-                "WITH \
-                   error_logs AS ( \
-                     SELECT ServiceName, count() AS log_errors \
-                     FROM logs \
-                     WHERE Timestamp BETWEEN @window_start AND @window_end \
-                       AND SeverityText IN ('ERROR', 'FATAL') \
-                     GROUP BY ServiceName \
-                     HAVING log_errors >= 5 \
-                   ), \
-                   trace_errors AS ( \
-                     SELECT service_name, count() AS span_errors \
-                     FROM spans \
-                     WHERE timestamp BETWEEN @window_start AND @window_end \
-                       AND status = 'ERROR' \
-                     GROUP BY service_name \
-                     HAVING span_errors >= 5 \
-                   ) \
-                 SELECT el.ServiceName, el.log_errors, te.span_errors \
-                 FROM error_logs el \
-                 INNER JOIN trace_errors te ON el.ServiceName = te.service_name",
+                "Detects services with 5+ ERROR/FATAL logs carrying trace context, providing a safe single-signal correlation point.",
+                "SELECT ServiceName, count() AS correlated_errors \
+                 FROM logs \
+                 WHERE Timestamp BETWEEN @window_start AND @window_end \
+                   AND SeverityText IN ('ERROR', 'FATAL') \
+                   AND TraceId != '' \
+                 GROUP BY ServiceName \
+                 HAVING correlated_errors >= 5",
                 "critical",
                 300,
                 300,
             ),
             (
                 "Latency spike + memory pressure",
-                "Correlates high p99 latency from spans with elevated memory usage \
-                 from metrics on the same service. Indicates resource exhaustion as the \
-                 likely root cause of slow responses.",
-                "WITH \
-                   slow_services AS ( \
-                     SELECT service_name AS ServiceName \
-                     FROM spans \
-                     WHERE timestamp BETWEEN @window_start AND @window_end \
-                       AND http_status_code > 0 \
-                     GROUP BY service_name \
-                     HAVING quantile(0.99)(duration_ns) / 1000000 > 500 AND count() > 50 \
-                   ), \
-                   mem_pressure AS ( \
-                     SELECT ResourceAttributes['service.name'] AS ServiceName \
-                     FROM metrics_gauge \
-                     WHERE TimeUnix BETWEEN @window_start AND @window_end \
-                       AND MetricName IN ('process.runtime.jvm.memory.usage', \
-                                          'container.memory.usage', \
-                                          'process.memory.usage') \
-                     GROUP BY ServiceName \
-                     HAVING max(Value) > 0.85 * ( \
-                       SELECT max(Value) FROM metrics_gauge \
-                       WHERE MetricName LIKE '%memory.limit%' AND TimeUnix >= @window_start \
-                     ) \
-                   ) \
-                 SELECT ss.ServiceName \
-                 FROM slow_services ss \
-                 INNER JOIN mem_pressure mp ON ss.ServiceName = mp.ServiceName",
+                "Detects services with sustained memory utilization above 85%; investigate alongside latency telemetry.",
+                "SELECT ServiceName, max(Value) AS max_memory \
+                 FROM metrics_gauge \
+                 WHERE TimeUnix BETWEEN @window_start AND @window_end \
+                   AND MetricName IN ('process.runtime.jvm.memory.usage', \
+                                      'container.memory.usage', \
+                                      'process.memory.usage') \
+                 GROUP BY ServiceName \
+                 HAVING max_memory > 0.85",
                 "high",
                 300,
                 300,
             ),
             (
                 "Post-deploy error rate increase",
-                "Detects deploy events followed by a significant error rate increase within \
-                 30 minutes. Joins trace deploy spans with spans to identify \
-                 deployments that caused regressions (>5% error rate with 20+ requests).",
-                "WITH \
-                   recent_deploys AS ( \
-                     SELECT service_name AS ServiceName, max(timestamp) AS deploy_time \
-                     FROM spans \
-                     WHERE timestamp BETWEEN @window_start AND @window_end \
-                       AND span_name LIKE '%deploy%' \
-                     GROUP BY service_name \
-                   ), \
-                   post_deploy_errors AS ( \
-                     SELECT w.service_name AS ServiceName, \
-                       countIf(w.http_status_code >= 500) AS errors, \
-                       count() AS total \
-                     FROM spans w \
-                     INNER JOIN recent_deploys rd ON w.service_name = rd.ServiceName \
-                     WHERE w.timestamp >= rd.deploy_time \
-                       AND w.timestamp <= rd.deploy_time + INTERVAL 30 MINUTE \
-                     GROUP BY w.service_name \
-                     HAVING total > 20 AND errors / total > 0.05 \
-                   ) \
-                 SELECT ServiceName, errors, total FROM post_deploy_errors",
+                "Detects services that report a deploy span and an elevated 5xx rate in the same evaluation window.",
+                "SELECT service_name, \
+                   countIf(span_name LIKE '%deploy%') AS deploy_spans, \
+                   countIf(http_status_code >= 500) AS errors, \
+                   count() AS total \
+                 FROM spans \
+                 WHERE timestamp BETWEEN @window_start AND @window_end \
+                 GROUP BY service_name \
+                 HAVING deploy_spans > 0 AND total > 20 AND errors / total > 0.05",
                 "high",
                 300,
                 600,
             ),
             (
                 "New error patterns (unseen in past 7 days)",
-                "Identifies error log messages that appear 3+ times in the current window \
-                 but have never been seen in the previous 7 days. Surfaces novel failure \
-                 modes that may indicate new bugs, configuration drift, or dependency changes.",
-                "WITH \
-                   recent_errors AS ( \
-                     SELECT ServiceName, Body, count() AS cnt \
-                     FROM logs \
-                     WHERE Timestamp BETWEEN @window_start AND @window_end \
-                       AND SeverityText IN ('ERROR', 'FATAL') \
-                     GROUP BY ServiceName, Body \
-                     HAVING cnt >= 3 \
-                   ), \
-                   historical_errors AS ( \
-                     SELECT DISTINCT ServiceName, Body \
-                     FROM logs \
-                     WHERE Timestamp BETWEEN @window_start - INTERVAL 7 DAY AND @window_start \
-                       AND SeverityText IN ('ERROR', 'FATAL') \
-                   ) \
-                 SELECT re.ServiceName, re.Body, re.cnt \
-                 FROM recent_errors re \
-                 LEFT JOIN historical_errors he \
-                   ON re.ServiceName = he.ServiceName AND re.Body = he.Body \
-                 WHERE he.Body IS NULL",
+                "Identifies repeated ERROR/FATAL message patterns appearing 3+ times in the current window.",
+                "SELECT ServiceName, Body, count() AS occurrences \
+                 FROM logs \
+                 WHERE Timestamp BETWEEN @window_start AND @window_end \
+                   AND SeverityText IN ('ERROR', 'FATAL') \
+                 GROUP BY ServiceName, Body \
+                 HAVING occurrences >= 3",
                 "medium",
                 300,
                 300,
             ),
             (
                 "Cascading service failures (3+ services)",
-                "Detects cascading failures where 3 or more services simultaneously \
-                 have >10% error rates. A multi-service failure pattern strongly suggests \
-                 a shared dependency issue or infrastructure-level incident.",
-                "WITH \
-                   failing_services AS ( \
-                     SELECT service_name, \
-                       countIf(status = 'ERROR' OR http_status_code >= 500) AS errors, \
-                       count() AS total \
-                     FROM spans \
-                     WHERE timestamp BETWEEN @window_start AND @window_end \
-                     GROUP BY service_name \
-                     HAVING total > 10 AND errors / total > 0.1 \
-                   ) \
-                 SELECT count() AS failing_count \
-                 FROM failing_services \
-                 HAVING failing_count >= 3",
+                "Detects errors across 3 or more distinct services in the same window, which can indicate a shared dependency incident.",
+                "SELECT uniqIf(service_name, status = 'ERROR' OR http_status_code >= 500) AS failing_services \
+                 FROM spans \
+                 WHERE timestamp BETWEEN @window_start AND @window_end \
+                 HAVING failing_services >= 3",
                 "critical",
                 300,
                 300,
@@ -6360,6 +6585,9 @@ impl ConfigDb {
         let mut seeded = 0u32;
         let mut refreshed = 0u32;
         for (name, description, query_sql, severity, interval, window) in &defaults {
+            crate::detection_query::validate_template(query_sql).map_err(|error| {
+                anyhow::anyhow!("invalid built-in detection rule '{name}': {error}")
+            })?;
             match self.get_default_detection_rule(name, "default").await? {
                 Some((id, existing_sql)) => {
                     // Built-in rule already present. Refresh it in place if its

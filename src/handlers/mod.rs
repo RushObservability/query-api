@@ -18,6 +18,7 @@ pub mod fluxcd;
 pub mod funnels;
 pub mod groups;
 pub mod health;
+pub(crate) mod infrastructure;
 pub mod ingest_buffer;
 pub mod ingest_gate;
 pub mod integrations;

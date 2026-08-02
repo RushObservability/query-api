@@ -607,7 +607,10 @@ pub async fn autocomplete(
                      WHERE tenant_id = '{tenant_id}' AND MetricName LIKE '{prefix}%' \
                      LIMIT 20"
                 );
-                match state.ch.query(&sql).fetch_all::<StringRow>().await {
+                match crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
+                    .fetch_all::<StringRow>()
+                    .await
+                {
                     Ok(rows) => {
                         for r in rows {
                             if !all.contains(&r.value) {
@@ -635,7 +638,10 @@ pub async fn autocomplete(
                      AND value LIKE '{prefix}%' \
                      LIMIT 20"
                 );
-                match state.ch.query(&sql).fetch_all::<StringRow>().await {
+                match crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
+                    .fetch_all::<StringRow>()
+                    .await
+                {
                     Ok(rows) => {
                         for r in rows {
                             if !all.contains(&r.value) {
@@ -664,7 +670,10 @@ pub async fn autocomplete(
                      AND value LIKE '{prefix}%' \
                      LIMIT 20"
                 );
-                match state.ch.query(&sql).fetch_all::<StringRow>().await {
+                match crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
+                    .fetch_all::<StringRow>()
+                    .await
+                {
                     Ok(rows) => {
                         for r in rows {
                             if !r.value.is_empty() && !all.contains(&r.value) {
@@ -686,9 +695,7 @@ pub async fn autocomplete(
                  WHERE tenant_id = '{tenant_id}' AND service_name LIKE '{prefix}%' \
                  LIMIT 20"
             );
-            state
-                .ch
-                .query(&sql)
+            crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
                 .fetch_all::<StringRow>()
                 .await
                 .map(|rows| rows.into_iter().map(|r| r.value).collect())
@@ -702,9 +709,7 @@ pub async fn autocomplete(
                  AND http_path LIKE '{prefix}%' \
                  LIMIT 20"
             );
-            state
-                .ch
-                .query(&sql)
+            crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
                 .fetch_all::<StringRow>()
                 .await
                 .map(|rows| rows.into_iter().map(|r| r.value).collect())
@@ -716,9 +721,7 @@ pub async fn autocomplete(
                  WHERE tenant_id = '{tenant_id}' AND ServiceName LIKE '{prefix}%' \
                  LIMIT 20"
             );
-            state
-                .ch
-                .query(&sql)
+            crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
                 .fetch_all::<StringRow>()
                 .await
                 .map(|rows| rows.into_iter().map(|r| r.value).collect())

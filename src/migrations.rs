@@ -620,6 +620,8 @@ GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
 const ROW_POLICY_TABLES: &[&str] = &[
     "logs",
     "spans",
+    "spans_by_trace",
+    "services",
     "metrics_gauge",
     "metrics_sum",
     "metrics_histogram",
@@ -632,25 +634,140 @@ const ROW_POLICY_TABLES: &[&str] = &[
     "metrics_sum_1h",
     "rum",
     "rum_replay",
+    "signal_usage",
+    "tenant_usage",
 ];
 
-/// Create row policies on all tenant-scoped tables. Only safe to call when
-/// ClickHouse supports the `rush_tenant_id` custom setting.
-pub async fn apply_row_policies(client: &Client) {
+fn validate_clickhouse_identifier(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        anyhow::bail!("invalid ClickHouse identifier: {value:?}");
+    }
+    Ok(())
+}
+
+fn row_policy_sql(table: &str, read_user: &str, alter: bool) -> String {
+    let verb = if alter {
+        "ALTER ROW POLICY"
+    } else {
+        "CREATE ROW POLICY IF NOT EXISTS"
+    };
+    format!(
+        "{verb} tenant_isolation ON observability.{table} \
+         FOR SELECT USING notEmpty(getSetting('rush_tenant_id')) \
+         AND tenant_id = getSetting('rush_tenant_id') TO {read_user}"
+    )
+}
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct TenantTableRow {
+    table: String,
+}
+
+/// Fail startup when a new tenant-bearing telemetry table is added without
+/// being enrolled in the policy and least-privilege grant set. Config and
+/// audit tables deliberately stay on the privileged client; `*_mv` objects
+/// write into already-protected target tables and are not granted to readers.
+async fn verify_policy_table_coverage(client: &Client) -> anyhow::Result<()> {
+    let rows = client
+        .query(
+            "SELECT DISTINCT table FROM system.columns \
+             WHERE database = 'observability' AND name = 'tenant_id' \
+               AND NOT startsWith(table, 'config_') \
+               AND table != 'audit_events' \
+               AND NOT endsWith(table, '_mv')",
+        )
+        .fetch_all::<TenantTableRow>()
+        .await?;
+    let missing: Vec<String> = rows
+        .into_iter()
+        .filter(|row| !ROW_POLICY_TABLES.contains(&row.table.as_str()))
+        .map(|row| row.table)
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "tenant-bearing telemetry tables lack row-policy enrollment: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Create or replace strict row policies on every tenant-scoped telemetry
+/// table. Existing permissive policies are altered in place during upgrades.
+pub async fn apply_row_policies(client: &Client, read_user: &str) -> anyhow::Result<()> {
+    validate_clickhouse_identifier(read_user)?;
+    verify_policy_table_coverage(client).await?;
     tracing::info!(
+        read_user,
         "applying row-level security policies ({} tables)",
         ROW_POLICY_TABLES.len()
     );
     for table in ROW_POLICY_TABLES {
-        let sql = format!(
-            "CREATE ROW POLICY IF NOT EXISTS tenant_isolation ON observability.{table} \
-             FOR SELECT USING tenant_id = getSetting('rush_tenant_id') OR getSetting('rush_tenant_id') = '' \
-             TO ALL"
+        let create = row_policy_sql(table, read_user, false);
+        client.query(&create).execute().await?;
+
+        let alter = row_policy_sql(table, read_user, true);
+        client.query(&alter).execute().await?;
+    }
+    Ok(())
+}
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct ShowPolicyRow {
+    statement: String,
+}
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct IsolationProbeRow {
+    leaked: u64,
+}
+
+/// Verify policy definition and behavior through the SELECT-only application
+/// principal. This checks more than custom-setting support: every expected
+/// table must have the strict policy, target the read user, and suppress rows
+/// whose tenant differs from the per-query setting.
+pub async fn verify_row_policies(
+    admin: &Client,
+    read: &Client,
+    read_user: &str,
+) -> anyhow::Result<()> {
+    validate_clickhouse_identifier(read_user)?;
+    for table in ROW_POLICY_TABLES {
+        let show = format!("SHOW CREATE ROW POLICY tenant_isolation ON observability.{table}");
+        let ddl = admin.query(&show).fetch_one::<ShowPolicyRow>().await?;
+        if !ddl
+            .statement
+            .contains("tenant_id = getSetting('rush_tenant_id')")
+            || !ddl
+                .statement
+                .contains("notEmpty(getSetting('rush_tenant_id'))")
+            || ddl.statement.contains("getSetting('rush_tenant_id') = ''")
+            || !ddl.statement.contains(read_user)
+        {
+            anyhow::bail!(
+                "row policy on observability.{table} is missing, permissive, or targets the wrong user"
+            );
+        }
+
+        let probe = format!(
+            "SELECT count() AS leaked FROM observability.{table} \
+             WHERE tenant_id != getSetting('rush_tenant_id')"
         );
-        if let Err(e) = client.query(&sql).execute().await {
-            tracing::warn!("failed to create row policy on {table}: {e}");
+        let row = read
+            .query(&probe)
+            .with_option("rush_tenant_id", "__rush_policy_probe__")
+            .with_option("max_execution_time", "10")
+            .fetch_one::<IsolationProbeRow>()
+            .await?;
+        if row.leaked != 0 {
+            anyhow::bail!("row policy leak detected on observability.{table}");
         }
     }
+    Ok(())
 }
 
 /// Run all migrations against ClickHouse.
@@ -1302,4 +1419,52 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
         tiering.traces_move_after_days,
         tiering.logs_move_after_days,
     );
+}
+
+#[cfg(test)]
+mod row_policy_tests {
+    use super::*;
+
+    #[test]
+    fn policy_table_set_covers_all_tenant_telemetry_stores() {
+        for table in [
+            "logs",
+            "spans",
+            "spans_by_trace",
+            "services",
+            "metrics_gauge",
+            "metrics_sum",
+            "metrics_histogram",
+            "metrics_exp_histogram",
+            "metrics_summary",
+            "metrics_gauge_1m",
+            "metrics_gauge_1h",
+            "metrics_sum_1m",
+            "metrics_sum_1h",
+            "rum",
+            "rum_replay",
+            "signal_usage",
+            "tenant_usage",
+        ] {
+            assert!(ROW_POLICY_TABLES.contains(&table), "missing {table}");
+        }
+    }
+
+    #[test]
+    fn read_principal_must_be_a_plain_identifier() {
+        assert!(validate_clickhouse_identifier("rush_query").is_ok());
+        assert!(validate_clickhouse_identifier("rush-query").is_err());
+        assert!(validate_clickhouse_identifier("rush_query TO ALL").is_err());
+    }
+
+    #[test]
+    fn policy_sql_is_strict_and_targets_only_the_read_principal() {
+        let sql = row_policy_sql("logs", "rushquery", true);
+        assert!(sql.starts_with("ALTER ROW POLICY tenant_isolation"));
+        assert!(sql.contains("notEmpty(getSetting('rush_tenant_id'))"));
+        assert!(sql.contains("tenant_id = getSetting('rush_tenant_id')"));
+        assert!(sql.ends_with("TO rushquery"));
+        assert!(!sql.contains(" OR "));
+        assert!(!sql.contains("TO ALL"));
+    }
 }

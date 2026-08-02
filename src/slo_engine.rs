@@ -47,6 +47,7 @@ fn clauses_predicate(c: &QueryClauses) -> String {
 /// pruned scan, but keeps each count exactly equal to its former standalone query).
 async fn eval_trace_availability(
     ch: &Client,
+    tenant_id: &str,
     common_filters: &[Filter],
     error_filters: &[Filter],
     total_filters: &[Filter],
@@ -62,8 +63,7 @@ async fn eval_trace_availability(
         clauses_predicate(&total_clauses),
         base.to_sql(),
     );
-    let row = ch
-        .query(&sql)
+    let row = crate::tenant_query(ch, &sql, tenant_id)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
@@ -75,6 +75,7 @@ async fn eval_trace_availability(
 /// countIf over the total WHERE is exactly the former two counts.
 async fn eval_trace_latency(
     ch: &Client,
+    tenant_id: &str,
     total_filters: &[Filter],
     threshold_ns: i64,
     from: &str,
@@ -85,8 +86,7 @@ async fn eval_trace_latency(
         "SELECT countIf(duration_ns > {threshold_ns}) as bad, count() as total FROM spans {}",
         total_clauses.to_sql(),
     );
-    let row = ch
-        .query(&sql)
+    let row = crate::tenant_query(ch, &sql, tenant_id)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
@@ -126,6 +126,7 @@ async fn eval_trace_latency(
 /// from the sum rollup's last/min/max/count aggregates.
 async fn eval_metric_availability(
     ch: &Client,
+    tenant_id: &str,
     common_filters: &[Filter],
     error_filters: &[Filter],
     total_filters: &[Filter],
@@ -141,8 +142,7 @@ async fn eval_metric_availability(
         clauses_predicate(&total_clauses),
         base.to_sql(),
     );
-    let row = ch
-        .query(&sql)
+    let row = crate::tenant_query(ch, &sql, tenant_id)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<SumBadTotalRow>()
         .await?;
@@ -158,6 +158,7 @@ async fn eval_metric_availability(
 /// + indexOf evaluation, including the duplicate-bound edge case.
 async fn eval_metric_latency(
     ch: &Client,
+    tenant_id: &str,
     total_filters: &[Filter],
     threshold_ms: f64,
     from: &str,
@@ -174,8 +175,7 @@ async fn eval_metric_latency(
          FROM metrics_histogram {}",
         clauses.to_sql(),
     );
-    let row = ch
-        .query(&sql)
+    let row = crate::tenant_query(ch, &sql, tenant_id)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<HistTotalFastRow>()
         .await?;
@@ -193,6 +193,7 @@ async fn eval_metric_latency(
 /// threshold_op defines what "good" means, so violating = NOT good.
 async fn eval_metric_threshold(
     ch: &Client,
+    tenant_id: &str,
     total_filters: &[Filter],
     threshold_value: f64,
     threshold_op: &str,
@@ -215,8 +216,7 @@ async fn eval_metric_threshold(
         "SELECT countIf({violating_op}) as bad, count() as total FROM metrics_gauge {}",
         clauses.to_sql(),
     );
-    let row = ch
-        .query(&sql)
+    let row = crate::tenant_query(ch, &sql, tenant_id)
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
@@ -274,7 +274,8 @@ async fn write_slo_metrics(
 
 pub fn spawn_slo_engine(
     config_db: Arc<ConfigDb>,
-    ch: Client,
+    read_ch: Client,
+    write_ch: Client,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) {
     tokio::spawn(async move {
@@ -284,7 +285,15 @@ pub fn spawn_slo_engine(
         loop {
             interval.tick().await;
             let start = std::time::Instant::now();
-            let ok = match eval_slos(&config_db, &ch, &http_client, &mut eval_state).await {
+            let ok = match eval_slos(
+                &config_db,
+                &read_ch,
+                &write_ch,
+                &http_client,
+                &mut eval_state,
+            )
+            .await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!("slo engine error: {e}");
@@ -306,9 +315,21 @@ fn window_minutes(window_type: &str) -> i64 {
     }
 }
 
+/// Events describe an incident lifecycle, not every evaluation-state change.
+/// A breach opens an incident and a compliant result closes it. `no_data`
+/// remains a valid live SLO state but never opens or closes an incident.
+fn should_record_incident_event(previous_event_state: Option<&str>, new_state: &str) -> bool {
+    match new_state {
+        "breaching" => previous_event_state != Some("breaching"),
+        "compliant" => previous_event_state == Some("breaching"),
+        _ => false,
+    }
+}
+
 async fn eval_slos(
     config_db: &ConfigDb,
-    ch: &Client,
+    read_ch: &Client,
+    write_ch: &Client,
     http_client: &reqwest::Client,
     eval_state: &mut crate::eval_state::EvalState,
 ) -> anyhow::Result<()> {
@@ -334,7 +355,8 @@ async fn eval_slos(
         futures_util::stream::iter(jobs.into_iter().map(|(slo, should_flush)| async move {
             let persisted = match eval_one_slo(
                 config_db,
-                ch,
+                read_ch,
+                write_ch,
                 http_client,
                 &slo,
                 now,
@@ -389,7 +411,8 @@ async fn persist_no_data(
 /// config table (state transition or coarse `last_eval_at` flush).
 async fn eval_one_slo(
     config_db: &ConfigDb,
-    ch: &Client,
+    read_ch: &Client,
+    write_ch: &Client,
     _http_client: &reqwest::Client,
     slo: &crate::models::slo::Slo,
     now: chrono::DateTime<chrono::Utc>,
@@ -450,7 +473,8 @@ async fn eval_one_slo(
     let eval_result = match (slo.slo_type.as_str(), slo.indicator_type.as_str()) {
         ("trace", "availability") => {
             eval_trace_availability(
-                ch,
+                read_ch,
+                &slo.tenant_id,
                 &common_filters,
                 &error_filters,
                 &total_filters,
@@ -461,11 +485,20 @@ async fn eval_one_slo(
         }
         ("trace", "latency") => {
             let threshold_ns = (slo.threshold_ms.unwrap_or(0.0) * 1_000_000.0) as i64;
-            eval_trace_latency(ch, &total_filters, threshold_ns, &from, now_str).await
+            eval_trace_latency(
+                read_ch,
+                &slo.tenant_id,
+                &total_filters,
+                threshold_ns,
+                &from,
+                now_str,
+            )
+            .await
         }
         ("metric", "availability") => {
             eval_metric_availability(
-                ch,
+                read_ch,
+                &slo.tenant_id,
                 &common_filters,
                 &error_filters,
                 &total_filters,
@@ -476,13 +509,22 @@ async fn eval_one_slo(
         }
         ("metric", "latency") => {
             let threshold_ms = slo.threshold_ms.unwrap_or(0.0);
-            eval_metric_latency(ch, &total_filters, threshold_ms, &from, now_str).await
+            eval_metric_latency(
+                read_ch,
+                &slo.tenant_id,
+                &total_filters,
+                threshold_ms,
+                &from,
+                now_str,
+            )
+            .await
         }
         ("metric", "threshold") => {
             let threshold_value = slo.threshold_value.unwrap_or(0.0);
             let threshold_op = slo.threshold_op.as_deref().unwrap_or("lt");
             eval_metric_threshold(
-                ch,
+                read_ch,
+                &slo.tenant_id,
                 &total_filters,
                 threshold_value,
                 threshold_op,
@@ -537,33 +579,47 @@ async fn eval_one_slo(
     let persisted;
 
     if new_state != old_state {
-        // State changed — record event, persist immediately, and notify.
-        let event_id = uuid::Uuid::new_v4().to_string();
-        let message = format!(
-            "SLO '{}': {} (errors={}, total={}, budget_remaining={:.4}%)",
-            slo.name,
-            match new_state {
-                "breaching" => "BREACHING",
-                "compliant" => "COMPLIANT",
-                _ => "NO_DATA",
-            },
-            error_count,
-            total_count,
-            error_budget_remaining * 100.0,
-        );
+        // Persist every live state transition, but only write history for the
+        // incident lifecycle: breach opened, then recovered. This prevents
+        // intermittent no-data windows from producing repeated compliant rows.
+        let previous_event_state = if matches!(new_state, "breaching" | "compliant") {
+            config_db
+                .latest_slo_event_state(&slo.id, &slo.tenant_id)
+                .await?
+        } else {
+            None
+        };
+        let record_event = should_record_incident_event(previous_event_state.as_deref(), new_state);
 
-        config_db
-            .create_slo_event(
-                &event_id,
-                &slo.id,
-                &slo.tenant_id,
-                new_state,
+        let message = record_event.then(|| {
+            format!(
+                "SLO '{}': {} (errors={}, total={}, budget_remaining={:.4}%)",
+                slo.name,
+                if new_state == "breaching" {
+                    "BREACHING"
+                } else {
+                    "COMPLIANT"
+                },
                 error_count,
                 total_count,
-                error_budget_remaining,
-                &message,
+                error_budget_remaining * 100.0,
             )
-            .await?;
+        });
+
+        if let Some(message) = &message {
+            config_db
+                .create_slo_event(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &slo.id,
+                    &slo.tenant_id,
+                    new_state,
+                    error_count,
+                    total_count,
+                    error_budget_remaining,
+                    message,
+                )
+                .await?;
+        }
 
         let breached_at = if new_state == "breaching" {
             Some(now_str)
@@ -583,31 +639,33 @@ async fn eval_one_slo(
             )
             .await?;
 
-        // Send notifications
-        let channel_ids: Vec<String> =
-            serde_json::from_str(&slo.notification_channel_ids).unwrap_or_default();
-        for channel_id in &channel_ids {
-            if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
-                let config: serde_json::Value =
-                    serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
-                if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                    let payload = match channel.channel_type.as_str() {
-                        "slack" => serde_json::json!({ "text": message }),
-                        _ => serde_json::json!({
-                            "slo": slo.name,
-                            "state": new_state,
-                            "error_count": error_count,
-                            "total_count": total_count,
-                            "error_budget_remaining": error_budget_remaining,
-                            "message": message,
-                        }),
-                    };
-                    if let Err(e) = crate::outbound::post_json(url, &payload).await {
-                        tracing::warn!(
-                            "slo {}: notification to {} failed: {e}",
-                            slo.id,
-                            channel.name
-                        );
+        // Notifications follow the same incident lifecycle as history.
+        if let Some(message) = &message {
+            let channel_ids: Vec<String> =
+                serde_json::from_str(&slo.notification_channel_ids).unwrap_or_default();
+            for channel_id in &channel_ids {
+                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
+                    let config: serde_json::Value =
+                        serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
+                    if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
+                        let payload = match channel.channel_type.as_str() {
+                            "slack" => serde_json::json!({ "text": message }),
+                            _ => serde_json::json!({
+                                "slo": slo.name,
+                                "state": new_state,
+                                "error_count": error_count,
+                                "total_count": total_count,
+                                "error_budget_remaining": error_budget_remaining,
+                                "message": message,
+                            }),
+                        };
+                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
+                            tracing::warn!(
+                                "slo {}: notification to {} failed: {e}",
+                                slo.id,
+                                channel.name
+                            );
+                        }
                     }
                 }
             }
@@ -644,7 +702,7 @@ async fn eval_one_slo(
     };
     let now_nanos = now.timestamp_nanos_opt().unwrap_or(0);
     write_slo_metrics(
-        ch,
+        write_ch,
         &slo.id,
         &slo.name,
         current_pct,
@@ -662,6 +720,22 @@ async fn eval_one_slo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incident_events_only_open_on_breach_and_close_on_recovery() {
+        assert!(should_record_incident_event(None, "breaching"));
+        assert!(!should_record_incident_event(
+            Some("breaching"),
+            "breaching"
+        ));
+        assert!(should_record_incident_event(Some("breaching"), "compliant"));
+        assert!(!should_record_incident_event(None, "compliant"));
+        assert!(!should_record_incident_event(
+            Some("compliant"),
+            "compliant"
+        ));
+        assert!(!should_record_incident_event(Some("breaching"), "no_data"));
+    }
 
     fn f(field: &str, val: &str) -> Filter {
         Filter {

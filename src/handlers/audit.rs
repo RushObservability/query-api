@@ -123,7 +123,7 @@ pub async fn list_audit(
     );
 
     let rows = state
-        .ch
+        .admin_ch
         .query(&sql)
         .fetch_all::<AuditRow>()
         .await
@@ -163,7 +163,7 @@ pub async fn verify_audit(
          FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY seq ASC";
 
     let rows = state
-        .ch
+        .admin_ch
         .query(sql)
         .fetch_all::<AuditRow>()
         .await

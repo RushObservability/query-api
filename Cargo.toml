@@ -88,6 +88,7 @@ hex = "0.4"
 # RSS drifts up. jemalloc keeps RSS lower and flatter; pair with a deploy-time
 # MALLOC_CONF=...,dirty_decay_ms/muzzy_decay_ms to release pages promptly.
 tikv-jemallocator = "0.6"
+sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [profile.release]
 lto = true

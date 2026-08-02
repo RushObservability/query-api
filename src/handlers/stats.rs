@@ -350,7 +350,7 @@ pub async fn get_stats(
     .fetch_one::<CountResult>();
 
     let storage_fut = state
-        .ch
+        .admin_ch
         .query(
             "SELECT \
              p.table as table_name, \
@@ -368,15 +368,13 @@ pub async fn get_stats(
         )
         .fetch_all::<TableStorage>();
 
-    let usage_fut = state
-        .ch
-        .query(&format!(
-            "SELECT signal, sum(events_count) AS events, sum(bytes_count) AS bytes \
+    let usage_sql = format!(
+        "SELECT signal, sum(events_count) AS events, sum(bytes_count) AS bytes \
          FROM observability.tenant_usage \
          WHERE tenant_id = '{escaped_tenant}' AND bucket >= toStartOfDay(now()) \
          GROUP BY signal"
-        ))
-        .fetch_all::<UsageRow>();
+    );
+    let usage_fut = crate::tenant_query(&state.ch, &usage_sql, tenant_id).fetch_all::<UsageRow>();
 
     // ── Fire all 12 queries concurrently ──
     let (
@@ -481,7 +479,7 @@ pub async fn get_stats(
         Some(v) => *v,
         None => {
             let probed = state
-                .ch
+                .admin_ch
                 .query("SELECT count() AS count FROM system.disks WHERE type != 'Local'")
                 .fetch_one::<CountResult>()
                 .await
@@ -602,7 +600,7 @@ pub async fn get_storage_partitions(
     crate::handlers::users::require_admin(&state, &headers).await?;
 
     let rows = state
-        .ch
+        .admin_ch
         .query(
             "SELECT \
              p.table AS table, \
@@ -689,7 +687,7 @@ pub async fn get_storage_partitions(
         Some(v) => *v,
         None => {
             let probed = state
-                .ch
+                .admin_ch
                 .query("SELECT count() AS count FROM system.disks WHERE type != 'Local'")
                 .fetch_one::<CountResult>()
                 .await

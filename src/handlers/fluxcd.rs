@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
 };
 use kube::api::DynamicObject;
@@ -8,8 +8,10 @@ use kube::discovery::ApiResource;
 use kube::{Api, Client, api::ListParams};
 use serde_json::{Value, json};
 
-use crate::AppState;
-use crate::handlers::users::require_auth;
+use crate::handlers::infrastructure::{
+    allowed_namespaces, audit_read, namespace_allowed, require_infrastructure_read,
+};
+use crate::{AppState, TenantContext};
 
 // ---------------------------------------------------------------------------
 // Flux v2 GitOps Toolkit integration.
@@ -18,15 +20,16 @@ use crate::handlers::users::require_auth;
 // (kustomize.toolkit.fluxcd.io) and HelmReleases (helm.toolkit.fluxcd.io); the
 // inputs are Sources (source.toolkit.fluxcd.io). Every resource carries a
 // Kubernetes `Ready` condition and a `spec.suspend` flag, so the summary logic
-// is uniform. Flux resources are multi-namespace, so we list across all
-// namespaces (the reader ClusterRole is cluster-scoped).
+// is uniform. Reads stay in the configured Flux namespace and must also pass
+// the selected Rush tenant's namespace allowlist.
 // ---------------------------------------------------------------------------
 
 async fn get_kube_client() -> Result<Client, (StatusCode, String)> {
-    Client::try_default().await.map_err(|e| {
+    Client::try_default().await.map_err(|error| {
+        tracing::error!(%error, "Kubernetes client initialization failed");
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("Kubernetes not available: {e}"),
+            "Kubernetes not available".to_string(),
         )
     })
 }
@@ -49,6 +52,19 @@ async fn check_fluxcd_enabled(state: &AppState) -> Result<(), (StatusCode, Strin
         ));
     }
     Ok(())
+}
+
+async fn fluxcd_namespace(state: &AppState) -> String {
+    if let Ok(namespace) = std::env::var("FLUXCD_NAMESPACE") {
+        return namespace;
+    }
+    state
+        .config_db
+        .get_setting("fluxcd_namespace")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "flux-system".to_string())
 }
 
 // ── CRD ApiResources ───────────────────────────────────────────────────────
@@ -242,8 +258,13 @@ fn summarise_source(kind: &str, obj: &DynamicObject) -> Value {
     })
 }
 
-async fn list_kind(client: &Client, kind: &str, ar: &ApiResource) -> Vec<DynamicObject> {
-    let api: Api<DynamicObject> = Api::all_with(client.clone(), ar);
+async fn list_kind(
+    client: &Client,
+    namespace: &str,
+    kind: &str,
+    ar: &ApiResource,
+) -> Vec<DynamicObject> {
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, ar);
     match api.list(&ListParams::default()).await {
         Ok(l) => l.items,
         Err(e) => {
@@ -259,19 +280,39 @@ async fn list_kind(client: &Client, kind: &str, ar: &ApiResource) -> Vec<Dynamic
 // ---------------------------------------------------------------------------
 pub async fn list_resources(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_fluxcd_enabled(&state).await?;
+    let namespace = fluxcd_namespace(&state).await;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    if !namespace_allowed(&allowed, &namespace) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "FluxCD namespace is not allowed for this tenant".to_string(),
+        ));
+    }
     let client = get_kube_client().await?;
 
     let mut items: Vec<Value> = Vec::new();
-    for k in list_kind(&client, "Kustomization", &kustomization_ar()).await {
+    for k in list_kind(&client, &namespace, "Kustomization", &kustomization_ar()).await {
         items.push(summarise_resource("Kustomization", &k));
     }
-    for h in list_kind(&client, "HelmRelease", &helmrelease_ar()).await {
+    for h in list_kind(&client, &namespace, "HelmRelease", &helmrelease_ar()).await {
         items.push(summarise_resource("HelmRelease", &h));
     }
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "fluxcd",
+        "list",
+        "resources",
+        &[namespace],
+    )
+    .await;
     Ok(Json(json!({ "resources": items })))
 }
 
@@ -280,18 +321,38 @@ pub async fn list_resources(
 // ---------------------------------------------------------------------------
 pub async fn list_sources(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_fluxcd_enabled(&state).await?;
+    let namespace = fluxcd_namespace(&state).await;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    if !namespace_allowed(&allowed, &namespace) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "FluxCD namespace is not allowed for this tenant".to_string(),
+        ));
+    }
     let client = get_kube_client().await?;
 
     let mut items: Vec<Value> = Vec::new();
     for (kind, ar) in source_ars() {
-        for s in list_kind(&client, kind, &ar).await {
+        for s in list_kind(&client, &namespace, kind, &ar).await {
             items.push(summarise_source(kind, &s));
         }
     }
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "fluxcd",
+        "list",
+        "sources",
+        &[namespace],
+    )
+    .await;
     Ok(Json(json!({ "sources": items })))
 }
 
@@ -300,11 +361,21 @@ pub async fn list_sources(
 // ---------------------------------------------------------------------------
 pub async fn get_resource(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path((kind, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_fluxcd_enabled(&state).await?;
+    let namespace = fluxcd_namespace(&state).await;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    if !namespace_allowed(&allowed, &namespace) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "FluxCD namespace is not allowed for this tenant".to_string(),
+        ));
+    }
     let client = get_kube_client().await?;
 
     let ar = match kind.as_str() {
@@ -322,22 +393,11 @@ pub async fn get_resource(
             })?,
     };
 
-    // Resource is identified by name across namespaces — fetch by listing on a
-    // field selector (name is unique enough; if duplicated across ns, take the first).
-    let api: Api<DynamicObject> = Api::all_with(client, &ar);
-    let obj = api
-        .list(&ListParams::default().fields(&format!("metadata.name={name}")))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get {kind} '{name}': {e}"),
-            )
-        })?
-        .items
-        .into_iter()
-        .next()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("{kind} '{name}' not found")))?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client, &namespace, &ar);
+    let obj = api.get(&name).await.map_err(|error| {
+        tracing::warn!(%error, namespace, kind, name, "FluxCD resource get failed");
+        (StatusCode::NOT_FOUND, format!("{kind} '{name}' not found"))
+    })?;
 
     let data = &obj.data;
     let spec = data.get("spec").unwrap_or(&Value::Null);
@@ -391,6 +451,16 @@ pub async fn get_resource(
         .unwrap_or("")
         .to_string();
 
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "fluxcd",
+        "get",
+        &format!("{kind}/{name}"),
+        &[namespace],
+    )
+    .await;
     Ok(Json(json!({
         "kind": kind,
         "name": obj.metadata.name.clone().unwrap_or_default(),

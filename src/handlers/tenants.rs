@@ -63,6 +63,10 @@ async fn resolve_signal_flags(state: &AppState, tenant_id: &str) -> SignalFlags 
 #[derive(serde::Deserialize)]
 pub struct CreateTenantRequest {
     pub name: String,
+    #[serde(default = "default_true")]
+    pub auth_required: bool,
+    #[serde(default = "default_true")]
+    pub ingest_auth_required: bool,
     /// Optional per-signal enable flags; each defaults to enabled when omitted.
     #[serde(default)]
     pub signals: Option<SignalFlags>,
@@ -78,12 +82,18 @@ pub struct SetAuthRequiredRequest {
     pub auth_required: bool,
 }
 
+#[derive(serde::Deserialize)]
+pub struct SetIngestAuthRequiredRequest {
+    pub ingest_auth_required: bool,
+}
+
 #[derive(serde::Serialize)]
 pub struct TenantResponse {
     pub id: String,
     pub name: String,
     pub enabled: bool,
     pub auth_required: bool,
+    pub ingest_auth_required: bool,
     pub created_at: String,
     /// Per-signal ingest enable flags (each defaults true when no row exists).
     pub signals: SignalFlags,
@@ -93,11 +103,19 @@ impl TenantResponse {
     /// Build a response, resolving the tenant's signal flags from config.
     async fn build(state: &AppState, row: (String, String, bool, bool, String)) -> TenantResponse {
         let signals = resolve_signal_flags(state, &row.0).await;
+        let ingest_auth_required = state
+            .config_db
+            .tenant_ingest_auth_required_checked(&row.0)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(true);
         TenantResponse {
             id: row.0,
             name: row.1,
             enabled: row.2,
             auth_required: row.3,
+            ingest_auth_required,
             created_at: row.4,
             signals,
         }
@@ -203,7 +221,7 @@ pub async fn create_tenant(
 
     state
         .config_db
-        .create_tenant(&id, &name)
+        .create_tenant(&id, &name, req.auth_required, req.ingest_auth_required)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "internal error");
@@ -257,7 +275,14 @@ pub async fn create_tenant(
                 .actor(caller.0.clone(), caller.1.clone())
                 .tenant(id.clone())
                 .resource("tenant", id.clone())
-                .changes(serde_json::json!({ "name": name }).to_string())
+                .changes(
+                    serde_json::json!({
+                        "name": name,
+                        "auth_required": req.auth_required,
+                        "ingest_auth_required": req.ingest_auth_required,
+                    })
+                    .to_string(),
+                )
                 .description("tenant created")
                 .context(crate::audit::actor_context_from_headers(&headers)),
         )
@@ -401,6 +426,65 @@ pub async fn set_auth_required(
     Ok(Json(TenantResponse::build(&state, tenant).await))
 }
 
+pub async fn set_ingest_auth_required(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetIngestAuthRequiredRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_admin(&state, &headers).await?;
+    let before = state
+        .config_db
+        .tenant_ingest_auth_required_checked(&id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read tenant ingest auth policy");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
+    let updated = state
+        .config_db
+        .set_tenant_ingest_auth_required(&id, req.ingest_auth_required)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to update tenant ingest auth policy");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
+    }
+    let tenant = state
+        .config_db
+        .get_tenant(&id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to load updated tenant");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
+
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("tenant.ingest_auth_required_change", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(id.clone())
+                .resource("tenant", id.clone())
+                .changes(
+                    serde_json::json!({
+                        "before": before,
+                        "after": req.ingest_auth_required,
+                    })
+                    .to_string(),
+                )
+                .description("tenant ingest authentication requirement changed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    Ok(Json(TenantResponse::build(&state, tenant).await))
+}
+
 // ── Per-tenant ingest signal enable/disable ────────────────────────────────
 
 /// Dropped-event counts per signal (blocked ingest volume).
@@ -447,7 +531,10 @@ async fn dropped_counts(state: &AppState, tenant_id: &str) -> DroppedCounts {
          GROUP BY signal"
     );
     let mut out = DroppedCounts::default();
-    match state.ch.query(&sql).fetch_all::<Row>().await {
+    match crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<Row>()
+        .await
+    {
         Ok(rows) => {
             for r in rows {
                 match r.signal.as_str() {

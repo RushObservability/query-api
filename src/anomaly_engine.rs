@@ -114,14 +114,16 @@ fn build_smtp_transport(cfg: &SmtpConfig) -> Option<AsyncSmtpTransport<Tokio1Exe
 /// anomaly events are ever persisted.
 pub fn spawn_anomaly_engine(
     config_db: Arc<ConfigDb>,
-    ch: Client,
+    read_ch: Client,
+    write_ch: Client,
     smtp_config: SmtpConfig,
     prom_base_url: String,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) {
     tokio::spawn(run_anomaly_engine(
         config_db,
-        ch,
+        read_ch,
+        write_ch,
         smtp_config,
         prom_base_url,
         self_metrics,
@@ -131,7 +133,8 @@ pub fn spawn_anomaly_engine(
 /// Run the anomaly engine loop forever. Call this directly from the standalone binary.
 pub async fn run_anomaly_engine(
     config_db: Arc<ConfigDb>,
-    ch: Client,
+    read_ch: Client,
+    write_ch: Client,
     smtp_config: SmtpConfig,
     prom_base_url: String,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
@@ -152,7 +155,8 @@ pub async fn run_anomaly_engine(
         let start = std::time::Instant::now();
         let ok = match eval_anomaly_rules(
             &config_db,
-            &ch,
+            &read_ch,
+            &write_ch,
             &http_client,
             &smtp_config,
             &smtp_transport,
@@ -172,7 +176,8 @@ pub async fn run_anomaly_engine(
 
 async fn eval_anomaly_rules(
     config_db: &ConfigDb,
-    ch: &Client,
+    read_ch: &Client,
+    write_ch: &Client,
     http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
@@ -196,7 +201,7 @@ async fn eval_anomaly_rules(
     // reads, so the tick pays for the slowest fetch instead of the sum of all.
     let fetched = futures_util::future::join_all(due_rules.iter().map(|rule| async move {
         match rule.source.as_str() {
-            "apm" => Some(fetch_apm_data(ch, rule, &now).await),
+            "apm" => Some(fetch_apm_data(read_ch, rule, &now).await),
             "prometheus" => Some(fetch_prom_data(http_client, prom_base_url, rule, &now).await),
             _ => None,
         }
@@ -379,7 +384,7 @@ async fn eval_anomaly_rules(
             "INSERT INTO logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES {}",
             eval_log_values.join(", ")
         );
-        if let Err(e) = ch.query(&sql).execute().await {
+        if let Err(e) = write_ch.query(&sql).execute().await {
             tracing::warn!(error = %e, engine = "anomaly", rows = eval_log_values.len(), "failed to write eval log batch");
         }
     }
@@ -414,7 +419,9 @@ async fn fetch_apm_data(
         now_str,
     );
 
-    let rows = ch.query(&sql).fetch_all::<ApmBucket>().await?;
+    let rows = crate::tenant_query(ch, &sql, &rule.tenant_id)
+        .fetch_all::<ApmBucket>()
+        .await?;
     if rows.is_empty() {
         return Ok(vec![]);
     }

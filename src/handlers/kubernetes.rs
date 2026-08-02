@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
 use kube::api::DynamicObject;
@@ -9,15 +9,19 @@ use kube::{Api, Client, api::ListParams};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::AppState;
-use crate::handlers::users::require_auth;
+use crate::handlers::infrastructure::{
+    allowed_namespaces, audit_read, cluster_wide_allowed, namespace_allowed,
+    require_infrastructure_read,
+};
+use crate::{AppState, TenantContext};
 
 // ---------------------------------------------------------------------------
 // Read-only general Kubernetes resource browser.
 //
 // Lists common core/apps/batch/networking objects via the in-cluster kube client
 // (DynamicObject + serde_json extraction, consistent with argocd.rs/fluxcd.rs).
-// READ-ONLY: list/get only. Secrets expose key names + count, never values.
+// READ-ONLY: list/get only. Secret resources are intentionally unsupported so
+// their values never enter this process, even if RBAC is misconfigured.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -26,10 +30,11 @@ pub struct NsQuery {
 }
 
 async fn get_kube_client() -> Result<Client, (StatusCode, String)> {
-    Client::try_default().await.map_err(|e| {
+    Client::try_default().await.map_err(|error| {
+        tracing::error!(%error, "Kubernetes client initialization failed");
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("Kubernetes not available: {e}"),
+            "Kubernetes not available".to_string(),
         )
     })
 }
@@ -67,7 +72,6 @@ fn kind_info(kind: &str) -> Option<(&'static str, &'static str, &'static str, &'
         "services" => ("", "v1", "Service", "services", true),
         "ingresses" => ("networking.k8s.io", "v1", "Ingress", "ingresses", true),
         "configmaps" => ("", "v1", "ConfigMap", "configmaps", true),
-        "secrets" => ("", "v1", "Secret", "secrets", true),
         "nodes" => ("", "v1", "Node", "nodes", false),
         "namespaces" => ("", "v1", "Namespace", "namespaces", false),
         "events" => ("", "v1", "Event", "events", true),
@@ -247,15 +251,6 @@ fn summarise(kind: &str, o: &DynamicObject) -> Value {
                 .unwrap_or(0);
             json!({ "keys": keys.to_string() })
         }
-        "secrets" => {
-            // keys/count only — never values
-            let keys = d
-                .get("data")
-                .and_then(|v| v.as_object())
-                .map(|m| m.len())
-                .unwrap_or(0);
-            json!({ "type": s(d, "/type"), "keys": keys.to_string() })
-        }
         "nodes" => {
             let ready = node_ready(d);
             unhealthy = !ready;
@@ -305,23 +300,82 @@ async fn list_kind(
     client: &Client,
     kind: &str,
     namespace: Option<&str>,
+    allowed: &[String],
 ) -> Result<Vec<DynamicObject>, (StatusCode, String)> {
     let (g, v, k, p, namespaced) = kind_info(kind)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Unknown kind '{kind}'")))?;
     let ar = api_resource(g, v, k, p);
-    let api: Api<DynamicObject> = match (namespaced, namespace) {
-        (true, Some(ns)) if !ns.is_empty() => Api::namespaced_with(client.clone(), ns, &ar),
-        _ => Api::all_with(client.clone(), &ar),
-    };
-    api.list(&ListParams::default())
-        .await
-        .map(|l| l.items)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to list {kind}: {e}"),
-            )
-        })
+    if !namespaced {
+        if !cluster_wide_allowed(allowed) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "cluster-scoped infrastructure access is not enabled".to_string(),
+            ));
+        }
+        return Api::all_with(client.clone(), &ar)
+            .list(&ListParams::default())
+            .await
+            .map(|list| list.items)
+            .map_err(|error| {
+                tracing::error!(kind, %error, "Kubernetes list failed");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Kubernetes request failed".to_string(),
+                )
+            });
+    }
+
+    if let Some(namespace) = namespace.filter(|namespace| !namespace.is_empty()) {
+        if !namespace_allowed(allowed, namespace) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("namespace '{namespace}' is not allowed for this tenant"),
+            ));
+        }
+        return Api::namespaced_with(client.clone(), namespace, &ar)
+            .list(&ListParams::default())
+            .await
+            .map(|list| list.items)
+            .map_err(|error| {
+                tracing::error!(kind, namespace, %error, "Kubernetes list failed");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Kubernetes request failed".to_string(),
+                )
+            });
+    }
+
+    if cluster_wide_allowed(allowed) {
+        return Api::all_with(client.clone(), &ar)
+            .list(&ListParams::default())
+            .await
+            .map(|list| list.items)
+            .map_err(|error| {
+                tracing::error!(kind, %error, "Kubernetes list failed");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Kubernetes request failed".to_string(),
+                )
+            });
+    }
+
+    let mut items = Vec::new();
+    for namespace in allowed.iter().filter(|namespace| namespace.as_str() != "*") {
+        let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+        let mut namespace_items = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|error| {
+                tracing::error!(kind, namespace, %error, "Kubernetes list failed");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Kubernetes request failed".to_string(),
+                )
+            })?
+            .items;
+        items.append(&mut namespace_items);
+    }
+    Ok(items)
 }
 
 // ---------------------------------------------------------------------------
@@ -329,16 +383,25 @@ async fn list_kind(
 // ---------------------------------------------------------------------------
 pub async fn summary(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_kubernetes_enabled(&state).await?;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
     let client = get_kube_client().await?;
 
-    let nodes = list_kind(&client, "nodes", None).await.unwrap_or_default();
+    let nodes = if cluster_wide_allowed(&allowed) {
+        list_kind(&client, "nodes", None, &allowed)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let nodes_ready = nodes.iter().filter(|n| node_ready(&n.data)).count();
 
-    let pods = list_kind(&client, "pods", None).await.unwrap_or_default();
+    let pods = list_kind(&client, "pods", None, &allowed).await?;
     let mut pods_running = 0usize;
     let mut pods_unhealthy = 0usize;
     for p in &pods {
@@ -351,22 +414,40 @@ pub async fn summary(
         }
     }
 
-    let namespaces = list_kind(&client, "namespaces", None)
-        .await
-        .unwrap_or_default();
-    let events = list_kind(&client, "events", None).await.unwrap_or_default();
+    let namespace_count = if cluster_wide_allowed(&allowed) {
+        list_kind(&client, "namespaces", None, &allowed)
+            .await
+            .unwrap_or_default()
+            .len()
+    } else {
+        allowed
+            .iter()
+            .filter(|namespace| namespace.as_str() != "*")
+            .count()
+    };
+    let events = list_kind(&client, "events", None, &allowed).await?;
     let warnings = events
         .iter()
         .filter(|e| s(&e.data, "/type") == "Warning")
         .count();
 
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "kubernetes",
+        "summary",
+        "summary",
+        &allowed,
+    )
+    .await;
     Ok(Json(json!({
         "nodes_ready": nodes_ready,
         "nodes_total": nodes.len(),
         "pods_running": pods_running,
         "pods_total": pods.len(),
         "pods_unhealthy": pods_unhealthy,
-        "namespaces": namespaces.len(),
+        "namespaces": namespace_count,
         "warnings": warnings,
     })))
 }
@@ -376,16 +457,46 @@ pub async fn summary(
 // ---------------------------------------------------------------------------
 pub async fn list_namespaces(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_kubernetes_enabled(&state).await?;
-    let client = get_kube_client().await?;
-    let items: Vec<Value> = list_kind(&client, "namespaces", None)
-        .await?
-        .iter()
-        .map(|o| summarise("namespaces", o))
-        .collect();
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    let items: Vec<Value> = if cluster_wide_allowed(&allowed) {
+        let client = get_kube_client().await?;
+        list_kind(&client, "namespaces", None, &allowed)
+            .await?
+            .iter()
+            .map(|object| summarise("namespaces", object))
+            .collect()
+    } else {
+        allowed
+            .iter()
+            .filter(|namespace| namespace.as_str() != "*")
+            .map(|namespace| {
+                json!({
+                    "kind": "namespaces",
+                    "name": namespace,
+                    "namespace": "",
+                    "creation_ts": "",
+                    "unhealthy": false,
+                    "cols": { "status": "Allowed" },
+                })
+            })
+            .collect()
+    };
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "kubernetes",
+        "list",
+        "namespaces",
+        &allowed,
+    )
+    .await;
     Ok(Json(json!({ "namespaces": items })))
 }
 
@@ -394,21 +505,34 @@ pub async fn list_namespaces(
 // ---------------------------------------------------------------------------
 pub async fn list_resources(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path(kind): Path<String>,
     Query(q): Query<NsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_kubernetes_enabled(&state).await?;
     if kind_info(&kind).is_none() {
         return Err((StatusCode::BAD_REQUEST, format!("Unknown kind '{kind}'")));
     }
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
     let client = get_kube_client().await?;
-    let items: Vec<Value> = list_kind(&client, &kind, q.namespace.as_deref())
+    let items: Vec<Value> = list_kind(&client, &kind, q.namespace.as_deref(), &allowed)
         .await?
         .iter()
         .map(|o| summarise(&kind, o))
         .collect();
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "kubernetes",
+        "list",
+        &kind,
+        &allowed,
+    )
+    .await;
     Ok(Json(json!({ "resources": items })))
 }
 
@@ -417,13 +541,31 @@ pub async fn list_resources(
 // ---------------------------------------------------------------------------
 pub async fn get_resource(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path((kind, namespace, name)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_kubernetes_enabled(&state).await?;
     let (g, v, k, p, namespaced) = kind_info(&kind)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Unknown kind '{kind}'")))?;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    if namespaced && (namespace.is_empty() || namespace == "_") {
+        return Err((StatusCode::BAD_REQUEST, "namespace is required".to_string()));
+    }
+    if namespaced && !namespace_allowed(&allowed, &namespace) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("namespace '{namespace}' is not allowed for this tenant"),
+        ));
+    }
+    if !namespaced && !cluster_wide_allowed(&allowed) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "cluster-scoped infrastructure access is not enabled".to_string(),
+        ));
+    }
     let client = get_kube_client().await?;
     let ar = api_resource(g, v, k, p);
 
@@ -432,11 +574,9 @@ pub async fn get_resource(
     } else {
         Api::all_with(client.clone(), &ar)
     };
-    let obj = api.get(&name).await.map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("{kind} '{name}' not found: {e}"),
-        )
+    let obj = api.get(&name).await.map_err(|error| {
+        tracing::warn!(kind, namespace, name, %error, "Kubernetes get failed");
+        (StatusCode::NOT_FOUND, format!("{kind} '{name}' not found"))
     })?;
 
     let d = &obj.data;
@@ -533,6 +673,16 @@ pub async fn get_resource(
 
     let labels = obj.metadata.labels.clone().unwrap_or_default();
 
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "kubernetes",
+        "get",
+        &format!("{kind}/{namespace}/{name}"),
+        &[namespace.clone()],
+    )
+    .await;
     Ok(Json(json!({
         "summary": summary,
         "conditions": conditions,

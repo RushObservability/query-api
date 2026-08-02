@@ -41,11 +41,27 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let ch = clickhouse::Client::default()
+    let write_ch = clickhouse::Client::default()
         .with_url(&clickhouse_url)
         .with_database(&clickhouse_db)
         .with_user(&clickhouse_user)
         .with_password(&clickhouse_password);
+
+    let read_user = std::env::var("CLICKHOUSE_READ_USER")?;
+    let read_password = std::env::var("CLICKHOUSE_READ_PASSWORD")?;
+    if read_user == clickhouse_user {
+        anyhow::bail!("CLICKHOUSE_READ_USER must differ from CLICKHOUSE_USER");
+    }
+    let read_ch = clickhouse::Client::default()
+        .with_url(&clickhouse_url)
+        .with_database(&clickhouse_db)
+        .with_user(&read_user)
+        .with_password(&read_password);
+
+    rush_api::probe_row_policy_support(&write_ch).await?;
+    migrations::apply_row_policies(&write_ch, &read_user).await?;
+    migrations::verify_row_policies(&write_ch, &read_ch, &read_user).await?;
+    rush_api::mark_row_policy_enforced();
 
     let config_db =
         Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
@@ -69,8 +85,15 @@ async fn main() -> anyhow::Result<()> {
     // The standalone engine has no /metrics endpoint; give it a private registry so the
     // engine-loop instrumentation still works (record_engine just updates in-memory atomics).
     let self_metrics = Arc::new(rush_api::self_metrics::SelfMetrics::new());
-    anomaly_engine::run_anomaly_engine(config_db, ch, smtp_config, prom_base_url, self_metrics)
-        .await;
+    anomaly_engine::run_anomaly_engine(
+        config_db,
+        read_ch,
+        write_ch,
+        smtp_config,
+        prom_base_url,
+        self_metrics,
+    )
+    .await;
 
     Ok(())
 }

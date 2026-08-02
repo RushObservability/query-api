@@ -9,76 +9,15 @@ use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::users::{require_auth, require_write};
 
-/// Validate that a detection rule SQL is a safe SELECT-only statement.
+/// Validate a detection rule through the same constrained compiler used by
+/// previews and scheduled evaluation.
 fn validate_detection_sql(query_sql: &str) -> Result<(), (StatusCode, String)> {
-    let trimmed = query_sql.trim();
-    let lower = trimmed.to_lowercase();
-
-    // Must start with SELECT
-    if !lower.starts_with("select ")
-        && !lower.starts_with("select\n")
-        && !lower.starts_with("select\t")
-    {
-        return Err((
+    crate::detection_query::validate_template(query_sql).map_err(|error| {
+        (
             StatusCode::BAD_REQUEST,
-            "query_sql must be a SELECT statement".to_string(),
-        ));
-    }
-
-    // Block DDL/DML, dangerous builtins, and ClickHouse data-exfiltration table functions
-    const FORBIDDEN: &[&str] = &[
-        "insert ",
-        "update ",
-        "delete ",
-        "drop ",
-        "create ",
-        "alter ",
-        "truncate ",
-        "exec(",
-        "execute(",
-        "call ",
-        "system(",
-        "grant ",
-        "revoke ",
-        "file(",
-        "load_file(",
-        "into outfile",
-        "into dumpfile",
-        // ClickHouse table functions that can reach external systems
-        "url(",
-        "remote(",
-        "remotesecure(",
-        "s3(",
-        "hdfs(",
-        "mysql(",
-        "postgresql(",
-        "jdbc(",
-        "odbc(",
-        "sqlite(",
-        // ClickHouse cluster/input functions and SQL comment sequences
-        "clusterallreplicas(",
-        "input(",
-        "--",
-        "/*",
-    ];
-    for kw in FORBIDDEN {
-        if lower.contains(kw) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("query_sql must not contain '{}'", kw.trim()),
-            ));
-        }
-    }
-
-    // No semicolons — prevents statement chaining
-    if trimmed.contains(';') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "query_sql must not contain semicolons".to_string(),
-        ));
-    }
-
-    Ok(())
+            format!("invalid detection query: {error}"),
+        )
+    })
 }
 use crate::models::detection::*;
 
@@ -457,11 +396,23 @@ pub async fn test_detection_rule(
         rule.window_secs,
     )
     .await
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("detection query failed: {e}"),
-        )
+    .map_err(|error| {
+        tracing::warn!(
+            error = %error,
+            rule_id = %id,
+            tenant_id = %tenant.tenant_id,
+            "detection query preview failed"
+        );
+        match error {
+            crate::detection_query::DetectionQueryError::Invalid(message) => (
+                StatusCode::BAD_REQUEST,
+                format!("invalid detection query: {message}"),
+            ),
+            crate::detection_query::DetectionQueryError::Execution(_) => (
+                StatusCode::BAD_REQUEST,
+                "detection query could not be evaluated".to_string(),
+            ),
+        }
     })?;
 
     Ok(Json(TestDetectionRuleResponse {

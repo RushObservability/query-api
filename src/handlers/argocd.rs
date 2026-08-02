@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
 };
 use kube::api::DynamicObject;
@@ -8,18 +8,21 @@ use kube::discovery::ApiResource;
 use kube::{Api, Client, api::ListParams};
 use serde_json::{Value, json};
 
-use crate::AppState;
-use crate::handlers::users::require_auth;
+use crate::handlers::infrastructure::{
+    allowed_namespaces, audit_read, namespace_allowed, require_infrastructure_read,
+};
+use crate::{AppState, TenantContext};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 async fn get_kube_client() -> Result<Client, (StatusCode, String)> {
-    Client::try_default().await.map_err(|e| {
+    Client::try_default().await.map_err(|error| {
+        tracing::error!(%error, "Kubernetes client initialization failed");
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("Kubernetes not available: {e}"),
+            "Kubernetes not available".to_string(),
         )
     })
 }
@@ -195,22 +198,39 @@ fn summarise_app(obj: &DynamicObject) -> Value {
 // ---------------------------------------------------------------------------
 pub async fn list_applications(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_argocd_enabled(&state).await?;
     let namespace = argocd_namespace(&state).await;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    if !namespace_allowed(&allowed, &namespace) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "ArgoCD namespace is not allowed for this tenant".to_string(),
+        ));
+    }
     let client = get_kube_client().await?;
 
     let apps: Api<DynamicObject> = Api::namespaced_with(client, &namespace, &application_ar());
-    let list = apps.list(&ListParams::default()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to list ArgoCD applications: {e}"),
-        )
+    let list = apps.list(&ListParams::default()).await.map_err(|error| {
+        tracing::error!(%error, namespace, "ArgoCD application list failed");
+        (StatusCode::BAD_GATEWAY, "ArgoCD request failed".to_string())
     })?;
 
     let items: Vec<Value> = list.items.iter().map(summarise_app).collect();
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "argocd",
+        "list",
+        "applications",
+        &[namespace],
+    )
+    .await;
     Ok(Json(json!({ "applications": items })))
 }
 
@@ -219,19 +239,29 @@ pub async fn list_applications(
 // ---------------------------------------------------------------------------
 pub async fn get_application(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_argocd_enabled(&state).await?;
     let namespace = argocd_namespace(&state).await;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    if !namespace_allowed(&allowed, &namespace) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "ArgoCD namespace is not allowed for this tenant".to_string(),
+        ));
+    }
     let client = get_kube_client().await?;
 
     let apps: Api<DynamicObject> = Api::namespaced_with(client, &namespace, &application_ar());
-    let app = apps.get(&name).await.map_err(|e| {
+    let app = apps.get(&name).await.map_err(|error| {
+        tracing::warn!(%error, namespace, name, "ArgoCD application get failed");
         (
             StatusCode::NOT_FOUND,
-            format!("Application '{name}' not found: {e}"),
+            format!("Application '{name}' not found"),
         )
     })?;
 
@@ -330,6 +360,16 @@ pub async fn get_application(
     let dest_server = jstr(&spec["destination"]["server"]).unwrap_or_default();
     let sync_revision = extract_sync_revision(sync);
 
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "argocd",
+        "get",
+        &format!("application/{name}"),
+        &[namespace],
+    )
+    .await;
     Ok(Json(json!({
         "name": app.metadata.name.as_deref().unwrap_or_default(),
         "project": jstr(&spec["project"]).unwrap_or_default(),
@@ -359,21 +399,31 @@ pub async fn get_application(
 // ---------------------------------------------------------------------------
 pub async fn list_applicationsets(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let mut caller = require_infrastructure_read(&state, &headers).await?;
+    caller.3 = tenant.tenant_id.clone();
     check_argocd_enabled(&state).await?;
     let namespace = argocd_namespace(&state).await;
+    let allowed = allowed_namespaces(&tenant.tenant_id)?;
+    if !namespace_allowed(&allowed, &namespace) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "ArgoCD namespace is not allowed for this tenant".to_string(),
+        ));
+    }
     let client = get_kube_client().await?;
 
     let appsets: Api<DynamicObject> =
         Api::namespaced_with(client, &namespace, &applicationset_ar());
-    let list = appsets.list(&ListParams::default()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to list ApplicationSets: {e}"),
-        )
-    })?;
+    let list = appsets
+        .list(&ListParams::default())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, namespace, "ArgoCD ApplicationSet list failed");
+            (StatusCode::BAD_GATEWAY, "ArgoCD request failed".to_string())
+        })?;
 
     let items: Vec<Value> = list
         .items
@@ -412,5 +462,15 @@ pub async fn list_applicationsets(
         })
         .collect();
 
+    audit_read(
+        &state,
+        &headers,
+        &caller,
+        "argocd",
+        "list",
+        "applicationsets",
+        &[namespace],
+    )
+    .await;
     Ok(Json(json!({ "applicationsets": items })))
 }

@@ -60,6 +60,11 @@ Migrations run on startup, so the schema and materialized views are created if t
 |---|---|---|
 | `CLICKHOUSE_URL` | `http://localhost:8123` | database endpoint |
 | `CLICKHOUSE_DATABASE` | `observability` | created on first run |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `default` / empty | migration, configuration, and write identity |
+| `CLICKHOUSE_READ_USER` / `CLICKHOUSE_READ_PASSWORD` | _(required)_ | distinct SELECT-only identity protected by tenant row policies |
+| `RUSH_ALLOW_INSECURE_TENANT_READS` | `false` | explicit single-tenant development override; never enable in production |
+| `RUSH_ENVIRONMENT` | `production` | use `development`, `local`, or `test` only for deliberate non-production compatibility |
+| `RUSH_ALLOW_ANONYMOUS_DEFAULT` | `false` | insecure development-only override for anonymous access to the default tenant |
 | `RUSH_API_KEY_SECRET` | _(empty)_ | HMAC key for API-key hashes — set it in production |
 | `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | stable key used to encrypt integration DSNs |
 | `RUSH_COLLECTOR_MANAGER_ENABLED` | `false` | enable API-managed local collector supervision |
@@ -69,6 +74,41 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_ALLOWED_ORIGINS` | _(same-origin)_ | CORS allowlist |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
 | `RUST_LOG` | — | e.g. `rush_api=info` |
+
+Startup fails unless the `rush_` ClickHouse custom-setting prefix, strict row
+policies, grants, and the separate read principal all verify. Fresh tenants are
+locked. Local Compose explicitly enables the tenant-read and anonymous-default
+development overrides; `/healthz` reports both states as insecure.
+
+### Tenant and ingest authentication
+
+Query keys are for telemetry read APIs. Ingest keys are separately scoped
+to one tenant, one or more of `logs`, `traces`, `metrics`, and `rum`, a requests-
+per-minute limit, and optional source IP/CIDR restrictions. Session cookies,
+query keys, and pre-migration `legacy` keys are rejected by ingest routes.
+
+Create an ingest key in **Settings → API Keys**, copy it once, and send it as:
+
+```text
+Authorization: Bearer rush_ing_...
+```
+
+Datadog's `DD-API-KEY` and Firehose's
+`X-Amz-Firehose-Access-Key` headers are also accepted, but the stored key must
+still be an ingest key with the matching signal and tenant scopes. Source CIDRs
+are evaluated against the direct network peer, so deployments behind a proxy or
+ingress must allowlist that peer range.
+
+Query and ingest authentication are independent per tenant. Turn off **Query
+auth** to allow anonymous reads, **Ingest auth** to accept telemetry without a
+key, or both for a fully open tenant. These explicit tenant choices are reported
+by `/healthz` and mark `secure=false`, but do not make `/readyz` unhealthy.
+
+Existing tenants without an explicit ingest policy inherit their existing query
+authentication setting, so previously open tenants remain open for ingestion.
+The global `RUSH_ALLOW_ANONYMOUS_DEFAULT` compatibility override still makes
+production readiness unhealthy. Existing API keys migrate to `legacy`
+query-only behavior; issue new ingest keys before upgrading secured collectors.
 
 ### Managed integrations
 

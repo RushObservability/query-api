@@ -931,16 +931,14 @@ async fn query_metric(
              FROM metrics_gauge WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch
-            .query(&sql)
+        let rows = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_option("max_execution_time", "30")
             .fetch_all::<GroupedRow>()
             .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!("SELECT {agg} AS value FROM metrics_gauge WHERE {where_clause}");
-        let row = ch
-            .query(&sql)
+        let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_option("max_execution_time", "30")
             .fetch_one::<ValueRow>()
             .await?;
@@ -1069,16 +1067,14 @@ async fn query_log(
              FROM logs WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch
-            .query(&sql)
+        let rows = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_option("max_execution_time", "30")
             .fetch_all::<GroupedRow>()
             .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!("SELECT count() AS value FROM logs WHERE {where_clause}");
-        let row = ch
-            .query(&sql)
+        let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_option("max_execution_time", "30")
             .fetch_one::<ValueRow>()
             .await?;
@@ -1147,16 +1143,14 @@ async fn query_apm(
              FROM spans WHERE {where_clause} \
              GROUP BY group_key"
         );
-        let rows = ch
-            .query(&sql)
+        let rows = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_option("max_execution_time", "30")
             .fetch_all::<GroupedRow>()
             .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
         let sql = format!("SELECT {agg} AS value FROM spans WHERE {where_clause}");
-        let row = ch
-            .query(&sql)
+        let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_option("max_execution_time", "30")
             .fetch_one::<ValueRow>()
             .await?;
@@ -1405,7 +1399,10 @@ async fn build_preview_timeseries(
         value: f64,
     }
 
-    match ch.query(&sql).fetch_all::<TsRow>().await {
+    match crate::tenant_query(ch, &sql, &monitor.tenant_id)
+        .fetch_all::<TsRow>()
+        .await
+    {
         Ok(rows) => rows
             .into_iter()
             .map(|r| TimeseriesPoint {

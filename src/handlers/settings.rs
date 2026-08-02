@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -9,8 +9,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::AppState;
 use crate::handlers::users::{require_admin, require_auth};
+use crate::{AppState, TenantContext};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -19,6 +19,11 @@ pub struct ApiKeyListEntry {
     pub id: String,
     pub name: String,
     pub prefix: String,
+    pub tenant_id: String,
+    pub key_type: String,
+    pub signals: Vec<String>,
+    pub rate_limit_per_minute: u64,
+    pub source_cidrs: Vec<String>,
     pub created_at: String,
 }
 
@@ -28,20 +33,41 @@ pub struct ApiKeyCreated {
     pub name: String,
     pub key: String,
     pub prefix: String,
+    pub tenant_id: String,
+    pub key_type: String,
+    pub signals: Vec<String>,
+    pub rate_limit_per_minute: u64,
+    pub source_cidrs: Vec<String>,
     pub created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
     pub name: String,
+    #[serde(default = "default_api_key_type")]
+    pub key_type: String,
+    #[serde(default)]
+    pub signals: Vec<String>,
+    #[serde(default)]
+    pub rate_limit_per_minute: u64,
+    #[serde(default)]
+    pub source_cidrs: Vec<String>,
 }
 
-fn generate_api_key() -> String {
+fn default_api_key_type() -> String {
+    "query".to_string()
+}
+
+fn generate_api_key(key_type: &str) -> String {
     let mut rng = rand::rng();
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
-    (0..64)
+    let random: String = (0..64)
         .map(|_| chars[rng.random_range(0..chars.len())])
-        .collect()
+        .collect();
+    format!(
+        "rush_{}_{random}",
+        if key_type == "ingest" { "ing" } else { "qry" }
+    )
 }
 
 /// Hash an API key using HMAC-SHA256 keyed with RUSH_API_KEY_SECRET.
@@ -81,30 +107,98 @@ pub async fn list_api_keys(
     })?;
     let keys: Vec<ApiKeyListEntry> = rows
         .into_iter()
-        .map(|(id, name, prefix, created_at)| ApiKeyListEntry {
-            id,
-            name,
-            prefix,
-            created_at,
-        })
+        .map(
+            |(
+                id,
+                name,
+                prefix,
+                tenant_id,
+                key_type,
+                signals,
+                rate_limit_per_minute,
+                source_cidrs,
+                created_at,
+            )| ApiKeyListEntry {
+                id,
+                name,
+                prefix,
+                tenant_id,
+                key_type,
+                signals,
+                rate_limit_per_minute,
+                source_cidrs,
+                created_at,
+            },
+        )
         .collect();
     Ok(Json(serde_json::json!({ "keys": keys })))
 }
 
 pub async fn create_api_key(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Json(req): Json<CreateApiKeyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 100 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must be 1-100 characters".to_string(),
+        ));
+    }
+    let key_type = req.key_type.trim().to_ascii_lowercase();
+    if !matches!(key_type.as_str(), "query" | "ingest") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "key_type must be 'query' or 'ingest'".to_string(),
+        ));
+    }
+    let signals = if key_type == "ingest" {
+        crate::api_key_auth::normalize_signals(&req.signals)
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?
+    } else {
+        if !req.signals.is_empty() || req.rate_limit_per_minute != 0 || !req.source_cidrs.is_empty()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "signal, rate, and source restrictions apply only to ingest keys".to_string(),
+            ));
+        }
+        Vec::new()
+    };
+    let rate_limit_per_minute = if key_type == "ingest" {
+        if !(1..=1_000_000).contains(&req.rate_limit_per_minute) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "ingest rate_limit_per_minute must be between 1 and 1000000".to_string(),
+            ));
+        }
+        req.rate_limit_per_minute
+    } else {
+        0
+    };
+    let source_cidrs = crate::api_key_auth::normalize_source_cidrs(&req.source_cidrs)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let id = uuid::Uuid::new_v4().to_string();
-    let key = generate_api_key();
+    let key = generate_api_key(&key_type);
     let key_hash = hash_api_key(&key);
-    let prefix = key[..8].to_string();
+    let prefix = key[..12].to_string();
 
     state
         .config_db
-        .create_api_key(&id, &req.name, &key_hash, &prefix)
+        .create_api_key(
+            &id,
+            name,
+            &key_hash,
+            &prefix,
+            &tenant.tenant_id,
+            &key_type,
+            &signals,
+            rate_limit_per_minute,
+            &source_cidrs,
+        )
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "internal error");
@@ -114,7 +208,7 @@ pub async fn create_api_key(
     tracing::info!(
         event = "api_key_created",
         key_id = %id,
-        key_name = %req.name,
+        key_name = %name,
         admin = %caller.1,
         "API key created"
     );
@@ -126,11 +220,19 @@ pub async fn create_api_key(
         .log(
             crate::audit::AuditEvent::new("apikey.create", "user")
                 .actor(caller.0.clone(), caller.1.clone())
-                .tenant(caller.3.clone())
+                .tenant(tenant.tenant_id.clone())
                 .resource("api_key", id.clone())
                 .changes(
-                    serde_json::json!({ "name": req.name, "prefix": prefix, "tenant": caller.3 })
-                        .to_string(),
+                    serde_json::json!({
+                        "name": name,
+                        "prefix": prefix,
+                        "tenant": tenant.tenant_id,
+                        "key_type": key_type,
+                        "signals": signals,
+                        "rate_limit_per_minute": rate_limit_per_minute,
+                        "source_restricted": !source_cidrs.is_empty(),
+                    })
+                    .to_string(),
                 )
                 .description("api key created")
                 .context(crate::audit::actor_context_from_headers(&headers)),
@@ -140,9 +242,14 @@ pub async fn create_api_key(
     // Return the full key ONLY on creation
     Ok(Json(ApiKeyCreated {
         id,
-        name: req.name,
+        name: name.to_string(),
         key,
         prefix,
+        tenant_id: tenant.tenant_id,
+        key_type,
+        signals,
+        rate_limit_per_minute,
+        source_cidrs,
         created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     }))
 }
@@ -1490,6 +1597,8 @@ pub async fn delete_api_key(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     }
+    state.api_key_cache.retain(|_, (grant, _)| grant.id != id);
+    state.ingest_key_limiter.remove(&id);
     tracing::info!(
         event = "api_key_deleted",
         key_id = %id,
