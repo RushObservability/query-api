@@ -3925,6 +3925,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "lettre",
+ "libc",
  "object_store",
  "opensaml",
  "openssl",

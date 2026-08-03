@@ -1246,6 +1246,8 @@ async fn main() -> anyhow::Result<()> {
     // so the same Arc is shared everywhere.
     let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
         std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    rush_api::process_metrics::sample(&self_metrics);
+    rush_api::process_metrics::spawn(self_metrics.clone());
     let instance_id = rush_api::stats_engine::configured_instance_id();
     tracing::info!(instance_id = %instance_id, "self-metrics instance identity configured");
 

@@ -9,6 +9,7 @@
 
 use crate::AppState;
 use crate::ch_writer::{SpoolBatch, WriteError};
+use std::time::Instant;
 
 /// Map the internal signal category ("apm") to the `signal` label value used by the
 /// `rush_ingest_*` self-metrics ("spans"). Other categories pass through unchanged.
@@ -30,6 +31,7 @@ pub async fn write_gated(
     tenant_id: &str,
     batch: SpoolBatch,
 ) -> Result<(), WriteError> {
+    let started = Instant::now();
     let cat = batch.signal_category();
     let n = batch.len();
     // Captured before the batch is moved into the writer. `signal` and `outcome` are the
@@ -43,7 +45,14 @@ pub async fn write_gated(
         state
             .usage_accumulator
             .record_dropped(tenant_id, cat, n as u64, 0);
-        record_ingest(state, signal, "dropped", n as u64, bytes);
+        record_ingest(
+            state,
+            signal,
+            "dropped",
+            n as u64,
+            bytes,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
         tracing::debug!(
             tenant_id = %tenant_id,
             signal = %cat,
@@ -55,17 +64,38 @@ pub async fn write_gated(
 
     match state.writer.write(batch).await {
         Ok(()) => {
-            record_ingest(state, signal, "accepted", n as u64, bytes);
+            record_ingest(
+                state,
+                signal,
+                "accepted",
+                n as u64,
+                bytes,
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
             Ok(())
         }
         Err(WriteError::Backpressure) => {
             // 429 — spool full / backpressure.
-            record_ingest(state, signal, "rejected", n as u64, bytes);
+            record_ingest(
+                state,
+                signal,
+                "rejected",
+                n as u64,
+                bytes,
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
             Err(WriteError::Backpressure)
         }
         Err(e) => {
             // Fatal write error — also counted as rejected (not durably accepted).
-            record_ingest(state, signal, "rejected", n as u64, bytes);
+            record_ingest(
+                state,
+                signal,
+                "rejected",
+                n as u64,
+                bytes,
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
             Err(e)
         }
     }
@@ -78,6 +108,7 @@ fn record_ingest(
     outcome: &'static str,
     events: u64,
     bytes: u64,
+    duration_ms: f64,
 ) {
     let labels = [("signal", signal), ("outcome", outcome)];
     state
@@ -86,4 +117,7 @@ fn record_ingest(
     state
         .self_metrics
         .inc_counter("rush_ingest_bytes_total", &labels, bytes);
+    state
+        .self_metrics
+        .observe_histogram("rush_ingest_batch_duration_ms", &labels, duration_ms);
 }

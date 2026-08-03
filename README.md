@@ -73,12 +73,18 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant-scoped API key for managed collector ingest |
 | `RUSH_ALLOWED_ORIGINS` | _(same-origin)_ | CORS allowlist |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
+| `RUSH_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `RUST_LOG` | — | e.g. `rush_api=info` |
 
 Startup fails unless the `rush_` ClickHouse custom-setting prefix, strict row
 policies, grants, and the separate read principal all verify. Fresh tenants are
 locked. Local Compose explicitly enables the tenant-read and anonymous-default
 development overrides; `/healthz` reports both states as insecure.
+
+`GET /metrics` exposes low-cardinality HTTP RED, ingest batch latency and
+outcome, query operation latency/result counts, usage-queue health, process and
+Tokio runtime gauges, ingest spool state, and ClickHouse health probes. The
+endpoint is intended for an internal Prometheus path and is not tenant data.
 
 ### Tenant and ingest authentication
 
