@@ -460,7 +460,9 @@ pub fn build_span_search_sql(search: &str) -> Option<String> {
 
 /// Build a SQL condition for free-text search on log columns (logs table).
 /// Whole words search `lower(Body)` through the native word text index using
-/// `hasToken`, `hasAllTokens`, or `hasAnyTokens`. Wildcards use substring predicates,
+/// `hasToken` predicates. Multi-word expressions deliberately expand to AND/OR
+/// combinations of `hasToken` because ClickHouse 26.1 requires the
+/// `enable_full_text_index` setting for `hasAllTokens` and `hasAnyTokens`. Wildcards use substring predicates,
 /// exact trace/span IDs route to indexed equality, and map columns use `key=value`.
 pub fn build_log_search_sql(search: &str) -> Option<String> {
     let expr = parse_search_expr(search)?;
@@ -469,9 +471,11 @@ pub fn build_log_search_sql(search: &str) -> Option<String> {
 
 /// Recursively generate SQL for a log search expression.
 ///
-/// Plain token groups use ClickHouse's native multi-token predicates. Besides emitting
-/// less SQL, these predicates let the text-index planner perform one direct read instead
-/// of independently evaluating multiple `hasToken` expressions. Mixed groups retain
+/// Plain token groups expand to `hasToken` predicates instead of ClickHouse's
+/// multi-token helpers. `hasAllTokens` and `hasAnyTokens` require
+/// `enable_full_text_index`, which is not enabled on all supported ClickHouse versions
+/// (including the local 26.1 setup). Keeping the expression in terms of `hasToken`
+/// preserves whole-word AND/OR semantics without a server setting. Mixed groups retain
 /// their specialized ID, wildcard, and attribute predicates.
 fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
     match expr {
@@ -586,14 +590,6 @@ fn log_plain_tokens(term: &str) -> Option<Vec<String>> {
     (!tokens.is_empty()).then_some(tokens)
 }
 
-fn format_token_array(tokens: &[String]) -> String {
-    tokens
-        .iter()
-        .map(|token| format!("'{}'", escape_string_literal(token)))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn log_token_predicate_sql(tokens: &[String]) -> String {
     if tokens.len() == 1 {
         format!(
@@ -601,18 +597,20 @@ fn log_token_predicate_sql(tokens: &[String]) -> String {
             escape_string_literal(&tokens[0])
         )
     } else {
-        format!(
-            "hasAllTokens(lower(Body), [{}])",
-            format_token_array(tokens)
-        )
+        let predicates = tokens
+            .iter()
+            .map(|token| format!("hasToken(lower(Body), '{}')", escape_string_literal(token)))
+            .collect::<Vec<_>>();
+        format!("({})", predicates.join(" AND "))
     }
 }
 
 fn log_any_token_predicate_sql(tokens: &[String]) -> String {
-    format!(
-        "hasAnyTokens(lower(Body), [{}])",
-        format_token_array(tokens)
-    )
+    let predicates = tokens
+        .iter()
+        .map(|token| format!("hasToken(lower(Body), '{}')", escape_string_literal(token)))
+        .collect::<Vec<_>>();
+    format!("({})", predicates.join(" OR "))
 }
 
 /// Generate a ClickHouse predicate for a single free-text log search term.
@@ -626,9 +624,9 @@ fn log_any_token_predicate_sql(tokens: &[String]) -> String {
 ///   bloom index), so this is index-accelerated, not a full scan (see the
 ///   measurement note in the wildcard branch below).
 /// - Every other term is split into word tokens the same way the index tokenizes
-///   (`splitByNonAlpha`: maximal alphanumeric runs), and matched with `hasToken` or
-///   `hasAllTokens`. A multi-word/quoted phrase therefore matches rows containing all of
-///   its words (not necessarily adjacent).
+///   (`splitByNonAlpha`: maximal alphanumeric runs), and matched with `hasToken`
+///   combinations. A multi-word/quoted phrase therefore matches rows containing all of
+///   its words (not necessarily adjacent), without requiring `enable_full_text_index`.
 ///
 /// Trade-offs vs the previous `ngrams(4)` + `LIKE '%term%'` approach: the index is ~6×
 /// smaller and common-term scans are faster, but free text no longer substring-matches
@@ -1098,12 +1096,15 @@ mod search_tests {
         assert!(!sql.contains("positionCaseInsensitive"));
         assert!(!sql.contains("ServiceName"));
 
-        // Multi-word phrase → one native all-token predicate (matches all words).
+        // Multi-word phrase → hasToken AND predicates (matches all words without
+        // requiring enable_full_text_index).
         let sql = build_log_search_sql("\"Using passed request\"").unwrap();
         assert_eq!(
             sql,
-            "hasAllTokens(lower(Body), ['using', 'passed', 'request'])"
+            "(hasToken(lower(Body), 'using') AND hasToken(lower(Body), 'passed') AND hasToken(lower(Body), 'request'))"
         );
+        assert!(!sql.contains("hasAllTokens"));
+        assert!(!sql.contains("hasAnyTokens"));
 
         // Wildcards fall back to a substring LIKE — kept as LIKE deliberately:
         // on 26.6 the LIKE pattern is text-index analyzed, while single-needle
@@ -1129,22 +1130,27 @@ mod search_tests {
         );
     }
 
-    // OR of bare tokens uses one native any-token direct read — NOT substring
-    // multiSearchAny (whole-word 'error' vs the substring 'error' are different).
+    // OR of bare tokens uses hasToken OR predicates — NOT substring multiSearchAny
+    // (whole-word 'error' vs the substring 'error' are different).
     #[test]
-    fn log_or_of_tokens_uses_has_any_tokens() {
+    fn log_or_of_tokens_expands_to_has_token_or() {
         let sql = build_log_search_sql("error OR warn").unwrap();
-        assert_eq!(sql, "hasAnyTokens(lower(Body), ['error', 'warn'])");
+        assert_eq!(
+            sql,
+            "(hasToken(lower(Body), 'error') OR hasToken(lower(Body), 'warn'))"
+        );
         assert!(!sql.contains("multiSearchAny"));
+        assert!(!sql.contains("hasAnyTokens"));
     }
 
     #[test]
-    fn log_and_of_tokens_uses_has_all_tokens() {
+    fn log_and_of_tokens_expands_to_has_token_and() {
         let sql = build_log_search_sql("connection timeout").unwrap();
         assert_eq!(
             sql,
-            "(hasAllTokens(lower(Body), ['connection', 'timeout']))"
+            "((hasToken(lower(Body), 'connection') AND hasToken(lower(Body), 'timeout')))"
         );
+        assert!(!sql.contains("hasAllTokens"));
     }
 
     // Mixed groups combine plain words into one direct read while retaining specialized
@@ -1155,19 +1161,30 @@ mod search_tests {
             build_log_search_sql("connection timeout *refused* db.system=postgresql").unwrap();
         assert_eq!(
             sql,
-            "(hasAllTokens(lower(Body), ['connection', 'timeout']) AND lower(Body) LIKE '%%refused%%' AND (LogAttributes['db.system'] = 'postgresql' OR ResourceAttributes['db.system'] = 'postgresql'))"
+            "((hasToken(lower(Body), 'connection') AND hasToken(lower(Body), 'timeout')) AND lower(Body) LIKE '%%refused%%' AND (LogAttributes['db.system'] = 'postgresql' OR ResourceAttributes['db.system'] = 'postgresql'))"
         );
     }
 
-    // A branch containing multiple required words cannot be flattened into hasAnyTokens,
+    // A branch containing multiple required words cannot be flattened into a plain OR,
     // which would change `(foo AND bar) OR baz` into `foo OR bar OR baz`.
     #[test]
     fn log_or_with_multi_token_branch_preserves_grouping() {
         let sql = build_log_search_sql("\"connection timeout\" OR refused").unwrap();
         assert_eq!(
             sql,
-            "(hasAllTokens(lower(Body), ['connection', 'timeout']) OR hasToken(lower(Body), 'refused'))"
+            "((hasToken(lower(Body), 'connection') AND hasToken(lower(Body), 'timeout')) OR hasToken(lower(Body), 'refused'))"
         );
+    }
+
+    #[test]
+    fn log_quoted_or_phrases_avoid_full_text_setting() {
+        let sql = build_log_search_sql("\"charge declined\" OR \"refund rejected\"").unwrap();
+        assert_eq!(
+            sql,
+            "((hasToken(lower(Body), 'charge') AND hasToken(lower(Body), 'declined')) OR (hasToken(lower(Body), 'refund') AND hasToken(lower(Body), 'rejected')))"
+        );
+        assert!(!sql.contains("hasAllTokens"));
+        assert!(!sql.contains("hasAnyTokens"));
     }
 
     // A mixed OR (wildcard + bare token) does not collapse; falls back to OR.
