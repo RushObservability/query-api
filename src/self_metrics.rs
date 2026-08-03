@@ -23,6 +23,7 @@
 //! one atomic increment. No locks are held across `.await`.
 
 use dashmap::DashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -199,9 +200,49 @@ pub struct SelfMetrics {
     histograms: DashMap<(&'static str, Labels), Histogram>,
 }
 
+/// RAII guard for a query-operation concurrency gauge. Keeping the decrement in
+/// `Drop` means early returns and handler errors cannot leave a stale in-flight
+/// value behind.
+pub struct QueryGuard {
+    metrics: Arc<SelfMetrics>,
+    operation: &'static str,
+    signal: &'static str,
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        self.metrics.add_gauge(
+            "rush_query_requests_in_flight",
+            &[("operation", self.operation), ("signal", self.signal)],
+            -1.0,
+        );
+    }
+}
+
 impl SelfMetrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Start tracking one query operation. Operation and signal values are
+    /// normalized to fixed allowlists before becoming labels.
+    pub fn query_guard(
+        self: &Arc<Self>,
+        operation: &'static str,
+        signal: &'static str,
+    ) -> QueryGuard {
+        let operation = bounded_query_operation(operation);
+        let signal = bounded_query_signal(signal);
+        self.add_gauge(
+            "rush_query_requests_in_flight",
+            &[("operation", operation), ("signal", signal)],
+            1.0,
+        );
+        QueryGuard {
+            metrics: self.clone(),
+            operation,
+            signal,
+        }
     }
 
     /// Sort a label slice into the canonical (key-sorted) order used as the map key.
@@ -671,6 +712,21 @@ mod tests {
             text.contains("rush_http_requests_in_flight 3\n"),
             "gauge render wrong:\n{text}"
         );
+    }
+
+    #[test]
+    fn query_guard_balances_operation_in_flight() {
+        let metrics = Arc::new(SelfMetrics::new());
+        let guard = metrics.query_guard("explore_logs", "logs");
+        let during = metrics.render_prometheus();
+        assert!(during.contains(
+            "rush_query_requests_in_flight{operation=\"explore_logs\",signal=\"logs\"} 1"
+        ));
+        drop(guard);
+        let after = metrics.render_prometheus();
+        assert!(after.contains(
+            "rush_query_requests_in_flight{operation=\"explore_logs\",signal=\"logs\"} 0"
+        ));
     }
 
     #[test]

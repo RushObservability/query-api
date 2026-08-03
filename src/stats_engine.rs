@@ -1,6 +1,7 @@
 use crate::self_metrics::{MetricKind, SelfMetrics};
 use crate::spool::IngestBuffer;
 use clickhouse::Client;
+use futures_util::future::join_all;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -240,116 +241,161 @@ async fn collect_and_write(
 /// Each metric is fetched independently and skipped gracefully if unavailable on this
 /// CH version (the query simply returns 0/None and we set what we got). Sources prefer
 /// instantaneous gauges (`system.metrics`, `system.asynchronous_metrics`) over event deltas.
-async fn collect_ch_health(ch: &Client, self_metrics: &SelfMetrics) {
+/// Fixed, low-cardinality ClickHouse health probes. Every query is best-effort:
+/// older ClickHouse versions may not expose a system metric or query-log column,
+/// and `run_ch_probe` records that as an unavailable probe rather than failing the
+/// stats tick.
+const CH_HEALTH_PROBES: &[(&str, &str)] = &[
     // (metric name, SQL returning a single Float64 column `v`)
     // NOTE: every probe MUST return a single Float64 column named `v`. clickhouse-rs uses
     // RowBinary and reinterprets bytes by declared type, so a UInt64 `count()`/`max()`
     // deserialized into f64 yields garbage — wrap all integer aggregates in toFloat64().
-    let probes: [(&'static str, &'static str); 17] = [
-        // Max parts in any single partition — the classic "too many parts" early warning.
-        (
-            "rush_ch_max_part_count_for_partition",
-            "SELECT toFloat64(max(c)) AS v FROM (SELECT count() AS c FROM system.parts WHERE database='observability' AND active GROUP BY table, partition)",
-        ),
-        // Active background merges / mutations right now.
-        (
-            "rush_ch_active_merges",
-            "SELECT toFloat64(count()) AS v FROM system.merges",
-        ),
-        (
-            "rush_ch_active_mutations",
-            "SELECT toFloat64(count()) AS v FROM system.mutations WHERE is_done = 0",
-        ),
-        // Longest currently-running merge, seconds.
-        (
-            "rush_ch_longest_running_merge_secs",
-            "SELECT toFloat64(max(elapsed)) AS v FROM system.merges",
-        ),
-        // Insert pressure — instantaneous current values from system.metrics.
-        (
-            "rush_ch_delayed_inserts",
-            "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'DelayedInserts'",
-        ),
-        // Cumulative rejected inserts (event counter).
-        (
-            "rush_ch_rejected_inserts",
-            "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'RejectedInserts'",
-        ),
-        // Server resident memory.
-        (
-            "rush_ch_memory_resident_bytes",
-            "SELECT toFloat64(value) AS v FROM system.asynchronous_metrics WHERE metric = 'MemoryResident'",
-        ),
-        // Cumulative failed queries (event counter).
-        (
-            "rush_ch_failed_query_total",
-            "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'FailedQuery'",
-        ),
-        // Background merges+mutations pool occupancy.
-        (
-            "rush_ch_background_pool_task",
-            "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'BackgroundMergesAndMutationsPoolTask'",
-        ),
-        // Live query pressure and resource usage from currently executing queries.
-        (
-            "rush_ch_active_queries",
-            "SELECT toFloat64(count()) AS v FROM system.processes",
-        ),
-        (
-            "rush_ch_longest_running_query_secs",
-            "SELECT toFloat64(max(elapsed)) AS v FROM system.processes",
-        ),
-        (
-            "rush_ch_active_query_memory_bytes",
-            "SELECT toFloat64(sum(memory_usage)) AS v FROM system.processes",
-        ),
-        (
-            "rush_ch_active_query_read_rows",
-            "SELECT toFloat64(sum(read_rows)) AS v FROM system.processes",
-        ),
-        (
-            "rush_ch_active_query_read_bytes",
-            "SELECT toFloat64(sum(read_bytes)) AS v FROM system.processes",
-        ),
-        // Recent query-log aggregates provide a database-side latency/error view. These
-        // probes are optional because query_log can be disabled or unavailable in small
-        // ClickHouse installations; failures are recorded and do not fail the stats tick.
-        (
-            "rush_ch_query_log_p95_duration_ms",
-            "SELECT quantile(0.95)(toFloat64(QueryDurationMicroseconds)) / 1000.0 AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
-        ),
-        (
-            "rush_ch_query_log_recent_errors",
-            "SELECT toFloat64(countIf(type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing'))) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND is_initial_query = 1",
-        ),
-        (
-            "rush_ch_memory_tracking_bytes",
-            "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'MemoryTracking'",
-        ),
-    ];
+    // Max parts in any single partition — the classic "too many parts" warning.
+    (
+        "rush_ch_max_part_count_for_partition",
+        "SELECT toFloat64(max(c)) AS v FROM (SELECT count() AS c FROM system.parts WHERE database='observability' AND active GROUP BY table, partition)",
+    ),
+    (
+        "rush_ch_active_parts",
+        "SELECT toFloat64(count()) AS v FROM system.parts WHERE database='observability' AND active",
+    ),
+    (
+        "rush_ch_active_merges",
+        "SELECT toFloat64(count()) AS v FROM system.merges",
+    ),
+    (
+        "rush_ch_active_mutations",
+        "SELECT toFloat64(count()) AS v FROM system.mutations WHERE is_done = 0",
+    ),
+    (
+        "rush_ch_longest_running_merge_secs",
+        "SELECT toFloat64(max(elapsed)) AS v FROM system.merges",
+    ),
+    (
+        "rush_ch_delayed_inserts",
+        "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'DelayedInserts'",
+    ),
+    (
+        "rush_ch_rejected_inserts_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'RejectedInserts'",
+    ),
+    (
+        "rush_ch_memory_resident_bytes",
+        "SELECT toFloat64(value) AS v FROM system.asynchronous_metrics WHERE metric = 'MemoryResident'",
+    ),
+    (
+        "rush_ch_memory_tracking_bytes",
+        "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'MemoryTracking'",
+    ),
+    (
+        "rush_ch_failed_query_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'FailedQuery'",
+    ),
+    (
+        "rush_ch_queries_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'Query'",
+    ),
+    (
+        "rush_ch_select_queries_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'SelectQuery'",
+    ),
+    (
+        "rush_ch_insert_queries_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'InsertQuery'",
+    ),
+    (
+        "rush_ch_selected_rows_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'SelectedRows'",
+    ),
+    (
+        "rush_ch_selected_bytes_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'SelectedBytes'",
+    ),
+    (
+        "rush_ch_inserted_rows_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'WrittenRows'",
+    ),
+    (
+        "rush_ch_inserted_bytes_total",
+        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'WrittenBytes'",
+    ),
+    (
+        "rush_ch_background_pool_task",
+        "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'BackgroundMergesAndMutationsPoolTask'",
+    ),
+    (
+        "rush_ch_active_queries",
+        "SELECT toFloat64(count()) AS v FROM system.processes",
+    ),
+    (
+        "rush_ch_longest_running_query_secs",
+        "SELECT toFloat64(max(elapsed)) AS v FROM system.processes",
+    ),
+    (
+        "rush_ch_active_query_memory_bytes",
+        "SELECT toFloat64(sum(memory_usage)) AS v FROM system.processes",
+    ),
+    (
+        "rush_ch_active_query_read_rows",
+        "SELECT toFloat64(sum(read_rows)) AS v FROM system.processes",
+    ),
+    (
+        "rush_ch_active_query_read_bytes",
+        "SELECT toFloat64(sum(read_bytes)) AS v FROM system.processes",
+    ),
+    (
+        "rush_ch_disk_local_used_bytes",
+        "SELECT toFloat64(sum(total_space - free_space)) AS v FROM system.disks WHERE type = 'Local'",
+    ),
+    // Query-log fields are optional: query_log may be disabled or have a shorter
+    // retention window, so unavailable probes are intentionally non-fatal.
+    (
+        "rush_ch_query_log_recent_queries",
+        "SELECT toFloat64(countIf(type = 'QueryFinish')) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_p50_duration_ms",
+        "SELECT quantile(0.50)(toFloat64(QueryDurationMicroseconds)) / 1000.0 AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_p95_duration_ms",
+        "SELECT quantile(0.95)(toFloat64(QueryDurationMicroseconds)) / 1000.0 AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_read_rows",
+        "SELECT toFloat64(sum(read_rows)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_read_bytes",
+        "SELECT toFloat64(sum(read_bytes)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_result_rows",
+        "SELECT toFloat64(sum(result_rows)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_result_bytes",
+        "SELECT toFloat64(sum(result_bytes)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_memory_p95_bytes",
+        "SELECT quantile(0.95)(toFloat64(memory_usage)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+    ),
+    (
+        "rush_ch_query_log_recent_errors",
+        "SELECT toFloat64(countIf(type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing'))) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND is_initial_query = 1",
+    ),
+];
 
+async fn collect_ch_health(ch: &Client, self_metrics: &SelfMetrics) {
     // Probes are independent, so issue them together rather than adding their round-trip
-    // latencies. The probe set is fixed and small, which keeps this fan-out bounded.
-    let p = &probes;
-    tokio::join!(
-        run_ch_probe(ch, self_metrics, p[0].0, p[0].1),
-        run_ch_probe(ch, self_metrics, p[1].0, p[1].1),
-        run_ch_probe(ch, self_metrics, p[2].0, p[2].1),
-        run_ch_probe(ch, self_metrics, p[3].0, p[3].1),
-        run_ch_probe(ch, self_metrics, p[4].0, p[4].1),
-        run_ch_probe(ch, self_metrics, p[5].0, p[5].1),
-        run_ch_probe(ch, self_metrics, p[6].0, p[6].1),
-        run_ch_probe(ch, self_metrics, p[7].0, p[7].1),
-        run_ch_probe(ch, self_metrics, p[8].0, p[8].1),
-        run_ch_probe(ch, self_metrics, p[9].0, p[9].1),
-        run_ch_probe(ch, self_metrics, p[10].0, p[10].1),
-        run_ch_probe(ch, self_metrics, p[11].0, p[11].1),
-        run_ch_probe(ch, self_metrics, p[12].0, p[12].1),
-        run_ch_probe(ch, self_metrics, p[13].0, p[13].1),
-        run_ch_probe(ch, self_metrics, p[14].0, p[14].1),
-        run_ch_probe(ch, self_metrics, p[15].0, p[15].1),
-        run_ch_probe(ch, self_metrics, p[16].0, p[16].1),
-    );
+    // latencies. `join_all` keeps this fan-out bounded by the fixed probe list.
+    join_all(
+        CH_HEALTH_PROBES
+            .iter()
+            .map(|(name, sql)| run_ch_probe(ch, self_metrics, name, sql)),
+    )
+    .await;
 }
 
 async fn run_ch_probe(
@@ -569,5 +615,20 @@ mod tests {
 
         let existing = vec![("instance", "already-set".to_string())];
         assert_eq!(labels_with_instance(&existing, "api-0"), existing);
+    }
+
+    #[test]
+    fn clickhouse_health_probes_are_fixed_and_low_cardinality() {
+        assert!(CH_HEALTH_PROBES.len() >= 30);
+        assert!(
+            CH_HEALTH_PROBES
+                .iter()
+                .any(|(name, _)| { *name == "rush_ch_query_log_p95_duration_ms" })
+        );
+        assert!(
+            CH_HEALTH_PROBES
+                .iter()
+                .all(|(name, sql)| { name.starts_with("rush_ch_") && sql.contains(" AS v") })
+        );
     }
 }

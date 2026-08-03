@@ -73,6 +73,7 @@ async fn prom_query_inner(
     params: InstantQueryParams,
     tenant_id: &str,
 ) -> Result<Json<PromResponse<VectorData>>, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("promql_instant", "metrics");
     let start = std::time::Instant::now();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -185,6 +186,7 @@ async fn prom_query_range_inner(
     params: RangeQueryParams,
     tenant_id: &str,
 ) -> Result<Json<PromResponse<MatrixData>>, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("promql_range", "metrics");
     let query_start = std::time::Instant::now();
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
@@ -296,6 +298,7 @@ async fn prom_series_inner(
     params: SeriesParams,
     tenant_id: &str,
 ) -> Result<Json<PromResponse<Vec<BTreeMap<String, String>>>>, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("promql_series", "metrics");
     let start = std::time::Instant::now();
     let match_exprs = params.match_exprs.unwrap_or_default();
     if match_exprs.is_empty() {
@@ -425,6 +428,7 @@ pub async fn prom_labels(
     Extension(tenant): Extension<TenantContext>,
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("promql_metadata", "metrics");
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
@@ -541,6 +545,7 @@ pub async fn prom_label_values(
     Path(label_name): Path<String>,
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("promql_metadata", "metrics");
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);

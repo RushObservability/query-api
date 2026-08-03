@@ -178,6 +178,7 @@ pub async fn query_logs(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_logs", "logs");
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
 
@@ -461,6 +462,7 @@ pub async fn get_log_detail(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogDetailRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_logs", "logs");
     if req.service_name.len() > 1024
         || req.severity_text.len() > 128
         || req.trace_id.len() > 128
@@ -527,6 +529,7 @@ pub async fn export_logs(
     Json(req): Json<LogExportRequest>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use crate::handlers::export;
+    let _query_guard = state.self_metrics.query_guard("explore_logs", "logs");
     let tenant_id = &tenant.tenant_id;
 
     if let Some(ref s) = req.search {
@@ -664,6 +667,7 @@ pub async fn count_logs(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CountQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_logs", "logs");
     let tenant_id = &tenant.tenant_id;
     let clauses = build_log_where(
         &req.filters,
@@ -739,6 +743,7 @@ pub async fn log_histogram(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogHistogramRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_logs", "logs");
     let tenant_id = &tenant.tenant_id;
 
     if let Some(ref s) = req.search {
@@ -833,6 +838,7 @@ pub async fn group_logs(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<crate::models::query::QueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_logs", "logs");
     if req.group_by.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,

@@ -20,6 +20,7 @@ pub async fn execute_query(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<QueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_spans", "spans");
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
 
@@ -221,6 +222,7 @@ pub async fn export_query(
     Json(req): Json<SpanExportRequest>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use crate::handlers::export;
+    let _query_guard = state.self_metrics.query_guard("explore_spans", "spans");
     let tenant_id = &tenant.tenant_id;
 
     if let Some(ref s) = req.search {
@@ -359,6 +361,7 @@ pub async fn count_query(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CountQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_spans", "spans");
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let clauses = build_where_clause_with_search(
@@ -415,6 +418,7 @@ pub async fn group_query(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<QueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_spans", "spans");
     if req.group_by.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -495,6 +499,7 @@ pub async fn timeseries_query(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<TimeseriesRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_spans", "spans");
     let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);

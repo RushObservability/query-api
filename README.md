@@ -82,9 +82,12 @@ locked. Local Compose explicitly enables the tenant-read and anonymous-default
 development overrides; `/healthz` reports both states as insecure.
 
 `GET /metrics` exposes low-cardinality HTTP RED, ingest batch latency and
-outcome, query operation latency/result counts, usage-queue health, process and
-Tokio runtime gauges, ingest spool state, and ClickHouse health probes. The
-endpoint is intended for an internal Prometheus path and is not tenant data.
+outcome, per-operation query concurrency/latency/result counts, usage-queue
+health, process and Tokio runtime gauges, ingest spool state, and ClickHouse
+health. ClickHouse metrics include active queries, merges/mutations, memory,
+disk, insert/select counters, and recent query-log latency, read-volume,
+result-volume, memory, and error aggregates. The endpoint is intended for an
+internal Prometheus path and is not tenant data.
 
 ### Tenant and ingest authentication
 
