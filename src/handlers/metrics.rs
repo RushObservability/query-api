@@ -90,7 +90,8 @@ async fn prom_query_inner(
             .await
             .map_err(|e| {
                 // Additive self-metric; never fails the request.
-                state.self_metrics.record_search(
+                state.self_metrics.record_query_and_search(
+                    "promql_instant",
                     "metrics",
                     Some(query_len),
                     0,
@@ -116,6 +117,7 @@ async fn prom_query_inner(
         let metric_names = crate::usage_tracker::extract_metrics_from_query(&params.query);
         for name in metric_names {
             state.usage.track(crate::usage_tracker::UsageEvent {
+                tenant_id: tenant_id.to_string(),
                 signal_name: name,
                 signal_type: "metric".to_string(),
                 source: "prom_api".to_string(),
@@ -134,7 +136,8 @@ async fn prom_query_inner(
     );
 
     // Self-metric: count of result series (one VectorResult per time series), not datapoints.
-    state.self_metrics.record_search(
+    state.self_metrics.record_query_and_search(
+        "promql_instant",
         "metrics",
         Some(query_len),
         result.len() as u64,
@@ -197,7 +200,8 @@ async fn prom_query_range_inner(
             .await
             .map_err(|e| {
                 // Additive self-metric; never fails the request.
-                state.self_metrics.record_search(
+                state.self_metrics.record_query_and_search(
+                    "promql_range",
                     "metrics",
                     Some(query_len),
                     0,
@@ -224,6 +228,7 @@ async fn prom_query_range_inner(
         let metric_names = crate::usage_tracker::extract_metrics_from_query(&params.query);
         for name in metric_names {
             state.usage.track(crate::usage_tracker::UsageEvent {
+                tenant_id: tenant_id.to_string(),
                 signal_name: name,
                 signal_type: "metric".to_string(),
                 source: "prom_api".to_string(),
@@ -242,7 +247,8 @@ async fn prom_query_range_inner(
     );
 
     // Self-metric: count of result series (one MatrixResult per time series), not datapoints.
-    state.self_metrics.record_search(
+    state.self_metrics.record_query_and_search(
+        "promql_range",
         "metrics",
         Some(query_len),
         result.len() as u64,
@@ -290,8 +296,16 @@ async fn prom_series_inner(
     params: SeriesParams,
     tenant_id: &str,
 ) -> Result<Json<PromResponse<Vec<BTreeMap<String, String>>>>, (StatusCode, String)> {
+    let start = std::time::Instant::now();
     let match_exprs = params.match_exprs.unwrap_or_default();
     if match_exprs.is_empty() {
+        state.self_metrics.record_query(
+            "promql_series",
+            "metrics",
+            0,
+            start.elapsed().as_millis() as u64,
+            true,
+        );
         return Ok(Json(PromResponse {
             status: "success",
             data: Vec::<BTreeMap<String, String>>::new(),
@@ -384,6 +398,13 @@ async fn prom_series_inner(
     // Deduplicate
     all_series.sort();
     all_series.dedup();
+    state.self_metrics.record_query(
+        "promql_series",
+        "metrics",
+        all_series.len() as u64,
+        start.elapsed().as_millis() as u64,
+        true,
+    );
 
     Ok(Json(PromResponse {
         status: "success",
@@ -404,6 +425,7 @@ pub async fn prom_labels(
     Extension(tenant): Extension<TenantContext>,
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
 
@@ -413,6 +435,13 @@ pub async fn prom_labels(
         params.match_expr.as_deref().unwrap_or("")
     );
     if let Some(cached) = prom_meta_cache_get(&cache_key) {
+        state.self_metrics.record_query(
+            "promql_metadata",
+            "metrics",
+            cached.len() as u64,
+            start.elapsed().as_millis() as u64,
+            true,
+        );
         return Ok(Json(PromResponse {
             status: "success",
             data: cached,
@@ -490,6 +519,13 @@ pub async fn prom_labels(
     labels.dedup();
 
     prom_meta_cache_put(cache_key, labels.clone());
+    state.self_metrics.record_query(
+        "promql_metadata",
+        "metrics",
+        labels.len() as u64,
+        start.elapsed().as_millis() as u64,
+        true,
+    );
 
     Ok(Json(PromResponse {
         status: "success",
@@ -505,6 +541,7 @@ pub async fn prom_label_values(
     Path(label_name): Path<String>,
     Query(params): Query<LabelsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
 
@@ -514,6 +551,13 @@ pub async fn prom_label_values(
         params.match_expr.as_deref().unwrap_or("")
     );
     if let Some(cached) = prom_meta_cache_get(&cache_key) {
+        state.self_metrics.record_query(
+            "promql_metadata",
+            "metrics",
+            cached.len() as u64,
+            start.elapsed().as_millis() as u64,
+            true,
+        );
         return Ok(Json(PromResponse {
             status: "success",
             data: cached,
@@ -597,6 +641,13 @@ pub async fn prom_label_values(
     values.dedup();
 
     prom_meta_cache_put(cache_key, values.clone());
+    state.self_metrics.record_query(
+        "promql_metadata",
+        "metrics",
+        values.len() as u64,
+        start.elapsed().as_millis() as u64,
+        true,
+    );
 
     Ok(Json(PromResponse {
         status: "success",

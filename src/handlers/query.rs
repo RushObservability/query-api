@@ -102,7 +102,7 @@ pub async fn execute_query(
         );
         let rows = rows_result.map_err(|e| {
             tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
-            state.self_metrics.record_search("spans", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
+            state.self_metrics.record_query_and_search("explore_spans", "spans", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
@@ -113,7 +113,7 @@ pub async fn execute_query(
             }
             .encode()
         });
-        emit_usage_and_log(&state, &req, total, rows.len(), start);
+        emit_usage_and_log(&state, tenant_id, &req, total, rows.len(), start);
         (serde_json::json!({ "rows": rows, "total": total }), next)
     } else {
         let (rows_result, count_result) = tokio::join!(
@@ -122,7 +122,7 @@ pub async fn execute_query(
         );
         let rows = rows_result.map_err(|e| {
             tracing::error!(error = %e, signal = "traces", handler = "execute_query", "query failed");
-            state.self_metrics.record_search("spans", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
+            state.self_metrics.record_query_and_search("explore_spans", "spans", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
@@ -133,7 +133,7 @@ pub async fn execute_query(
             }
             .encode()
         });
-        emit_usage_and_log(&state, &req, total, rows.len(), start);
+        emit_usage_and_log(&state, tenant_id, &req, total, rows.len(), start);
         (serde_json::json!({ "rows": rows, "total": total }), next)
     };
 
@@ -149,6 +149,7 @@ pub async fn execute_query(
 /// Shared usage-tracking + structured log for the explore query handler (wide & slim).
 fn emit_usage_and_log(
     state: &AppState,
+    tenant_id: &str,
     req: &QueryRequest,
     total: u64,
     row_count: usize,
@@ -166,7 +167,9 @@ fn emit_usage_and_log(
             })
             .collect();
         let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
-        state.usage.track_many(signals, "span", "explore");
+        state
+            .usage
+            .track_many(tenant_id, signals, "span", "explore");
     }
     tracing::info!(
         signal = "traces",
@@ -182,7 +185,8 @@ fn emit_usage_and_log(
     // Low cardinality — labeled only by the fixed `signal="spans"`. `query_len` is None
     // for browse (no free-text term) so the length histogram only reflects real searches;
     // char count (not bytes) matches the handler's 512-char validation.
-    state.self_metrics.record_search(
+    state.self_metrics.record_query_and_search(
+        "explore_spans",
         "spans",
         req.search.as_ref().map(|s| s.chars().count()),
         row_count as u64,
@@ -491,6 +495,7 @@ pub async fn timeseries_query(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<TimeseriesRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let start = std::time::Instant::now();
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let clauses = build_where_clause_with_search(
@@ -544,6 +549,13 @@ pub async fn timeseries_query(
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", "query failed");
+                state.self_metrics.record_query(
+                    "explore_spans",
+                    "spans",
+                    0,
+                    start.elapsed().as_millis() as u64,
+                    false,
+                );
                 (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
 
@@ -560,8 +572,17 @@ pub async fn timeseries_query(
                 })
                 .collect();
             let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
-            state.usage.track_many(signals, "span", "explore");
+            state
+                .usage
+                .track_many(tenant_id, signals, "span", "explore");
         }
+        state.self_metrics.record_query(
+            "explore_spans",
+            "spans",
+            buckets.len() as u64,
+            start.elapsed().as_millis() as u64,
+            true,
+        );
 
         Ok(Json(
             serde_json::json!({ "buckets": buckets, "grouped": true }),
@@ -587,6 +608,13 @@ pub async fn timeseries_query(
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", "query failed");
+                state.self_metrics.record_query(
+                    "explore_spans",
+                    "spans",
+                    0,
+                    start.elapsed().as_millis() as u64,
+                    false,
+                );
                 (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
 
@@ -603,8 +631,17 @@ pub async fn timeseries_query(
                 })
                 .collect();
             let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
-            state.usage.track_many(signals, "span", "explore");
+            state
+                .usage
+                .track_many(tenant_id, signals, "span", "explore");
         }
+        state.self_metrics.record_query(
+            "explore_spans",
+            "spans",
+            buckets.len() as u64,
+            start.elapsed().as_millis() as u64,
+            true,
+        );
 
         Ok(Json(
             serde_json::json!({ "buckets": buckets, "grouped": false }),

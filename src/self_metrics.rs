@@ -48,6 +48,19 @@ pub const RESULT_COUNT_BUCKETS: [f64; 10] = [
 pub const QUERY_LEN_BUCKETS: [f64; 10] =
     [0.0, 1.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0];
 
+/// Allowlisted operation names used by operation-level query metrics. Keep this list
+/// intentionally small: operation names become Prometheus label values and must never
+/// be derived from raw URLs, SQL, tenant IDs, or user input.
+pub const QUERY_OPERATIONS: [&str; 7] = [
+    "explore_logs",
+    "explore_spans",
+    "promql_instant",
+    "promql_range",
+    "promql_series",
+    "promql_metadata",
+    "other",
+];
+
 /// A label set, stored already-sorted by key so identical sets map to one series.
 type Labels = Vec<(&'static str, String)>;
 
@@ -344,6 +357,66 @@ impl SelfMetrics {
         }
     }
 
+    /// Record a query operation with bounded `operation` and `signal` labels.
+    ///
+    /// These metrics complement the older signal-level `rush_search_*` series with
+    /// enough detail to understand which product surface is driving load. Unknown
+    /// operation names collapse into `other`, preserving a finite label set even if a
+    /// future caller accidentally passes an unbounded value.
+    pub fn record_query(
+        &self,
+        operation: &'static str,
+        signal: &'static str,
+        result_rows: u64,
+        duration_ms: u64,
+        ok: bool,
+    ) {
+        let operation = bounded_query_operation(operation);
+        let signal = bounded_query_signal(signal);
+        let outcome = if ok { "ok" } else { "error" };
+        let labels = [("operation", operation), ("signal", signal)];
+        self.inc_counter(
+            "rush_query_requests_total",
+            &[
+                ("operation", operation),
+                ("signal", signal),
+                ("outcome", outcome),
+            ],
+            1,
+        );
+        self.observe_histogram_with(
+            "rush_query_duration_ms",
+            &labels,
+            duration_ms as f64,
+            &SEARCH_LATENCY_BUCKETS_MS,
+        );
+        self.observe_histogram_with(
+            "rush_query_result_rows",
+            &labels,
+            result_rows as f64,
+            &RESULT_COUNT_BUCKETS,
+        );
+        if result_rows == 0 {
+            self.inc_counter("rush_query_empty_total", &labels, 1);
+        }
+    }
+
+    /// Record both the existing signal-level search metrics and the newer operation-level
+    /// metrics for a query handler. Keeping this helper preserves the existing dashboards
+    /// while making operation attribution consistent across success and error paths.
+    pub fn record_query_and_search(
+        &self,
+        operation: &'static str,
+        signal: &'static str,
+        query_len: Option<usize>,
+        result_rows: u64,
+        duration_ms: u64,
+        ok: bool,
+    ) {
+        self.record_search(signal, query_len, result_rows, duration_ms, ok);
+        self.record_query(operation, signal, result_rows, duration_ms, ok);
+    }
+
     // ── Output 1: Prometheus text exposition (0.0.4) ──────────────────────────────
 
     /// Render the full registry as Prometheus text exposition format (version 0.0.4).
@@ -490,6 +563,21 @@ impl SelfMetrics {
         }
 
         points
+    }
+}
+
+fn bounded_query_operation(operation: &'static str) -> &'static str {
+    match operation {
+        "explore_logs" | "explore_spans" | "promql_instant" | "promql_range" | "promql_series"
+        | "promql_metadata" => operation,
+        _ => "other",
+    }
+}
+
+fn bounded_query_signal(signal: &'static str) -> &'static str {
+    match signal {
+        "logs" | "spans" | "metrics" => signal,
+        _ => "other",
     }
 }
 
@@ -901,5 +989,27 @@ mod tests {
         assert!(!text.contains("tenant"), "tenant label leaked:\n{text}");
         assert!(!text.contains("route="), "route label leaked:\n{text}");
         assert!(!text.contains("promql"), "query text leaked:\n{text}");
+    }
+
+    #[test]
+    fn record_query_emits_operation_metrics_with_allowlisted_labels() {
+        let m = SelfMetrics::new();
+        m.record_query("explore_logs", "logs", 4, 25, true);
+        m.record_query("untrusted-operation", "untrusted-signal", 0, 100, false);
+
+        let text = m.render_prometheus();
+        assert!(text.contains("# TYPE rush_query_requests_total counter"));
+        assert!(text.contains(
+            "rush_query_requests_total{operation=\"explore_logs\",outcome=\"ok\",signal=\"logs\"} 1"
+        ));
+        assert!(text.contains(
+            "rush_query_requests_total{operation=\"other\",outcome=\"error\",signal=\"other\"} 1"
+        ));
+        assert!(text.contains(
+            "rush_query_duration_ms_count{operation=\"explore_logs\",signal=\"logs\"} 1"
+        ));
+        assert!(text.contains("rush_query_empty_total{operation=\"other\",signal=\"other\"} 1"));
+        assert!(!text.contains("untrusted-operation"));
+        assert!(!text.contains("untrusted-signal"));
     }
 }

@@ -1246,6 +1246,8 @@ async fn main() -> anyhow::Result<()> {
     // so the same Arc is shared everywhere.
     let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
         std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    let instance_id = rush_api::stats_engine::configured_instance_id();
+    tracing::info!(instance_id = %instance_id, "self-metrics instance identity configured");
 
     // Spawn background engines (skipped in drain-worker-only mode)
     //
@@ -1389,6 +1391,7 @@ async fn main() -> anyhow::Result<()> {
             admin_ch.clone(),
             writer.buffer.clone(),
             self_metrics.clone(),
+            instance_id,
         );
     }
 
@@ -1426,10 +1429,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Spawn usage tracker (fire-and-forget signal usage tracking)
-    let usage = usage_tracker::spawn(admin_ch.clone());
+    let usage = usage_tracker::spawn(admin_ch.clone(), self_metrics.clone());
 
     // Spawn usage accumulator (per-tenant ingest metering)
-    let usage_accumulator = UsageAccumulator::new();
+    let usage_accumulator = UsageAccumulator::with_metrics(self_metrics.clone());
     usage_accumulator.spawn_flusher(admin_ch.clone());
 
     let login_limiter: std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant)>> =

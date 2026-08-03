@@ -265,7 +265,7 @@ pub async fn query_logs(
             result
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
-                    state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
+                    state.self_metrics.record_query_and_search("explore_logs", "logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
                 })?
         } else {
@@ -301,7 +301,7 @@ pub async fn query_logs(
             let rows = result
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
-                    state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
+                    state.self_metrics.record_query_and_search("explore_logs", "logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
                 })?;
             let total = rows.len() as u64;
@@ -336,7 +336,7 @@ pub async fn query_logs(
         let rows = result
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "logs", handler = "query_logs", "search query failed");
-                state.self_metrics.record_search("logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
+                state.self_metrics.record_query_and_search("explore_logs", "logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                 (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
         let total = rows.len() as u64;
@@ -357,7 +357,8 @@ pub async fn query_logs(
     // cardinality — labeled only by the fixed `signal`. `query_len` is None for pure
     // browse (no term) so the length histogram only reflects real searches; char count
     // (not bytes) matches the 512-char validation above.
-    state.self_metrics.record_search(
+    state.self_metrics.record_query_and_search(
+        "explore_logs",
         "logs",
         req.search.as_ref().map(|s| s.chars().count()),
         rows.len() as u64,
@@ -378,7 +379,7 @@ pub async fn query_logs(
             })
             .collect();
         let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
-        state.usage.track_many(signals, "log", "explore");
+        state.usage.track_many(tenant_id, signals, "log", "explore");
     }
 
     #[derive(serde::Serialize)]
