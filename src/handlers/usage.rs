@@ -84,13 +84,22 @@ pub async fn get_usage(
          LIMIT {limit}"
     );
 
-    let usage = crate::tenant_query(&state.ch, &sql, tenant_id)
+    // Query tracking is supplementary to the usage page. A stale deployment
+    // may not have the signal_usage table/schema yet, and a ClickHouse read
+    // compatibility problem here must not hide the working ingest-metering
+    // sections or turn the whole page into a 5xx. Keep the tenant-scoped query
+    // and log the failure for operators, but return an empty list until the
+    // tracking store is available again.
+    let usage = match crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<UsageRow>()
         .await
-        .map_err(|e| {
-            tracing::error!("Usage query failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-        })?;
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, tenant = %tenant_id, "signal usage query unavailable");
+            Vec::new()
+        }
+    };
 
     // Count total tracked signals
     // Distinct tracked signals in window — uniqExact over the dedup key avoids FINAL.
