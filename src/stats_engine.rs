@@ -226,6 +226,22 @@ async fn collect_and_write(
     );
     self_metrics.set_gauge("rush_ingest_spool_oldest_age_secs", &[], buf_oldest as f64);
 
+    // Storage capacity gauges are process-global and intentionally have no
+    // tenant labels. They power the admin capacity view and keep disk headroom
+    // visible even when no recent stats snapshot has been written yet.
+    self_metrics.set_gauge(
+        "rush_stats_disk_local_free_bytes",
+        &[],
+        disk_local_free_bytes as f64,
+    );
+    self_metrics.set_gauge(
+        "rush_stats_disk_local_total_bytes",
+        &[],
+        disk_local_total_bytes as f64,
+    );
+    self_metrics.set_gauge("rush_stats_storage_bytes", &[], storage_bytes as f64);
+    self_metrics.set_gauge("rush_stats_storage_rows", &[], storage_rows as f64);
+
     // ── ClickHouse health gauges (group D) into both SelfMetrics and metrics_gauge ──
     collect_ch_health(ch, self_metrics).await;
 
