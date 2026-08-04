@@ -23,6 +23,7 @@ use crate::models::ingest::{
 };
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
+use crate::shutdown::{ShutdownController, ShutdownPhase};
 use crate::spool::{IngestBuffer, SpoolFull};
 
 // ─── Public error type ───────────────────────────────────────────────────────
@@ -372,6 +373,30 @@ impl BatchAccumulator {
         }
         out
     }
+
+    /// Put a failed graceful-shutdown flush back into memory. This is needed
+    /// when the durable spool is full: dropping the batch would violate the
+    /// shutdown no-loss contract.
+    async fn restore(&self, batch: SpoolBatch) {
+        let slot = batch.slot();
+        let mut g = self.slots[slot].lock().await;
+        match g.batch.as_mut() {
+            Some(existing) => existing.extend_from(batch),
+            None => {
+                g.first_row_at = Some(Instant::now());
+                g.batch = Some(batch);
+            }
+        }
+    }
+
+    async fn is_empty(&self) -> bool {
+        for slot in &self.slots {
+            if slot.lock().await.batch.is_some() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 // ─── ChWriter ────────────────────────────────────────────────────────────────
@@ -514,10 +539,17 @@ impl ChWriter {
         for batch in self.batcher.drain_all().await {
             let table = batch.table();
             let rows = batch.len();
-            if let Err(e) = self.write_now(batch).await {
+            if let Err(e) = self.write_now(batch.clone()).await {
+                self.batcher.restore(batch).await;
                 tracing::warn!(error = %e, table = table, rows = rows, "flush_all: write failed (spool full?)");
             }
         }
+    }
+
+    /// Whether the cross-request batcher still contains rows that have not
+    /// reached ClickHouse or the durable spool.
+    pub async fn has_pending_batches(&self) -> bool {
+        !self.batcher.is_empty().await
     }
 
     /// Spawn the background flush task. It wakes on a fixed cadence (a fraction of
@@ -546,7 +578,8 @@ impl ChWriter {
                     if let Some(batch) = me.batcher.take_aged(slot, now).await {
                         let table = batch.table();
                         let rows = batch.len();
-                        if let Err(e) = me.write_now(batch).await {
+                        if let Err(e) = me.write_now(batch.clone()).await {
+                            me.batcher.restore(batch).await;
                             tracing::warn!(error = %e, table = table, rows = rows, "batch flush failed (spool full?)");
                         }
                     }
@@ -566,65 +599,87 @@ impl ChWriter {
     }
 
     /// Spawn a background tokio task that replays spooled segments to CH.
-    pub fn spawn_replayer(self) {
+    pub fn spawn_replayer(self, shutdown: ShutdownController) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(5);
             const MAX_BACKOFF: Duration = Duration::from_secs(60);
             const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
             loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                match shutdown.phase() {
+                    ShutdownPhase::Running => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                            _ = shutdown.wait_for_request() => {}
+                        }
+                        if shutdown.phase() != ShutdownPhase::Running {
+                            continue;
+                        }
+                    }
+                    ShutdownPhase::Stopping => {
+                        // The HTTP server has stopped admitting work, but the
+                        // main task must flush in-memory batches first.
+                        shutdown.wait_for_drain().await;
+                        continue;
+                    }
+                    ShutdownPhase::Finished => return,
+                    ShutdownPhase::Draining => {}
+                }
 
-                loop {
-                    let drain = match self.buffer.next_batch().await {
-                        Some(d) => d,
-                        None => break, // buffer empty
-                    };
+                let drain = match self.buffer.next_batch().await {
+                    Some(d) => d,
+                    None => {
+                        // Stay alive during draining: the main task may need
+                        // to retry flushing a batch after the spool frees space.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
 
-                    let mut all_ok = true;
-                    for (table, payload) in &drain.records {
-                        let batch: SpoolBatch = match decode_spool(payload) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    table = table,
-                                    "replayer: deserialise failed — skipping record"
-                                );
-                                continue;
-                            }
-                        };
-
-                        if let Err(e) = try_insert(&self.ch, &batch).await {
+                let mut all_ok = true;
+                for (table, payload) in &drain.records {
+                    let batch: SpoolBatch = match decode_spool(payload) {
+                        Ok(b) => b,
+                        Err(e) => {
                             tracing::warn!(
                                 error = %e,
                                 table = table,
-                                "replayer: CH insert failed — backing off"
+                                "replayer: deserialise failed — skipping record"
                             );
-                            all_ok = false;
-                            break;
+                            continue;
                         }
-                    }
+                    };
 
-                    if all_ok {
-                        let n = drain.records.len();
-                        self.buffer.commit(drain).await;
-                        tracing::info!(records = n, "replayer: batch replayed and committed");
-                        backoff = Duration::from_secs(5); // reset on success
-                    } else {
-                        // CH is still down — back off and stop this replay pass.
-                        // (drain not committed → retried next pass.)
+                    if let Err(e) = try_insert(&self.ch, &batch).await {
                         tracing::warn!(
-                            backoff_secs = backoff.as_secs(),
-                            "replayer: CH unavailable, backing off"
+                            error = %e,
+                            table = table,
+                            "replayer: CH insert failed — backing off"
                         );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        all_ok = false;
                         break;
                     }
                 }
+
+                if all_ok {
+                    let n = drain.records.len();
+                    self.buffer.commit(drain).await;
+                    tracing::info!(records = n, "replayer: batch replayed and committed");
+                    backoff = Duration::from_secs(5); // reset on success
+                } else {
+                    // CH is still down — back off and stop this replay pass.
+                    // (drain not committed → retried next pass.) During graceful
+                    // shutdown this intentionally waits rather than exiting;
+                    // Kubernetes can enforce its termination grace period.
+                    tracing::warn!(
+                        backoff_secs = backoff.as_secs(),
+                        "replayer: CH unavailable, backing off"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
             }
-        });
+        })
     }
 }
 

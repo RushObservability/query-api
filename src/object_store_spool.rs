@@ -19,6 +19,7 @@ use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use uuid::Uuid;
 
 use crate::spool::SpoolFull;
 
@@ -93,6 +94,20 @@ impl ObjectStoreSpool {
         Ok(s)
     }
 
+    /// Reconcile local gauges with the shared object-store prefix.
+    ///
+    /// Appends and commits update local atomics immediately, but another
+    /// replica can append or drain objects without touching this process. A
+    /// periodic reconciliation keeps capacity/backlog metrics useful on every
+    /// replica and corrects counters after cross-pod recovery.
+    pub async fn refresh_counts(&self) -> anyhow::Result<()> {
+        let metas = self.list_sorted().await?;
+        let total = metas.iter().map(|(_, size)| *size).sum();
+        self.bytes.store(total, Ordering::Relaxed);
+        self.count.store(metas.len(), Ordering::Relaxed);
+        Ok(())
+    }
+
     /// All buffered objects as (key, size), sorted oldest-first by key.
     async fn list_sorted(&self) -> anyhow::Result<Vec<(OsPath, u64)>> {
         let pfx = OsPath::from(self.prefix.trim_end_matches('/'));
@@ -109,6 +124,12 @@ impl ObjectStoreSpool {
     /// Spill one batch as a new object. Returns `SpoolFull` if over the cap or
     /// the put fails (so the caller applies 429 backpressure rather than dropping).
     pub async fn append(&self, table: &str, payload: &[u8]) -> Result<(), SpoolFull> {
+        // This is already the failure path, so reconcile before enforcing the
+        // cap. It accounts for objects written or drained by another replica.
+        // Two concurrent producers can still race; exact global reservations
+        // require a distributed quota/CAS protocol and are intentionally out
+        // of scope for this single-writer drain design.
+        let _ = self.refresh_counts().await;
         let rec_len = (table.len() + 1 + payload.len()) as u64;
         if self.bytes.load(Ordering::Relaxed) + rec_len > self.max_bytes {
             return Err(SpoolFull);
@@ -118,7 +139,15 @@ impl ObjectStoreSpool {
             .unwrap_or_default()
             .as_millis() as u64;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let key = OsPath::from(format!("{}{:013}-{:08}.batch", self.prefix, millis, seq));
+        // The UUID prevents two replicas that start with the same local seq and
+        // spill in the same millisecond from overwriting one another.
+        let key = OsPath::from(format!(
+            "{}{:013}-{:08}-{}.batch",
+            self.prefix,
+            millis,
+            seq,
+            Uuid::new_v4()
+        ));
 
         let mut body = Vec::with_capacity(rec_len as usize);
         body.extend_from_slice(table.as_bytes());
@@ -144,7 +173,7 @@ impl ObjectStoreSpool {
 
     /// Oldest spilled batch + its object key (handle), or None if empty.
     /// Corrupt objects are deleted and skipped.
-    pub async fn next_batch(&self) -> Option<(OsPath, Vec<(String, Vec<u8>)>)> {
+    pub async fn next_batch(&self) -> Option<(OsPath, u64, Vec<(String, Vec<u8>)>)> {
         loop {
             let metas = match self.list_sorted().await {
                 Ok(m) => m,
@@ -168,7 +197,7 @@ impl ObjectStoreSpool {
                 }
             };
             match split_record(&data) {
-                Some((table, payload)) => return Some((key, vec![(table, payload)])),
+                Some((table, payload)) => return Some((key, size, vec![(table, payload)])),
                 None => {
                     tracing::error!(key = %key, "object-store buffer: corrupt object — discarding");
                     let _ = self.store.delete(&key).await;
@@ -185,14 +214,15 @@ impl ObjectStoreSpool {
     }
 
     /// Delete a successfully-drained object.
-    pub async fn commit(&self, key: &OsPath) {
-        // Best-effort size accounting: re-deriving exact size isn't worth a HEAD;
-        // recompute totals lazily on next open. Decrement count; bytes via list drift
-        // is corrected on restart. Here we just delete + decrement count.
+    pub async fn commit(&self, key: &OsPath, size: u64) {
         if let Err(e) = self.store.delete(key).await {
             tracing::warn!(error = %e, key = %key, "object-store buffer: delete failed");
             return;
         }
+        self.bytes.fetch_sub(
+            size.min(self.bytes.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
         self.count
             .fetch_sub(self.count.load(Ordering::Relaxed).min(1), Ordering::Relaxed);
         self.committed.fetch_add(1, Ordering::Relaxed);
@@ -254,15 +284,16 @@ mod tests {
         assert_eq!(s.segment_count(), 2);
 
         // oldest first
-        let (k1, recs1) = s.next_batch().await.unwrap();
+        let (k1, size1, recs1) = s.next_batch().await.unwrap();
         assert_eq!(recs1, vec![("logs".to_string(), b"alpha".to_vec())]);
-        s.commit(&k1).await;
+        s.commit(&k1, size1).await;
 
-        let (k2, recs2) = s.next_batch().await.unwrap();
+        let (k2, size2, recs2) = s.next_batch().await.unwrap();
         assert_eq!(recs2, vec![("spans".to_string(), b"beta".to_vec())]);
-        s.commit(&k2).await;
+        s.commit(&k2, size2).await;
 
         assert!(s.next_batch().await.is_none());
+        assert_eq!(s.total_bytes(), 0);
     }
 
     #[tokio::test]
@@ -290,5 +321,70 @@ mod tests {
             .unwrap();
         assert_eq!(s2.segment_count(), 1);
         assert!(s2.next_batch().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn uncommitted_batch_remains_available_for_retry() {
+        let s = ObjectStoreSpool::open(store(), "ingest", 1_000_000)
+            .await
+            .unwrap();
+        s.append("logs", b"retry-me").await.unwrap();
+
+        let (_, _, first) = s.next_batch().await.unwrap();
+        // A failed ClickHouse insert must not delete the object. The replayer
+        // can safely read the same batch again on its next pass (at-least-once).
+        let (_, _, retry) = s.next_batch().await.unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(s.segment_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_reopen_preserves_order_and_reconciles_external_drain() {
+        let st = store();
+        let writer = ObjectStoreSpool::open(st.clone(), "ingest", 1_000_000)
+            .await
+            .unwrap();
+        writer.append("logs", b"first").await.unwrap();
+        writer.append("logs", b"second").await.unwrap();
+        let expected_bytes = writer.total_bytes();
+
+        let reader = ObjectStoreSpool::open(st, "ingest", 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(reader.total_bytes(), expected_bytes);
+        // A different process can commit a key; refresh makes this reader's
+        // gauges converge instead of reporting a phantom backlog forever.
+        let (key, size, records) = reader.next_batch().await.unwrap();
+        assert_eq!(records[0].1, b"first");
+        writer.commit(&key, size).await;
+        reader.refresh_counts().await.unwrap();
+        assert_eq!(reader.segment_count(), 1);
+        assert_eq!(reader.total_bytes(), expected_bytes - size);
+
+        let (key, size, records) = reader.next_batch().await.unwrap();
+        assert_eq!(records[0].1, b"second");
+        reader.commit(&key, size).await;
+        reader.refresh_counts().await.unwrap();
+        assert_eq!(reader.segment_count(), 0);
+        assert_eq!(reader.total_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_replicas_get_unique_keys_for_same_millisecond() {
+        let st = store();
+        let left = ObjectStoreSpool::open(st.clone(), "ingest", 1_000_000)
+            .await
+            .unwrap();
+        let right = ObjectStoreSpool::open(st, "ingest", 1_000_000)
+            .await
+            .unwrap();
+        let (left_result, right_result) =
+            tokio::join!(left.append("logs", b"left"), right.append("logs", b"right"));
+        left_result.unwrap();
+        right_result.unwrap();
+
+        let keys = left.list_sorted().await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0].0, keys[1].0);
     }
 }

@@ -107,7 +107,8 @@ pub async fn healthz(State(state): State<AppState>) -> Json<Value> {
 
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let auth = authentication_posture(&state).await;
-    let ready = crate::tenant_isolation_ready() && auth.ready();
+    let shutting_down = state.shutdown.is_requested();
+    let ready = !shutting_down && crate::tenant_isolation_ready() && auth.ready();
     let status = if ready {
         StatusCode::OK
     } else {
@@ -116,7 +117,8 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     (
         status,
         Json(json!({
-            "status": if ready { "ready" } else { "not_ready" },
+            "status": if ready { "ready" } else if shutting_down { "draining" } else { "not_ready" },
+            "shutdown": shutting_down,
             "tenant_isolation": crate::tenant_isolation_status(),
             "authentication": {
                 "environment": if auth.production { "production" } else { "development" },

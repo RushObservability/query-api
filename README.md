@@ -22,7 +22,7 @@ No separate ingester, no message queue, no second datastore. axum on the front, 
 - Prometheus `remote_write`
 - Vector log shipping and RUM beacons
 
-Every write goes through the same path. If ClickHouse is down or overloaded, batches spill to a durable on-disk spool and replay on recovery; when the spool fills, callers get a `429` instead of silent data loss. An optional object-store (S3/MinIO) buffer makes that backlog survive a pod restart and drain from any replica. A metric firewall can drop or relabel series at ingest before they're ever stored.
+Every write goes through the same path. If ClickHouse is down or overloaded, batches spill to a durable on-disk spool and replay on recovery; when the spool fills, callers get a `429` instead of silent data loss. An optional object-store (S3/MinIO) buffer makes that backlog survive a pod restart and be shared by replicas. In HA, API replicas produce into the shared prefix while exactly one dedicated drain worker replays it; running multiple replayers is rejected because the queue is at-least-once and has no distributed claim protocol. A metric firewall can drop or relabel series at ingest before they're ever stored.
 
 **Query.** The Explore search, trace waterfall, service maps, log filters, and a Prometheus-compatible metrics API all compile to ClickHouse SQL in here. Spans land in `spans` (raw OTLP in `spans_raw`, flattened by a materialized view), logs in `logs`, metrics across the `metrics_*` tables.
 
@@ -73,6 +73,12 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant-scoped API key for managed collector ingest |
 | `RUSH_ALLOWED_ORIGINS` | _(same-origin)_ | CORS allowlist |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
+| `RUSH_BUFFER_BACKEND` | `disk` | `disk` or shared `object_store` |
+| `RUSH_BUFFER_REQUIRE_OBJECT_STORE` | `false` | refuse unsafe fallback to disk |
+| `RUSH_EXPECTED_QUERY_API_REPLICAS` | `1` | deployment contract for HA buffering |
+| `RUSH_RUN_REPLAYER` | `true` | set `false` on HA API replicas |
+| `RUSH_DRAIN_WORKER_ONLY` | `false` | run one shared-buffer drain worker |
+| `RUSH_SHUTDOWN_TOKEN` | _(empty)_ | optional token for non-loopback shutdown callers |
 | `RUSH_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `RUST_LOG` | — | e.g. `rush_api=info` |
 
@@ -88,6 +94,62 @@ health. ClickHouse metrics include active queries, merges/mutations, memory,
 disk, insert/select counters, and recent query-log latency, read-volume,
 result-volume, memory, and error aggregates. The endpoint is intended for an
 internal Prometheus path and is not tenant data.
+
+### HA ingest buffering
+
+The local `disk` spool is pod-local. Keep `RUSH_EXPECTED_QUERY_API_REPLICAS=1`
+for the default single-pod deployment. For more than one API replica, configure
+the shared object-store backend and deploy exactly one drain worker:
+
+```text
+# query-api Deployment (all API replicas)
+RUSH_BUFFER_BACKEND=object_store
+RUSH_BUFFER_REQUIRE_OBJECT_STORE=true
+RUSH_EXPECTED_QUERY_API_REPLICAS=3
+RUSH_RUN_REPLAYER=false
+
+# dedicated drain worker (one pod only)
+RUSH_BUFFER_BACKEND=object_store
+RUSH_BUFFER_REQUIRE_OBJECT_STORE=true
+RUSH_EXPECTED_QUERY_API_REPLICAS=3
+RUSH_DRAIN_WORKER_ONLY=true
+RUSH_RUN_REPLAYER=true
+```
+
+The API starts only when the selected backend matches this contract; an
+object-store initialization failure cannot silently fall back to a pod-local
+spool in HA. The object-store queue provides at-least-once delivery. During a
+ClickHouse outage, restore ClickHouse, keep the single drain worker running, and
+watch `rush_ingest_spool_oldest_age_secs`, `rush_ingest_spool_segments`, and
+`rush_ingest_spool_utilization_ratio` until the backlog returns to zero. Do not
+scale drain workers horizontally until the queue has a distributed claim/lease
+protocol.
+
+### Kubernetes graceful shutdown
+
+`POST /shutdown` is intended for a pod-local `preStop` hook. It immediately
+marks `/readyz` unavailable and rejects new application requests, then the
+process flushes in-memory batches and waits for the durable spool to reach zero
+before exiting. The endpoint accepts loopback callers without authentication;
+set `RUSH_SHUTDOWN_TOKEN` if a non-loopback management caller must trigger it.
+
+The published query-api image includes `curl`, so a Deployment can use:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - >-
+          exec /usr/bin/curl --fail --silent --show-error --max-time 5
+          --request POST http://127.0.0.1:8080/shutdown
+```
+
+Give the pod enough `terminationGracePeriodSeconds` for the expected backlog.
+If ClickHouse is unavailable, the process keeps retrying instead of claiming a
+clean drain; Kubernetes will ultimately enforce the grace-period deadline.
 
 ### Tenant and ingest authentication
 

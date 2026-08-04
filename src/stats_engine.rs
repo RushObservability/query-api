@@ -56,6 +56,11 @@ async fn collect_and_write(
     self_metrics: &SelfMetrics,
     instance_id: &str,
 ) -> anyhow::Result<()> {
+    // Object-store buffers are shared by ingest replicas. Reconcile before
+    // exporting gauges so a drain performed by another pod is reflected here.
+    if let Err(e) = buffer.refresh_counts().await {
+        tracing::warn!(error = %e, "stats engine: failed to refresh ingest buffer counters");
+    }
     let now = chrono::Utc::now();
     let now_nanos = now.timestamp_nanos_opt().unwrap_or(0);
     let one_hour_ago = (now - chrono::Duration::hours(1))
@@ -218,7 +223,16 @@ async fn collect_and_write(
     tracing::debug!("stats engine: wrote {} metrics", metrics.len());
 
     // ── Ingest spool gauges into SelfMetrics (group B; set from the tick, not the hot path) ──
-    self_metrics.set_gauge("rush_ingest_spool_bytes", &[], buffer.total_bytes() as f64);
+    let buffer_bytes = buffer.total_bytes();
+    let buffer_max_bytes = buffer.max_bytes();
+    let buffer_utilization_ratio = spool_utilization_ratio(buffer_bytes, buffer_max_bytes);
+    self_metrics.set_gauge("rush_ingest_spool_bytes", &[], buffer_bytes as f64);
+    self_metrics.set_gauge("rush_ingest_spool_max_bytes", &[], buffer_max_bytes as f64);
+    self_metrics.set_gauge(
+        "rush_ingest_spool_utilization_ratio",
+        &[],
+        buffer_utilization_ratio,
+    );
     self_metrics.set_gauge(
         "rush_ingest_spool_segments",
         &[],
@@ -456,6 +470,14 @@ fn record_ch_probe(self_metrics: &SelfMetrics, probe: &'static str, start: Insta
     );
 }
 
+fn spool_utilization_ratio(bytes: u64, max_bytes: u64) -> f64 {
+    if max_bytes == 0 {
+        0.0
+    } else {
+        bytes as f64 / max_bytes as f64
+    }
+}
+
 /// Insert the SelfMetrics snapshot into `metrics_gauge` / `metrics_sum` (by kind). Labels
 /// become the ClickHouse `Attributes` map. Reuses the same raw-SQL insert path the
 /// rush_stats_* gauges use. Best-effort: a failed insert is logged, not fatal to the tick.
@@ -646,5 +668,13 @@ mod tests {
                 .iter()
                 .all(|(name, sql)| { name.starts_with("rush_ch_") && sql.contains(" AS v") })
         );
+    }
+
+    #[test]
+    fn spool_utilization_ratio_handles_empty_and_full_buffers() {
+        assert_eq!(spool_utilization_ratio(0, 0), 0.0);
+        assert_eq!(spool_utilization_ratio(0, 100), 0.0);
+        assert_eq!(spool_utilization_ratio(100, 100), 1.0);
+        assert_eq!(spool_utilization_ratio(125, 100), 1.25);
     }
 }

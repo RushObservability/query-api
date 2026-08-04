@@ -31,7 +31,7 @@ RUN cargo build --release --no-default-features --features ${RUSH_FEATURES}
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
     && groupadd --system appgroup && useradd --system --gid appgroup --no-create-home appuser
 
 COPY --from=builder /app/target/release/rush-api /usr/local/bin/rush-api

@@ -284,7 +284,10 @@ pub struct DrainBatch {
 
 enum BatchHandle {
     Disk(PathBuf),
-    ObjectStore(object_store::path::Path),
+    ObjectStore {
+        key: object_store::path::Path,
+        size: u64,
+    },
 }
 
 pub enum IngestBuffer {
@@ -349,6 +352,16 @@ impl IngestBuffer {
         }
     }
 
+    /// Reconcile shared-backend counters with the durable store. This is a
+    /// no-op for the local disk backend and is called from the stats cadence,
+    /// not the ingest hot path.
+    pub async fn refresh_counts(&self) -> anyhow::Result<()> {
+        match self {
+            IngestBuffer::Disk(_) => Ok(()),
+            IngestBuffer::ObjectStore(s) => s.refresh_counts().await,
+        }
+    }
+
     /// Age (seconds) of the oldest pending batch — the replay lag. `None`/0 when empty.
     pub async fn oldest_age_secs(&self) -> Option<u64> {
         match self {
@@ -398,10 +411,12 @@ impl IngestBuffer {
                 .ok()
                 .flatten()
             }
-            IngestBuffer::ObjectStore(s) => s.next_batch().await.map(|(key, records)| DrainBatch {
-                records,
-                handle: BatchHandle::ObjectStore(key),
-            }),
+            IngestBuffer::ObjectStore(s) => {
+                s.next_batch().await.map(|(key, size, records)| DrainBatch {
+                    records,
+                    handle: BatchHandle::ObjectStore { key, size },
+                })
+            }
         }
     }
 
@@ -409,7 +424,9 @@ impl IngestBuffer {
     pub async fn commit(&self, batch: DrainBatch) {
         match (self, batch.handle) {
             (IngestBuffer::Disk(s), BatchHandle::Disk(path)) => s.remove_segment(&path),
-            (IngestBuffer::ObjectStore(s), BatchHandle::ObjectStore(key)) => s.commit(&key).await,
+            (IngestBuffer::ObjectStore(s), BatchHandle::ObjectStore { key, size }) => {
+                s.commit(&key, size).await
+            }
             // Mismatched handle/backend can't happen (handles are minted by the same backend).
             _ => tracing::error!("ingest buffer: commit handle/backend mismatch"),
         }

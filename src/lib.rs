@@ -2,6 +2,7 @@ pub mod alert_engine;
 pub mod anomaly_engine;
 pub mod api_key_auth;
 pub mod audit;
+pub mod buffer_topology;
 pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
@@ -24,6 +25,7 @@ pub mod retention_enforcer;
 pub mod rollup;
 pub mod saml;
 pub mod self_metrics;
+pub mod shutdown;
 pub mod siem_engine;
 pub mod slo_engine;
 pub mod spool;
@@ -224,4 +226,6 @@ pub struct AppState {
     /// API-managed integration collector supervisor. The community build keeps
     /// this disabled unless a collector feature and manager setting are present.
     pub collectors: Arc<integrations::CollectorManager>,
+    /// Coordinates readiness, HTTP admission, and durable ingest draining.
+    pub shutdown: shutdown::ShutdownController,
 }

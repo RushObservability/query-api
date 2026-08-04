@@ -42,6 +42,7 @@ pub mod rum;
 pub mod service_links;
 pub mod services;
 pub mod settings;
+pub mod shutdown;
 pub mod slos;
 pub mod sre_proxy;
 pub mod sso;

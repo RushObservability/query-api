@@ -21,6 +21,7 @@ use rush_api::AppState;
 use rush_api::TenantContext;
 use rush_api::alert_engine;
 use rush_api::anomaly_engine;
+use rush_api::buffer_topology;
 use rush_api::ch_writer::ChWriter;
 use rush_api::clickhouse_config::ConfigDb;
 use rush_api::config::RushConfig;
@@ -240,7 +241,8 @@ async fn csrf_protection_middleware(req: Request, next: Next) -> Response {
 /// patterns, NOT the raw URI), `method` is the HTTP method, and `status_class` is the
 /// 2xx/3xx/4xx/5xx family. The raw path and tenant_id are deliberately NOT used as labels.
 ///
-/// `/metrics` and `/healthz` are skipped so scraping doesn't inflate the request counters.
+/// `/metrics`, health probes, and `/shutdown` are skipped so control-plane
+/// traffic doesn't inflate the request counters.
 /// Cost on the hot path: one `MatchedPath` clone, atomic counter increments, one histogram
 /// observe (bounded linear scan), and a gauge inc/dec — no locks held across `.await`.
 async fn http_metrics_middleware(
@@ -256,7 +258,10 @@ async fn http_metrics_middleware(
         .unwrap_or_else(|| "unmatched".to_string());
 
     // Skip self-instrumentation for the scrape + health endpoints.
-    if route == "/metrics" || route == "/healthz" || route == "/readyz" {
+    if matches!(
+        route.as_str(),
+        "/metrics" | "/healthz" | "/readyz" | "/shutdown"
+    ) {
         return next.run(req).await;
     }
 
@@ -418,6 +423,7 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
         "/healthz"
             | "/readyz"
             | "/metrics"
+            | "/shutdown"
             | "/api/v1/auth/login"
             | "/api/v1/auth/logout"
             | "/api/v1/sso/status"
@@ -426,6 +432,31 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
             | "/auth/sso/acs"
             | "/auth/sso/metadata"
     ) || setup_validation_token.is_some_and(|token| !token.is_empty() && !token.contains('/'))
+}
+
+/// Once shutdown starts, readiness is already false and this gate prevents new
+/// application/ingest work from entering while existing requests drain.
+async fn shutdown_gate_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.shutdown.is_requested()
+        && !matches!(
+            req.uri().path(),
+            "/shutdown" | "/healthz" | "/readyz" | "/metrics"
+        )
+    {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "draining",
+                "error": "query-api is shutting down",
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 fn should_reject_for_tenant_auth(
@@ -1239,6 +1270,31 @@ async fn main() -> anyhow::Result<()> {
     let run_replayer = std::env::var("RUSH_RUN_REPLAYER")
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
         .unwrap_or(true);
+    let expected_query_api_replicas = match std::env::var("RUSH_EXPECTED_QUERY_API_REPLICAS") {
+        Ok(raw) => raw.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!(
+                "RUSH_EXPECTED_QUERY_API_REPLICAS must be a positive integer, got {raw:?}"
+            )
+        })?,
+        Err(_) => 1,
+    };
+    let require_object_store = std::env::var("RUSH_BUFFER_REQUIRE_OBJECT_STORE")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+    let backend = std::env::var("RUSH_BUFFER_BACKEND").unwrap_or_else(|_| "disk".to_string());
+    let shutdown_controller = rush_api::shutdown::ShutdownController::new();
+
+    // Validate the deployment contract before starting engines. For an HA
+    // rollout this prevents every API replica from replaying the same shared
+    // object before the dedicated drain worker is ready.
+    buffer_topology::validate(
+        &backend,
+        &backend,
+        expected_query_api_replicas,
+        drain_only,
+        run_replayer,
+        require_object_store,
+    )?;
 
     // System-health self-metrics registry. Single in-process source of truth for the
     // open `/metrics` Prometheus endpoint AND the self-ingested series the stats engine
@@ -1350,31 +1406,45 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(2_147_483_648); // 2 GiB default
 
     // Backend selection. Disk is the default and needs no object store. The
-    // object-store backend is opt-in via RUSH_BUFFER_BACKEND=object_store; if its
-    // config is missing/invalid we log and fall back to disk so ingestion always works.
-    let backend = std::env::var("RUSH_BUFFER_BACKEND").unwrap_or_else(|_| "disk".to_string());
-    let buffer = if backend == "object_store" {
+    // object-store backend is opt-in via RUSH_BUFFER_BACKEND=object_store; a
+    // single-replica deployment may fall back to disk, while HA must fail closed.
+    let (buffer, effective_backend) = if backend == "object_store" {
         match build_object_store_buffer(spool_max_bytes).await {
             Ok(b) => {
                 tracing::info!("ingest buffer backend: object_store");
-                std::sync::Arc::new(b)
+                (std::sync::Arc::new(b), "object_store")
             }
             Err(e) => {
+                if require_object_store || expected_query_api_replicas > 1 {
+                    return Err(anyhow::anyhow!(
+                        "object_store buffer backend failed to initialize and disk fallback is unsafe for this deployment: {e}"
+                    ));
+                }
                 tracing::error!(error = %e, "object_store buffer backend failed to init — falling back to disk");
                 let spool = Spool::open(&spool_dir, spool_max_bytes)
                     .expect("failed to open spool directory");
-                std::sync::Arc::new(IngestBuffer::Disk(spool))
+                (std::sync::Arc::new(IngestBuffer::Disk(spool)), "disk")
             }
         }
     } else {
         let spool =
             Spool::open(&spool_dir, spool_max_bytes).expect("failed to open spool directory");
-        std::sync::Arc::new(IngestBuffer::Disk(spool))
+        (std::sync::Arc::new(IngestBuffer::Disk(spool)), "disk")
     };
+    buffer_topology::validate(
+        &backend,
+        effective_backend,
+        expected_query_api_replicas,
+        drain_only,
+        run_replayer,
+        require_object_store,
+    )?;
     let writer = ChWriter::new(admin_ch.clone(), buffer);
-    if drain_only || run_replayer {
-        writer.clone().spawn_replayer();
-    }
+    let replayer_handle = if drain_only || run_replayer {
+        Some(writer.clone().spawn_replayer(shutdown_controller.clone()))
+    } else {
+        None
+    };
     // Cross-request insert batching: only the HTTP-serving process buffers
     // ingest rows. The drain-only process never calls `write`, so it needs no
     // flusher (and must not buffer — it only replays the spool).
@@ -1401,10 +1471,12 @@ async fn main() -> anyhow::Result<()> {
     // into ClickHouse. Don't serve HTTP, run engines, or load the firewall.
     if drain_only {
         tracing::info!(
-            backend = %backend,
+            backend = effective_backend,
             "RUSH_DRAIN_WORKER_ONLY — draining ingest buffer to ClickHouse; not serving HTTP"
         );
-        std::future::pending::<()>().await;
+        shutdown_signal(shutdown_controller.clone()).await;
+        graceful_shutdown_drain(writer, shutdown_controller, replayer_handle).await;
+        return Ok(());
     }
 
     // Metric firewall: load compiled rules now, then refresh periodically so
@@ -1533,6 +1605,7 @@ async fn main() -> anyhow::Result<()> {
         audit,
         self_metrics,
         collectors,
+        shutdown: shutdown_controller.clone(),
     };
 
     let inner = Router::new()
@@ -2087,6 +2160,7 @@ async fn main() -> anyhow::Result<()> {
         // Health
         .route("/healthz", get(handlers::health::healthz))
         .route("/readyz", get(handlers::health::readyz))
+        .route("/shutdown", post(handlers::shutdown::shutdown))
         // System-health self-metrics (Prometheus exposition). OPEN — no auth, like /healthz.
         .route("/metrics", get(metrics_handler))
         // Catch-all for unmatched DD agent paths (debug logging)
@@ -2166,6 +2240,10 @@ async fn main() -> anyhow::Result<()> {
         // MatchedPath (templated route) is populated by routing before it runs.
         .layer(axum::middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            shutdown_gate_middleware,
+        ))
         // Keep a writer handle for the graceful-shutdown flush before `state` is
         // consumed by `with_state`.
         .with_state(state.clone());
@@ -2244,16 +2322,15 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(shutdown_controller.clone()))
     .await?;
-    tracing::info!("graceful shutdown: flushing buffered ingest batches");
-    shutdown_writer.flush_all().await;
+    graceful_shutdown_drain(shutdown_writer, shutdown_controller, replayer_handle).await;
 
     Ok(())
 }
 
 /// Resolve when a shutdown signal (Ctrl-C / SIGTERM) is received.
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown: rush_api::shutdown::ShutdownController) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -2273,7 +2350,44 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = shutdown.wait_for_request() => {},
     }
+    shutdown.request();
+}
+
+/// Stop admitting work, flush in-memory batches, then keep retrying the durable
+/// spool until both layers are empty. If ClickHouse stays unavailable, this
+/// intentionally waits until Kubernetes' termination grace period expires
+/// instead of claiming a clean shutdown and losing queued telemetry.
+async fn graceful_shutdown_drain(
+    writer: ChWriter,
+    shutdown: rush_api::shutdown::ShutdownController,
+    replayer_handle: Option<tokio::task::JoinHandle<()>>,
+) {
+    tracing::info!("graceful shutdown: flushing buffered ingest batches");
+    writer.flush_all().await;
+    shutdown.begin_drain();
+    let replayer_handle =
+        replayer_handle.unwrap_or_else(|| writer.clone().spawn_replayer(shutdown.clone()));
+
+    loop {
+        if writer.has_pending_batches().await {
+            writer.flush_all().await;
+        }
+        if !writer.has_pending_batches().await
+            && writer.spool_segments() == 0
+            && writer.spool_bytes() == 0
+        {
+            shutdown.finish();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    if let Err(error) = replayer_handle.await {
+        tracing::warn!(%error, "graceful shutdown: replayer task ended with an error");
+    }
+    tracing::info!("graceful shutdown: durable ingest queue is empty");
 }
 
 #[cfg(test)]
