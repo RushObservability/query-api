@@ -128,6 +128,17 @@ fn consume_local_login_limit(
     }
 }
 
+fn account_failure_limit_exceeded(
+    credentials_valid: bool,
+    local_allowed: bool,
+    distributed_allowed: bool,
+) -> bool {
+    // A valid password must never be rejected because an attacker previously
+    // targeted the username. Account limits classify failed credentials only;
+    // the IP limit still applies before password verification.
+    !credentials_valid && !(local_allowed && distributed_allowed)
+}
+
 fn login_audit_context(headers: &HeaderMap, client_ip: IpAddr) -> (String, String, String) {
     let (_, user_agent, request_id) = crate::audit::actor_context_from_headers(headers);
     (client_ip.to_string(), user_agent, request_id)
@@ -172,18 +183,8 @@ pub async fn login(
         state.login_ip_limit_per_minute,
         local_now,
     );
-    let local_account_allowed = consume_local_login_limit(
-        &state.login_limiter,
-        format!("account:{account_hash}"),
-        state.login_account_limit_per_minute,
-        local_now,
-    );
 
-    if let Err(error) = state
-        .config_db
-        .record_login_attempt(&ip_hash, &account_hash)
-        .await
-    {
+    if let Err(error) = state.config_db.record_login_ip_attempt(&ip_hash).await {
         tracing::error!(%error, "failed to persist login rate-limit attempt");
         state
             .audit
@@ -206,12 +207,12 @@ pub async fn login(
     let since = (chrono::Utc::now() - chrono::Duration::seconds(60))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
-    let (ip_attempts, account_attempts) = match state
+    let ip_attempts = match state
         .config_db
-        .login_attempt_counts(&ip_hash, &account_hash, &since)
+        .login_ip_attempt_count(&ip_hash, &since)
         .await
     {
-        Ok(counts) => counts,
+        Ok(count) => count,
         Err(error) => {
             tracing::error!(%error, "failed to read login rate-limit attempts");
             state
@@ -235,13 +236,7 @@ pub async fn login(
         }
     };
     let distributed_ip_allowed = ip_attempts <= u64::from(state.login_ip_limit_per_minute);
-    let distributed_account_allowed =
-        account_attempts <= u64::from(state.login_account_limit_per_minute);
-    if !(local_ip_allowed
-        && local_account_allowed
-        && distributed_ip_allowed
-        && distributed_account_allowed)
-    {
+    if !(local_ip_allowed && distributed_ip_allowed) {
         state
             .audit
             .log(
@@ -250,8 +245,8 @@ pub async fn login(
                     .outcome("failure")
                     .changes(
                         serde_json::json!({
-                            "ip_limit_exceeded": !(local_ip_allowed && distributed_ip_allowed),
-                            "account_limit_exceeded": !(local_account_allowed && distributed_account_allowed),
+                            "ip_limit_exceeded": true,
+                            "account_limit_exceeded": false,
                         })
                         .to_string(),
                     )
@@ -265,13 +260,105 @@ pub async fn login(
         ));
     }
 
-    let (user_id, username, display_name, tenant_id, role) = match state
+    let authenticated = state
         .config_db
         .authenticate(&req.username, &req.password)
-        .await
-    {
+        .await;
+    let (user_id, username, display_name, tenant_id, role) = match authenticated {
         Some(u) => u,
         None => {
+            // Only failed credentials consume the account budget. Checking
+            // this after password verification ensures targeted failures can
+            // never deny a legitimate login with the correct password.
+            let local_account_allowed = consume_local_login_limit(
+                &state.login_limiter,
+                format!("account:{account_hash}"),
+                state.login_account_limit_per_minute,
+                Instant::now(),
+            );
+            if let Err(error) = state
+                .config_db
+                .record_login_account_failure(&account_hash)
+                .await
+            {
+                tracing::error!(%error, "failed to persist account login failure");
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                            .actor_name(req.username.clone())
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({ "reason": "rate_limit_store_unavailable" })
+                                    .to_string(),
+                            )
+                            .description("authentication unavailable")
+                            .context(login_audit_context(&headers, client_ip)),
+                    )
+                    .await;
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication temporarily unavailable".to_string(),
+                ));
+            }
+            let account_failures = match state
+                .config_db
+                .login_account_failure_count(&account_hash, &since)
+                .await
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::error!(%error, "failed to read account login failures");
+                    state
+                        .audit
+                        .log(
+                            crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                                .actor_name(req.username.clone())
+                                .outcome("failure")
+                                .changes(
+                                    serde_json::json!({ "reason": "rate_limit_store_unavailable" })
+                                        .to_string(),
+                                )
+                                .description("authentication unavailable")
+                                .context(login_audit_context(&headers, client_ip)),
+                        )
+                        .await;
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authentication temporarily unavailable".to_string(),
+                    ));
+                }
+            };
+            let distributed_account_allowed =
+                account_failures <= u64::from(state.login_account_limit_per_minute);
+            if account_failure_limit_exceeded(
+                false,
+                local_account_allowed,
+                distributed_account_allowed,
+            ) {
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
+                            .actor_name(req.username.clone())
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({
+                                    "ip_limit_exceeded": false,
+                                    "account_limit_exceeded": true,
+                                })
+                                .to_string(),
+                            )
+                            .description("login rate limit exceeded")
+                            .context(login_audit_context(&headers, client_ip)),
+                    )
+                    .await;
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many login attempts, try again later".to_string(),
+                ));
+            }
+
             tracing::warn!(
                 event = "login_failed",
                 username = %req.username,
@@ -546,6 +633,14 @@ mod tests {
             now
         ));
         assert!(consume_local_login_limit(&limiter, "ip:b".into(), 2, now));
+    }
+
+    #[test]
+    fn valid_credentials_are_not_rejected_by_account_failure_limit() {
+        assert!(!account_failure_limit_exceeded(true, false, false));
+        assert!(account_failure_limit_exceeded(false, false, true));
+        assert!(account_failure_limit_exceeded(false, true, false));
+        assert!(!account_failure_limit_exceeded(false, true, true));
     }
 
     #[test]

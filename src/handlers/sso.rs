@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 use crate::AppState;
-use crate::handlers::users::{require_admin, require_auth};
+use crate::handlers::users::require_admin;
 use crate::saml;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -472,6 +472,13 @@ struct OidcTokenResponse {
     access_token: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct OidcProfile {
+    external_id: String,
+    username: String,
+    display_name: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct OidcDiscovery {
     issuer: String,
@@ -558,6 +565,116 @@ fn validate_oidc_discovery(discovery: &OidcDiscovery, issuer_url: &str) -> anyho
     validate_oidc_endpoint(&discovery.token_endpoint, "OIDC token endpoint")?;
     validate_oidc_endpoint(&discovery.jwks_uri, "OIDC JWKS endpoint")?;
     Ok(())
+}
+
+fn oidc_string_claim<'a>(claims: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    claims
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Apply the OIDC client-binding rules that `jsonwebtoken` cannot express.
+/// In particular, a generic JWT audience check accepts a matching audience
+/// even when the token also names another client. Rush has no configured set
+/// of trusted co-audiences, so fail closed on every additional audience and
+/// verify `azp` whenever the provider supplies it.
+fn validate_oidc_client_binding(claims: &serde_json::Value, client_id: &str) -> anyhow::Result<()> {
+    let audiences = match claims.get("aud") {
+        Some(serde_json::Value::String(audience)) if !audience.is_empty() => {
+            vec![audience.as_str()]
+        }
+        Some(serde_json::Value::Array(audiences)) if !audiences.is_empty() => audiences
+            .iter()
+            .map(|audience| {
+                audience
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("OIDC audience entries must be strings"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        _ => anyhow::bail!("id_token is missing a valid 'aud' claim"),
+    };
+
+    if !audiences.contains(&client_id) {
+        anyhow::bail!("id_token audience does not include this OIDC client");
+    }
+    if audiences.iter().any(|audience| *audience != client_id) {
+        anyhow::bail!("id_token contains an untrusted additional audience");
+    }
+
+    if let Some(authorized_party) = claims.get("azp") {
+        if authorized_party.as_str() != Some(client_id) {
+            anyhow::bail!("id_token authorized party does not match this OIDC client");
+        }
+    } else if audiences.len() > 1 {
+        anyhow::bail!("a multi-audience id_token must include 'azp'");
+    }
+
+    if claims
+        .get("iat")
+        .and_then(serde_json::Value::as_i64)
+        .is_none()
+        && claims
+            .get("iat")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        anyhow::bail!("id_token is missing a valid 'iat' claim");
+    }
+
+    Ok(())
+}
+
+fn extract_oidc_profile(
+    claims: &serde_json::Value,
+    email_claim: &str,
+    first_name_claim: &str,
+    last_name_claim: &str,
+) -> anyhow::Result<OidcProfile> {
+    let external_id = oidc_string_claim(claims, "sub")
+        .ok_or_else(|| anyhow::anyhow!("id_token missing 'sub' claim"))?
+        .to_string();
+
+    // An email address is suitable as a username only when the IdP explicitly
+    // attests that it is verified. Providers that omit `email_verified` can
+    // still authenticate: Rush safely falls back to the stable OIDC subject.
+    let verified_email = match oidc_string_claim(claims, email_claim) {
+        Some(email) => match claims.get("email_verified") {
+            Some(serde_json::Value::Bool(true)) => Some(email.to_string()),
+            Some(serde_json::Value::Bool(false)) => {
+                anyhow::bail!("id_token email claim is not verified")
+            }
+            Some(_) => anyhow::bail!("id_token 'email_verified' claim must be a boolean"),
+            None => None,
+        },
+        None => None,
+    };
+
+    let first_name = oidc_string_claim(claims, first_name_claim).unwrap_or("");
+    let last_name = oidc_string_claim(claims, last_name_claim).unwrap_or("");
+    let configured_name = format!("{first_name} {last_name}").trim().to_string();
+    let display_name = if !configured_name.is_empty() {
+        configured_name
+    } else {
+        oidc_string_claim(claims, "name")
+            .or_else(|| oidc_string_claim(claims, "preferred_username"))
+            .map(str::to_string)
+            .or_else(|| verified_email.clone())
+            .unwrap_or_else(|| external_id.clone())
+    };
+    let username = verified_email.unwrap_or_else(|| external_id.clone());
+
+    Ok(OidcProfile {
+        external_id,
+        username,
+        display_name,
+    })
 }
 
 // ── Initiate SSO Login (protocol-aware: OIDC or SAML) ──
@@ -823,9 +940,9 @@ async fn sso_callback_inner(
         issuer_url,
         _oidc_scopes,
         groups_claim,
-        _email_claim,
-        _first_name_claim,
-        _last_name_claim,
+        email_claim,
+        first_name_claim,
+        last_name_claim,
         jit_provisioning,
         default_group_id,
         _created_at,
@@ -926,39 +1043,13 @@ async fn sso_callback_inner(
         ));
     }
 
-    // 5. Extract claims
-    let external_id = claims
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let email = claims
-        .get("email")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let display_name = claims
-        .get("name")
-        .or_else(|| claims.get("preferred_username"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&email)
-        .to_string();
-
-    // Username: prefer email, fall back to sub
-    let username = if email.is_empty() {
-        external_id.clone()
-    } else {
-        email.clone()
-    };
-
-    if external_id.is_empty() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "id_token missing 'sub' claim".to_string(),
-        ));
-    }
+    // 5. Extract the configured profile claims. Unverified email addresses are
+    // never promoted into Rush usernames.
+    let profile = extract_oidc_profile(&claims, &email_claim, &first_name_claim, &last_name_claim)
+        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let external_id = profile.external_id;
+    let username = profile.username;
+    let display_name = profile.display_name;
 
     // 6. Extract groups from the configurable groups claim
     let idp_groups: Vec<String> = claims
@@ -1138,6 +1229,7 @@ async fn verify_and_decode_jwt(
         .map_err(|e| anyhow::anyhow!("failed to build decoding key from JWK: {e}"))?;
 
     let mut validation = Validation::new(header.alg);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub", "iat"]);
     validation.set_issuer(&[issuer_url]);
     // Validate the audience claim against the registered client_id.
     // This ensures tokens issued for other apps at the same IdP are rejected.
@@ -1145,6 +1237,8 @@ async fn verify_and_decode_jwt(
 
     let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)
         .map_err(|e| anyhow::anyhow!("JWT signature verification failed: {e}"))?;
+
+    validate_oidc_client_binding(&token_data.claims, client_id)?;
 
     Ok(token_data.claims)
 }
@@ -1156,7 +1250,7 @@ pub async fn list_sso_providers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let rows = state
         .config_db
         .list_sso_providers()
@@ -1210,6 +1304,27 @@ pub async fn list_sso_providers(
             },
         )
         .collect();
+
+    // This response contains security-sensitive identity-provider metadata.
+    // Record the read without copying any provider values into the audit log.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("sso.config_read", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("sso_provider", "all")
+                .outcome("success")
+                .metadata(
+                    serde_json::json!({
+                        "provider_count": providers.len(),
+                    })
+                    .to_string(),
+                )
+                .description("SSO provider configuration listed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "providers": providers })))
 }
@@ -2301,6 +2416,94 @@ mod tests {
         let mut insecure = valid;
         insecure.jwks_uri = "http://169.254.169.254/latest/meta-data".to_string();
         assert!(validate_oidc_discovery(&insecure, "https://idp.example.com").is_err());
+    }
+
+    #[test]
+    fn oidc_client_binding_rejects_extra_audiences_and_wrong_authorized_party() {
+        let valid = serde_json::json!({
+            "aud": "rush-client",
+            "azp": "rush-client",
+            "iat": 1_700_000_000,
+        });
+        validate_oidc_client_binding(&valid, "rush-client").unwrap();
+
+        let extra_audience = serde_json::json!({
+            "aud": ["rush-client", "other-client"],
+            "azp": "rush-client",
+            "iat": 1_700_000_000,
+        });
+        assert!(validate_oidc_client_binding(&extra_audience, "rush-client").is_err());
+
+        let wrong_azp = serde_json::json!({
+            "aud": "rush-client",
+            "azp": "other-client",
+            "iat": 1_700_000_000,
+        });
+        assert!(validate_oidc_client_binding(&wrong_azp, "rush-client").is_err());
+    }
+
+    #[test]
+    fn oidc_client_binding_requires_issued_at() {
+        let claims = serde_json::json!({ "aud": "rush-client" });
+        assert!(validate_oidc_client_binding(&claims, "rush-client").is_err());
+    }
+
+    #[test]
+    fn oidc_profile_uses_configured_claims_and_verified_email() {
+        let claims = serde_json::json!({
+            "sub": "subject-1",
+            "mail": "person@example.com",
+            "email_verified": true,
+            "first": "Ada",
+            "last": "Lovelace",
+        });
+        let profile = extract_oidc_profile(&claims, "mail", "first", "last").unwrap();
+        assert_eq!(
+            profile,
+            OidcProfile {
+                external_id: "subject-1".to_string(),
+                username: "person@example.com".to_string(),
+                display_name: "Ada Lovelace".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn oidc_profile_rejects_explicitly_unverified_email() {
+        let claims = serde_json::json!({
+            "sub": "subject-1",
+            "email": "unverified@example.com",
+            "email_verified": false,
+        });
+        assert!(extract_oidc_profile(&claims, "email", "given_name", "family_name").is_err());
+    }
+
+    #[test]
+    fn oidc_profile_without_email_attestation_falls_back_to_subject() {
+        let claims = serde_json::json!({
+            "sub": "subject-1",
+            "email": "unattested@example.com",
+            "name": "Example User",
+        });
+        let profile = extract_oidc_profile(&claims, "email", "given_name", "family_name").unwrap();
+        assert_eq!(profile.username, "subject-1");
+        assert_eq!(profile.display_name, "Example User");
+    }
+
+    #[test]
+    fn sso_provider_configuration_listing_requires_admin() {
+        // Guard the endpoint itself: testing only `require_admin` would not
+        // catch a future regression that accidentally calls `require_auth`.
+        let source = include_str!("sso.rs");
+        let endpoint = source
+            .split("pub async fn list_sso_providers")
+            .nth(1)
+            .expect("list_sso_providers must exist")
+            .split("pub async fn save_sso_provider")
+            .next()
+            .expect("save_sso_provider must follow the list endpoint");
+        assert!(endpoint.contains("require_admin(&state, &headers)"));
+        assert!(!endpoint.contains("require_auth(&state, &headers)"));
     }
 
     #[test]

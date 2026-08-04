@@ -619,9 +619,10 @@ impl ConfigDb {
             ORDER BY (token)
             TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
             // Shared login-attempt ledger. Identifiers are keyed hashes, never
-            // raw usernames or addresses, and expire after one day. The auth
-            // handler combines this cross-replica view with an atomic local
-            // limiter to close same-process concurrency races.
+            // raw usernames or addresses, and expire after one day. IP rows
+            // count every request; account rows count failed credentials only.
+            // Keeping those dimensions separate prevents an attacker from
+            // locking out a valid account while retaining cross-replica limits.
             "CREATE TABLE IF NOT EXISTS config_login_attempts (
                 attempted_at String,
                 ip_hash      String,
@@ -2128,43 +2129,60 @@ impl ConfigDb {
             .await;
     }
 
-    pub async fn record_login_attempt(
-        &self,
-        ip_hash: &str,
-        account_hash: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn record_login_ip_attempt(&self, ip_hash: &str) -> anyhow::Result<()> {
         self.client
             .query("INSERT INTO config_login_attempts (attempted_at, ip_hash, account_hash) VALUES (?, ?, ?)")
             .bind(Self::now_str())
             .bind(ip_hash)
+            .bind("")
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_login_account_failure(&self, account_hash: &str) -> anyhow::Result<()> {
+        self.client
+            .query("INSERT INTO config_login_attempts (attempted_at, ip_hash, account_hash) VALUES (?, ?, ?)")
+            .bind(Self::now_str())
+            .bind("")
             .bind(account_hash)
             .execute()
             .await?;
         Ok(())
     }
 
-    pub async fn login_attempt_counts(
-        &self,
-        ip_hash: &str,
-        account_hash: &str,
-        since: &str,
-    ) -> anyhow::Result<(u64, u64)> {
+    pub async fn login_ip_attempt_count(&self, ip_hash: &str, since: &str) -> anyhow::Result<u64> {
         #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Counts {
-            ip_attempts: u64,
-            account_attempts: u64,
+        struct Count {
+            attempts: u64,
         }
-        let counts = self
+        let count = self
             .client
-            .query("SELECT countIf(ip_hash = ?) AS ip_attempts, countIf(account_hash = ?) AS account_attempts FROM config_login_attempts WHERE attempted_at >= ? AND (ip_hash = ? OR account_hash = ?)")
-            .bind(ip_hash)
-            .bind(account_hash)
+            .query("SELECT count() AS attempts FROM config_login_attempts WHERE attempted_at >= ? AND ip_hash = ?")
             .bind(since)
             .bind(ip_hash)
-            .bind(account_hash)
-            .fetch_one::<Counts>()
+            .fetch_one::<Count>()
             .await?;
-        Ok((counts.ip_attempts, counts.account_attempts))
+        Ok(count.attempts)
+    }
+
+    pub async fn login_account_failure_count(
+        &self,
+        account_hash: &str,
+        since: &str,
+    ) -> anyhow::Result<u64> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Count {
+            attempts: u64,
+        }
+        let count = self
+            .client
+            .query("SELECT count() AS attempts FROM config_login_attempts WHERE attempted_at >= ? AND account_hash = ?")
+            .bind(since)
+            .bind(account_hash)
+            .fetch_one::<Count>()
+            .await?;
+        Ok(count.attempts)
     }
 
     pub async fn list_users(
