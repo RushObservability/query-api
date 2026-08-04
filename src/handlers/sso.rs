@@ -26,6 +26,26 @@ const SSO_SETUP_COOKIE_SECURE: &str = "__Host-rush_sso_setup";
 const SSO_SETUP_COOKIE_INSECURE: &str = "rush_sso_setup";
 const SSO_SETUP_TTL_SECS: i64 = 30 * 60;
 
+fn public_sso_internal_error(
+    status: StatusCode,
+    operation: &'static str,
+    error: impl std::fmt::Display,
+    public_message: &'static str,
+) -> (StatusCode, String) {
+    tracing::error!(operation, error = %error, "SSO request failed");
+    (status, public_message.to_string())
+}
+
+fn public_sso_rejection(
+    status: StatusCode,
+    operation: &'static str,
+    error: impl std::fmt::Display,
+    public_message: &'static str,
+) -> (StatusCode, String) {
+    tracing::warn!(operation, reason = %error, "SSO request rejected");
+    (status, public_message.to_string())
+}
+
 /// Browser-bound state for one OIDC or SAML authentication transaction.
 ///
 /// The value is authenticated with an application secret and stored only in an
@@ -461,6 +481,7 @@ pub struct SsoStatusResponse {
     pub enabled: bool,
     pub provider_name: String,
     pub protocol: String,
+    pub local_auth_restricted: bool,
 }
 
 // ── OIDC Token Response ──
@@ -736,8 +757,14 @@ pub async fn sso_login(
                         .to_string(),
                 ));
             }
-            let base_url =
-                resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let base_url = resolve_base_url(&headers).map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "saml_login_base_url",
+                    error,
+                    "SSO is temporarily unavailable",
+                )
+            })?;
             let acs_url = format!("{base_url}/auth/sso/acs");
             let relay_state = "/";
 
@@ -758,10 +785,23 @@ pub async fn sso_login(
                 redirect_path: relay_state.to_string(),
                 issued_at: chrono::Utc::now().timestamp(),
             };
-            let encoded = encode_sso_transaction(&transaction)
-                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let encoded = encode_sso_transaction(&transaction).map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "saml_transaction_encode",
+                    error,
+                    "SSO is temporarily unavailable",
+                )
+            })?;
             let cookie = sso_transaction_cookie(&encoded, "saml", SSO_TRANSACTION_TTL_SECS)
-                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+                .map_err(|error| {
+                    public_sso_internal_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "saml_transaction_cookie",
+                        error,
+                        "SSO is temporarily unavailable",
+                    )
+                })?;
 
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert(
@@ -789,8 +829,14 @@ pub async fn sso_login(
             let csrf_state = random_urlsafe::<32>();
             let nonce = random_urlsafe::<32>();
             let pkce_verifier = random_urlsafe::<32>();
-            let base =
-                resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let base = resolve_base_url(&headers).map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "oidc_login_base_url",
+                    error,
+                    "SSO is temporarily unavailable",
+                )
+            })?;
             let redirect_uri = format!("{base}/auth/sso/callback");
             let discovery = fetch_oidc_discovery(&issuer_url).await.map_err(|e| {
                 tracing::warn!(reason = %e, "OIDC discovery rejected");
@@ -828,10 +874,23 @@ pub async fn sso_login(
                 redirect_path: "/".to_string(),
                 issued_at: chrono::Utc::now().timestamp(),
             };
-            let encoded = encode_sso_transaction(&transaction)
-                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let encoded = encode_sso_transaction(&transaction).map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "oidc_transaction_encode",
+                    error,
+                    "SSO is temporarily unavailable",
+                )
+            })?;
             let cookie = sso_transaction_cookie(&encoded, "oidc", SSO_TRANSACTION_TTL_SECS)
-                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+                .map_err(|error| {
+                    public_sso_internal_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "oidc_transaction_cookie",
+                        error,
+                        "SSO is temporarily unavailable",
+                    )
+                })?;
 
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert(
@@ -905,8 +964,14 @@ async fn sso_callback_inner(
     // 1. Verify the callback is bound to the browser that initiated this OIDC
     // transaction. The signed HttpOnly cookie also carries the nonce and PKCE
     // verifier, so none of these values are accepted from callback parameters.
-    let transaction =
-        extract_sso_transaction(&headers).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let transaction = extract_sso_transaction(&headers).map_err(|error| {
+        public_sso_rejection(
+            StatusCode::BAD_REQUEST,
+            "oidc_transaction_validate",
+            error,
+            "SSO login transaction is invalid or expired",
+        )
+    })?;
     if transaction.protocol != "oidc" || transaction.state != params.state {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -966,7 +1031,14 @@ async fn sso_callback_inner(
             "OIDC provider metadata is unavailable or invalid".to_string(),
         )
     })?;
-    let base = resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let base = resolve_base_url(&headers).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oidc_callback_base_url",
+            error,
+            "SSO authentication could not be completed",
+        )
+    })?;
     let redirect_uri = format!("{base}/auth/sso/callback");
 
     let token_res = crate::outbound::strict_public_https_request(
@@ -974,10 +1046,12 @@ async fn sso_callback_inner(
         &discovery.token_endpoint,
     )
     .await
-    .map_err(|e| {
-        (
+    .map_err(|error| {
+        public_sso_internal_error(
             StatusCode::BAD_GATEWAY,
-            format!("token endpoint rejected: {e}"),
+            "oidc_token_endpoint_policy",
+            error,
+            "SSO provider request failed",
         )
     })?
     .form(&[
@@ -990,10 +1064,12 @@ async fn sso_callback_inner(
     ])
     .send()
     .await
-    .map_err(|e| {
-        (
+    .map_err(|error| {
+        public_sso_internal_error(
             StatusCode::BAD_GATEWAY,
-            format!("token exchange failed: {e}"),
+            "oidc_token_exchange",
+            error,
+            "SSO provider request failed",
         )
     })?;
 
@@ -1026,13 +1102,22 @@ async fn sso_callback_inner(
     // 4. Verify the id_token JWT signature against the provider's JWKS and decode claims
     let claims = verify_and_decode_jwt(&id_token, &discovery, &issuer_url, &client_id)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|error| {
+            public_sso_rejection(
                 StatusCode::BAD_GATEWAY,
-                format!("id_token verification failed: {e}"),
+                "oidc_id_token_verify",
+                error,
+                "SSO identity token is invalid",
             )
         })?;
-    validate_oidc_nonce(&transaction, &claims).map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+    validate_oidc_nonce(&transaction, &claims).map_err(|error| {
+        public_sso_rejection(
+            StatusCode::UNAUTHORIZED,
+            "oidc_nonce_validate",
+            error,
+            "SSO identity token is invalid",
+        )
+    })?;
     if !consume_sso_key_once(
         format!("oidc:{}", transaction.state),
         transaction.issued_at + SSO_TRANSACTION_TTL_SECS,
@@ -1046,7 +1131,14 @@ async fn sso_callback_inner(
     // 5. Extract the configured profile claims. Unverified email addresses are
     // never promoted into Rush usernames.
     let profile = extract_oidc_profile(&claims, &email_claim, &first_name_claim, &last_name_claim)
-        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+        .map_err(|error| {
+            public_sso_rejection(
+                StatusCode::UNAUTHORIZED,
+                "oidc_profile_extract",
+                error,
+                "SSO identity token is invalid",
+            )
+        })?;
     let external_id = profile.external_id;
     let username = profile.username;
     let display_name = profile.display_name;
@@ -1067,10 +1159,12 @@ async fn sso_callback_inner(
         .config_db
         .resolve_idp_groups(&idp_groups, &provider_id)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|error| {
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("group mapping error: {e}"),
+                "oidc_group_mapping",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
 
@@ -1094,8 +1188,8 @@ async fn sso_callback_inner(
         "oidc",
     )
     .await?;
-    let user_id = match existing_user {
-        Some(uid) => uid,
+    let (user_id, jit_created) = match existing_user {
+        Some(uid) => (uid, false),
         None => {
             if !jit_provisioning {
                 return Err((
@@ -1103,28 +1197,55 @@ async fn sso_callback_inner(
                     "JIT provisioning is disabled and user does not exist".to_string(),
                 ));
             }
-            state
+            let id = state
                 .config_db
                 .create_sso_user(&username, &display_name, &identity_key, "oidc", "default")
                 .await
-                .map_err(|e| {
-                    (
+                .map_err(|error| {
+                    public_sso_internal_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user creation error: {e}"),
+                        "oidc_user_create",
+                        error,
+                        "SSO authentication could not be completed",
                     )
-                })?
+                })?;
+            (id, true)
         }
     };
+
+    if jit_created {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.create", "system")
+                    .tenant("default")
+                    .resource("user", user_id.clone())
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "username": &username,
+                            "auth_provider": "oidc",
+                            "jit_provisioned": true,
+                        })
+                        .to_string(),
+                    )
+                    .description("SSO user provisioned after verified OIDC authentication")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+    }
 
     // 9. Update the user's group memberships with the mapped set
     state
         .config_db
         .update_user_groups_from_idp(&user_id, &mapped_group_ids)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|error| {
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("group update error: {e}"),
+                "oidc_group_update",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
 
@@ -1133,17 +1254,25 @@ async fn sso_callback_inner(
         .config_db
         .create_session(&user_id)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|error| {
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("session error: {e}"),
+                "oidc_session_create",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
 
     // 11. Set the rush_session cookie and redirect to /
     let cookie = crate::handlers::auth::session_cookie(&token, 86400);
-    let clear_transaction = sso_transaction_cookie("", "oidc", 0)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let clear_transaction = sso_transaction_cookie("", "oidc", 0).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "oidc_transaction_clear",
+            error,
+            "SSO authentication could not be completed",
+        )
+    })?;
 
     // Audit the successful OIDC authentication without logging the code,
     // tokens, transaction cookie, or IdP claims beyond the stable provider id.
@@ -1467,7 +1596,7 @@ pub async fn save_sso_provider(
         }
     }
 
-    state
+    let previous_active_provider_id = state
         .config_db
         .upsert_sso_provider(
             &id,
@@ -1493,6 +1622,13 @@ pub async fn save_sso_provider(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let active_provider_id = if enabled {
+        Some(id.clone())
+    } else if previous_active_provider_id.as_deref() == Some(id.as_str()) {
+        None
+    } else {
+        previous_active_provider_id.clone()
+    };
 
     tracing::info!(event = "sso_provider_saved", provider_id = %id, "SSO provider saved");
 
@@ -1504,7 +1640,9 @@ pub async fn save_sso_provider(
         "enabled": enabled,
         "issuer_url": req.issuer_url.as_deref().unwrap_or(""),
         "client_id": req.client_id.as_deref().unwrap_or(""),
-        "client_secret_set": req.client_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        "client_secret_set": req.client_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+        "previous_active_provider_id": previous_active_provider_id,
+        "active_provider_id": active_provider_id,
     })
     .to_string();
     if let Ok(caller) = &admin_result {
@@ -1551,7 +1689,14 @@ pub async fn save_sso_provider(
                 .unwrap_or_else(|_| "default".to_string()),
         )
         .resource("sso_provider", id.clone())
-        .changes(serde_json::json!({ "enabled": enabled }).to_string())
+        .changes(
+            serde_json::json!({
+                "enabled": enabled,
+                "previous_active_provider_id": previous_active_provider_id,
+                "active_provider_id": active_provider_id,
+            })
+            .to_string(),
+        )
         .description("sso provider enabled state set")
         .context(crate::audit::actor_context_from_headers(&headers));
         let event = if let Ok(caller) = &admin_result {
@@ -1572,6 +1717,12 @@ pub async fn delete_sso_provider(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
+    let was_active = state
+        .config_db
+        .get_sso_provider(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+        .is_some_and(|provider| provider.3);
     let deleted = state
         .config_db
         .delete_sso_provider(&id)
@@ -1593,7 +1744,14 @@ pub async fn delete_sso_provider(
                     .actor(caller.0.clone(), caller.1.clone())
                     .tenant(caller.3.clone())
                     .resource("sso_provider", id.clone())
-                    .changes(serde_json::json!({ "deleted": true }).to_string())
+                    .changes(
+                        serde_json::json!({
+                            "deleted": true,
+                            "was_active": was_active,
+                            "active_provider_cleared": was_active,
+                        })
+                        .to_string(),
+                    )
                     .description("sso provider deleted")
                     .context(crate::audit::actor_context_from_headers(&headers)),
             )
@@ -1770,8 +1928,14 @@ async fn sso_acs_inner(
             "SAML response is too large".to_string(),
         ));
     }
-    let transaction =
-        extract_sso_transaction(&headers).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let transaction = extract_sso_transaction(&headers).map_err(|error| {
+        public_sso_rejection(
+            StatusCode::BAD_REQUEST,
+            "saml_transaction_validate",
+            error,
+            "SSO login transaction is invalid or expired",
+        )
+    })?;
     if transaction.protocol != "saml" || transaction.saml_request_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1841,10 +2005,12 @@ async fn sso_acs_inner(
         &base64::engine::general_purpose::STANDARD,
         saml_response.trim(),
     )
-    .map_err(|e| {
-        (
+    .map_err(|error| {
+        public_sso_rejection(
             StatusCode::BAD_REQUEST,
-            format!("invalid base64 in SAMLResponse: {e}"),
+            "saml_response_decode",
+            error,
+            "invalid SAMLResponse encoding",
         )
     })?;
     let xml = String::from_utf8_lossy(&xml_bytes);
@@ -1855,7 +2021,7 @@ async fn sso_acs_inner(
         tracing::error!(provider_id = %provider_id, "enabled SAML provider has no certificate");
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "SAML provider has no signing certificate".to_string(),
+            "SSO authentication is temporarily unavailable".to_string(),
         ));
     }
     let signed_xml = saml::verify_signature(&xml, &saml_cert).map_err(|e| {
@@ -1866,7 +2032,14 @@ async fn sso_acs_inner(
         )
     })?;
 
-    let base_url = resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let base_url = resolve_base_url(&headers).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "saml_acs_base_url",
+            error,
+            "SSO authentication could not be completed",
+        )
+    })?;
     let acs_url = format!("{base_url}/auth/sso/acs");
     let assertion = saml::validate_signed_assertion(
         &signed_xml,
@@ -1914,10 +2087,12 @@ async fn sso_acs_inner(
         .config_db
         .resolve_idp_groups(&assertion.groups, &provider_id)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|error| {
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("group mapping error: {e}"),
+                "saml_group_mapping",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
 
@@ -1941,8 +2116,8 @@ async fn sso_acs_inner(
         auth_provider,
     )
     .await?;
-    let user_id = match existing_user {
-        Some(uid) => uid,
+    let (user_id, jit_created) = match existing_user {
+        Some(uid) => (uid, false),
         None => {
             if !jit_provisioning {
                 return Err((
@@ -1952,27 +2127,55 @@ async fn sso_acs_inner(
             }
             let email = assertion.email.as_deref().unwrap_or(&assertion.name_id);
             let display = assertion.display_name.as_deref().unwrap_or(email);
-            state
+            let id = state
                 .config_db
                 .create_sso_user(email, display, &identity_key, auth_provider, "default")
                 .await
-                .map_err(|e| {
-                    (
+                .map_err(|error| {
+                    public_sso_internal_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user creation error: {e}"),
+                        "saml_user_create",
+                        error,
+                        "SSO authentication could not be completed",
                     )
-                })?
+                })?;
+            (id, true)
         }
     };
+
+    if jit_created {
+        let username = assertion.email.as_deref().unwrap_or(&assertion.name_id);
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.create", "system")
+                    .tenant("default")
+                    .resource("user", user_id.clone())
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "username": username,
+                            "auth_provider": auth_provider,
+                            "jit_provisioned": true,
+                        })
+                        .to_string(),
+                    )
+                    .description("SSO user provisioned after verified SAML authentication")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+    }
 
     state
         .config_db
         .update_user_groups_from_idp(&user_id, &mapped_group_ids)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|error| {
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("group update error: {e}"),
+                "saml_group_update",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
 
@@ -1980,10 +2183,12 @@ async fn sso_acs_inner(
         .config_db
         .create_session(&user_id)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|error| {
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("session error: {e}"),
+                "saml_session_create",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
 
@@ -2015,8 +2220,14 @@ async fn sso_acs_inner(
         .await;
 
     let cookie = crate::handlers::auth::session_cookie(&token, 86400);
-    let clear_transaction = sso_transaction_cookie("", "saml", 0)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let clear_transaction = sso_transaction_cookie("", "saml", 0).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "saml_transaction_clear",
+            error,
+            "SSO authentication could not be completed",
+        )
+    })?;
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.append(header::SET_COOKIE, cookie.parse().unwrap());
@@ -2057,7 +2268,14 @@ pub async fn sso_metadata(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         })?;
 
-    let base_url = resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let base_url = resolve_base_url(&headers).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "saml_metadata_base_url",
+            error,
+            "SSO metadata is temporarily unavailable",
+        )
+    })?;
     let acs_url = format!("{base_url}/auth/sso/acs");
 
     let sp_entity_id = match &provider {
@@ -2081,8 +2299,14 @@ pub async fn sso_status(
         .config_db
         .get_enabled_sso_provider()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
-    {
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_status_read",
+                error,
+                "SSO status is temporarily unavailable",
+            )
+        })? {
         Some((
             _id,
             name,
@@ -2107,11 +2331,13 @@ pub async fn sso_status(
             enabled: true,
             provider_name: name,
             protocol,
+            local_auth_restricted: crate::handlers::auth::sso_only_mode_enabled(),
         })),
         None => Ok(Json(SsoStatusResponse {
             enabled: false,
             provider_name: String::new(),
             protocol: String::new(),
+            local_auth_restricted: false,
         })),
     }
 }
@@ -2193,13 +2419,26 @@ pub async fn exchange_setup_token(
     if req.token.len() < 32 || req.token.len() > 256 {
         return Err((StatusCode::BAD_REQUEST, "invalid setup token".to_string()));
     }
-    let token_hash =
-        setup_token_hash(&req.token).map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let token_hash = setup_token_hash(&req.token).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "setup_token_hash",
+            error,
+            "SSO setup is temporarily unavailable",
+        )
+    })?;
     let consumed = state
         .config_db
         .consume_setup_token(&token_hash, "sso_setup")
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "setup_token_consume",
+                error,
+                "SSO setup is temporarily unavailable",
+            )
+        })?;
     let (provider, _hostname, created_by) = consumed.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -2222,10 +2461,22 @@ pub async fn exchange_setup_token(
         session_id: random_urlsafe::<24>(),
         issued_at: chrono::Utc::now().timestamp(),
     };
-    let setup_secret =
-        sso_transaction_secret().map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
-    let encoded = encode_setup_session_with_secret(&session, &setup_secret)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let setup_secret = sso_transaction_secret().map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "setup_session_secret",
+            error,
+            "SSO setup is temporarily unavailable",
+        )
+    })?;
+    let encoded = encode_setup_session_with_secret(&session, &setup_secret).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "setup_session_encode",
+            error,
+            "SSO setup is temporarily unavailable",
+        )
+    })?;
     let cookie = setup_session_cookie(&encoded, SSO_SETUP_TTL_SECS);
     state
         .audit
@@ -2309,6 +2560,32 @@ pub async fn complete_setup_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_sso_errors_do_not_expose_internal_details() {
+        let internal = "clickhouse host=db.internal password=secret";
+        let (status, message) = public_sso_internal_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "test_database_failure",
+            internal,
+            "SSO authentication could not be completed",
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "SSO authentication could not be completed");
+        assert!(!message.contains("clickhouse"));
+        assert!(!message.contains("secret"));
+
+        let (status, message) = public_sso_rejection(
+            StatusCode::UNAUTHORIZED,
+            "test_jwt_failure",
+            "JWT signature verification failed for kid internal-signing-key",
+            "SSO identity token is invalid",
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(message, "SSO identity token is invalid");
+        assert!(!message.contains("signature"));
+        assert!(!message.contains("internal-signing-key"));
+    }
 
     fn transaction() -> SsoTransaction {
         SsoTransaction {

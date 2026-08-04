@@ -1175,6 +1175,31 @@ async fn main() -> anyhow::Result<()> {
     // Build the audit chain before bootstrap tenant mutation so a newly seeded
     // default tenant is recorded like every other tenant creation.
     let audit = std::sync::Arc::new(rush_api::audit::AuditLogger::new(admin_ch.clone()).await);
+    let sso_reconciliation = config_db.reconcile_active_sso_provider().await?;
+    if sso_reconciliation.changed {
+        if !sso_reconciliation.ambiguous_provider_ids.is_empty() {
+            tracing::error!(
+                provider_count = sso_reconciliation.ambiguous_provider_ids.len(),
+                "multiple legacy SSO providers were enabled; SSO was disabled until an administrator selects one"
+            );
+        }
+        audit
+            .log(
+                rush_api::audit::AuditEvent::new("sso.active_provider_reconcile", "system")
+                    .tenant("default")
+                    .resource("sso_active_provider", "primary")
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "active_provider_id": sso_reconciliation.active_provider_id,
+                            "ambiguous_provider_ids": sso_reconciliation.ambiguous_provider_ids,
+                        })
+                        .to_string(),
+                    )
+                    .description("legacy SSO enabled-provider state reconciled during startup"),
+            )
+            .await;
+    }
     for provider_id in config_db.legacy_sso_client_secret_ids().await? {
         if !config_db
             .encrypt_legacy_sso_client_secret(&provider_id)
@@ -1529,6 +1554,14 @@ async fn main() -> anyhow::Result<()> {
 
     handlers::auth::validate_login_rate_limit_secret()
         .map_err(|error| anyhow::anyhow!("invalid login rate-limit configuration: {error}"))?;
+    handlers::auth::validate_sso_only_config()
+        .map_err(|error| anyhow::anyhow!("invalid SSO-only configuration: {error}"))?;
+    if handlers::auth::sso_only_mode_enabled() {
+        config_db
+            .validate_break_glass_account(&handlers::auth::break_glass_username())
+            .await
+            .context("invalid SSO-only break-glass account")?;
+    }
     let login_account_limit_per_minute =
         handlers::auth::login_limit_from_env("RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE", 10)
             .map_err(|error| anyhow::anyhow!("invalid login rate-limit configuration: {error}"))?;

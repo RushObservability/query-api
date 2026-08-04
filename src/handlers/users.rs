@@ -151,14 +151,46 @@ pub async fn create_user(
         ));
     }
 
-    let id = state
+    let id = match state
         .config_db
         .create_user(&username, &password, &display_name)
         .await
-        .map_err(|e| {
+    {
+        Ok(id) => id,
+        Err(error)
+            if error
+                .downcast_ref::<crate::clickhouse_config::UsernameAlreadyExists>()
+                .is_some() =>
+        {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("user.create", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("user", "canonical-username-conflict")
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({
+                                "username": username,
+                                "reason": "canonical_username_conflict",
+                            })
+                            .to_string(),
+                        )
+                        .description("user creation rejected because username is already in use")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::CONFLICT,
+                "username is already in use".to_string(),
+            ));
+        }
+        Err(e) => {
             tracing::error!(error = %e, "internal error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-        })?;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()));
+        }
+    };
 
     // New users default to the viewers group
     if let Err(error) = state
@@ -294,8 +326,68 @@ pub async fn change_password(
         ));
     }
 
-    // Non-admin users must supply their current password to change it.
-    if caller.4 != "admin" {
+    let (target_username, auth_provider) = state
+        .config_db
+        .get_user_identity_provider(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
+
+    if auth_provider != "local" {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.password_change", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", id.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "reason": "sso_managed_identity",
+                            "auth_provider": auth_provider,
+                        })
+                        .to_string(),
+                    )
+                    .description("password change rejected for SSO-managed user")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::CONFLICT,
+            "this user is managed by SSO; change credentials at the identity provider".to_string(),
+        ));
+    }
+
+    // The break-glass account is deliberately outside SSO administration. It
+    // can rotate its own password after step-up verification, but another
+    // administrator cannot reset it.
+    if crate::handlers::auth::is_break_glass_username(&target_username) && caller.0 != id {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.password_change", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", id.clone())
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "break_glass_protected" }).to_string())
+                    .description("password reset rejected for protected break-glass account")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the break-glass account can only change its own password".to_string(),
+        ));
+    }
+
+    // Self-service changes always require step-up verification, including for
+    // administrators. Admin resets remain available for other local accounts.
+    if caller.0 == id || caller.4 != "admin" {
         let current = req.current_password.as_deref().unwrap_or("");
         if current.is_empty() {
             return Err((
@@ -303,20 +395,58 @@ pub async fn change_password(
                 "current_password is required".to_string(),
             ));
         }
-        if state
-            .config_db
-            .authenticate(&caller.1, current)
-            .await
-            .is_none()
-        {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "current password is incorrect".to_string(),
-            ));
+        match state.config_db.authenticate(&caller.1, current).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("user.password_change", "user")
+                            .actor(caller.0.clone(), caller.1.clone())
+                            .tenant(caller.3.clone())
+                            .resource("user", id.clone())
+                            .outcome("failure")
+                            .changes(serde_json::json!({ "reason": "step_up_failed" }).to_string())
+                            .description(
+                                "password change rejected after failed step-up authentication",
+                            )
+                            .context(crate::audit::actor_context_from_headers(&headers)),
+                    )
+                    .await;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "current password is incorrect".to_string(),
+                ));
+            }
+            Err(error) => {
+                tracing::error!(%error, "password verification failed");
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("user.password_change", "user")
+                            .actor(caller.0.clone(), caller.1.clone())
+                            .tenant(caller.3.clone())
+                            .resource("user", id.clone())
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({ "reason": "identity_store_unavailable" })
+                                    .to_string(),
+                            )
+                            .description(
+                                "password change unavailable during step-up authentication",
+                            )
+                            .context(crate::audit::actor_context_from_headers(&headers)),
+                    )
+                    .await;
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication temporarily unavailable".to_string(),
+                ));
+            }
         }
     }
 
-    let updated = state
+    let outcome = state
         .config_db
         .change_password(&id, &req.password)
         .await
@@ -325,8 +455,37 @@ pub async fn change_password(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         })?;
 
-    if !updated {
-        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+    match outcome {
+        crate::clickhouse_config::PasswordChangeOutcome::Updated => {}
+        crate::clickhouse_config::PasswordChangeOutcome::UserNotFound => {
+            return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+        }
+        crate::clickhouse_config::PasswordChangeOutcome::SsoManaged { auth_provider } => {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("user.password_change", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("user", id.clone())
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({
+                                "reason": "sso_managed_identity",
+                                "auth_provider": auth_provider,
+                            })
+                            .to_string(),
+                        )
+                        .description("password change rejected for SSO-managed user")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::CONFLICT,
+                "this user is managed by SSO; change credentials at the identity provider"
+                    .to_string(),
+            ));
+        }
     }
 
     // AUDIT: password change. NEVER log the password value.

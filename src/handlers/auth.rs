@@ -13,6 +13,15 @@ use crate::AppState;
 
 type HmacSha256 = Hmac<Sha256>;
 
+fn public_auth_error(
+    status: StatusCode,
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) -> (StatusCode, String) {
+    tracing::error!(operation, error = %error, "authentication request failed");
+    (status, "authentication temporarily unavailable".to_string())
+}
+
 fn login_rate_limit_secret() -> Result<Vec<u8>, String> {
     let secret = std::env::var("RUSH_LOGIN_RATE_LIMIT_SECRET")
         .or_else(|_| std::env::var("RUSH_SSO_TRANSACTION_SECRET"))
@@ -26,6 +35,49 @@ fn login_rate_limit_secret() -> Result<Vec<u8>, String> {
 
 pub fn validate_login_rate_limit_secret() -> Result<(), String> {
     login_rate_limit_secret().map(|_| ())
+}
+
+pub(crate) fn sso_only_mode_enabled() -> bool {
+    std::env::var("RUSH_SSO_ONLY")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn break_glass_username() -> String {
+    std::env::var("RUSH_BREAK_GLASS_USERNAME")
+        .unwrap_or_else(|_| "admin".to_string())
+        .trim()
+        .to_lowercase()
+}
+
+pub fn validate_sso_only_config() -> Result<(), String> {
+    if sso_only_mode_enabled() && break_glass_username().is_empty() {
+        return Err(
+            "RUSH_BREAK_GLASS_USERNAME must not be empty when RUSH_SSO_ONLY is enabled".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn is_break_glass_username(username: &str) -> bool {
+    username.trim().to_lowercase() == break_glass_username()
+}
+
+fn local_login_allowed(
+    sso_only: bool,
+    sso_enabled: bool,
+    username: &str,
+    role: &str,
+    break_glass: &str,
+) -> bool {
+    !sso_only
+        || !sso_enabled
+        || (username.trim().to_lowercase() == break_glass.trim().to_lowercase() && role == "admin")
 }
 
 fn keyed_login_identifier(label: &[u8], value: &str, secret: &[u8]) -> String {
@@ -171,8 +223,13 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let client_ip = resolve_login_client_ip(peer.ip(), &headers, &state.trusted_proxy_cidrs);
-    let secret =
-        login_rate_limit_secret().map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let secret = login_rate_limit_secret().map_err(|error| {
+        public_auth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rate_limit_configuration",
+            error,
+        )
+    })?;
     let account = req.username.trim().to_lowercase();
     let ip_hash = keyed_login_identifier(b"ip", &client_ip.to_string(), &secret);
     let account_hash = keyed_login_identifier(b"account", &account, &secret);
@@ -260,10 +317,69 @@ pub async fn login(
         ));
     }
 
-    let authenticated = state
+    let mut authenticated = match state
         .config_db
         .authenticate(&req.username, &req.password)
-        .await;
+        .await
+    {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            tracing::error!(operation = "credential_lookup", %error, "authentication request failed");
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                        .actor_name(req.username.clone())
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "identity_store_unavailable" })
+                                .to_string(),
+                        )
+                        .description("authentication unavailable")
+                        .context(login_audit_context(&headers, client_ip)),
+                )
+                .await;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable".to_string(),
+            ));
+        }
+    };
+
+    // Optional enterprise SSO-only policy. It is enforced only while a valid
+    // provider is active, and retains one explicitly named, local admin as the
+    // break-glass path. Rejections remain indistinguishable from bad credentials.
+    if sso_only_mode_enabled() {
+        let sso_enabled = match state.config_db.is_sso_enabled().await {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                tracing::error!(operation = "sso_policy_lookup", %error, "authentication request failed");
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                            .actor_name(req.username.clone())
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({ "reason": "sso_policy_unavailable" })
+                                    .to_string(),
+                            )
+                            .description("authentication unavailable")
+                            .context(login_audit_context(&headers, client_ip)),
+                    )
+                    .await;
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication temporarily unavailable".to_string(),
+                ));
+            }
+        };
+        if let Some((_, username, _, _, role)) = authenticated.as_ref()
+            && !local_login_allowed(true, sso_enabled, username, role, &break_glass_username())
+        {
+            authenticated = None;
+        }
+    }
     let (user_id, username, display_name, tenant_id, role) = match authenticated {
         Some(u) => u,
         None => {
@@ -388,11 +504,8 @@ pub async fn login(
         .config_db
         .create_session(&user_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("session error: {e}"),
-            )
+        .map_err(|error| {
+            public_auth_error(StatusCode::INTERNAL_SERVER_ERROR, "session_create", error)
         })?;
 
     tracing::info!(
@@ -644,6 +757,33 @@ mod tests {
     }
 
     #[test]
+    fn sso_only_mode_allows_only_the_named_admin_break_glass_identity() {
+        assert!(local_login_allowed(true, true, " Admin ", "admin", "admin"));
+        assert!(!local_login_allowed(
+            true,
+            true,
+            "other-admin",
+            "admin",
+            "admin"
+        ));
+        assert!(!local_login_allowed(true, true, "admin", "viewer", "admin"));
+        assert!(local_login_allowed(
+            false,
+            true,
+            "local-user",
+            "viewer",
+            "admin"
+        ));
+        assert!(local_login_allowed(
+            true,
+            false,
+            "local-user",
+            "viewer",
+            "admin"
+        ));
+    }
+
+    #[test]
     fn concurrent_local_attempts_cannot_overshoot_the_limit() {
         let limiter = std::sync::Arc::new(dashmap::DashMap::new());
         let start = std::sync::Arc::new(std::sync::Barrier::new(32));
@@ -679,6 +819,19 @@ mod tests {
         assert_eq!(account.len(), 64);
         assert_ne!(account, ip);
         assert!(!account.contains("admin"));
+    }
+
+    #[test]
+    fn public_auth_errors_do_not_expose_internal_details() {
+        let (status, message) = public_auth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "test",
+            "clickhouse host=db.internal password=secret",
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "authentication temporarily unavailable");
+        assert!(!message.contains("clickhouse"));
+        assert!(!message.contains("secret"));
     }
 
     #[test]

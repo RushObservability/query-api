@@ -74,6 +74,8 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE` | `10` | maximum login attempts against one normalized account per minute across replicas |
 | `RUSH_LOGIN_IP_LIMIT_PER_MINUTE` | `50` | maximum login attempts from one resolved client address per minute across replicas |
 | `RUSH_TRUSTED_PROXY_CIDRS` | _(empty)_ | comma-separated proxy networks allowed to supply `X-Forwarded-For`/`X-Real-IP`; other peers' forwarding headers are ignored |
+| `RUSH_SSO_ONLY` | `false` | when `true` and an SSO provider is active, reject local sign-in except for the configured admin break-glass account |
+| `RUSH_BREAK_GLASS_USERNAME` | `admin` | canonical username of the local admin retained for emergency access in SSO-only mode; other admins cannot reset its password |
 | `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | stable key used to encrypt integration DSNs |
 | `RUSH_COLLECTOR_MANAGER_ENABLED` | `false` | enable API-managed local collector supervision |
 | `RUSH_POSTGRES_COLLECTOR_BIN` | `../postgres-collector/target/debug/postgres-collector` | managed PostgreSQL collector executable |

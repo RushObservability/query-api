@@ -8,12 +8,24 @@ use dashmap::DashMap;
 use openssl::symm::Cipher;
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// (user_id, username, display_name, tenant_id, role) — the require_auth tuple.
 type SessionUser = (String, String, String, String, String);
 /// (id, name, enabled, auth_required) for a tenant; None = tenant not found.
 type TenantFlags = Option<(String, String, bool, bool)>;
+
+#[derive(Debug, thiserror::Error)]
+#[error("username is already in use")]
+pub struct UsernameAlreadyExists;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordChangeOutcome {
+    Updated,
+    UserNotFound,
+    SsoManaged { auth_provider: String },
+}
 
 /// Server-owned authorization attached to a hashed API key. The plaintext key
 /// is returned only once at creation and never stored here.
@@ -67,6 +79,68 @@ mod auth_storage_tests {
     use super::*;
 
     #[test]
+    fn legacy_sso_provider_reconciliation_adopts_only_one_enabled_provider() {
+        let resolution = resolve_legacy_active_sso_provider(vec!["provider-a".to_string()]);
+        assert_eq!(resolution.active_provider_id.as_deref(), Some("provider-a"));
+        assert!(resolution.ambiguous_provider_ids.is_empty());
+        assert!(resolution.changed);
+    }
+
+    #[test]
+    fn legacy_sso_provider_reconciliation_fails_closed_on_ambiguity() {
+        let resolution = resolve_legacy_active_sso_provider(vec![
+            "provider-b".to_string(),
+            "provider-a".to_string(),
+            "provider-b".to_string(),
+        ]);
+        assert_eq!(resolution.active_provider_id, None);
+        assert_eq!(
+            resolution.ambiguous_provider_ids,
+            vec!["provider-a".to_string(), "provider-b".to_string()]
+        );
+        assert!(resolution.changed);
+    }
+
+    #[test]
+    fn enabled_sso_provider_lookup_uses_the_singleton_pointer() {
+        let source = include_str!("clickhouse_config.rs");
+        let lookup = source
+            .rsplit_once("pub async fn get_enabled_sso_provider")
+            .map(|(_, lookup)| lookup)
+            .expect("enabled-provider lookup must exist")
+            .split("/// Validate the configured encryption key")
+            .next()
+            .expect("secret migration must follow enabled-provider lookup");
+        assert!(lookup.contains("effective_active_sso_provider_id"));
+        assert!(!lookup.contains("WHERE enabled = 1 AND is_deleted = 0 LIMIT 1"));
+    }
+
+    #[test]
+    fn sso_provider_mutations_maintain_the_singleton_pointer() {
+        let source = include_str!("clickhouse_config.rs");
+        let upsert = source
+            .rsplit_once("pub async fn upsert_sso_provider")
+            .map(|(_, upsert)| upsert)
+            .expect("SSO provider upsert must exist")
+            .split("pub async fn delete_sso_provider")
+            .next()
+            .expect("SSO provider delete must follow upsert");
+        assert!(upsert.contains("if enabled"));
+        assert!(upsert.contains("set_active_sso_provider_id(id)"));
+        assert!(upsert.contains("set_active_sso_provider_id(\"\")"));
+
+        let delete = source
+            .rsplit_once("pub async fn delete_sso_provider")
+            .map(|(_, delete)| delete)
+            .expect("SSO provider delete must exist")
+            .split("// ── IdP group mapping operations")
+            .next()
+            .expect("group mapping operations must follow provider delete");
+        assert!(delete.contains("if was_active"));
+        assert!(delete.contains("set_active_sso_provider_id(\"\")"));
+    }
+
+    #[test]
     fn session_storage_uses_a_one_way_key_not_the_bearer_value() {
         let raw = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let stored = session_storage_key(raw);
@@ -74,6 +148,67 @@ mod auth_storage_tests {
         assert_eq!(stored, session_storage_key(raw));
         assert_ne!(stored, raw);
         assert!(!stored.contains(raw));
+    }
+
+    #[test]
+    fn usernames_use_one_trimmed_case_insensitive_identity() {
+        assert_eq!(
+            canonical_username("  Alice@Example.COM  "),
+            "alice@example.com"
+        );
+        assert_eq!(canonical_username("ADMIN"), canonical_username("admin"));
+    }
+
+    #[test]
+    fn missing_identity_dummy_hash_performs_real_argon2_verification() {
+        let hash = dummy_password_hash();
+        assert!(PasswordHash::new(hash).is_ok());
+        assert!(verify_password("not-a-real-rush-password", hash));
+        assert!(!verify_password("attacker-input", hash));
+    }
+
+    #[test]
+    fn authentication_is_canonical_and_fails_closed_on_collisions() {
+        let source = include_str!("clickhouse_config.rs");
+        let authentication = source
+            .rsplit_once("pub async fn authenticate")
+            .map(|(_, authentication)| authentication)
+            .expect("authentication method must exist")
+            .split("async fn derive_user_role")
+            .next()
+            .expect("role derivation must follow authentication");
+        assert!(authentication.contains(
+            "lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?))"
+        ));
+        assert!(authentication.contains("LIMIT 2"));
+        assert!(authentication.contains("dummy_password_hash()"));
+        assert!(authentication.contains("if rows.len() > 1"));
+    }
+
+    #[test]
+    fn user_rewrites_preserve_sso_identity_and_password_changes_reject_it() {
+        let source = include_str!("clickhouse_config.rs");
+        let password_change = source
+            .rsplit_once("pub async fn change_password")
+            .map(|(_, method)| method)
+            .expect("password change method must exist")
+            .split("pub async fn delete_sessions_for_user")
+            .next()
+            .expect("session deletion must follow password change");
+        assert!(password_change.contains("if row.auth_provider != \"local\""));
+        assert!(password_change.contains("PasswordChangeOutcome::SsoManaged"));
+        assert!(password_change.contains(".bind(&row.auth_provider)"));
+        assert!(password_change.contains(".bind(&row.external_id)"));
+
+        let enabled_change = source
+            .rsplit_once("pub async fn set_user_enabled")
+            .map(|(_, method)| method)
+            .expect("enabled mutation must exist")
+            .split("pub async fn get_username")
+            .next()
+            .expect("username lookup must follow enabled mutation");
+        assert!(enabled_change.contains(".bind(&row.auth_provider)"));
+        assert!(enabled_change.contains(".bind(&row.external_id)"));
     }
 
     #[test]
@@ -195,6 +330,25 @@ fn hash_password(password: &str) -> anyhow::Result<String> {
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))
+}
+
+fn canonical_username(username: &str) -> String {
+    username.trim().to_lowercase()
+}
+
+/// A process-wide, precomputed Argon2 hash used when an account is absent or
+/// cannot use local authentication. Verifying it keeps the expensive portion
+/// of the login path equivalent without creating a fresh hash on every miss.
+fn dummy_password_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        let salt = SaltString::encode_b64(b"rush-login-dummy-salt")
+            .expect("static dummy password salt must be valid");
+        Argon2::default()
+            .hash_password(b"not-a-real-rush-password", &salt)
+            .expect("static dummy password hash must be constructible")
+            .to_string()
+    })
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {
@@ -327,6 +481,37 @@ pub type SsoProviderRow = (
     String,
     String,
 );
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SsoActiveProviderReconciliation {
+    pub active_provider_id: Option<String>,
+    pub ambiguous_provider_ids: Vec<String>,
+    pub changed: bool,
+}
+
+fn resolve_legacy_active_sso_provider(
+    mut provider_ids: Vec<String>,
+) -> SsoActiveProviderReconciliation {
+    provider_ids.sort();
+    provider_ids.dedup();
+    match provider_ids.as_slice() {
+        [] => SsoActiveProviderReconciliation {
+            active_provider_id: None,
+            ambiguous_provider_ids: Vec::new(),
+            changed: false,
+        },
+        [provider_id] => SsoActiveProviderReconciliation {
+            active_provider_id: Some(provider_id.clone()),
+            ambiguous_provider_ids: Vec::new(),
+            changed: true,
+        },
+        _ => SsoActiveProviderReconciliation {
+            active_provider_id: None,
+            ambiguous_provider_ids: provider_ids,
+            changed: true,
+        },
+    }
+}
 
 #[derive(clickhouse::Row, serde::Deserialize)]
 pub struct AlertRuleRow {
@@ -466,6 +651,10 @@ pub struct ConfigDb {
     /// request to decide drop-vs-write, so it mirrors the tenant_flags TTL cache.
     /// Defaults (no stored row) are cached too so all-enabled tenants stay cheap.
     signal_cache: DashMap<(String, String), (bool, Instant)>,
+    /// Serializes canonical username checks and inserts inside one replica.
+    /// Authentication also fails closed if separately racing replicas ever
+    /// produce a collision.
+    username_mutation_lock: tokio::sync::Mutex<()>,
 }
 
 /// A metric firewall rule (storage + API shape). `enabled`/`*_regex` are 0/1.
@@ -538,8 +727,13 @@ impl ConfigDb {
             ingest_auth_cache: DashMap::new(),
             perms_cache: DashMap::new(),
             signal_cache: DashMap::new(),
+            username_mutation_lock: tokio::sync::Mutex::new(()),
         };
         db.run_migrations().await?;
+        // Do this at startup so the first unknown-user login has no one-time
+        // initialization cost that could become a timing signal.
+        let _ = dummy_password_hash();
+        db.validate_unique_usernames().await?;
         Ok(db)
     }
 
@@ -671,6 +865,16 @@ impl ConfigDb {
                 is_deleted            UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            // One authoritative pointer prevents multiple provider rows from
+            // making login selection ambiguous. Provider rows retain their
+            // legacy `enabled` column for migration compatibility, but all
+            // runtime reads use this singleton after startup reconciliation.
+            "CREATE TABLE IF NOT EXISTS config_sso_active_provider (
+                slot        String,
+                provider_id String DEFAULT '',
+                version     UInt64
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (slot)",
             // ── IdP group mappings ────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_idp_group_mappings (
                 id            String,
@@ -1243,6 +1447,53 @@ impl ConfigDb {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64
+    }
+
+    async fn ensure_username_available(&self, username: &str) -> anyhow::Result<()> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Count {
+            n: u64,
+        }
+
+        if canonical_username(username).is_empty() {
+            anyhow::bail!("username must not be empty");
+        }
+        let row = self
+            .client
+            .query("SELECT countDistinct(id) AS n FROM config_users FINAL WHERE lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?)) AND is_deleted = 0")
+            .bind(username)
+            .fetch_one::<Count>()
+            .await?;
+        if row.n != 0 {
+            return Err(UsernameAlreadyExists.into());
+        }
+        Ok(())
+    }
+
+    /// Refuse to start with ambiguous legacy identities. All authentication
+    /// lookups use this same canonical form and independently fail closed if a
+    /// collision appears after startup (for example, through another replica).
+    async fn validate_unique_usernames(&self) -> anyhow::Result<()> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Collision {
+            canonical: String,
+            n: u64,
+        }
+
+        let collision = self
+            .client
+            .query("SELECT lowerUTF8(trimBoth(username)) AS canonical, countDistinct(id) AS n FROM config_users FINAL WHERE is_deleted = 0 GROUP BY canonical HAVING n > 1 ORDER BY canonical LIMIT 1")
+            .fetch_one::<Collision>()
+            .await;
+        match collision {
+            Ok(row) => anyhow::bail!(
+                "canonical username collision for {:?} across {} active users; resolve the duplicate before starting query-api",
+                row.canonical,
+                row.n
+            ),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     // ── Tenant operations ─────────────────────────────────────────────────────
@@ -1988,7 +2239,7 @@ impl ConfigDb {
         &self,
         username: &str,
         password: &str,
-    ) -> Option<(String, String, String, String, String)> {
+    ) -> anyhow::Result<Option<(String, String, String, String, String)>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String,
@@ -1996,22 +2247,47 @@ impl ConfigDb {
             password_hash: String,
             display_name: String,
             tenant_id: String,
+            auth_provider: String,
         }
-        let result = self.client
-            .query("SELECT id, username, password_hash, display_name, tenant_id FROM config_users FINAL WHERE username = ? AND enabled = 1 AND is_deleted = 0 LIMIT 1")
+
+        let mut rows = self.client
+            .query("SELECT id, username, password_hash, display_name, tenant_id, auth_provider FROM config_users FINAL WHERE lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?)) AND enabled = 1 AND is_deleted = 0 ORDER BY id LIMIT 2")
             .bind(username)
-            .fetch_one::<Row>()
-            .await;
-        let row = result.ok()?;
-        if !verify_password(password, &row.password_hash) {
-            return None;
+            .fetch_all::<Row>()
+            .await?;
+
+        // Only local identities have a password. Unknown, disabled, SSO, and
+        // ambiguous identities all verify the same dummy Argon2 hash so their
+        // response timing does not reveal account state or provider type.
+        let usable_local_identity = rows.len() == 1 && rows[0].auth_provider == "local";
+        let password_hash = if usable_local_identity {
+            rows[0].password_hash.as_str()
+        } else {
+            dummy_password_hash()
+        };
+        let credentials_valid = verify_password(password, password_hash);
+
+        if rows.len() > 1 {
+            anyhow::bail!(
+                "canonical username collision detected during authentication; refusing ambiguous identity"
+            );
         }
+        if !usable_local_identity || !credentials_valid {
+            return Ok(None);
+        }
+        let row = rows.pop().expect("one local identity was checked above");
         // Derive role from group membership
         let role = self
             .derive_user_role(&row.id)
             .await
             .unwrap_or_else(|_| "viewer".to_string());
-        Some((row.id, row.username, row.display_name, row.tenant_id, role))
+        Ok(Some((
+            row.id,
+            row.username,
+            row.display_name,
+            row.tenant_id,
+            role,
+        )))
     }
 
     async fn derive_user_role(&self, user_id: &str) -> anyhow::Result<String> {
@@ -2223,6 +2499,8 @@ impl ConfigDb {
         display_name: &str,
     ) -> anyhow::Result<String> {
         self.invalidate_config_caches();
+        let _username_guard = self.username_mutation_lock.lock().await;
+        self.ensure_username_available(username).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let password_hash = hash_password(password)?;
         let now = Self::now_str();
@@ -2301,28 +2579,61 @@ impl ConfigDb {
         }
     }
 
-    pub async fn change_password(&self, user_id: &str, new_password: &str) -> anyhow::Result<bool> {
-        let existing = self.get_user(user_id).await?;
-        let (_, username, display_name, tenant_id, enabled, created_at) = match existing {
-            Some(u) => u,
-            None => return Ok(false),
+    pub async fn change_password(
+        &self,
+        user_id: &str,
+        new_password: &str,
+    ) -> anyhow::Result<PasswordChangeOutcome> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            username: String,
+            display_name: String,
+            tenant_id: String,
+            role: String,
+            enabled: u8,
+            auth_provider: String,
+            external_id: String,
+            created_at: String,
+        }
+
+        let existing = self
+            .client
+            .query("SELECT username, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at FROM config_users FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(user_id)
+            .fetch_one::<Row>()
+            .await;
+        let row = match existing {
+            Ok(row) => row,
+            Err(clickhouse::error::Error::RowNotFound) => {
+                return Ok(PasswordChangeOutcome::UserNotFound);
+            }
+            Err(error) => return Err(error.into()),
         };
+        if row.auth_provider != "local" {
+            return Ok(PasswordChangeOutcome::SsoManaged {
+                auth_provider: row.auth_provider,
+            });
+        }
+
         let password_hash = hash_password(new_password)?;
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'viewer', ?, 'local', '', ?, ?, 0)")
+            .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(user_id)
-            .bind(&username)
+            .bind(&row.username)
             .bind(&password_hash)
-            .bind(&display_name)
-            .bind(&tenant_id)
-            .bind(if enabled { 1u8 } else { 0u8 })
-            .bind(&created_at)
+            .bind(&row.display_name)
+            .bind(&row.tenant_id)
+            .bind(&row.role)
+            .bind(row.enabled)
+            .bind(&row.auth_provider)
+            .bind(&row.external_id)
+            .bind(&row.created_at)
             .bind(ver)
             .execute()
             .await?;
         self.delete_sessions_for_user(user_id).await?;
-        Ok(true)
+        Ok(PasswordChangeOutcome::Updated)
     }
 
     pub async fn delete_sessions_for_user(&self, user_id: &str) -> anyhow::Result<()> {
@@ -2336,31 +2647,41 @@ impl ConfigDb {
 
     pub async fn set_user_enabled(&self, user_id: &str, enabled: bool) -> anyhow::Result<bool> {
         self.invalidate_config_caches();
-        let existing = self.get_user(user_id).await?;
-        let (_, username, display_name, tenant_id, _, created_at) = match existing {
-            Some(u) => u,
-            None => return Ok(false),
-        };
-        // Need password hash — fetch it separately
         #[derive(clickhouse::Row, serde::Deserialize)]
-        struct PwRow {
+        struct Row {
+            username: String,
             password_hash: String,
+            display_name: String,
+            tenant_id: String,
+            role: String,
+            auth_provider: String,
+            external_id: String,
+            created_at: String,
         }
-        let pw = self.client
-            .query("SELECT password_hash FROM config_users FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+        let row = match self
+            .client
+            .query("SELECT username, password_hash, display_name, tenant_id, role, auth_provider, external_id, created_at FROM config_users FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
             .bind(user_id)
-            .fetch_one::<PwRow>()
-            .await?;
+            .fetch_one::<Row>()
+            .await
+        {
+            Ok(row) => row,
+            Err(clickhouse::error::Error::RowNotFound) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'viewer', ?, 'local', '', ?, ?, 0)")
+            .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(user_id)
-            .bind(&username)
-            .bind(&pw.password_hash)
-            .bind(&display_name)
-            .bind(&tenant_id)
+            .bind(&row.username)
+            .bind(&row.password_hash)
+            .bind(&row.display_name)
+            .bind(&row.tenant_id)
+            .bind(&row.role)
             .bind(if enabled { 1u8 } else { 0u8 })
-            .bind(&created_at)
+            .bind(&row.auth_provider)
+            .bind(&row.external_id)
+            .bind(&row.created_at)
             .bind(ver)
             .execute()
             .await?;
@@ -2389,6 +2710,59 @@ impl ConfigDb {
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub async fn get_user_identity_provider(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            username: String,
+            auth_provider: String,
+        }
+        let result = self
+            .client
+            .query("SELECT username, auth_provider FROM config_users FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(user_id)
+            .fetch_one::<Row>()
+            .await;
+        match result {
+            Ok(row) => Ok(Some((row.username, row.auth_provider))),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn validate_break_glass_account(&self, username: &str) -> anyhow::Result<()> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            auth_provider: String,
+            enabled: u8,
+        }
+
+        let rows = self
+            .client
+            .query("SELECT id, auth_provider, enabled FROM config_users FINAL WHERE lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?)) AND is_deleted = 0 ORDER BY id LIMIT 2")
+            .bind(username)
+            .fetch_all::<Row>()
+            .await?;
+        if rows.len() != 1 {
+            anyhow::bail!(
+                "RUSH_BREAK_GLASS_USERNAME must identify exactly one active user"
+            );
+        }
+        let row = &rows[0];
+        if row.auth_provider != "local" || row.enabled == 0 {
+            anyhow::bail!(
+                "RUSH_BREAK_GLASS_USERNAME must identify an enabled local user"
+            );
+        }
+        if self.derive_user_role(&row.id).await? != "admin" {
+            anyhow::bail!("RUSH_BREAK_GLASS_USERNAME must identify an administrator");
+        }
+        Ok(())
     }
 
     // ── Group operations ───────────────────────────────────────────────────────
@@ -2851,11 +3225,134 @@ impl ConfigDb {
         }
     }
 
+    async fn stored_active_sso_provider_id(&self) -> anyhow::Result<Option<String>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            provider_id: String,
+        }
+
+        match self
+            .client
+            .query(
+                "SELECT provider_id FROM config_sso_active_provider FINAL WHERE slot = 'primary' LIMIT 1",
+            )
+            .fetch_one::<Row>()
+            .await
+        {
+            Ok(row) => Ok(Some(row.provider_id)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn legacy_enabled_sso_provider_ids(&self) -> anyhow::Result<Vec<String>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+        }
+
+        Ok(self
+            .client
+            .query(
+                "SELECT id FROM config_sso_providers FINAL WHERE enabled = 1 AND is_deleted = 0 ORDER BY created_at ASC, id ASC",
+            )
+            .fetch_all::<Row>()
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect())
+    }
+
+    async fn set_active_sso_provider_id(&self, provider_id: &str) -> anyhow::Result<()> {
+        self.client
+            .query(
+                "INSERT INTO config_sso_active_provider (slot, provider_id, version) VALUES ('primary', ?, ?)",
+            )
+            .bind(provider_id)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    async fn effective_active_sso_provider_id(&self) -> anyhow::Result<Option<String>> {
+        if let Some(provider_id) = self.stored_active_sso_provider_id().await? {
+            return Ok((!provider_id.is_empty()).then_some(provider_id));
+        }
+
+        let resolution =
+            resolve_legacy_active_sso_provider(self.legacy_enabled_sso_provider_ids().await?);
+        if !resolution.ambiguous_provider_ids.is_empty() {
+            anyhow::bail!(
+                "multiple legacy SSO providers are enabled; startup reconciliation is required"
+            );
+        }
+        Ok(resolution.active_provider_id)
+    }
+
+    /// Lightweight SSO policy check that does not decrypt provider secrets.
+    /// Break-glass local authentication must remain available even when an SSO
+    /// encryption key is temporarily unavailable or being recovered.
+    pub async fn is_sso_enabled(&self) -> anyhow::Result<bool> {
+        Ok(self.effective_active_sso_provider_id().await?.is_some())
+    }
+
+    /// Establish the singleton active-provider pointer for installations that
+    /// predate it. A single legacy enabled provider is adopted. Multiple legacy
+    /// enabled rows fail closed by activating none; the caller records the
+    /// mandatory system audit event so an administrator can choose explicitly.
+    pub async fn reconcile_active_sso_provider(
+        &self,
+    ) -> anyhow::Result<SsoActiveProviderReconciliation> {
+        if let Some(provider_id) = self.stored_active_sso_provider_id().await? {
+            if provider_id.is_empty() {
+                return Ok(SsoActiveProviderReconciliation {
+                    active_provider_id: None,
+                    ambiguous_provider_ids: Vec::new(),
+                    changed: false,
+                });
+            }
+            let provider = self
+                .fetch_sso_provider_row(
+                    "SELECT id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1",
+                    Some(&provider_id),
+                )
+                .await?;
+            if provider.is_some() {
+                return Ok(SsoActiveProviderReconciliation {
+                    active_provider_id: Some(provider_id),
+                    ambiguous_provider_ids: Vec::new(),
+                    changed: false,
+                });
+            }
+
+            self.set_active_sso_provider_id("").await?;
+            return Ok(SsoActiveProviderReconciliation {
+                active_provider_id: None,
+                ambiguous_provider_ids: Vec::new(),
+                changed: true,
+            });
+        }
+
+        let resolution =
+            resolve_legacy_active_sso_provider(self.legacy_enabled_sso_provider_ids().await?);
+        if resolution.changed {
+            self.set_active_sso_provider_id(resolution.active_provider_id.as_deref().unwrap_or(""))
+                .await?;
+        }
+        Ok(resolution)
+    }
+
     pub async fn get_sso_provider(&self, id: &str) -> anyhow::Result<Option<SsoProviderRow>> {
-        self.fetch_sso_provider_row(
+        let mut provider = self.fetch_sso_provider_row(
             "SELECT id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1",
             Some(id),
-        ).await
+        ).await?;
+        let active_provider_id = self.effective_active_sso_provider_id().await?;
+        if let Some(provider) = &mut provider {
+            provider.3 = active_provider_id.as_deref() == Some(provider.0.as_str());
+        }
+        Ok(provider)
     }
 
     pub async fn list_sso_providers(&self) -> anyhow::Result<Vec<SsoProviderRow>> {
@@ -2864,7 +3361,6 @@ impl ConfigDb {
             id: String,
             name: String,
             protocol: String,
-            enabled: u8,
             client_id: String,
             client_secret: String,
             issuer_url: String,
@@ -2882,17 +3378,19 @@ impl ConfigDb {
             saml_sp_entity_id: String,
         }
         let rows = self.client
-            .query("SELECT id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE is_deleted = 0 ORDER BY created_at ASC")
+            .query("SELECT id, name, protocol, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE is_deleted = 0 ORDER BY created_at ASC")
             .fetch_all::<Row>()
             .await?;
+        let active_provider_id = self.effective_active_sso_provider_id().await?;
         rows.into_iter()
             .map(|r| {
                 let client_secret = decrypt_sso_secret(&r.client_secret)?;
+                let enabled = active_provider_id.as_deref() == Some(r.id.as_str());
                 Ok((
                     r.id,
                     r.name,
                     r.protocol,
-                    r.enabled != 0,
+                    enabled,
                     r.client_id,
                     client_secret,
                     r.issuer_url,
@@ -2914,10 +3412,20 @@ impl ConfigDb {
     }
 
     pub async fn get_enabled_sso_provider(&self) -> anyhow::Result<Option<SsoProviderRow>> {
-        self.fetch_sso_provider_row(
-            "SELECT id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE enabled = 1 AND is_deleted = 0 LIMIT 1",
-            None,
-        ).await
+        let Some(provider_id) = self.effective_active_sso_provider_id().await? else {
+            return Ok(None);
+        };
+        let mut provider = self
+            .fetch_sso_provider_row(
+                "SELECT id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1",
+                Some(&provider_id),
+            )
+            .await?;
+        let Some(provider) = &mut provider else {
+            anyhow::bail!("active SSO provider does not exist");
+        };
+        provider.3 = true;
+        Ok(Some(provider.clone()))
     }
 
     /// Validate the configured encryption key against stored envelopes and
@@ -3005,7 +3513,8 @@ impl ConfigDb {
         saml_idp_sso_url: &str,
         saml_idp_cert: &str,
         saml_sp_entity_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
+        let previous_active_provider_id = self.effective_active_sso_provider_id().await?;
         let now = Self::now_str();
         let ver = Self::next_version();
         let encrypted_client_secret = encrypt_sso_secret(client_secret)?;
@@ -3023,7 +3532,12 @@ impl ConfigDb {
             .bind(&now).bind(ver)
             .execute()
             .await?;
-        Ok(())
+        if enabled {
+            self.set_active_sso_provider_id(id).await?;
+        } else if previous_active_provider_id.as_deref() == Some(id) {
+            self.set_active_sso_provider_id("").await?;
+        }
+        Ok(previous_active_provider_id)
     }
 
     pub async fn delete_sso_provider(&self, id: &str) -> anyhow::Result<bool> {
@@ -3031,6 +3545,7 @@ impl ConfigDb {
         if existing.is_none() {
             return Ok(false);
         }
+        let was_active = existing.as_ref().is_some_and(|provider| provider.3);
         let ver = Self::next_version();
         let now = Self::now_str();
         self.client
@@ -3038,6 +3553,9 @@ impl ConfigDb {
             .bind(id).bind(&now).bind(ver)
             .execute()
             .await?;
+        if was_active {
+            self.set_active_sso_provider_id("").await?;
+        }
         Ok(true)
     }
 
@@ -3193,6 +3711,8 @@ impl ConfigDb {
         auth_provider: &str,
         tenant_id: &str,
     ) -> anyhow::Result<String> {
+        let _username_guard = self.username_mutation_lock.lock().await;
+        self.ensure_username_available(username).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = Self::now_str();
         let ver = Self::next_version();
