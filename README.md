@@ -66,6 +66,7 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_ENVIRONMENT` | `production` | use `development`, `local`, or `test` only for deliberate non-production compatibility |
 | `RUSH_ALLOW_ANONYMOUS_DEFAULT` | `false` | insecure development-only override for anonymous access to the default tenant |
 | `RUSH_API_KEY_SECRET` | _(empty)_ | HMAC key for API-key hashes — set it in production |
+| `RUSH_SSO_TRANSACTION_SECRET` | falls back to `RUSH_API_KEY_SECRET` | stable 32+ byte HMAC key for browser-bound OIDC/SAML login transactions |
 | `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | stable key used to encrypt integration DSNs |
 | `RUSH_COLLECTOR_MANAGER_ENABLED` | `false` | enable API-managed local collector supervision |
 | `RUSH_POSTGRES_COLLECTOR_BIN` | `../postgres-collector/target/debug/postgres-collector` | managed PostgreSQL collector executable |

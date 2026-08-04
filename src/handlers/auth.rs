@@ -167,7 +167,21 @@ pub async fn login(
 /// Reads the `rush_session` cookie, deletes that session, and clears the cookie.
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(token) = extract_session_cookie(&headers) {
+        let caller = state.config_db.get_session_user(&token).await;
         state.config_db.delete_session(&token).await;
+        if let Some((user_id, username, _, tenant_id, _)) = caller {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("auth.logout", "user")
+                        .actor(user_id, username)
+                        .tenant(tenant_id)
+                        .outcome("success")
+                        .description("user session ended")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+        }
     }
 
     let clear_cookie = session_cookie("", 0);

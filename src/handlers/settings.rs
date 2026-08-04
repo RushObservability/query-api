@@ -426,6 +426,7 @@ pub async fn get_runtime_config(
     runtime.extend([
         config_entry("RUSH_LICENSE_KEY", None, true, false),
         config_entry("RUSH_API_KEY_SECRET", None, true, false),
+        config_entry("RUSH_SSO_TRANSACTION_SECRET", None, true, false),
         config_entry("RUSH_INTEGRATION_ENCRYPTION_KEY", None, true, false),
         config_entry("RUSH_AUDIT_HMAC_SECRET", None, true, false),
         config_entry("RUSH_COLLECTOR_API_KEY", None, true, false),

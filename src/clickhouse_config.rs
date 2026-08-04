@@ -2891,6 +2891,51 @@ impl ConfigDb {
         Ok(id)
     }
 
+    pub async fn update_user_external_identity(
+        &self,
+        user_id: &str,
+        auth_provider: &str,
+        external_id: &str,
+    ) -> anyhow::Result<bool> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            username: String,
+            password_hash: String,
+            display_name: String,
+            tenant_id: String,
+            role: String,
+            enabled: u8,
+            created_at: String,
+        }
+        let row = match self
+            .client
+            .query("SELECT username, password_hash, display_name, tenant_id, role, enabled, created_at FROM config_users FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(user_id)
+            .fetch_one::<Row>()
+            .await
+        {
+            Ok(row) => row,
+            Err(clickhouse::error::Error::RowNotFound) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        self.client
+            .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(user_id)
+            .bind(&row.username)
+            .bind(&row.password_hash)
+            .bind(&row.display_name)
+            .bind(&row.tenant_id)
+            .bind(&row.role)
+            .bind(row.enabled)
+            .bind(auth_provider)
+            .bind(external_id)
+            .bind(&row.created_at)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(true)
+    }
+
     pub async fn update_user_groups_from_idp(
         &self,
         user_id: &str,
@@ -3289,80 +3334,55 @@ impl ConfigDb {
 
     pub async fn create_setup_token(
         &self,
+        token_hash: &str,
         purpose: &str,
         created_by: &str,
         provider: &str,
         hostname: &str,
-    ) -> anyhow::Result<String> {
-        let token: String = {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            let bytes: [u8; 16] = rng.random();
-            bytes.iter().map(|b| format!("{b:02x}")).collect()
-        };
-
-        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(48))
+    ) -> anyhow::Result<()> {
+        let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(30))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_setup_tokens (token, purpose, created_by, expires_at, used, provider, hostname, version, is_deleted) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0)")
-            .bind(&token).bind(purpose).bind(created_by).bind(&expires_at)
+            .bind(token_hash).bind(purpose).bind(created_by).bind(&expires_at)
             .bind(provider).bind(hostname).bind(ver)
             .execute()
             .await?;
-        Ok(token)
+        Ok(())
     }
 
-    pub async fn validate_setup_token(
+    pub async fn consume_setup_token(
         &self,
-        token: &str,
+        token_hash: &str,
         purpose: &str,
-    ) -> anyhow::Result<(bool, String)> {
+    ) -> anyhow::Result<Option<(String, String, String)>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
-            provider: String,
-        }
-        let now = Self::now_str();
-        let result = self.client
-            .query("SELECT provider FROM config_setup_tokens FINAL WHERE token = ? AND purpose = ? AND used = 0 AND expires_at > ? AND is_deleted = 0 LIMIT 1")
-            .bind(token).bind(purpose).bind(&now)
-            .fetch_one::<Row>()
-            .await;
-        match result {
-            Ok(r) => Ok((true, r.provider)),
-            Err(clickhouse::error::Error::RowNotFound) => Ok((false, String::new())),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub async fn mark_setup_token_used(&self, token: &str) -> anyhow::Result<bool> {
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row {
-            purpose: String,
-            created_by: String,
-            expires_at: String,
             provider: String,
             hostname: String,
+            created_by: String,
+            expires_at: String,
         }
-        let result = self.client
-            .query("SELECT purpose, created_by, expires_at, provider, hostname FROM config_setup_tokens FINAL WHERE token = ? AND used = 0 AND is_deleted = 0 LIMIT 1")
-            .bind(token)
+        let now = Self::now_str();
+        let row = match self.client
+            .query("SELECT provider, hostname, created_by, expires_at FROM config_setup_tokens FINAL WHERE token = ? AND purpose = ? AND used = 0 AND expires_at > ? AND is_deleted = 0 LIMIT 1")
+            .bind(token_hash).bind(purpose).bind(&now)
             .fetch_one::<Row>()
-            .await;
-        let row = match result {
-            Ok(r) => r,
-            Err(clickhouse::error::Error::RowNotFound) => return Ok(false),
-            Err(e) => return Err(e.into()),
+            .await {
+            Ok(row) => row,
+            Err(clickhouse::error::Error::RowNotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_setup_tokens (token, purpose, created_by, expires_at, used, provider, hostname, version, is_deleted) VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0)")
-            .bind(token).bind(&row.purpose).bind(&row.created_by).bind(&row.expires_at)
+            .bind(token_hash).bind(purpose).bind(&row.created_by).bind(&row.expires_at)
             .bind(&row.provider).bind(&row.hostname).bind(ver)
             .execute()
             .await?;
-        Ok(true)
+        Ok(Some((row.provider, row.hostname, row.created_by)))
     }
 
     // ── Dashboard operations ───────────────────────────────────────────────────

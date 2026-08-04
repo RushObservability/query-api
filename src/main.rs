@@ -2276,17 +2276,8 @@ async fn main() -> anyhow::Result<()> {
              Set custom_settings_prefixes = 'rush_' in ClickHouse config to enable row policies."
         );
     }
-    // L3: Warn when RUSH_BASE_URL is unset — SAML/OIDC redirect URIs derived from Host header.
-    if std::env::var("RUSH_BASE_URL")
-        .map(|s| s.is_empty())
-        .unwrap_or(true)
-    {
-        tracing::warn!(
-            "RUSH_BASE_URL is not set. SAML ACS and OIDC redirect URIs will be derived from \
-             the Host request header, which can be spoofed. Set RUSH_BASE_URL to your \
-             public hostname for production deployments."
-        );
-    }
+    rush_api::handlers::sso::validate_base_url_config()
+        .map_err(|error| anyhow::anyhow!("invalid canonical URL configuration: {error}"))?;
 
     // R01: Warn when RUSH_API_KEY_SECRET is unset or too short.
     // An empty or short secret means HMAC-SHA256 provides no real keyed-hash protection.

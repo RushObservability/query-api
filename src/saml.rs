@@ -6,14 +6,18 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use flate2::{Compression, write::DeflateEncoder};
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use std::collections::HashMap;
 use std::io::Write;
 
 /// Parsed fields from a SAML Response assertion.
 #[derive(Debug, Clone)]
 pub struct SamlAssertion {
+    pub assertion_id: String,
+    pub response_id: Option<String>,
+    pub issuer: String,
+    pub expires_at: i64,
     pub name_id: String,
     pub email: Option<String>,
     pub display_name: Option<String>,
@@ -21,13 +25,30 @@ pub struct SamlAssertion {
     pub attributes: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SamlLoginRequest {
+    pub request_id: String,
+    pub redirect_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct SubjectConfirmation {
+    recipient: String,
+    in_response_to: String,
+    not_on_or_after: String,
+}
+
 /// Build a SAML AuthnRequest XML string.
-pub fn build_authn_request(sp_entity_id: &str, acs_url: &str, idp_sso_url: &str) -> String {
-    let id = format!("_rush_{}", uuid::Uuid::new_v4());
+pub fn build_authn_request(
+    request_id: &str,
+    sp_entity_id: &str,
+    acs_url: &str,
+    idp_sso_url: &str,
+) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
 
     format!(
-        r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{id}" Version="2.0" IssueInstant="{now}" Destination="{idp_sso_url}" AssertionConsumerServiceURL="{acs_url}" ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"><saml:Issuer>{sp_entity_id}</saml:Issuer></samlp:AuthnRequest>"#,
+        r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{request_id}" Version="2.0" IssueInstant="{now}" Destination="{idp_sso_url}" AssertionConsumerServiceURL="{acs_url}" ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"><saml:Issuer>{sp_entity_id}</saml:Issuer></samlp:AuthnRequest>"#,
     )
 }
 
@@ -49,13 +70,17 @@ pub fn build_login_redirect_url(
     acs_url: &str,
     idp_sso_url: &str,
     relay_state: &str,
-) -> String {
-    let xml = build_authn_request(sp_entity_id, acs_url, idp_sso_url);
+) -> SamlLoginRequest {
+    let request_id = format!("_rush_{}", uuid::Uuid::new_v4());
+    let xml = build_authn_request(&request_id, sp_entity_id, acs_url, idp_sso_url);
     let encoded = encode_authn_request_redirect(&xml);
     let relay_encoded = urlencoding::encode(relay_state);
 
     let sep = if idp_sso_url.contains('?') { "&" } else { "?" };
-    format!("{idp_sso_url}{sep}SAMLRequest={encoded}&RelayState={relay_encoded}")
+    SamlLoginRequest {
+        request_id,
+        redirect_url: format!("{idp_sso_url}{sep}SAMLRequest={encoded}&RelayState={relay_encoded}"),
+    }
 }
 
 /// Verify the enveloped XML signature of a SAML Response against the IdP's
@@ -68,10 +93,10 @@ pub fn build_login_redirect_url(
 /// attacks. Verification trusts ONLY the metadata-pinned certificate passed in
 /// (inline KeyInfo certs are never imported as key material).
 ///
-/// Returns `Ok(true)` only if a signature verifies against `idp_cert_pem`,
-/// `Ok(false)` if present-but-invalid (tampered / wrong key), and `Err` only on
-/// a structural problem (e.g. the certificate could not be parsed).
-pub fn verify_signature(xml: &str, idp_cert_pem: &str) -> Result<bool, String> {
+/// Returns only the XML element actually covered by the verified signature.
+/// Callers must parse this value rather than the untrusted outer envelope.
+pub fn verify_signature(xml: &str, idp_cert_pem: &str) -> Result<String, String> {
+    validate_idp_certificate(idp_cert_pem)?;
     // bergshamra wants the bare base64 certificate body — it rejects the PEM
     // armor lines. Drop the BEGIN/END lines and concatenate.
     let cert_b64: String = idp_cert_pem
@@ -81,17 +106,71 @@ pub fn verify_signature(xml: &str, idp_cert_pem: &str) -> Result<bool, String> {
         .join("");
 
     match opensaml::crypto::verify::verify_signature(xml, std::slice::from_ref(&cert_b64)) {
-        Ok((valid, _verified_content)) => Ok(valid),
+        Ok((true, Some(verified_content))) => Ok(verified_content),
+        Ok((true, None)) => Err("SAML signature did not cover consumable content".to_string()),
+        Ok((false, _)) => Err("SAML signature verification failed".to_string()),
         Err(e) => Err(format!("SAML signature verification error: {e:?}")),
     }
 }
 
-/// Parse a base64-encoded SAMLResponse XML and extract assertion fields.
-///
-/// If `idp_cert_pem` is provided (non-empty), the XML signature will be
-/// verified against the IdP certificate before the assertion is trusted.
-/// If no certificate is provided, signature verification is skipped
-/// (backward compatible for development setups without a configured cert).
+/// Validate a configured IdP certificate before an SSO provider can be enabled.
+/// PEM and bare base64 DER forms are accepted because both are commonly copied
+/// from IdP metadata/admin consoles.
+pub fn validate_idp_certificate(idp_cert: &str) -> Result<(), String> {
+    let trimmed = idp_cert.trim();
+    if trimmed.is_empty() {
+        return Err("SAML signing certificate is required".to_string());
+    }
+    if openssl::x509::X509::from_pem(trimmed.as_bytes()).is_ok() {
+        return Ok(());
+    }
+    let der = B64
+        .decode(trimmed.lines().collect::<String>())
+        .map_err(|_| "SAML signing certificate is not valid PEM or base64 DER".to_string())?;
+    openssl::x509::X509::from_der(&der)
+        .map(|_| ())
+        .map_err(|_| "SAML signing certificate is not a valid X.509 certificate".to_string())
+}
+
+#[derive(Debug)]
+struct ParsedSamlAssertion {
+    assertion: SamlAssertion,
+    root_name: String,
+    response_in_response_to: String,
+    destination: String,
+    conditions_not_before: String,
+    conditions_not_on_or_after: String,
+    audiences: Vec<String>,
+    confirmations: Vec<SubjectConfirmation>,
+    assertion_count: usize,
+}
+
+fn attribute(
+    element: &BytesStart<'_>,
+    key: &[u8],
+    decoder: quick_xml::encoding::Decoder,
+) -> Option<String> {
+    element
+        .attributes()
+        .flatten()
+        .find(|attribute| attribute.key.as_ref() == key)
+        .and_then(|attribute| {
+            attribute
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+                .ok()
+        })
+        .map(|value| value.into_owned())
+}
+
+fn parse_saml_time(value: &str, field: &str) -> Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| value.timestamp())
+        .map_err(|_| format!("SAML {field} is not a valid RFC3339 timestamp"))
+}
+
+/// Parse a base64-encoded SAMLResponse XML for diagnostics/tests. Authentication
+/// code must first verify the signature and call `validate_signed_assertion` on
+/// the returned signed content.
 pub fn parse_saml_response(
     b64_response: &str,
     groups_claim: &str,
@@ -101,13 +180,109 @@ pub fn parse_saml_response(
         .map_err(|e| format!("failed to base64-decode SAMLResponse: {e}"))?;
     let xml = String::from_utf8_lossy(&xml_bytes);
 
-    parse_assertion_xml(&xml, groups_claim)
+    Ok(parse_assertion_xml(&xml, groups_claim)?.assertion)
 }
 
-/// Parse assertion fields from raw SAML Response XML.
-fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, String> {
+/// Validate every SAML field used to establish identity or bind the response to
+/// this service provider. `signed_xml` must be the exact content returned by
+/// `verify_signature`, never the untrusted outer response envelope.
+pub fn validate_signed_assertion(
+    signed_xml: &str,
+    groups_claim: &str,
+    expected_request_id: &str,
+    expected_recipient: &str,
+    expected_audience: &str,
+    expected_issuer: &str,
+    now: i64,
+) -> Result<SamlAssertion, String> {
+    const CLOCK_SKEW_SECS: i64 = 120;
+
+    let parsed = parse_assertion_xml(signed_xml, groups_claim)?;
+    if parsed.assertion_count != 1 {
+        return Err("SAML response must contain exactly one assertion".to_string());
+    }
+    if parsed.assertion.assertion_id.is_empty() {
+        return Err("SAML assertion is missing ID".to_string());
+    }
+    if parsed.assertion.issuer.is_empty() {
+        return Err("SAML assertion is missing Issuer".to_string());
+    }
+    if parsed.assertion.issuer != expected_issuer {
+        return Err("SAML assertion issuer does not match the configured IdP".to_string());
+    }
+    if parsed.conditions_not_before.is_empty() || parsed.conditions_not_on_or_after.is_empty() {
+        return Err(
+            "SAML assertion Conditions must include NotBefore and NotOnOrAfter".to_string(),
+        );
+    }
+    let not_before = parse_saml_time(&parsed.conditions_not_before, "NotBefore")?;
+    let not_on_or_after = parse_saml_time(&parsed.conditions_not_on_or_after, "NotOnOrAfter")?;
+    if now + CLOCK_SKEW_SECS < not_before {
+        return Err("SAML assertion is not yet valid".to_string());
+    }
+    if now - CLOCK_SKEW_SECS >= not_on_or_after {
+        return Err("SAML assertion has expired".to_string());
+    }
+    if !parsed
+        .audiences
+        .iter()
+        .any(|audience| audience == expected_audience)
+    {
+        return Err("SAML assertion audience does not match this service provider".to_string());
+    }
+
+    if parsed.root_name == "Response" {
+        if parsed.destination != expected_recipient {
+            return Err("SAML response Destination does not match the ACS URL".to_string());
+        }
+        if parsed.response_in_response_to != expected_request_id {
+            return Err("SAML response InResponseTo does not match the login request".to_string());
+        }
+    }
+
+    let confirmation = parsed.confirmations.iter().find(|confirmation| {
+        confirmation.recipient == expected_recipient
+            && confirmation.in_response_to == expected_request_id
+    });
+    let confirmation = confirmation.ok_or_else(|| {
+        "SAML SubjectConfirmationData does not match the ACS URL and login request".to_string()
+    })?;
+    if confirmation.not_on_or_after.is_empty() {
+        return Err("SAML SubjectConfirmationData is missing NotOnOrAfter".to_string());
+    }
+    let subject_expiry = parse_saml_time(
+        &confirmation.not_on_or_after,
+        "SubjectConfirmationData NotOnOrAfter",
+    )?;
+    if now - CLOCK_SKEW_SECS >= subject_expiry {
+        return Err("SAML subject confirmation has expired".to_string());
+    }
+
+    let mut assertion = parsed.assertion;
+    assertion.expires_at = not_on_or_after.min(subject_expiry);
+    Ok(assertion)
+}
+
+/// Parse assertion fields and protocol constraints from raw XML. This parser is
+/// deliberately separate from signature verification so callers cannot
+/// accidentally treat fields outside the signed element as trusted.
+fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssertion, String> {
     let mut reader = Reader::from_str(xml);
 
+    let mut root_name = String::new();
+    let mut response_id: Option<String> = None;
+    let mut response_in_response_to = String::new();
+    let mut destination = String::new();
+    let mut assertion_id = String::new();
+    let mut assertion_count = 0usize;
+    let mut in_assertion = false;
+    let mut issuer = String::new();
+    let mut in_issuer = false;
+    let mut conditions_not_before = String::new();
+    let mut conditions_not_on_or_after = String::new();
+    let mut audiences = Vec::new();
+    let mut in_audience = false;
+    let mut confirmations = Vec::new();
     let mut name_id = String::new();
     let mut attributes: HashMap<String, String> = HashMap::new();
     let mut current_attr_name = String::new();
@@ -123,22 +298,54 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, S
 
     let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        let is_empty = matches!(&event, Ok(Event::Empty(_)));
+        match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name = e.name();
                 let local = local_name(name.as_ref());
+                if root_name.is_empty() {
+                    root_name = local.to_string();
+                }
                 match local {
+                    "Response" => {
+                        response_id = attribute(e, b"ID", reader.decoder());
+                        response_in_response_to =
+                            attribute(e, b"InResponseTo", reader.decoder()).unwrap_or_default();
+                        destination =
+                            attribute(e, b"Destination", reader.decoder()).unwrap_or_default();
+                    }
+                    "Assertion" => {
+                        assertion_count += 1;
+                        in_assertion = true;
+                        if assertion_id.is_empty() {
+                            assertion_id =
+                                attribute(e, b"ID", reader.decoder()).unwrap_or_default();
+                        }
+                    }
+                    "Issuer" => in_issuer = true,
+                    "Conditions" => {
+                        conditions_not_before =
+                            attribute(e, b"NotBefore", reader.decoder()).unwrap_or_default();
+                        conditions_not_on_or_after =
+                            attribute(e, b"NotOnOrAfter", reader.decoder()).unwrap_or_default();
+                    }
+                    "Audience" => in_audience = true,
+                    "SubjectConfirmationData" => confirmations.push(SubjectConfirmation {
+                        recipient: attribute(e, b"Recipient", reader.decoder()).unwrap_or_default(),
+                        in_response_to: attribute(e, b"InResponseTo", reader.decoder())
+                            .unwrap_or_default(),
+                        not_on_or_after: attribute(e, b"NotOnOrAfter", reader.decoder())
+                            .unwrap_or_default(),
+                    }),
                     "NameID" => {
                         in_name_id = true;
                     }
                     "StatusCode" => {
                         // Record only the first (top-level) StatusCode Value.
                         if status_code.is_empty() {
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"Value" {
-                                    status_code = String::from_utf8_lossy(&attr.value).to_string();
-                                }
-                            }
+                            status_code =
+                                attribute(e, b"Value", reader.decoder()).unwrap_or_default();
                         }
                     }
                     "StatusMessage" => {
@@ -146,17 +353,25 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, S
                     }
                     "Attribute" => {
                         // Extract the Name attribute
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"Name" {
-                                current_attr_name =
-                                    String::from_utf8_lossy(&attr.value).to_string();
-                            }
-                        }
+                        current_attr_name =
+                            attribute(e, b"Name", reader.decoder()).unwrap_or_default();
                     }
                     "AttributeValue" => {
                         in_attr_value = true;
                     }
                     _ => {}
+                }
+                if is_empty {
+                    match local {
+                        "Assertion" => in_assertion = false,
+                        "Issuer" => in_issuer = false,
+                        "Audience" => in_audience = false,
+                        "NameID" => in_name_id = false,
+                        "StatusMessage" => in_status_message = false,
+                        "AttributeValue" => in_attr_value = false,
+                        "Attribute" => current_attr_name.clear(),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::Text(ref e)) => {
@@ -169,7 +384,11 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, S
                             .map(|value| value.into_owned())
                     })
                     .unwrap_or_default();
-                if in_name_id {
+                if in_issuer && in_assertion {
+                    issuer = text;
+                } else if in_audience {
+                    audiences.push(text);
+                } else if in_name_id {
                     name_id = text;
                 } else if in_status_message {
                     status_message = text;
@@ -186,6 +405,9 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, S
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match local {
+                    "Assertion" => in_assertion = false,
+                    "Issuer" => in_issuer = false,
+                    "Audience" => in_audience = false,
                     "NameID" => in_name_id = false,
                     "StatusMessage" => in_status_message = false,
                     "AttributeValue" => in_attr_value = false,
@@ -233,12 +455,26 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<SamlAssertion, S
         .or_else(|| attributes.get("name"))
         .cloned();
 
-    Ok(SamlAssertion {
-        name_id,
-        email,
-        display_name,
-        groups,
-        attributes,
+    Ok(ParsedSamlAssertion {
+        assertion: SamlAssertion {
+            assertion_id,
+            response_id,
+            issuer,
+            expires_at: 0,
+            name_id,
+            email,
+            display_name,
+            groups,
+            attributes,
+        },
+        root_name,
+        response_in_response_to,
+        destination,
+        conditions_not_before,
+        conditions_not_on_or_after,
+        audiences,
+        confirmations,
+        assertion_count,
     })
 }
 
@@ -289,6 +525,7 @@ mod tests {
     #[test]
     fn test_build_authn_request() {
         let xml = build_authn_request(
+            "_request-1",
             "https://rush.example.com",
             "https://rush.example.com/auth/sso/acs",
             "https://idp.example.com/sso",
@@ -383,14 +620,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_returns_false_when_no_signature() {
+    fn verify_fails_closed_when_no_signature() {
         let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Subject><saml:NameID>user@test.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#;
-        // No <ds:Signature> present → not verified (not an error).
         let res = verify_signature(xml, &test_cert_pem());
-        assert!(
-            matches!(res, Ok(false)),
-            "no signature => Ok(false), got {res:?}"
-        );
+        assert!(res.is_err(), "unsigned response must fail closed: {res:?}");
     }
 
     #[test]
@@ -412,9 +645,154 @@ mod tests {
             r#"<saml:NameID>user@test.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#,
         );
         let res = verify_signature(xml, &test_cert_pem());
+        assert!(res.is_err(), "bogus signature must not verify: {res:?}");
+    }
+
+    fn constrained_response(
+        request_id: &str,
+        audience: &str,
+        recipient: &str,
+        not_before: &str,
+        not_on_or_after: &str,
+    ) -> String {
+        format!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_response-1" Destination="{recipient}" InResponseTo="{request_id}">
+  <samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
+  <saml:Assertion ID="_assertion-1">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <saml:Subject>
+      <saml:NameID>jane@acme.com</saml:NameID>
+      <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+        <saml:SubjectConfirmationData Recipient="{recipient}" InResponseTo="{request_id}" NotOnOrAfter="{not_on_or_after}"/>
+      </saml:SubjectConfirmation>
+    </saml:Subject>
+    <saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{not_on_or_after}">
+      <saml:AudienceRestriction><saml:Audience>{audience}</saml:Audience></saml:AudienceRestriction>
+    </saml:Conditions>
+    <saml:AttributeStatement>
+      <saml:Attribute Name="groups"><saml:AttributeValue>operators</saml:AttributeValue></saml:Attribute>
+    </saml:AttributeStatement>
+  </saml:Assertion>
+</samlp:Response>"#
+        )
+    }
+
+    #[test]
+    fn validates_correlated_unexpired_assertion_constraints() {
+        let now = 1_700_000_000;
+        let recipient = "https://rush.example.com/auth/sso/acs";
+        let audience = "https://rush.example.com";
+        let xml = constrained_response(
+            "_request-1",
+            audience,
+            recipient,
+            "2023-11-14T22:11:20Z",
+            "2023-11-14T22:18:20Z",
+        );
+        let assertion = validate_signed_assertion(
+            &xml,
+            "groups",
+            "_request-1",
+            recipient,
+            audience,
+            "https://idp.example.com",
+            now,
+        )
+        .unwrap();
+        assert_eq!(assertion.assertion_id, "_assertion-1");
+        assert_eq!(assertion.response_id.as_deref(), Some("_response-1"));
+        assert_eq!(assertion.issuer, "https://idp.example.com");
+        assert_eq!(assertion.groups, vec!["operators"]);
+    }
+
+    #[test]
+    fn rejects_wrong_audience_and_request_correlation() {
+        let now = 1_700_000_000;
+        let recipient = "https://rush.example.com/auth/sso/acs";
+        let xml = constrained_response(
+            "_request-1",
+            "https://other-sp.example.com",
+            recipient,
+            "2023-11-14T22:11:20Z",
+            "2023-11-14T22:18:20Z",
+        );
         assert!(
-            !matches!(res, Ok(true)),
-            "bogus signature must not verify, got {res:?}"
+            validate_signed_assertion(
+                &xml,
+                "groups",
+                "_request-1",
+                recipient,
+                "https://rush.example.com",
+                "https://idp.example.com",
+                now,
+            )
+            .unwrap_err()
+            .contains("audience")
+        );
+        assert!(
+            validate_signed_assertion(
+                &xml,
+                "groups",
+                "_different-request",
+                recipient,
+                "https://other-sp.example.com",
+                "https://idp.example.com",
+                now,
+            )
+            .unwrap_err()
+            .contains("InResponseTo")
+        );
+    }
+
+    #[test]
+    fn rejects_expired_assertion() {
+        let now = 1_700_000_000;
+        let recipient = "https://rush.example.com/auth/sso/acs";
+        let xml = constrained_response(
+            "_request-1",
+            "https://rush.example.com",
+            recipient,
+            "2023-11-14T21:00:00Z",
+            "2023-11-14T21:30:00Z",
+        );
+        assert!(
+            validate_signed_assertion(
+                &xml,
+                "groups",
+                "_request-1",
+                recipient,
+                "https://rush.example.com",
+                "https://idp.example.com",
+                now,
+            )
+            .unwrap_err()
+            .contains("expired")
+        );
+    }
+
+    #[test]
+    fn rejects_unconfigured_assertion_issuer() {
+        let now = 1_700_000_000;
+        let recipient = "https://rush.example.com/auth/sso/acs";
+        let xml = constrained_response(
+            "_request-1",
+            "https://rush.example.com",
+            recipient,
+            "2023-11-14T22:11:20Z",
+            "2023-11-14T22:18:20Z",
+        );
+        assert!(
+            validate_signed_assertion(
+                &xml,
+                "groups",
+                "_request-1",
+                recipient,
+                "https://rush.example.com",
+                "https://other-idp.example.com",
+                now,
+            )
+            .unwrap_err()
+            .contains("issuer")
         );
     }
 }

@@ -2,13 +2,370 @@ use axum::{
     Json,
     extract::{Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Redirect},
+    response::IntoResponse,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use dashmap::{DashMap, mapref::entry::Entry};
+use hmac::{Hmac, Mac};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 use crate::AppState;
 use crate::handlers::users::{require_admin, require_auth};
 use crate::saml;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const SSO_TRANSACTION_VERSION: u8 = 1;
+const SSO_TRANSACTION_TTL_SECS: i64 = 10 * 60;
+const SSO_TRANSACTION_COOKIE_SECURE: &str = "__Host-rush_sso_tx";
+const SSO_TRANSACTION_COOKIE_INSECURE: &str = "rush_sso_tx";
+const SSO_SETUP_COOKIE_SECURE: &str = "__Host-rush_sso_setup";
+const SSO_SETUP_COOKIE_INSECURE: &str = "rush_sso_setup";
+const SSO_SETUP_TTL_SECS: i64 = 30 * 60;
+
+/// Browser-bound state for one OIDC or SAML authentication transaction.
+///
+/// The value is authenticated with an application secret and stored only in an
+/// HttpOnly cookie. This binds the callback to the browser that initiated it
+/// without putting a bearer-capable transaction record in ClickHouse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SsoTransaction {
+    version: u8,
+    protocol: String,
+    provider_id: String,
+    state: String,
+    nonce: String,
+    pkce_verifier: String,
+    saml_request_id: String,
+    redirect_path: String,
+    issued_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SsoSetupSession {
+    version: u8,
+    provider: String,
+    created_by: String,
+    session_id: String,
+    issued_at: i64,
+}
+
+fn random_urlsafe<const N: usize>() -> String {
+    let bytes: [u8; N] = rand::rng().random();
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn sso_transaction_secret() -> Result<Vec<u8>, String> {
+    let secret = std::env::var("RUSH_SSO_TRANSACTION_SECRET")
+        .or_else(|_| std::env::var("RUSH_API_KEY_SECRET"))
+        .map_err(|_| {
+            "SSO is unavailable: configure RUSH_SSO_TRANSACTION_SECRET with at least 32 bytes"
+                .to_string()
+        })?;
+    if secret.as_bytes().len() < 32 {
+        return Err(
+            "SSO is unavailable: RUSH_SSO_TRANSACTION_SECRET must be at least 32 bytes".to_string(),
+        );
+    }
+    Ok(secret.into_bytes())
+}
+
+fn encode_sso_transaction_with_secret(
+    transaction: &SsoTransaction,
+    secret: &[u8],
+) -> Result<String, String> {
+    let payload = serde_json::to_vec(transaction)
+        .map_err(|e| format!("failed to encode SSO transaction: {e}"))?;
+    let payload = URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| "invalid SSO secret")?;
+    mac.update(payload.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{payload}.{signature}"))
+}
+
+fn decode_sso_transaction_with_secret(
+    encoded: &str,
+    secret: &[u8],
+    now: i64,
+) -> Result<SsoTransaction, String> {
+    let (payload, signature) = encoded
+        .split_once('.')
+        .ok_or_else(|| "invalid SSO transaction cookie".to_string())?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| "invalid SSO transaction signature".to_string())?;
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| "invalid SSO secret")?;
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| "invalid SSO transaction signature".to_string())?;
+
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| "invalid SSO transaction payload".to_string())?;
+    let transaction: SsoTransaction = serde_json::from_slice(&payload)
+        .map_err(|_| "invalid SSO transaction payload".to_string())?;
+    if transaction.version != SSO_TRANSACTION_VERSION {
+        return Err("unsupported SSO transaction version".to_string());
+    }
+    if transaction.issued_at > now + 60
+        || now.saturating_sub(transaction.issued_at) > SSO_TRANSACTION_TTL_SECS
+    {
+        return Err("SSO transaction expired".to_string());
+    }
+    Ok(transaction)
+}
+
+fn encode_sso_transaction(transaction: &SsoTransaction) -> Result<String, String> {
+    encode_sso_transaction_with_secret(transaction, &sso_transaction_secret()?)
+}
+
+fn setup_token_hash(token: &str) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(&sso_transaction_secret()?)
+        .map_err(|_| "invalid SSO secret")?;
+    mac.update(b"rush-sso-setup-token-v1\0");
+    mac.update(token.as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+fn encode_setup_session_with_secret(
+    session: &SsoSetupSession,
+    secret: &[u8],
+) -> Result<String, String> {
+    let payload = serde_json::to_vec(session)
+        .map_err(|error| format!("failed to encode SSO setup session: {error}"))?;
+    let payload = URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| "invalid SSO secret")?;
+    mac.update(payload.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{payload}.{signature}"))
+}
+
+fn decode_setup_session_with_secret(
+    encoded: &str,
+    secret: &[u8],
+    now: i64,
+) -> Result<SsoSetupSession, String> {
+    let (payload, signature) = encoded
+        .split_once('.')
+        .ok_or_else(|| "invalid SSO setup session".to_string())?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| "invalid SSO setup session".to_string())?;
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| "invalid SSO secret")?;
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| "invalid SSO setup session".to_string())?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| "invalid SSO setup session".to_string())?;
+    let session: SsoSetupSession = serde_json::from_slice(&payload)
+        .map_err(|_| "invalid SSO setup session".to_string())?;
+    if session.version != SSO_TRANSACTION_VERSION
+        || session.issued_at > now + 60
+        || now.saturating_sub(session.issued_at) > SSO_SETUP_TTL_SECS
+    {
+        return Err("SSO setup session expired".to_string());
+    }
+    Ok(session)
+}
+
+fn setup_session_cookie(value: &str, max_age: i64) -> String {
+    if insecure_cookies_enabled() {
+        format!(
+            "{SSO_SETUP_COOKIE_INSECURE}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}"
+        )
+    } else {
+        format!(
+            "{SSO_SETUP_COOKIE_SECURE}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}"
+        )
+    }
+}
+
+fn extract_setup_session(headers: &HeaderMap) -> Result<SsoSetupSession, String> {
+    let cookie_name = if insecure_cookies_enabled() {
+        SSO_SETUP_COOKIE_INSECURE
+    } else {
+        SSO_SETUP_COOKIE_SECURE
+    };
+    let cookie_header = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "missing SSO setup session".to_string())?;
+    let encoded = cookie_header
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix(&format!("{cookie_name}=")))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing SSO setup session".to_string())?;
+    decode_setup_session_with_secret(
+        encoded,
+        &sso_transaction_secret()?,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+fn insecure_cookies_enabled() -> bool {
+    std::env::var("RUSH_INSECURE_COOKIES")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false)
+}
+
+fn sso_transaction_cookie(value: &str, protocol: &str, max_age: i64) -> Result<String, String> {
+    if insecure_cookies_enabled() {
+        if protocol == "saml" && max_age > 0 {
+            return Err(
+                "SAML SSO requires HTTPS so its cross-site callback cookie is secure".into(),
+            );
+        }
+        return Ok(format!(
+            "{SSO_TRANSACTION_COOKIE_INSECURE}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}"
+        ));
+    }
+    let same_site = if protocol == "saml" { "None" } else { "Lax" };
+    Ok(format!(
+        "{SSO_TRANSACTION_COOKIE_SECURE}={value}; HttpOnly; Secure; SameSite={same_site}; Path=/; Max-Age={max_age}"
+    ))
+}
+
+fn extract_sso_transaction(headers: &HeaderMap) -> Result<SsoTransaction, String> {
+    let cookie_name = if insecure_cookies_enabled() {
+        SSO_TRANSACTION_COOKIE_INSECURE
+    } else {
+        SSO_TRANSACTION_COOKIE_SECURE
+    };
+    let cookie_header = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "missing SSO transaction cookie".to_string())?;
+    let encoded = cookie_header
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix(&format!("{cookie_name}=")))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing SSO transaction cookie".to_string())?;
+    decode_sso_transaction_with_secret(
+        encoded,
+        &sso_transaction_secret()?,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn validate_oidc_nonce(
+    transaction: &SsoTransaction,
+    claims: &serde_json::Value,
+) -> Result<(), String> {
+    let returned_nonce = claims
+        .get("nonce")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "id_token missing nonce claim".to_string())?;
+    if returned_nonce != transaction.nonce {
+        return Err("id_token nonce did not match the login transaction".to_string());
+    }
+    Ok(())
+}
+
+fn external_identity_key(
+    provider_id: &str,
+    issuer: &str,
+    subject: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [provider_id, issuer, subject] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+async fn find_namespaced_external_user(
+    state: &AppState,
+    headers: &HeaderMap,
+    provider_id: &str,
+    issuer: &str,
+    subject: &str,
+    auth_provider: &str,
+) -> Result<(Option<String>, String), (StatusCode, String)> {
+    let identity_key = external_identity_key(provider_id, issuer, subject);
+    let existing = state
+        .config_db
+        .find_user_by_external_id(&identity_key, auth_provider)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "external identity lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+        })?;
+    if existing.is_some() {
+        return Ok((existing, identity_key));
+    }
+
+    // One-time compatibility migration for identities created before issuer and
+    // provider namespacing was introduced. The migration is performed only
+    // after a fully verified assertion from the currently configured provider.
+    let legacy = state
+        .config_db
+        .find_user_by_external_id(subject, auth_provider)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "legacy external identity lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+        })?;
+    if let Some(user_id) = legacy {
+        state
+            .config_db
+            .update_user_external_identity(&user_id, auth_provider, &identity_key)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "external identity migration failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            })?;
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.identity_namespace_migrate", "system")
+                    .tenant("default".to_string())
+                    .resource("user", user_id.clone())
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "auth_provider": auth_provider,
+                            "provider_id": provider_id,
+                        })
+                        .to_string(),
+                    )
+                    .context(crate::audit::actor_context_from_headers(headers)),
+            )
+            .await;
+        return Ok((Some(user_id), identity_key));
+    }
+    Ok((None, identity_key))
+}
+
+static CONSUMED_SSO_KEYS: OnceLock<DashMap<String, i64>> = OnceLock::new();
+
+/// Atomically consume a transaction/replay key inside this API process. OIDC
+/// authorization codes and the browser-bound transaction cookie provide the
+/// cross-replica backstop; this map closes concurrent replays on one replica.
+fn consume_sso_key_once(key: String, expires_at: i64) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let consumed = CONSUMED_SSO_KEYS.get_or_init(DashMap::new);
+    if consumed.len() > 10_000 {
+        consumed.retain(|_, expiry| *expiry > now);
+    }
+    match consumed.entry(key) {
+        Entry::Vacant(entry) => {
+            entry.insert(expires_at.max(now + 1));
+            true
+        }
+        Entry::Occupied(_) => false,
+    }
+}
 
 // ── SSO Types ──
 
@@ -102,6 +459,79 @@ struct OidcTokenResponse {
     access_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct OidcDiscovery {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    jwks_uri: String,
+}
+
+const OIDC_METADATA_MAX_BYTES: usize = 1024 * 1024;
+
+fn validate_oidc_endpoint(raw: &str, label: &str) -> anyhow::Result<url::Url> {
+    let parsed = url::Url::parse(raw).map_err(|_| anyhow::anyhow!("{label} is not a valid URL"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!("{label} must be an HTTPS URL without credentials or a fragment");
+    }
+    Ok(parsed)
+}
+
+async fn fetch_bounded_oidc_json<T: serde::de::DeserializeOwned>(
+    raw_url: &str,
+    label: &str,
+) -> anyhow::Result<T> {
+    validate_oidc_endpoint(raw_url, label)?;
+    let response = crate::outbound::public_https_request(reqwest::Method::GET, raw_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("{label} request rejected: {e}"))?
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("{label} request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("{label} returned an error: {e}"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > OIDC_METADATA_MAX_BYTES as u64)
+    {
+        anyhow::bail!("{label} response is too large");
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("{label} response failed: {e}"))?;
+    if bytes.len() > OIDC_METADATA_MAX_BYTES {
+        anyhow::bail!("{label} response is too large");
+    }
+    serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("{label} is invalid JSON: {e}"))
+}
+
+async fn fetch_oidc_discovery(issuer_url: &str) -> anyhow::Result<OidcDiscovery> {
+    let issuer = validate_oidc_endpoint(issuer_url, "OIDC issuer")?;
+    if issuer.query().is_some() {
+        anyhow::bail!("OIDC issuer must not include a query");
+    }
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer_url.trim_end_matches('/')
+    );
+    let discovery: OidcDiscovery =
+        fetch_bounded_oidc_json(&discovery_url, "OIDC discovery document").await?;
+    if discovery.issuer != issuer_url {
+        anyhow::bail!("OIDC discovery issuer does not exactly match the configured issuer");
+    }
+    validate_oidc_endpoint(&discovery.authorization_endpoint, "OIDC authorization endpoint")?;
+    validate_oidc_endpoint(&discovery.token_endpoint, "OIDC token endpoint")?;
+    validate_oidc_endpoint(&discovery.jwks_uri, "OIDC JWKS endpoint")?;
+    Ok(discovery)
+}
+
 // ── Initiate SSO Login (protocol-aware: OIDC or SAML) ──
 
 /// GET /auth/sso/login -- Redirect to IdP.
@@ -127,7 +557,7 @@ pub async fn sso_login(
         })?;
 
     let (
-        _id,
+        provider_id,
         _name,
         protocol,
         _enabled,
@@ -150,21 +580,57 @@ pub async fn sso_login(
 
     match protocol.as_str() {
         "saml" => {
-            let base_url = resolve_base_url(&headers);
+            if saml_idp_sso_url.is_empty()
+                || saml_sp_entity_id.is_empty()
+                || _saml_cert.trim().is_empty()
+                || issuer_url.trim().is_empty()
+            {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SAML provider is incomplete; IdP issuer, SSO URL, SP entity ID, and signing certificate are required"
+                        .to_string(),
+                ));
+            }
+            let base_url = resolve_base_url(&headers)
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
             let acs_url = format!("{base_url}/auth/sso/acs");
             let relay_state = "/";
 
-            let redirect_url = saml::build_login_redirect_url(
+            let login_request = saml::build_login_redirect_url(
                 &saml_sp_entity_id,
                 &acs_url,
                 &saml_idp_sso_url,
                 relay_state,
             );
+            let transaction = SsoTransaction {
+                version: SSO_TRANSACTION_VERSION,
+                protocol: "saml".to_string(),
+                provider_id,
+                state: String::new(),
+                nonce: String::new(),
+                pkce_verifier: String::new(),
+                saml_request_id: login_request.request_id,
+                redirect_path: relay_state.to_string(),
+                issued_at: chrono::Utc::now().timestamp(),
+            };
+            let encoded = encode_sso_transaction(&transaction)
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let cookie = sso_transaction_cookie(&encoded, "saml", SSO_TRANSACTION_TTL_SECS)
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
 
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert(
+                header::SET_COOKIE,
+                cookie.parse().map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to create SSO transaction cookie".to_string(),
+                    )
+                })?,
+            );
+            resp_headers.insert(
                 header::LOCATION,
-                redirect_url.parse().map_err(|_| {
+                login_request.redirect_url.parse().map_err(|_| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "invalid redirect URL".to_string(),
@@ -175,45 +641,103 @@ pub async fn sso_login(
         }
         _ => {
             // OIDC flow
-            let csrf_state: String = {
-                use rand::Rng;
-                let mut rng = rand::rng();
-                let bytes: [u8; 16] = rng.random();
-                bytes.iter().map(|b| format!("{b:02x}")).collect()
-            };
+            let csrf_state = random_urlsafe::<32>();
+            let nonce = random_urlsafe::<32>();
+            let pkce_verifier = random_urlsafe::<32>();
+            let base = resolve_base_url(&headers)
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let redirect_uri = format!("{base}/auth/sso/callback");
+            let discovery = fetch_oidc_discovery(&issuer_url).await.map_err(|e| {
+                tracing::warn!(reason = %e, "OIDC discovery rejected");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "OIDC provider metadata is unavailable or invalid".to_string(),
+                )
+            })?;
+            let mut authorize_url = url::Url::parse(&discovery.authorization_endpoint).map_err(
+                |_| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "OIDC authorization endpoint is invalid".to_string(),
+                    )
+                },
+            )?;
+            authorize_url
+                .query_pairs_mut()
+                .append_pair("client_id", &client_id)
+                .append_pair("redirect_uri", &redirect_uri)
+                .append_pair("response_type", "code")
+                .append_pair("scope", &oidc_scopes)
+                .append_pair("state", &csrf_state)
+                .append_pair("nonce", &nonce)
+                .append_pair("code_challenge", &pkce_challenge(&pkce_verifier))
+                .append_pair("code_challenge_method", "S256");
 
-            state
-                .config_db
-                .store_sso_state(&csrf_state)
-                .await
-                .map_err(|e| {
+            let transaction = SsoTransaction {
+                version: SSO_TRANSACTION_VERSION,
+                protocol: "oidc".to_string(),
+                provider_id,
+                state: csrf_state,
+                nonce,
+                pkce_verifier,
+                saml_request_id: String::new(),
+                redirect_path: "/".to_string(),
+                issued_at: chrono::Utc::now().timestamp(),
+            };
+            let encoded = encode_sso_transaction(&transaction)
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let cookie = sso_transaction_cookie(&encoded, "oidc", SSO_TRANSACTION_TTL_SECS)
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert(
+                header::SET_COOKIE,
+                cookie.parse().map_err(|_| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("state error: {e}"),
+                        "failed to create SSO transaction cookie".to_string(),
                     )
-                })?;
-
-            let scopes_encoded = oidc_scopes
-                .split_whitespace()
-                .collect::<Vec<&str>>()
-                .join("+");
-
-            let base = resolve_base_url(&headers);
-            let redirect_uri = format!("{base}/auth/sso/callback");
-            let authorize_url = format!(
-                "{issuer_url}/authorize?client_id={client_id}&redirect_uri={redirect}&response_type=code&scope={scopes}&state={csrf_state}",
-                issuer_url = issuer_url.trim_end_matches('/'),
-                client_id = urlencoding::encode(&client_id),
-                redirect = urlencoding::encode(&redirect_uri),
-                scopes = scopes_encoded,
+                })?,
             );
-
-            Ok(Redirect::temporary(&authorize_url).into_response())
+            resp_headers.insert(
+                header::LOCATION,
+                authorize_url.as_str().parse().map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "invalid OIDC redirect URL".to_string(),
+                    )
+                })?,
+            );
+            Ok((StatusCode::FOUND, resp_headers, "").into_response())
         }
     }
 }
 
 // ── OIDC Callback ──
+
+async fn audit_sso_failure(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    status: StatusCode,
+) {
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                .outcome("failure")
+                .description(format!("{method} SSO authentication failed"))
+                .changes(
+                    serde_json::json!({
+                        "method": method,
+                        "http_status": status.as_u16(),
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(headers)),
+        )
+        .await;
+}
 
 /// GET /auth/sso/callback?code=...&state=... -- Exchange code for tokens, JIT provision user
 pub async fn sso_callback(
@@ -221,19 +745,25 @@ pub async fn sso_callback(
     headers: HeaderMap,
     Query(params): Query<SsoCallbackQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // 1. Verify CSRF state
-    let valid = state
-        .config_db
-        .validate_sso_state(&params.state)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("state error: {e}"),
-            )
-        })?;
+    let audit_headers = headers.clone();
+    let result = sso_callback_inner(state.clone(), headers, params).await;
+    if let Err((status, _)) = &result {
+        audit_sso_failure(&state, &audit_headers, "oidc", *status).await;
+    }
+    result
+}
 
-    if !valid {
+async fn sso_callback_inner(
+    state: AppState,
+    headers: HeaderMap,
+    params: SsoCallbackQuery,
+) -> Result<(StatusCode, HeaderMap, &'static str), (StatusCode, String)> {
+    // 1. Verify the callback is bound to the browser that initiated this OIDC
+    // transaction. The signed HttpOnly cookie also carries the nonce and PKCE
+    // verifier, so none of these values are accepted from callback parameters.
+    let transaction =
+        extract_sso_transaction(&headers).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if transaction.protocol != "oidc" || transaction.state != params.state {
         return Err((
             StatusCode::BAD_REQUEST,
             "invalid or expired state parameter".to_string(),
@@ -277,21 +807,37 @@ pub async fn sso_callback(
         _f15,
         _f16,
     ) = provider;
+    if transaction.provider_id != provider_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "SSO provider changed during authentication".to_string(),
+        ));
+    }
 
     // 3. Exchange authorization code for tokens
-    let token_url = format!("{}/token", issuer_url.trim_end_matches('/'));
-    let base = resolve_base_url(&headers);
+    let discovery = fetch_oidc_discovery(&issuer_url).await.map_err(|e| {
+        tracing::warn!(reason = %e, "OIDC discovery rejected during callback");
+        (
+            StatusCode::BAD_GATEWAY,
+            "OIDC provider metadata is unavailable or invalid".to_string(),
+        )
+    })?;
+    let base = resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
     let redirect_uri = format!("{base}/auth/sso/callback");
 
-    let client = reqwest::Client::new();
-    let token_res = client
-        .post(&token_url)
+    let token_res = crate::outbound::public_https_request(
+        reqwest::Method::POST,
+        &discovery.token_endpoint,
+    )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("token endpoint rejected: {e}")))?
         .form(&[
             ("grant_type", "authorization_code"),
-            ("code", &params.code),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", &client_id),
-            ("client_secret", &client_secret),
+            ("code", params.code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("code_verifier", transaction.pkce_verifier.as_str()),
         ])
         .send()
         .await
@@ -326,7 +872,7 @@ pub async fn sso_callback(
     })?;
 
     // 4. Verify the id_token JWT signature against the provider's JWKS and decode claims
-    let claims = verify_and_decode_jwt(&client, &id_token, &issuer_url, &client_id)
+    let claims = verify_and_decode_jwt(&id_token, &discovery, &issuer_url, &client_id)
         .await
         .map_err(|e| {
             (
@@ -334,6 +880,16 @@ pub async fn sso_callback(
                 format!("id_token verification failed: {e}"),
             )
         })?;
+    validate_oidc_nonce(&transaction, &claims).map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+    if !consume_sso_key_once(
+        format!("oidc:{}", transaction.state),
+        transaction.issued_at + SSO_TRANSACTION_TTL_SECS,
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "OIDC login transaction was already consumed".to_string(),
+        ));
+    }
 
     // 5. Extract claims
     let external_id = claims
@@ -403,16 +959,16 @@ pub async fn sso_callback(
     }
 
     // 8. JIT provision: find or create user
-    let user_id = match state
-        .config_db
-        .find_user_by_external_id(&external_id, "oidc")
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("user lookup error: {e}"),
-            )
-        })? {
+    let (existing_user, identity_key) = find_namespaced_external_user(
+        &state,
+        &headers,
+        &provider_id,
+        &issuer_url,
+        &external_id,
+        "oidc",
+    )
+    .await?;
+    let user_id = match existing_user {
         Some(uid) => uid,
         None => {
             if !jit_provisioning {
@@ -423,7 +979,7 @@ pub async fn sso_callback(
             }
             state
                 .config_db
-                .create_sso_user(&username, &display_name, &external_id, "oidc", "default")
+                .create_sso_user(&username, &display_name, &identity_key, "oidc", "default")
                 .await
                 .map_err(|e| {
                     (
@@ -460,9 +1016,41 @@ pub async fn sso_callback(
 
     // 11. Set the rush_session cookie and redirect to /
     let cookie = crate::handlers::auth::session_cookie(&token, 86400);
+    let clear_transaction = sso_transaction_cookie("", "oidc", 0)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Audit the successful OIDC authentication without logging the code,
+    // tokens, transaction cookie, or IdP claims beyond the stable provider id.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("auth.login.success", "user")
+                .actor(user_id.clone(), username.clone())
+                .tenant("default".to_string())
+                .outcome("success")
+                .description("user authenticated (SSO/OIDC)")
+                .changes(
+                    serde_json::json!({
+                        "method": "oidc",
+                        "provider_id": provider_id,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.append(
+        header::SET_COOKIE,
+        clear_transaction.parse().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to clear SSO transaction cookie".to_string(),
+            )
+        })?,
+    );
     headers.insert(header::LOCATION, "/".parse().unwrap());
 
     Ok((StatusCode::FOUND, headers, ""))
@@ -472,15 +1060,11 @@ pub async fn sso_callback(
 /// Fetches the OIDC discovery document to resolve the JWKS URI, then verifies the signature.
 /// Rejects `alg:none` and any token that fails signature validation.
 async fn verify_and_decode_jwt(
-    http_client: &reqwest::Client,
     token: &str,
+    discovery: &OidcDiscovery,
     issuer_url: &str,
     client_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    // FINDING-05: Reject non-HTTPS issuer URLs to prevent SSRF via OIDC discovery.
-    if !issuer_url.starts_with("https://") {
-        anyhow::bail!("issuer_url must use HTTPS (got: {issuer_url})");
-    }
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 
@@ -502,35 +1086,8 @@ async fn verify_and_decode_jwt(
         alg => anyhow::bail!("JWT algorithm {alg:?} is not accepted for OIDC"),
     }
 
-    // Fetch the OIDC discovery document to get the JWKS URI
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer_url.trim_end_matches('/')
-    );
-    let discovery: serde_json::Value = http_client
-        .get(&discovery_url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("OIDC discovery request failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("OIDC discovery parse error: {e}"))?;
-
-    let jwks_uri = discovery["jwks_uri"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("OIDC discovery document missing jwks_uri"))?;
-
     // Fetch the JSON Web Key Set
-    let jwks: JwkSet = http_client
-        .get(jwks_uri)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("JWKS fetch failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("JWKS parse error: {e}"))?;
+    let jwks: JwkSet = fetch_bounded_oidc_json(&discovery.jwks_uri, "OIDC JWKS").await?;
 
     // Select the matching key: prefer by kid, fall back to first key
     let jwk = if let Some(kid) = header.kid.as_deref() {
@@ -630,6 +1187,14 @@ pub async fn save_sso_provider(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
     let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let protocol = req.protocol.as_deref().unwrap_or("oidc");
+    if !matches!(protocol, "oidc" | "saml") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "SSO protocol must be 'oidc' or 'saml'".to_string(),
+        ));
+    }
+    let enabled = req.enabled.unwrap_or(false);
 
     // If updating and no new secret provided, keep the existing one
     let client_secret = match &req.client_secret {
@@ -647,13 +1212,72 @@ pub async fn save_sso_provider(
         }
     };
 
+    if enabled && protocol == "saml" {
+        if req.issuer_url.as_deref().unwrap_or("").trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "SAML IdP issuer/entity ID is required".to_string(),
+            ));
+        }
+        let certificate = req.saml_idp_cert.as_deref().unwrap_or("");
+        saml::validate_idp_certificate(certificate).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let sso_url = req.saml_idp_sso_url.as_deref().unwrap_or("");
+        let parsed = url::Url::parse(sso_url).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "SAML IdP SSO URL must be a valid HTTPS URL".to_string(),
+            )
+        })?;
+        if parsed.scheme() != "https" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "SAML IdP SSO URL must use HTTPS".to_string(),
+            ));
+        }
+        if req
+            .saml_sp_entity_id
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "SAML SP entity ID is required".to_string(),
+            ));
+        }
+    }
+    if enabled && protocol == "oidc" {
+        let issuer = req.issuer_url.as_deref().unwrap_or("");
+        let parsed = url::Url::parse(issuer).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "OIDC issuer must be a valid HTTPS URL".to_string(),
+            )
+        })?;
+        if parsed.scheme() != "https" || parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "OIDC issuer must be an HTTPS URL without query or fragment".to_string(),
+            ));
+        }
+        if req.client_id.as_deref().unwrap_or("").trim().is_empty()
+            || client_secret.trim().is_empty()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "OIDC client ID and client secret are required".to_string(),
+            ));
+        }
+    }
+
     state
         .config_db
         .upsert_sso_provider(
             &id,
             &req.name,
-            req.protocol.as_deref().unwrap_or("oidc"),
-            req.enabled.unwrap_or(false),
+            protocol,
+            enabled,
             req.client_id.as_deref().unwrap_or(""),
             &client_secret,
             req.issuer_url.as_deref().unwrap_or(""),
@@ -688,8 +1312,8 @@ pub async fn save_sso_provider(
             .resource("sso_provider", id.clone())
             .changes(serde_json::json!({
                 "name": req.name,
-                "protocol": req.protocol.as_deref().unwrap_or("oidc"),
-                "enabled": req.enabled.unwrap_or(false),
+                "protocol": protocol,
+                "enabled": enabled,
                 "issuer_url": req.issuer_url.as_deref().unwrap_or(""),
                 "client_id": req.client_id.as_deref().unwrap_or(""),
                 "client_secret_set": req.client_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
@@ -905,6 +1529,33 @@ pub async fn sso_acs(
     headers: HeaderMap,
     body: String,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let audit_headers = headers.clone();
+    let result = sso_acs_inner(state.clone(), headers, body).await;
+    if let Err((status, _)) = &result {
+        audit_sso_failure(&state, &audit_headers, "saml", *status).await;
+    }
+    result
+}
+
+async fn sso_acs_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: String,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    if body.len() > 2 * 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "SAML response is too large".to_string(),
+        ));
+    }
+    let transaction =
+        extract_sso_transaction(&headers).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if transaction.protocol != "saml" || transaction.saml_request_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid SAML login transaction".to_string(),
+        ));
+    }
     let params: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
         .into_owned()
         .collect();
@@ -919,18 +1570,6 @@ pub async fn sso_acs(
                 "missing SAMLResponse in POST body".to_string(),
             )
         })?;
-
-    let relay_state_raw = params
-        .iter()
-        .find(|(k, _)| k == "RelayState")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| "/".to_string());
-    // Reject absolute URLs and protocol-relative URLs to prevent open redirect
-    let relay_state = if relay_state_raw.starts_with('/') && !relay_state_raw.starts_with("//") {
-        relay_state_raw
-    } else {
-        "/".to_string()
-    };
 
     let provider = state
         .config_db
@@ -954,7 +1593,7 @@ pub async fn sso_acs(
         _enabled,
         _client_id,
         _client_secret,
-        _issuer_url,
+        issuer_url,
         _oidc_scopes,
         groups_claim,
         _email_claim,
@@ -968,6 +1607,12 @@ pub async fn sso_acs(
         saml_cert,
         _saml_entity,
     ) = provider;
+    if transaction.provider_id != provider_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "SSO provider changed during authentication".to_string(),
+        ));
+    }
 
     // Decode the base64 SAMLResponse to raw XML for signature verification
     let xml_bytes = base64::Engine::decode(
@@ -982,49 +1627,67 @@ pub async fn sso_acs(
     })?;
     let xml = String::from_utf8_lossy(&xml_bytes);
 
-    // If the provider has a certificate configured, verify the XML signature
-    if saml_cert.is_empty() {
-        tracing::warn!(
-            event = "saml_sig_skip",
-            provider_id = %provider_id,
-            "SAML signature verification skipped — no certificate configured. \
-             Configure a signing certificate to prevent forged assertion attacks."
-        );
+    // Fail closed: a configured signing certificate and a signature covering
+    // the exact content we consume are mandatory for every SAML login.
+    if saml_cert.trim().is_empty() {
+        tracing::error!(provider_id = %provider_id, "enabled SAML provider has no certificate");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SAML provider has no signing certificate".to_string(),
+        ));
     }
-    if !saml_cert.is_empty() {
-        match saml::verify_signature(&xml, &saml_cert) {
-            Ok(true) => tracing::info!("SAML signature verified"),
-            Ok(false) => {
-                tracing::warn!("SAML signature verification failed");
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    "SAML signature verification failed".to_string(),
-                ));
-            }
-            Err(e) => {
-                tracing::warn!("SAML signature check error: {e}");
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    format!("SAML signature error: {e}"),
-                ));
-            }
-        }
-    }
-
-    let assertion = saml::parse_saml_response(saml_response, &groups_claim).map_err(|e| {
-        tracing::warn!("SAML response parse error: {e}");
+    let signed_xml = saml::verify_signature(&xml, &saml_cert).map_err(|e| {
+        tracing::warn!("SAML signature check failed: {e}");
         (
-            StatusCode::BAD_REQUEST,
-            format!("invalid SAML response: {e}"),
+            StatusCode::UNAUTHORIZED,
+            "SAML signature verification failed".to_string(),
         )
     })?;
 
-    tracing::info!(
-        name_id = %assertion.name_id,
-        email = ?assertion.email,
-        groups = ?assertion.groups,
-        "SAML assertion parsed"
-    );
+    let base_url = resolve_base_url(&headers)
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let acs_url = format!("{base_url}/auth/sso/acs");
+    let assertion = saml::validate_signed_assertion(
+        &signed_xml,
+        &groups_claim,
+        &transaction.saml_request_id,
+        &acs_url,
+        &_saml_entity,
+        &issuer_url,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(|e| {
+        tracing::warn!(reason = %e, "SAML assertion rejected");
+        (
+            StatusCode::UNAUTHORIZED,
+            "SAML assertion did not satisfy service-provider constraints".to_string(),
+        )
+    })?;
+
+    let replay_expiry = assertion
+        .expires_at
+        .min(transaction.issued_at + SSO_TRANSACTION_TTL_SECS);
+    for replay_key in [
+        format!("saml-request:{}", transaction.saml_request_id),
+        format!("saml-assertion:{}", assertion.assertion_id),
+    ] {
+        if !consume_sso_key_once(replay_key, replay_expiry) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "SAML response has already been consumed".to_string(),
+            ));
+        }
+    }
+    if let Some(response_id) = &assertion.response_id {
+        if !consume_sso_key_once(format!("saml-response:{response_id}"), replay_expiry) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "SAML response has already been consumed".to_string(),
+            ));
+        }
+    }
+
+    tracing::info!(provider_id = %provider_id, "SAML assertion validated");
 
     let mut mapped_group_ids = state
         .config_db
@@ -1048,14 +1711,16 @@ pub async fn sso_acs(
     let external_id = &assertion.name_id;
     let auth_provider = "saml";
 
-    let user_id = match state
-        .config_db
-        .find_user_by_external_id(external_id, auth_provider)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "internal error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-        })? {
+    let (existing_user, identity_key) = find_namespaced_external_user(
+        &state,
+        &headers,
+        &provider_id,
+        &assertion.issuer,
+        external_id,
+        auth_provider,
+    )
+    .await?;
+    let user_id = match existing_user {
         Some(uid) => uid,
         None => {
             if !jit_provisioning {
@@ -1068,7 +1733,7 @@ pub async fn sso_acs(
             let display = assertion.display_name.as_deref().unwrap_or(email);
             state
                 .config_db
-                .create_sso_user(email, display, external_id, auth_provider, "default")
+                .create_sso_user(email, display, &identity_key, auth_provider, "default")
                 .await
                 .map_err(|e| {
                     (
@@ -1129,12 +1794,26 @@ pub async fn sso_acs(
         .await;
 
     let cookie = crate::handlers::auth::session_cookie(&token, 86400);
+    let clear_transaction = sso_transaction_cookie("", "saml", 0)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    resp_headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+    resp_headers.append(
+        header::SET_COOKIE,
+        clear_transaction.parse().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to clear SSO transaction cookie".to_string(),
+            )
+        })?,
+    );
     resp_headers.insert(
         header::LOCATION,
-        relay_state.parse().unwrap_or_else(|_| "/".parse().unwrap()),
+        transaction
+            .redirect_path
+            .parse()
+            .unwrap_or_else(|_| "/".parse().unwrap()),
     );
 
     Ok((StatusCode::FOUND, resp_headers, "").into_response())
@@ -1157,7 +1836,8 @@ pub async fn sso_metadata(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         })?;
 
-    let base_url = resolve_base_url(&headers);
+    let base_url = resolve_base_url(&headers)
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
     let acs_url = format!("{base_url}/auth/sso/acs");
 
     let sp_entity_id = match &provider {
@@ -1328,29 +2008,150 @@ pub async fn complete_setup_token(
     }
 }
 
-// ── Helpers ──
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Resolve the base URL for SAML ACS / SP entity ID construction.
-/// RUSH_BASE_URL env var takes precedence over request headers to prevent
-/// host-header injection attacks (FINDING-17).
-fn resolve_base_url(headers: &HeaderMap) -> String {
-    if let Ok(base) = std::env::var("RUSH_BASE_URL") {
-        if !base.is_empty() {
-            return base.trim_end_matches('/').to_string();
+    fn transaction() -> SsoTransaction {
+        SsoTransaction {
+            version: SSO_TRANSACTION_VERSION,
+            protocol: "oidc".to_string(),
+            provider_id: "provider-1".to_string(),
+            state: "state-1".to_string(),
+            nonce: "nonce-1".to_string(),
+            pkce_verifier: "verifier-1".to_string(),
+            saml_request_id: String::new(),
+            redirect_path: "/".to_string(),
+            issued_at: 1_700_000_000,
         }
     }
 
-    // Fallback: derive from request headers (dev/single-node only).
-    // Set RUSH_BASE_URL in production to prevent host-header injection.
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
+    #[test]
+    fn signed_transaction_round_trips_and_rejects_tampering() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let encoded = encode_sso_transaction_with_secret(&transaction(), secret).unwrap();
+        assert_eq!(
+            decode_sso_transaction_with_secret(&encoded, secret, 1_700_000_100).unwrap(),
+            transaction()
+        );
 
+        let mut tampered = encoded.into_bytes();
+        tampered[5] = if tampered[5] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert!(decode_sso_transaction_with_secret(&tampered, secret, 1_700_000_100).is_err());
+    }
+
+    #[test]
+    fn signed_transaction_expires() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let encoded = encode_sso_transaction_with_secret(&transaction(), secret).unwrap();
+        assert!(
+            decode_sso_transaction_with_secret(
+                &encoded,
+                secret,
+                1_700_000_000 + SSO_TRANSACTION_TTL_SECS + 1,
+            )
+            .unwrap_err()
+            .contains("expired")
+        );
+    }
+
+    #[test]
+    fn pkce_uses_rfc7636_s256_derivation() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            pkce_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn oidc_nonce_is_required_and_bound_to_transaction() {
+        let transaction = transaction();
+        assert!(validate_oidc_nonce(&transaction, &serde_json::json!({})).is_err());
+        assert!(
+            validate_oidc_nonce(&transaction, &serde_json::json!({ "nonce": "attacker" })).is_err()
+        );
+        assert!(
+            validate_oidc_nonce(
+                &transaction,
+                &serde_json::json!({ "nonce": transaction.nonce })
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn replay_key_is_consumed_only_once() {
+        let key = format!("test:{}", uuid::Uuid::new_v4());
+        let expiry = chrono::Utc::now().timestamp() + 60;
+        assert!(consume_sso_key_once(key.clone(), expiry));
+        assert!(!consume_sso_key_once(key, expiry));
+    }
+}
+
+// ── Helpers ──
+
+fn normalize_base_url(raw: &str, production: bool) -> Result<String, String> {
+    let parsed = url::Url::parse(raw).map_err(|_| "RUSH_BASE_URL is not a valid URL".to_string())?;
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return Err("RUSH_BASE_URL must be an origin without credentials, path, query, or fragment".to_string());
+    }
+    if production && parsed.scheme() != "https" {
+        return Err("RUSH_BASE_URL must use HTTPS in production".to_string());
+    }
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("RUSH_BASE_URL must use HTTP or HTTPS".to_string());
+    }
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
+/// Validate the canonical public origin before the API starts accepting
+/// traffic. Production is fail-closed; local development may derive an origin
+/// from the Host header for convenience.
+pub fn validate_base_url_config() -> Result<(), String> {
+    let production = crate::api_key_auth::production_mode();
+    match std::env::var("RUSH_BASE_URL") {
+        Ok(value) if !value.trim().is_empty() => normalize_base_url(value.trim(), production).map(|_| ()),
+        _ if production => Err("RUSH_BASE_URL is required in production".to_string()),
+        _ => Ok(()),
+    }
+}
+
+fn resolve_base_url(headers: &HeaderMap) -> Result<String, String> {
+    let production = crate::api_key_auth::production_mode();
+    if let Ok(base) = std::env::var("RUSH_BASE_URL") {
+        if !base.trim().is_empty() {
+            return normalize_base_url(base.trim(), production);
+        }
+    }
+    if production {
+        return Err("SSO is unavailable until RUSH_BASE_URL is configured".to_string());
+    }
+
+    let trust_proxy = crate::api_key_auth::env_flag("RUSH_TRUST_PROXY_HEADERS");
+    let scheme = if trust_proxy {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("http")
+    } else if insecure_cookies_enabled() {
+        "http"
+    } else {
+        "https"
+    };
+    if !matches!(scheme, "http" | "https") {
+        return Err("request scheme is invalid".to_string());
+    }
     let host = headers
         .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .unwrap_or("localhost:8080");
-
-    format!("{scheme}://{host}")
+    normalize_base_url(&format!("{scheme}://{host}"), false)
 }
