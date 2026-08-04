@@ -1,11 +1,137 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Instant;
 
 use crate::AppState;
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn login_rate_limit_secret() -> Result<Vec<u8>, String> {
+    let secret = std::env::var("RUSH_LOGIN_RATE_LIMIT_SECRET")
+        .or_else(|_| std::env::var("RUSH_SSO_TRANSACTION_SECRET"))
+        .or_else(|_| std::env::var("RUSH_API_KEY_SECRET"))
+        .map_err(|_| "login rate limiting is not configured".to_string())?;
+    if secret.len() < 32 {
+        return Err("login rate limiting secret must contain at least 32 bytes".to_string());
+    }
+    Ok(secret.into_bytes())
+}
+
+pub fn validate_login_rate_limit_secret() -> Result<(), String> {
+    login_rate_limit_secret().map(|_| ())
+}
+
+fn keyed_login_identifier(label: &[u8], value: &str, secret: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(b"rush-login-rate-limit-v1\0");
+    mac.update(label);
+    mac.update(b"\0");
+    mac.update(value.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+pub fn trusted_proxy_cidrs_from_env() -> Result<Vec<String>, String> {
+    let raw = std::env::var("RUSH_TRUSTED_PROXY_CIDRS").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    crate::api_key_auth::normalize_source_cidrs(&values)
+}
+
+pub fn login_limit_from_env(name: &str, default: u32) -> Result<u32, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|limit| (1..=10_000).contains(limit))
+            .ok_or_else(|| format!("{name} must be an integer between 1 and 10000")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn is_trusted_proxy(address: IpAddr, trusted_proxy_cidrs: &[String]) -> bool {
+    !trusted_proxy_cidrs.is_empty()
+        && crate::api_key_auth::source_allowed(address, trusted_proxy_cidrs)
+}
+
+fn resolve_login_client_ip(
+    peer_ip: IpAddr,
+    headers: &HeaderMap,
+    trusted_proxy_cidrs: &[String],
+) -> IpAddr {
+    if !is_trusted_proxy(peer_ip, trusted_proxy_cidrs) {
+        return peer_ip;
+    }
+
+    if let Some(raw) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    {
+        let chain = raw
+            .split(',')
+            .map(|value| value.trim().parse::<IpAddr>())
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(chain) = chain else {
+            return peer_ip;
+        };
+        let mut client = peer_ip;
+        for address in chain.into_iter().rev() {
+            if !is_trusted_proxy(client, trusted_proxy_cidrs) {
+                break;
+            }
+            client = address;
+        }
+        return client;
+    }
+
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer_ip)
+}
+
+fn consume_local_login_limit(
+    limiter: &dashmap::DashMap<String, (u32, Instant)>,
+    key: String,
+    limit: u32,
+    now: Instant,
+) -> bool {
+    match limiter.entry(key) {
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert((1, now));
+            true
+        }
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            let (count, window_start) = *entry.get();
+            let next = if now.duration_since(window_start).as_secs() >= 60 {
+                (1, now)
+            } else {
+                (count.saturating_add(1), window_start)
+            };
+            entry.insert(next);
+            next.0 <= limit
+        }
+    }
+}
+
+fn login_audit_context(headers: &HeaderMap, client_ip: IpAddr) -> (String, String, String) {
+    let (_, user_agent, request_id) = crate::audit::actor_context_from_headers(headers);
+    (client_ip.to_string(), user_agent, request_id)
+}
 
 #[derive(serde::Deserialize)]
 pub struct LoginRequest {
@@ -25,56 +151,118 @@ pub struct UserInfo {
 /// POST /api/v1/auth/login
 ///
 /// Accepts `{ "username": "...", "password": "..." }`.
-/// On success, returns the user info + session token in the body and sets
-/// a `rush_session` HttpOnly cookie.
+/// On success, returns user information and keeps the session bearer solely in
+/// an HttpOnly cookie; it is never exposed to frontend JavaScript.
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Rate limit: max 10 attempts per (IP, username) pair per 60-second window.
-    // Keying on both IP and username prevents simple IP-rotation attacks: an
-    // attacker cycling X-Forwarded-For values still hits the per-username limit.
-    // X-Forwarded-For is included as a hint but the username anchor is the binding
-    // constraint, since that header is spoofable by any client.
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    // Combine IP + username so that neither axis alone can be used to bypass the limit.
-    let rate_key = format!("{}:{}", ip, req.username);
+    let client_ip = resolve_login_client_ip(peer.ip(), &headers, &state.trusted_proxy_cidrs);
+    let secret =
+        login_rate_limit_secret().map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let account = req.username.trim().to_lowercase();
+    let ip_hash = keyed_login_identifier(b"ip", &client_ip.to_string(), &secret);
+    let account_hash = keyed_login_identifier(b"account", &account, &secret);
+    let local_now = Instant::now();
+    let local_ip_allowed = consume_local_login_limit(
+        &state.login_limiter,
+        format!("ip:{ip_hash}"),
+        state.login_ip_limit_per_minute,
+        local_now,
+    );
+    let local_account_allowed = consume_local_login_limit(
+        &state.login_limiter,
+        format!("account:{account_hash}"),
+        state.login_account_limit_per_minute,
+        local_now,
+    );
+
+    if let Err(error) = state
+        .config_db
+        .record_login_attempt(&ip_hash, &account_hash)
+        .await
     {
-        let now = std::time::Instant::now();
-        let current = state.login_limiter.get(&rate_key).map(|e| *e.value());
-        let (count, window_start) = current.unwrap_or((0u32, now));
-        let (new_count, new_window) = if now.duration_since(window_start).as_secs() >= 60 {
-            (1u32, now)
-        } else {
-            (count + 1, window_start)
-        };
+        tracing::error!(%error, "failed to persist login rate-limit attempt");
         state
-            .login_limiter
-            .insert(rate_key, (new_count, new_window));
-        if new_count > 10 {
-            // AUDIT: rate-limit lockout. Awaited (low volume) — the audit logger
-            // swallows its own errors so this never affects the response.
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                    .actor_name(req.username.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({ "reason": "rate_limit_store_unavailable" }).to_string(),
+                    )
+                    .description("authentication unavailable")
+                    .context(login_audit_context(&headers, client_ip)),
+            )
+            .await;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication temporarily unavailable".to_string(),
+        ));
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(60))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let (ip_attempts, account_attempts) = match state
+        .config_db
+        .login_attempt_counts(&ip_hash, &account_hash, &since)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::error!(%error, "failed to read login rate-limit attempts");
             state
                 .audit
                 .log(
-                    crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
+                    crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
                         .actor_name(req.username.clone())
                         .outcome("failure")
-                        .description("login rate limit exceeded")
-                        .context(crate::audit::actor_context_from_headers(&headers)),
+                        .changes(
+                            serde_json::json!({ "reason": "rate_limit_store_unavailable" })
+                                .to_string(),
+                        )
+                        .description("authentication unavailable")
+                        .context(login_audit_context(&headers, client_ip)),
                 )
                 .await;
             return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many login attempts, try again later".to_string(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable".to_string(),
             ));
         }
+    };
+    let distributed_ip_allowed = ip_attempts <= u64::from(state.login_ip_limit_per_minute);
+    let distributed_account_allowed =
+        account_attempts <= u64::from(state.login_account_limit_per_minute);
+    if !(local_ip_allowed
+        && local_account_allowed
+        && distributed_ip_allowed
+        && distributed_account_allowed)
+    {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
+                    .actor_name(req.username.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "ip_limit_exceeded": !(local_ip_allowed && distributed_ip_allowed),
+                            "account_limit_exceeded": !(local_account_allowed && distributed_account_allowed),
+                        })
+                        .to_string(),
+                    )
+                    .description("login rate limit exceeded")
+                    .context(login_audit_context(&headers, client_ip)),
+            )
+            .await;
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many login attempts, try again later".to_string(),
+        ));
     }
 
     let (user_id, username, display_name, tenant_id, role) = match state
@@ -99,7 +287,7 @@ pub async fn login(
                         .actor_name(req.username.clone())
                         .outcome("failure")
                         .description("invalid username or password")
-                        .context(crate::audit::actor_context_from_headers(&headers)),
+                        .context(login_audit_context(&headers, client_ip)),
                 )
                 .await;
             return Err((
@@ -139,7 +327,7 @@ pub async fn login(
                 .tenant(tenant_id.clone())
                 .outcome("success")
                 .description("user authenticated (local)")
-                .context(crate::audit::actor_context_from_headers(&headers)),
+                .context(login_audit_context(&headers, client_ip)),
         )
         .await;
 
@@ -256,13 +444,19 @@ fn session_cookie_with_mode(token: &str, max_age: i64, insecure: bool) -> String
 }
 
 pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+    extract_session_cookie_with_mode(headers, insecure_cookies_enabled())
+}
+
+fn extract_session_cookie_with_mode(headers: &HeaderMap, insecure: bool) -> Option<String> {
+    let cookie_name = if insecure {
+        "rush_session="
+    } else {
+        "__Host-rush_session="
+    };
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie_header.split(';') {
         let part = part.trim();
-        if let Some(value) = part
-            .strip_prefix("__Host-rush_session=")
-            .or_else(|| part.strip_prefix("rush_session="))
-        {
+        if let Some(value) = part.strip_prefix(cookie_name) {
             let value = value.trim();
             if !value.is_empty() {
                 return Some(value.to_string());
@@ -274,7 +468,7 @@ pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::session_cookie_with_mode;
+    use super::*;
 
     #[test]
     fn production_session_cookie_is_host_only_and_secure() {
@@ -291,6 +485,130 @@ mod tests {
         assert_eq!(
             cookie,
             "rush_session=session-token; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_cannot_spoof_forwarded_client_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        let peer: IpAddr = "198.51.100.4".parse().unwrap();
+        let trusted = vec!["10.0.0.0/8".to_string()];
+
+        assert_eq!(resolve_login_client_ip(peer, &headers, &trusted), peer);
+    }
+
+    #[test]
+    fn trusted_proxy_chain_selects_first_untrusted_hop_from_the_right() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.9, 10.20.30.40".parse().unwrap(),
+        );
+        let trusted = vec!["10.0.0.0/8".to_string()];
+
+        assert_eq!(
+            resolve_login_client_ip("10.1.2.3".parse().unwrap(), &headers, &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_forwarded_chain_fails_closed_to_peer_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9, not-an-ip".parse().unwrap());
+        let peer: IpAddr = "10.1.2.3".parse().unwrap();
+        let trusted = vec!["10.0.0.0/8".to_string()];
+
+        assert_eq!(resolve_login_client_ip(peer, &headers, &trusted), peer);
+    }
+
+    #[test]
+    fn account_and_ip_local_limits_are_independent_and_atomic() {
+        let limiter = dashmap::DashMap::new();
+        let now = Instant::now();
+        assert!(consume_local_login_limit(
+            &limiter,
+            "account:a".into(),
+            2,
+            now
+        ));
+        assert!(consume_local_login_limit(
+            &limiter,
+            "account:a".into(),
+            2,
+            now
+        ));
+        assert!(!consume_local_login_limit(
+            &limiter,
+            "account:a".into(),
+            2,
+            now
+        ));
+        assert!(consume_local_login_limit(&limiter, "ip:b".into(), 2, now));
+    }
+
+    #[test]
+    fn concurrent_local_attempts_cannot_overshoot_the_limit() {
+        let limiter = std::sync::Arc::new(dashmap::DashMap::new());
+        let start = std::sync::Arc::new(std::sync::Barrier::new(32));
+        let handles = (0..32)
+            .map(|_| {
+                let limiter = limiter.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    consume_local_login_limit(
+                        &limiter,
+                        "account:concurrent".into(),
+                        10,
+                        Instant::now(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let allowed = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|allowed| *allowed)
+            .count();
+
+        assert_eq!(allowed, 10);
+    }
+
+    #[test]
+    fn rate_limit_identifiers_are_keyed_and_domain_separated() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let account = keyed_login_identifier(b"account", "admin", secret);
+        let ip = keyed_login_identifier(b"ip", "admin", secret);
+        assert_eq!(account.len(), 64);
+        assert_ne!(account, ip);
+        assert!(!account.contains("admin"));
+    }
+
+    #[test]
+    fn secure_cookie_selection_cannot_be_overridden_by_plain_cookie() {
+        // Test the selection rule without mutating process-wide environment:
+        // secure mode's cookie name is host-prefixed and a plain cookie does
+        // not share that prefix.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "rush_session=attacker; __Host-rush_session=protected"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_session_cookie_with_mode(&headers, false).as_deref(),
+            Some("protected")
+        );
+
+        let mut plain_only = HeaderMap::new();
+        plain_only.insert(header::COOKIE, "rush_session=attacker".parse().unwrap());
+        assert_eq!(extract_session_cookie_with_mode(&plain_only, false), None);
+        assert_eq!(
+            extract_session_cookie_with_mode(&plain_only, true).as_deref(),
+            Some("attacker")
         );
     }
 }

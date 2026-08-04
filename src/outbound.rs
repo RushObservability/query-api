@@ -73,6 +73,24 @@ pub fn validate_notification_url(raw_url: &str) -> Result<(), String> {
 /// has no redirects, bounded connect/total timeouts, and pinned DNS
 /// resolution. Private/internal targets require explicit configuration.
 pub async fn public_https_request(method: Method, raw_url: &str) -> Result<RequestBuilder, String> {
+    guarded_request(method, raw_url, allow_private_notification_urls()).await
+}
+
+/// Strict public-HTTPS request path for identity-provider metadata and other
+/// security-sensitive server-side fetches. Unlike notification delivery this
+/// has no private-network compatibility override.
+pub async fn strict_public_https_request(
+    method: Method,
+    raw_url: &str,
+) -> Result<RequestBuilder, String> {
+    guarded_request(method, raw_url, false).await
+}
+
+async fn guarded_request(
+    method: Method,
+    raw_url: &str,
+    allow_private: bool,
+) -> Result<RequestBuilder, String> {
     validate_notification_url(raw_url)?;
     let url = Url::parse(raw_url).map_err(|_| "notification URL is invalid".to_string())?;
     let host = url
@@ -80,7 +98,6 @@ pub async fn public_https_request(method: Method, raw_url: &str) -> Result<Reque
         .ok_or_else(|| "notification URL must include a host".to_string())?
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
-    let allow_private = allow_private_notification_urls();
 
     let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
         .await
@@ -90,10 +107,7 @@ pub async fn public_https_request(method: Method, raw_url: &str) -> Result<Reque
         return Err("notification host could not be resolved".to_string());
     }
     if url.scheme() == "http" && !allow_private {
-        return Err(
-            "HTTP notification endpoints require RUSH_ALLOW_PRIVATE_NOTIFICATION_URLS=true"
-                .to_string(),
-        );
+        return Err("endpoint must use HTTPS".to_string());
     }
     if !allow_private
         && addresses

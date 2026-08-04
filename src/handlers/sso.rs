@@ -123,8 +123,8 @@ fn encode_sso_transaction(transaction: &SsoTransaction) -> Result<String, String
 }
 
 fn setup_token_hash(token: &str) -> Result<String, String> {
-    let mut mac = HmacSha256::new_from_slice(&sso_transaction_secret()?)
-        .map_err(|_| "invalid SSO secret")?;
+    let mut mac =
+        HmacSha256::new_from_slice(&sso_transaction_secret()?).map_err(|_| "invalid SSO secret")?;
     mac.update(b"rush-sso-setup-token-v1\0");
     mac.update(token.as_bytes());
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
@@ -161,8 +161,8 @@ fn decode_setup_session_with_secret(
     let payload = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| "invalid SSO setup session".to_string())?;
-    let session: SsoSetupSession = serde_json::from_slice(&payload)
-        .map_err(|_| "invalid SSO setup session".to_string())?;
+    let session: SsoSetupSession =
+        serde_json::from_slice(&payload).map_err(|_| "invalid SSO setup session".to_string())?;
     if session.version != SSO_TRANSACTION_VERSION
         || session.issued_at > now + 60
         || now.saturating_sub(session.issued_at) > SSO_SETUP_TTL_SECS
@@ -271,17 +271,21 @@ fn validate_oidc_nonce(
     Ok(())
 }
 
-fn external_identity_key(
-    provider_id: &str,
-    issuer: &str,
-    subject: &str,
-) -> String {
+fn external_identity_key(provider_id: &str, issuer: &str, subject: &str) -> String {
     let mut digest = Sha256::new();
     for value in [provider_id, issuer, subject] {
         digest.update((value.len() as u64).to_be_bytes());
         digest.update(value.as_bytes());
     }
     URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+fn setup_provider_protocol(provider: &str) -> Option<&'static str> {
+    match provider {
+        "custom-oidc" => Some("oidc"),
+        "google" | "okta" | "azure" | "custom-saml" => Some("saml"),
+        _ => None,
+    }
 }
 
 async fn find_namespaced_external_user(
@@ -299,7 +303,10 @@ async fn find_namespaced_external_user(
         .await
         .map_err(|error| {
             tracing::error!(%error, "external identity lookup failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
         })?;
     if existing.is_some() {
         return Ok((existing, identity_key));
@@ -314,7 +321,10 @@ async fn find_namespaced_external_user(
         .await
         .map_err(|error| {
             tracing::error!(%error, "legacy external identity lookup failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
         })?;
     if let Some(user_id) = legacy {
         state
@@ -323,7 +333,10 @@ async fn find_namespaced_external_user(
             .await
             .map_err(|error| {
                 tracing::error!(%error, "external identity migration failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             })?;
         state
             .audit
@@ -487,7 +500,7 @@ async fn fetch_bounded_oidc_json<T: serde::de::DeserializeOwned>(
     label: &str,
 ) -> anyhow::Result<T> {
     validate_oidc_endpoint(raw_url, label)?;
-    let response = crate::outbound::public_https_request(reqwest::Method::GET, raw_url)
+    let response = crate::outbound::strict_public_https_request(reqwest::Method::GET, raw_url)
         .await
         .map_err(|e| anyhow::anyhow!("{label} request rejected: {e}"))?
         .header(reqwest::header::ACCEPT, "application/json")
@@ -496,6 +509,13 @@ async fn fetch_bounded_oidc_json<T: serde::de::DeserializeOwned>(
         .map_err(|e| anyhow::anyhow!("{label} request failed: {e}"))?
         .error_for_status()
         .map_err(|e| anyhow::anyhow!("{label} returned an error: {e}"))?;
+    parse_bounded_oidc_response(response, label).await
+}
+
+async fn parse_bounded_oidc_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    label: &str,
+) -> anyhow::Result<T> {
     if response
         .content_length()
         .is_some_and(|length| length > OIDC_METADATA_MAX_BYTES as u64)
@@ -523,13 +543,21 @@ async fn fetch_oidc_discovery(issuer_url: &str) -> anyhow::Result<OidcDiscovery>
     );
     let discovery: OidcDiscovery =
         fetch_bounded_oidc_json(&discovery_url, "OIDC discovery document").await?;
+    validate_oidc_discovery(&discovery, issuer_url)?;
+    Ok(discovery)
+}
+
+fn validate_oidc_discovery(discovery: &OidcDiscovery, issuer_url: &str) -> anyhow::Result<()> {
     if discovery.issuer != issuer_url {
         anyhow::bail!("OIDC discovery issuer does not exactly match the configured issuer");
     }
-    validate_oidc_endpoint(&discovery.authorization_endpoint, "OIDC authorization endpoint")?;
+    validate_oidc_endpoint(
+        &discovery.authorization_endpoint,
+        "OIDC authorization endpoint",
+    )?;
     validate_oidc_endpoint(&discovery.token_endpoint, "OIDC token endpoint")?;
     validate_oidc_endpoint(&discovery.jwks_uri, "OIDC JWKS endpoint")?;
-    Ok(discovery)
+    Ok(())
 }
 
 // ── Initiate SSO Login (protocol-aware: OIDC or SAML) ──
@@ -591,8 +619,8 @@ pub async fn sso_login(
                         .to_string(),
                 ));
             }
-            let base_url = resolve_base_url(&headers)
-                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let base_url =
+                resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
             let acs_url = format!("{base_url}/auth/sso/acs");
             let relay_state = "/";
 
@@ -644,8 +672,8 @@ pub async fn sso_login(
             let csrf_state = random_urlsafe::<32>();
             let nonce = random_urlsafe::<32>();
             let pkce_verifier = random_urlsafe::<32>();
-            let base = resolve_base_url(&headers)
-                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let base =
+                resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
             let redirect_uri = format!("{base}/auth/sso/callback");
             let discovery = fetch_oidc_discovery(&issuer_url).await.map_err(|e| {
                 tracing::warn!(reason = %e, "OIDC discovery rejected");
@@ -654,14 +682,13 @@ pub async fn sso_login(
                     "OIDC provider metadata is unavailable or invalid".to_string(),
                 )
             })?;
-            let mut authorize_url = url::Url::parse(&discovery.authorization_endpoint).map_err(
-                |_| {
+            let mut authorize_url =
+                url::Url::parse(&discovery.authorization_endpoint).map_err(|_| {
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         "OIDC authorization endpoint is invalid".to_string(),
                     )
-                },
-            )?;
+                })?;
             authorize_url
                 .query_pairs_mut()
                 .append_pair("client_id", &client_id)
@@ -825,44 +852,52 @@ async fn sso_callback_inner(
     let base = resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
     let redirect_uri = format!("{base}/auth/sso/callback");
 
-    let token_res = crate::outbound::public_https_request(
+    let token_res = crate::outbound::strict_public_https_request(
         reqwest::Method::POST,
         &discovery.token_endpoint,
     )
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("token endpoint rejected: {e}")))?
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", params.code.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("code_verifier", transaction.pkce_verifier.as_str()),
-        ])
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("token exchange failed: {e}"),
-            )
-        })?;
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("token endpoint rejected: {e}"),
+        )
+    })?
+    .form(&[
+        ("grant_type", "authorization_code"),
+        ("code", params.code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
+        ("code_verifier", transaction.pkce_verifier.as_str()),
+    ])
+    .send()
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("token exchange failed: {e}"),
+        )
+    })?;
 
     if !token_res.status().is_success() {
-        let body = token_res.text().await.unwrap_or_default();
-        tracing::warn!("OIDC token exchange failed: {body}");
+        tracing::warn!(status = %token_res.status(), "OIDC token exchange failed");
         return Err((
             StatusCode::BAD_GATEWAY,
-            format!("IdP token exchange failed: {body}"),
+            "IdP token exchange failed".to_string(),
         ));
     }
 
-    let token_data: OidcTokenResponse = token_res.json().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("invalid token response: {e}"),
-        )
-    })?;
+    let token_data: OidcTokenResponse =
+        parse_bounded_oidc_response(token_res, "OIDC token response")
+            .await
+            .map_err(|error| {
+                tracing::warn!(reason = %error, "OIDC token response rejected");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "invalid token response".to_string(),
+                )
+            })?;
 
     let id_token = token_data.id_token.ok_or_else(|| {
         (
@@ -1185,7 +1220,16 @@ pub async fn save_sso_provider(
     headers: HeaderMap,
     Json(req): Json<SaveSsoProviderRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let caller = require_admin(&state, &headers).await?;
+    let admin_result = require_admin(&state, &headers).await;
+    let setup_session = if admin_result.is_err() {
+        extract_setup_session(&headers).ok()
+    } else {
+        None
+    };
+    if admin_result.is_err() && setup_session.is_none() {
+        return Err(admin_result.unwrap_err());
+    }
+    let is_update = req.id.is_some();
     let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let protocol = req.protocol.as_deref().unwrap_or("oidc");
     if !matches!(protocol, "oidc" | "saml") {
@@ -1195,6 +1239,21 @@ pub async fn save_sso_provider(
         ));
     }
     let enabled = req.enabled.unwrap_or(false);
+    if let Some(session) = &setup_session {
+        let expected_protocol = setup_provider_protocol(&session.provider).ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "invalid setup session provider".to_string(),
+            )
+        })?;
+        if is_update || !enabled || protocol != expected_protocol {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "setup links may only create and enable their assigned SSO provider type"
+                    .to_string(),
+            ));
+        }
+    }
 
     // If updating and no new secret provided, keep the existing one
     let client_secret = match &req.client_secret {
@@ -1269,6 +1328,28 @@ pub async fn save_sso_provider(
                 "OIDC client ID and client secret are required".to_string(),
             ));
         }
+        fetch_oidc_discovery(issuer).await.map_err(|error| {
+            tracing::warn!(reason = %error, "OIDC provider configuration rejected");
+            (
+                StatusCode::BAD_REQUEST,
+                "OIDC discovery metadata or endpoints are invalid".to_string(),
+            )
+        })?;
+    }
+
+    // Do not burn the one-time setup session until the submitted provider has
+    // passed all protocol-specific validation. This lets an administrator fix
+    // an invalid certificate or discovery URL without requesting another link.
+    if let Some(session) = &setup_session {
+        if !consume_sso_key_once(
+            format!("sso-setup-session:{}", session.session_id),
+            session.issued_at + SSO_SETUP_TTL_SECS,
+        ) {
+            return Err((
+                StatusCode::CONFLICT,
+                "setup session was already used".to_string(),
+            ));
+        }
     }
 
     state
@@ -1285,6 +1366,9 @@ pub async fn save_sso_provider(
                 .as_deref()
                 .unwrap_or("openid profile email groups"),
             req.groups_claim.as_deref().unwrap_or("groups"),
+            req.email_claim.as_deref().unwrap_or("email"),
+            req.first_name_claim.as_deref().unwrap_or("given_name"),
+            req.last_name_claim.as_deref().unwrap_or("family_name"),
             req.jit_provisioning.unwrap_or(true),
             req.default_group_id.as_deref().unwrap_or(""),
             req.saml_idp_metadata_url.as_deref().unwrap_or(""),
@@ -1295,49 +1379,72 @@ pub async fn save_sso_provider(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
-    tracing::info!(
-        event = "sso_provider_saved",
-        provider_id = %id,
-        provider_name = %req.name,
-        admin = %caller.1,
-        "SSO provider saved"
-    );
+    tracing::info!(event = "sso_provider_saved", provider_id = %id, "SSO provider saved");
 
     // AUDIT: SSO provider config update. NEVER log client_secret or SAML cert —
     // only non-sensitive config (name/protocol/issuer/enabled).
-    state.audit.log(
-        crate::audit::AuditEvent::new("sso.config_update", "user")
-            .actor(caller.0.clone(), caller.1.clone())
-            .tenant(caller.3.clone())
-            .resource("sso_provider", id.clone())
-            .changes(serde_json::json!({
-                "name": req.name,
-                "protocol": protocol,
-                "enabled": enabled,
-                "issuer_url": req.issuer_url.as_deref().unwrap_or(""),
-                "client_id": req.client_id.as_deref().unwrap_or(""),
-                "client_secret_set": req.client_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
-            }).to_string())
-            .description("sso provider config updated")
-            .context(crate::audit::actor_context_from_headers(&headers)),
-    ).await;
-    // Also emit an explicit enable/disable event reflecting the new state.
-    if let Some(enabled) = req.enabled {
+    let changes = serde_json::json!({
+        "name": req.name,
+        "protocol": protocol,
+        "enabled": enabled,
+        "issuer_url": req.issuer_url.as_deref().unwrap_or(""),
+        "client_id": req.client_id.as_deref().unwrap_or(""),
+        "client_secret_set": req.client_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+    })
+    .to_string();
+    if let Ok(caller) = &admin_result {
         state
             .audit
             .log(
-                crate::audit::AuditEvent::new(
-                    if enabled { "sso.enable" } else { "sso.disable" },
-                    "user",
-                )
-                .actor(caller.0.clone(), caller.1.clone())
-                .tenant(caller.3.clone())
-                .resource("sso_provider", id.clone())
-                .changes(serde_json::json!({ "enabled": enabled }).to_string())
-                .description("sso provider enabled state set")
-                .context(crate::audit::actor_context_from_headers(&headers)),
+                crate::audit::AuditEvent::new("sso.config_update", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("sso_provider", id.clone())
+                    .changes(changes.clone())
+                    .description("sso provider config updated")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
             )
             .await;
+    } else {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.config_update", "anonymous")
+                    .actor_name("SSO setup link")
+                    .tenant("default".to_string())
+                    .resource("sso_provider", id.clone())
+                    .changes(changes.clone())
+                    .description("sso provider created through scoped setup session")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+    }
+    // Also emit an explicit enable/disable event reflecting the new state.
+    if let Some(enabled) = req.enabled {
+        let event = crate::audit::AuditEvent::new(
+            if enabled { "sso.enable" } else { "sso.disable" },
+            if admin_result.is_ok() {
+                "user"
+            } else {
+                "anonymous"
+            },
+        )
+        .tenant(
+            admin_result
+                .as_ref()
+                .map(|caller| caller.3.clone())
+                .unwrap_or_else(|_| "default".to_string()),
+        )
+        .resource("sso_provider", id.clone())
+        .changes(serde_json::json!({ "enabled": enabled }).to_string())
+        .description("sso provider enabled state set")
+        .context(crate::audit::actor_context_from_headers(&headers));
+        let event = if let Ok(caller) = &admin_result {
+            event.actor(caller.0.clone(), caller.1.clone())
+        } else {
+            event.actor_name("SSO setup link")
+        };
+        state.audit.log(event).await;
     }
 
     Ok(Json(serde_json::json!({ "id": id, "ok": true })))
@@ -1644,8 +1751,7 @@ async fn sso_acs_inner(
         )
     })?;
 
-    let base_url = resolve_base_url(&headers)
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let base_url = resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
     let acs_url = format!("{base_url}/auth/sso/acs");
     let assertion = saml::validate_signed_assertion(
         &signed_xml,
@@ -1836,8 +1942,7 @@ pub async fn sso_metadata(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         })?;
 
-    let base_url = resolve_base_url(&headers)
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let base_url = resolve_base_url(&headers).map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
     let acs_url = format!("{base_url}/auth/sso/acs");
 
     let sp_entity_id = match &provider {
@@ -1901,9 +2006,12 @@ pub async fn sso_status(
 #[derive(Deserialize)]
 pub struct CreateSetupTokenRequest {
     pub purpose: Option<String>,
-    pub created_by: Option<String>,
     pub provider: Option<String>,
-    pub hostname: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ExchangeSetupTokenRequest {
+    pub token: String,
 }
 
 /// POST /api/v1/sso/setup-token -- Create a one-time setup link for security teams
@@ -1914,22 +2022,26 @@ pub async fn create_setup_token(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let caller = crate::handlers::users::require_admin(&state, &headers).await?;
     let purpose = req.purpose.as_deref().unwrap_or("sso_setup");
-    let created_by = req.created_by.as_deref().unwrap_or("admin");
     let provider = req.provider.as_deref().unwrap_or("");
-    let hostname = req.hostname.as_deref().unwrap_or("");
+    if purpose != "sso_setup" || setup_provider_protocol(provider).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "unsupported SSO setup link".to_string(),
+        ));
+    }
+    let base = resolve_base_url(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let token = random_urlsafe::<32>();
+    let token_hash =
+        setup_token_hash(&token).map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
 
-    let token = state
+    state
         .config_db
-        .create_setup_token(purpose, created_by, provider, hostname)
+        .create_setup_token(&token_hash, purpose, &caller.0, provider, &base)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
-    let base = if hostname.is_empty() {
-        String::new()
-    } else {
-        hostname.to_string()
-    };
-    let url = format!("{base}/setup/sso?token={token}");
+    // Keep the bearer token in the fragment so browsers do not send it in the
+    // request target, Referer header, reverse-proxy logs, or server access logs.
+    let url = format!("{base}/setup/sso#token={token}");
 
     // The one-time token itself is never written to the audit row. Record only
     // its purpose and non-secret setup metadata so token creation is traceable.
@@ -1944,7 +2056,7 @@ pub async fn create_setup_token(
                     serde_json::json!({
                         "purpose": purpose,
                         "provider": provider,
-                        "hostname_configured": !hostname.is_empty(),
+                        "expires_in_seconds": SSO_SETUP_TTL_SECS,
                     })
                     .to_string(),
                 )
@@ -1956,56 +2068,127 @@ pub async fn create_setup_token(
     Ok(Json(serde_json::json!({ "token": token, "url": url })))
 }
 
-/// GET /api/v1/sso/setup-token/{token}/validate -- Check if a setup token is still valid
-pub async fn validate_setup_token(
+/// POST /api/v1/sso/setup-token/exchange -- consume a URL token and establish
+/// a narrowly scoped HttpOnly setup session.
+pub async fn exchange_setup_token(
     State(state): State<AppState>,
-    axum::extract::Path(token): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (valid, provider) = state
+    headers: HeaderMap,
+    Json(req): Json<ExchangeSetupTokenRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if req.token.len() < 32 || req.token.len() > 256 {
+        return Err((StatusCode::BAD_REQUEST, "invalid setup token".to_string()));
+    }
+    let token_hash =
+        setup_token_hash(&req.token).map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let consumed = state
         .config_db
-        .validate_setup_token(&token, "sso_setup")
+        .consume_setup_token(&token_hash, "sso_setup")
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let (provider, _hostname, created_by) = consumed.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "setup token is invalid or expired".to_string(),
+        )
+    })?;
+    if !consume_sso_key_once(
+        format!("sso-setup-link:{token_hash}"),
+        chrono::Utc::now().timestamp() + SSO_SETUP_TTL_SECS,
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            "setup token was already used".to_string(),
+        ));
+    }
+    let session = SsoSetupSession {
+        version: SSO_TRANSACTION_VERSION,
+        provider: provider.clone(),
+        created_by,
+        session_id: random_urlsafe::<24>(),
+        issued_at: chrono::Utc::now().timestamp(),
+    };
+    let setup_secret =
+        sso_transaction_secret().map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let encoded = encode_setup_session_with_secret(&session, &setup_secret)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let cookie = setup_session_cookie(&encoded, SSO_SETUP_TTL_SECS);
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("sso.setup_token_exchange", "anonymous")
+                .actor_name("SSO setup link")
+                .outcome("success")
+                .changes(serde_json::json!({ "provider": provider }).to_string())
+                .description("SSO setup link exchanged for scoped session")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
-    Ok(Json(
-        serde_json::json!({ "valid": valid, "provider": provider }),
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::SET_COOKIE,
+        cookie.parse().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create setup session".to_string(),
+            )
+        })?,
+    );
+    Ok((
+        response_headers,
+        Json(serde_json::json!({ "valid": true, "provider": provider })),
     ))
 }
 
-/// POST /api/v1/sso/setup-token/{token}/complete -- Mark a setup token as used
-pub async fn complete_setup_token(
+/// GET /api/v1/sso/setup-session -- validate the scoped setup cookie.
+pub async fn validate_setup_session(
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session = extract_setup_session(&headers).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "setup session is invalid or expired".to_string(),
+        )
+    })?;
+
+    Ok(Json(
+        serde_json::json!({ "valid": true, "provider": session.provider }),
+    ))
+}
+
+/// POST /api/v1/sso/setup-session/complete -- end the narrowly scoped setup session.
+pub async fn complete_setup_session(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Path(token): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers).await?;
-    let marked = state
-        .config_db
-        .mark_setup_token_used(&token)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
-    if marked {
-        // Do not log the setup token or any token-derived value.
-        state
-            .audit
-            .log(
-                crate::audit::AuditEvent::new("sso.setup_token_complete", "user")
-                    .actor(caller.0.clone(), caller.1.clone())
-                    .tenant(caller.3.clone())
-                    .resource("sso_setup_token", "one-time")
-                    .changes(serde_json::json!({ "used": true }).to_string())
-                    .description("sso setup token completed")
-                    .context(crate::audit::actor_context_from_headers(&headers)),
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session = extract_setup_session(&headers).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "setup session is invalid or expired".to_string(),
+        )
+    })?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("sso.setup_session_complete", "anonymous")
+                .actor_name("SSO setup link")
+                .outcome("success")
+                .changes(serde_json::json!({ "provider": session.provider }).to_string())
+                .description("SSO setup session completed")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::SET_COOKIE,
+        setup_session_cookie("", 0).parse().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to clear setup session".to_string(),
             )
-            .await;
-        Ok(Json(serde_json::json!({ "ok": true })))
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            "token not found or already used".to_string(),
-        ))
-    }
+        })?,
+    );
+    Ok((response_headers, Json(serde_json::json!({ "ok": true }))))
 }
 
 #[cfg(test)]
@@ -2088,12 +2271,101 @@ mod tests {
         assert!(consume_sso_key_once(key.clone(), expiry));
         assert!(!consume_sso_key_once(key, expiry));
     }
+
+    #[test]
+    fn canonical_base_url_is_an_origin_and_https_in_production() {
+        assert_eq!(
+            normalize_base_url("https://rush.example.com/", true).unwrap(),
+            "https://rush.example.com"
+        );
+        assert!(normalize_base_url("http://rush.example.com", true).is_err());
+        assert!(normalize_base_url("https://rush.example.com/callback", true).is_err());
+        assert!(normalize_base_url("https://user@rush.example.com", true).is_err());
+        assert_eq!(
+            normalize_base_url("http://localhost:5173", false).unwrap(),
+            "http://localhost:5173"
+        );
+    }
+
+    #[test]
+    fn oidc_metadata_requires_exact_issuer_and_secure_endpoints() {
+        let valid = OidcDiscovery {
+            issuer: "https://idp.example.com".to_string(),
+            authorization_endpoint: "https://idp.example.com/oauth/authorize".to_string(),
+            token_endpoint: "https://idp.example.com/oauth/token".to_string(),
+            jwks_uri: "https://keys.example.com/jwks.json".to_string(),
+        };
+        validate_oidc_discovery(&valid, "https://idp.example.com").unwrap();
+        assert!(validate_oidc_discovery(&valid, "https://other.example.com").is_err());
+
+        let mut insecure = valid;
+        insecure.jwks_uri = "http://169.254.169.254/latest/meta-data".to_string();
+        assert!(validate_oidc_discovery(&insecure, "https://idp.example.com").is_err());
+    }
+
+    #[test]
+    fn external_identity_is_namespaced_by_provider_and_issuer() {
+        let first = external_identity_key("provider-a", "https://idp.example.com", "subject-1");
+        assert_ne!(
+            first,
+            external_identity_key("provider-b", "https://idp.example.com", "subject-1")
+        );
+        assert_ne!(
+            first,
+            external_identity_key("provider-a", "https://other.example.com", "subject-1")
+        );
+        assert_eq!(
+            first,
+            external_identity_key("provider-a", "https://idp.example.com", "subject-1")
+        );
+    }
+
+    #[test]
+    fn setup_session_is_signed_and_short_lived() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let session = SsoSetupSession {
+            version: SSO_TRANSACTION_VERSION,
+            provider: "okta".to_string(),
+            created_by: "admin-id".to_string(),
+            session_id: "session-1".to_string(),
+            issued_at: 1_700_000_000,
+        };
+        let encoded = encode_setup_session_with_secret(&session, secret).unwrap();
+        assert_eq!(
+            decode_setup_session_with_secret(&encoded, secret, 1_700_000_100).unwrap(),
+            session
+        );
+        assert!(
+            decode_setup_session_with_secret(
+                &encoded,
+                secret,
+                1_700_000_000 + SSO_SETUP_TTL_SECS + 1,
+            )
+            .is_err()
+        );
+        assert!(
+            decode_setup_session_with_secret(
+                &encoded,
+                b"fedcba9876543210fedcba9876543210",
+                1_700_000_100
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn setup_link_is_bound_to_one_supported_protocol() {
+        assert_eq!(setup_provider_protocol("custom-oidc"), Some("oidc"));
+        assert_eq!(setup_provider_protocol("okta"), Some("saml"));
+        assert_eq!(setup_provider_protocol("attacker-controlled"), None);
+    }
 }
 
 // ── Helpers ──
 
 fn normalize_base_url(raw: &str, production: bool) -> Result<String, String> {
-    let parsed = url::Url::parse(raw).map_err(|_| "RUSH_BASE_URL is not a valid URL".to_string())?;
+    let parsed =
+        url::Url::parse(raw).map_err(|_| "RUSH_BASE_URL is not a valid URL".to_string())?;
     if parsed.host_str().is_none()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
@@ -2101,7 +2373,10 @@ fn normalize_base_url(raw: &str, production: bool) -> Result<String, String> {
         || parsed.fragment().is_some()
         || !matches!(parsed.path(), "" | "/")
     {
-        return Err("RUSH_BASE_URL must be an origin without credentials, path, query, or fragment".to_string());
+        return Err(
+            "RUSH_BASE_URL must be an origin without credentials, path, query, or fragment"
+                .to_string(),
+        );
     }
     if production && parsed.scheme() != "https" {
         return Err("RUSH_BASE_URL must use HTTPS in production".to_string());
@@ -2118,7 +2393,9 @@ fn normalize_base_url(raw: &str, production: bool) -> Result<String, String> {
 pub fn validate_base_url_config() -> Result<(), String> {
     let production = crate::api_key_auth::production_mode();
     match std::env::var("RUSH_BASE_URL") {
-        Ok(value) if !value.trim().is_empty() => normalize_base_url(value.trim(), production).map(|_| ()),
+        Ok(value) if !value.trim().is_empty() => {
+            normalize_base_url(value.trim(), production).map(|_| ())
+        }
         _ if production => Err("RUSH_BASE_URL is required in production".to_string()),
         _ => Ok(()),
     }

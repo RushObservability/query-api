@@ -2,8 +2,12 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clickhouse::Client;
 use dashmap::DashMap;
+use openssl::symm::Cipher;
+use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 /// (user_id, username, display_name, tenant_id, role) — the require_auth tuple.
@@ -56,6 +60,73 @@ fn normalize_slo_incident_events(
     }
 
     normalized.into_iter().rev().take(limit).collect()
+}
+
+#[cfg(test)]
+mod auth_storage_tests {
+    use super::*;
+
+    #[test]
+    fn session_storage_uses_a_one_way_key_not_the_bearer_value() {
+        let raw = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let stored = session_storage_key(raw);
+        assert!(stored.starts_with("sha256:"));
+        assert_eq!(stored, session_storage_key(raw));
+        assert_ne!(stored, raw);
+        assert!(!stored.contains(raw));
+    }
+
+    #[test]
+    fn sso_secret_encryption_round_trips_and_uses_random_nonces() {
+        let key = config_encryption_key_from_secret(
+            "0123456789abcdef0123456789abcdef-extra-key-material",
+        )
+        .unwrap();
+        let first = encrypt_sso_secret_with_key("client-secret", &key).unwrap();
+        let second = encrypt_sso_secret_with_key("client-secret", &key).unwrap();
+        assert!(first.starts_with(ENCRYPTED_SECRET_PREFIX));
+        assert_ne!(first, second);
+        assert_eq!(
+            decrypt_sso_secret_with_key(&first, &key).unwrap(),
+            "client-secret"
+        );
+    }
+
+    #[test]
+    fn sso_secret_envelope_rejects_tampering_and_wrong_keys() {
+        let key = config_encryption_key_from_secret(
+            "0123456789abcdef0123456789abcdef-extra-key-material",
+        )
+        .unwrap();
+        let wrong_key = config_encryption_key_from_secret(
+            "fedcba9876543210fedcba9876543210-extra-key-material",
+        )
+        .unwrap();
+        let encrypted = encrypt_sso_secret_with_key("client-secret", &key).unwrap();
+        let mut tampered = encrypted.clone().into_bytes();
+        let tag_start = encrypted.rfind('.').unwrap() + 1;
+        tampered[tag_start] = if tampered[tag_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let tampered = String::from_utf8(tampered).unwrap();
+
+        assert!(decrypt_sso_secret_with_key(&tampered, &key).is_err());
+        assert!(decrypt_sso_secret_with_key(&encrypted, &wrong_key).is_err());
+    }
+
+    #[test]
+    fn legacy_plaintext_secret_is_read_only_for_startup_migration() {
+        let key = config_encryption_key_from_secret(
+            "0123456789abcdef0123456789abcdef-extra-key-material",
+        )
+        .unwrap();
+        assert_eq!(
+            decrypt_sso_secret_with_key("legacy-secret", &key).unwrap(),
+            "legacy-secret"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -133,6 +204,104 @@ fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+const ENCRYPTED_SECRET_PREFIX: &str = "enc:v1:";
+const CONFIG_ENCRYPTION_CONTEXT: &[u8] = b"rush-config-encryption-v1\0";
+const SSO_SECRET_AAD: &[u8] = b"rush-sso-client-secret-v1";
+
+fn session_storage_key(token: &str) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())))
+}
+
+fn config_encryption_key_from_secret(secret: &str) -> anyhow::Result<[u8; 32]> {
+    if secret.len() < 32 {
+        anyhow::bail!("RUSH_CONFIG_ENCRYPTION_KEY must contain at least 32 bytes");
+    }
+    let mut digest = Sha256::new();
+    digest.update(CONFIG_ENCRYPTION_CONTEXT);
+    digest.update(secret.as_bytes());
+    Ok(digest.finalize().into())
+}
+
+fn config_encryption_key() -> anyhow::Result<[u8; 32]> {
+    let secret = std::env::var("RUSH_CONFIG_ENCRYPTION_KEY").map_err(|_| {
+        anyhow::anyhow!(
+            "RUSH_CONFIG_ENCRYPTION_KEY is required to store or read SSO client secrets"
+        )
+    })?;
+    config_encryption_key_from_secret(&secret)
+}
+
+fn encrypt_sso_secret_with_key(plaintext: &str, key: &[u8; 32]) -> anyhow::Result<String> {
+    if plaintext.is_empty() {
+        return Ok(String::new());
+    }
+    let nonce: [u8; 12] = rand::rng().random();
+    let mut tag = [0u8; 16];
+    let ciphertext = openssl::symm::encrypt_aead(
+        Cipher::aes_256_gcm(),
+        key,
+        Some(&nonce),
+        SSO_SECRET_AAD,
+        plaintext.as_bytes(),
+        &mut tag,
+    )?;
+    Ok(format!(
+        "{ENCRYPTED_SECRET_PREFIX}{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(nonce),
+        URL_SAFE_NO_PAD.encode(ciphertext),
+        URL_SAFE_NO_PAD.encode(tag)
+    ))
+}
+
+fn encrypt_sso_secret(plaintext: &str) -> anyhow::Result<String> {
+    if plaintext.is_empty() {
+        return Ok(String::new());
+    }
+    encrypt_sso_secret_with_key(plaintext, &config_encryption_key()?)
+}
+
+fn decrypt_sso_secret_with_key(stored: &str, key: &[u8; 32]) -> anyhow::Result<String> {
+    if stored.is_empty() || !stored.starts_with(ENCRYPTED_SECRET_PREFIX) {
+        return Ok(stored.to_string());
+    }
+    let encoded = stored
+        .strip_prefix(ENCRYPTED_SECRET_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+    let mut parts = encoded.split('.');
+    let nonce = parts
+        .next()
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+    let ciphertext = parts
+        .next()
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+    let tag = parts
+        .next()
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+    if parts.next().is_some() || nonce.len() != 12 || tag.len() != 16 {
+        anyhow::bail!("invalid encrypted SSO secret");
+    }
+    let plaintext = openssl::symm::decrypt_aead(
+        Cipher::aes_256_gcm(),
+        key,
+        Some(&nonce),
+        SSO_SECRET_AAD,
+        &ciphertext,
+        &tag,
+    )
+    .map_err(|_| anyhow::anyhow!("SSO client secret could not be decrypted"))?;
+    String::from_utf8(plaintext).map_err(|_| anyhow::anyhow!("SSO client secret is invalid UTF-8"))
+}
+
+fn decrypt_sso_secret(stored: &str) -> anyhow::Result<String> {
+    if stored.is_empty() || !stored.starts_with(ENCRYPTED_SECRET_PREFIX) {
+        return Ok(stored.to_string());
+    }
+    decrypt_sso_secret_with_key(stored, &config_encryption_key()?)
 }
 
 // ── Module-level row types used by helper methods ─────────────────────────────
@@ -285,10 +454,6 @@ pub struct MonitorRow {
 
 pub struct ConfigDb {
     pub client: Client,
-    /// Session token → cached auth tuple. Purged on logout and any user/group
-    /// mutation; otherwise expires after CONFIG_CACHE_TTL. This is the hottest
-    /// lookup in the service (every UI request).
-    session_cache: DashMap<String, (SessionUser, Instant)>,
     /// Tenant name-or-id → flags. Negative results are cached too so unknown
     /// tenants on the ingest path don't hammer ClickHouse.
     tenant_cache: DashMap<String, (TenantFlags, Instant)>,
@@ -369,7 +534,6 @@ impl ConfigDb {
             .with_password(password);
         let db = Self {
             client,
-            session_cache: DashMap::new(),
             tenant_cache: DashMap::new(),
             ingest_auth_cache: DashMap::new(),
             perms_cache: DashMap::new(),
@@ -383,7 +547,6 @@ impl ConfigDb {
     /// coarse but cheap (the caches rebuild on next request), and it guarantees
     /// permission changes made through this process take effect immediately.
     fn invalidate_config_caches(&self) {
-        self.session_cache.clear();
         self.tenant_cache.clear();
         self.ingest_auth_cache.clear();
         self.perms_cache.clear();
@@ -455,6 +618,17 @@ impl ConfigDb {
             ) ENGINE = MergeTree()
             ORDER BY (token)
             TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
+            // Shared login-attempt ledger. Identifiers are keyed hashes, never
+            // raw usernames or addresses, and expire after one day. The auth
+            // handler combines this cross-replica view with an atomic local
+            // limiter to close same-process concurrency races.
+            "CREATE TABLE IF NOT EXISTS config_login_attempts (
+                attempted_at String,
+                ip_hash      String,
+                account_hash String
+            ) ENGINE = MergeTree()
+            ORDER BY (account_hash, attempted_at, ip_hash)
+            TTL parseDateTimeBestEffort(attempted_at) + INTERVAL 1 DAY",
             // ── Group tenants ─────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_group_tenants (
                 group_id  String,
@@ -1878,9 +2052,10 @@ impl ConfigDb {
         let expires_at = (chrono::Utc::now() + chrono::Duration::hours(24))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
+        let stored_token = session_storage_key(&token);
         self.client
             .query("INSERT INTO config_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
-            .bind(&token)
+            .bind(&stored_token)
             .bind(user_id)
             .bind(&created_at)
             .bind(&expires_at)
@@ -1893,14 +2068,10 @@ impl ConfigDb {
         &self,
         token: &str,
     ) -> Option<(String, String, String, String, String)> {
-        // Hot path: every session-authenticated request lands here (middleware
-        // plus most handlers). Serve from cache when fresh.
-        if let Some(entry) = self.session_cache.get(token) {
-            let (user, at) = entry.value();
-            if Self::cache_fresh(*at) {
-                return Some(user.clone());
-            }
-        }
+        let stored_token = session_storage_key(token);
+        // Session authorization is deliberately not cached. Password changes,
+        // user disables, and logout must become visible to every API replica
+        // without a per-process cache grace period.
         #[derive(clickhouse::Row, serde::Deserialize)]
         #[allow(dead_code)]
         struct Row {
@@ -1912,35 +2083,88 @@ impl ConfigDb {
             user_id: String,
         }
         let now = Self::now_str();
-        let result = self.client
-            .query("SELECT u.id, u.username, u.display_name, u.tenant_id, s.expires_at, s.user_id FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? LIMIT 1")
-            .bind(token)
+        let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id, s.expires_at, s.user_id FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? LIMIT 1";
+        let result = self
+            .client
+            .query(sql)
+            .bind(&stored_token)
             .bind(&now)
             .fetch_one::<Row>()
             .await;
-        let row = result.ok()?;
+        let row = match result {
+            Ok(row) => row,
+            Err(clickhouse::error::Error::RowNotFound) => {
+                // Rolling-upgrade compatibility: only send the raw bearer to
+                // ClickHouse after its hashed lookup misses. Legacy rows expire
+                // under their original 24-hour TTL and are never recreated.
+                self.client
+                    .query(sql)
+                    .bind(token)
+                    .bind(&now)
+                    .fetch_one::<Row>()
+                    .await
+                    .ok()?
+            }
+            Err(_) => return None,
+        };
         let role = self
             .derive_user_role(&row.id)
             .await
             .unwrap_or_else(|_| "viewer".to_string());
         let user: SessionUser = (row.id, row.username, row.display_name, row.tenant_id, role);
-        self.session_cache
-            .insert(token.to_string(), (user.clone(), Instant::now()));
         Some(user)
     }
 
     pub async fn delete_session(&self, token: &str) {
-        // Purge the auth cache first so logout takes effect immediately even if
-        // the storage delete lags.
-        self.session_cache.remove(token);
+        let stored_token = session_storage_key(token);
         // Lightweight DELETE instead of a heavyweight ALTER ... DELETE mutation:
         // marks rows via a mask column instead of rewriting parts.
         let _ = self
             .client
-            .query("DELETE FROM config_sessions WHERE token = ?")
+            .query("DELETE FROM config_sessions WHERE token = ? OR token = ?")
+            .bind(&stored_token)
             .bind(token)
             .execute()
             .await;
+    }
+
+    pub async fn record_login_attempt(
+        &self,
+        ip_hash: &str,
+        account_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .query("INSERT INTO config_login_attempts (attempted_at, ip_hash, account_hash) VALUES (?, ?, ?)")
+            .bind(Self::now_str())
+            .bind(ip_hash)
+            .bind(account_hash)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn login_attempt_counts(
+        &self,
+        ip_hash: &str,
+        account_hash: &str,
+        since: &str,
+    ) -> anyhow::Result<(u64, u64)> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Counts {
+            ip_attempts: u64,
+            account_attempts: u64,
+        }
+        let counts = self
+            .client
+            .query("SELECT countIf(ip_hash = ?) AS ip_attempts, countIf(account_hash = ?) AS account_attempts FROM config_login_attempts WHERE attempted_at >= ? AND (ip_hash = ? OR account_hash = ?)")
+            .bind(ip_hash)
+            .bind(account_hash)
+            .bind(since)
+            .bind(ip_hash)
+            .bind(account_hash)
+            .fetch_one::<Counts>()
+            .await?;
+        Ok((counts.ip_attempts, counts.account_attempts))
     }
 
     pub async fn list_users(
@@ -2079,12 +2303,13 @@ impl ConfigDb {
             .bind(ver)
             .execute()
             .await?;
+        self.delete_sessions_for_user(user_id).await?;
         Ok(true)
     }
 
     pub async fn delete_sessions_for_user(&self, user_id: &str) -> anyhow::Result<()> {
         self.client
-            .query("ALTER TABLE config_sessions DELETE WHERE user_id = ?")
+            .query("DELETE FROM config_sessions WHERE user_id = ?")
             .bind(user_id)
             .execute()
             .await?;
@@ -2579,27 +2804,30 @@ impl ConfigDb {
             None => self.client.query(sql).fetch_one::<Row>().await,
         };
         match result {
-            Ok(r) => Ok(Some((
-                r.id,
-                r.name,
-                r.protocol,
-                r.enabled != 0,
-                r.client_id,
-                r.client_secret,
-                r.issuer_url,
-                r.oidc_scopes,
-                r.groups_claim,
-                r.email_claim,
-                r.first_name_claim,
-                r.last_name_claim,
-                r.jit_provisioning != 0,
-                r.default_group_id,
-                r.created_at,
-                r.saml_idp_metadata_url,
-                r.saml_idp_sso_url,
-                r.saml_idp_cert,
-                r.saml_sp_entity_id,
-            ))),
+            Ok(r) => {
+                let client_secret = decrypt_sso_secret(&r.client_secret)?;
+                Ok(Some((
+                    r.id,
+                    r.name,
+                    r.protocol,
+                    r.enabled != 0,
+                    r.client_id,
+                    client_secret,
+                    r.issuer_url,
+                    r.oidc_scopes,
+                    r.groups_claim,
+                    r.email_claim,
+                    r.first_name_claim,
+                    r.last_name_claim,
+                    r.jit_provisioning != 0,
+                    r.default_group_id,
+                    r.created_at,
+                    r.saml_idp_metadata_url,
+                    r.saml_idp_sso_url,
+                    r.saml_idp_cert,
+                    r.saml_sp_entity_id,
+                )))
+            }
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -2639,16 +2867,16 @@ impl ConfigDb {
             .query("SELECT id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE is_deleted = 0 ORDER BY created_at ASC")
             .fetch_all::<Row>()
             .await?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|r| {
-                (
+                let client_secret = decrypt_sso_secret(&r.client_secret)?;
+                Ok((
                     r.id,
                     r.name,
                     r.protocol,
                     r.enabled != 0,
                     r.client_id,
-                    r.client_secret,
+                    client_secret,
                     r.issuer_url,
                     r.oidc_scopes,
                     r.groups_claim,
@@ -2662,9 +2890,9 @@ impl ConfigDb {
                     r.saml_idp_sso_url,
                     r.saml_idp_cert,
                     r.saml_sp_entity_id,
-                )
+                ))
             })
-            .collect())
+            .collect()
     }
 
     pub async fn get_enabled_sso_provider(&self) -> anyhow::Result<Option<SsoProviderRow>> {
@@ -2672,6 +2900,70 @@ impl ConfigDb {
             "SELECT id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, created_at, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id FROM config_sso_providers FINAL WHERE enabled = 1 AND is_deleted = 0 LIMIT 1",
             None,
         ).await
+    }
+
+    /// Validate the configured encryption key against stored envelopes and
+    /// return providers that still need the plaintext-to-envelope migration.
+    pub async fn legacy_sso_client_secret_ids(&self) -> anyhow::Result<Vec<String>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct SecretRow {
+            id: String,
+            client_secret: String,
+        }
+        let stored = self
+            .client
+            .query("SELECT id, client_secret FROM config_sso_providers FINAL WHERE is_deleted = 0 AND client_secret != ''")
+            .fetch_all::<SecretRow>()
+            .await?;
+        if stored.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Validate the configured key and every existing encrypted envelope
+        // before rewriting any row. A missing, rotated, or malformed key must
+        // fail startup instead of silently making SSO unusable later.
+        let key = config_encryption_key()?;
+        let mut legacy = Vec::new();
+        for row in stored {
+            if row.client_secret.starts_with(ENCRYPTED_SECRET_PREFIX) {
+                decrypt_sso_secret_with_key(&row.client_secret, &key)?;
+            } else {
+                legacy.push(row.id);
+            }
+        }
+        Ok(legacy)
+    }
+
+    /// Encrypt exactly one legacy provider. Startup calls this one row at a
+    /// time and immediately appends the mandatory audit event afterward.
+    pub async fn encrypt_legacy_sso_client_secret(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(provider) = self.get_sso_provider(provider_id).await? else {
+            return Ok(false);
+        };
+        self.upsert_sso_provider(
+            &provider.0,
+            &provider.1,
+            &provider.2,
+            provider.3,
+            &provider.4,
+            &provider.5,
+            &provider.6,
+            &provider.7,
+            &provider.8,
+            &provider.9,
+            &provider.10,
+            &provider.11,
+            provider.12,
+            &provider.13,
+            &provider.15,
+            &provider.16,
+            &provider.17,
+            &provider.18,
+        )
+        .await?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2686,6 +2978,9 @@ impl ConfigDb {
         issuer_url: &str,
         oidc_scopes: &str,
         groups_claim: &str,
+        email_claim: &str,
+        first_name_claim: &str,
+        last_name_claim: &str,
         jit_provisioning: bool,
         default_group_id: &str,
         saml_idp_metadata_url: &str,
@@ -2695,12 +2990,14 @@ impl ConfigDb {
     ) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
+        let encrypted_client_secret = encrypt_sso_secret(client_secret)?;
         self.client
-            .query("INSERT INTO config_sso_providers (id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'email', 'given_name', 'family_name', ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_sso_providers (id, name, protocol, enabled, client_id, client_secret, issuer_url, oidc_scopes, groups_claim, email_claim, first_name_claim, last_name_claim, jit_provisioning, default_group_id, saml_idp_metadata_url, saml_idp_sso_url, saml_idp_cert, saml_sp_entity_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(protocol)
             .bind(if enabled { 1u8 } else { 0u8 })
-            .bind(client_id).bind(client_secret).bind(issuer_url)
+            .bind(client_id).bind(&encrypted_client_secret).bind(issuer_url)
             .bind(oidc_scopes).bind(groups_claim)
+            .bind(email_claim).bind(first_name_claim).bind(last_name_claim)
             .bind(if jit_provisioning { 1u8 } else { 0u8 })
             .bind(default_group_id)
             .bind(saml_idp_metadata_url).bind(saml_idp_sso_url)

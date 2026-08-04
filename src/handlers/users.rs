@@ -337,6 +337,7 @@ pub async fn change_password(
                 .actor(caller.0.clone(), caller.1.clone())
                 .tenant(caller.3.clone())
                 .resource("user", id.clone())
+                .changes(serde_json::json!({ "sessions_revoked": true }).to_string())
                 .description(if caller.4 == "admin" && caller.0 != id {
                     "password reset by admin"
                 } else {

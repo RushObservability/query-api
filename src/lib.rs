@@ -211,8 +211,13 @@ pub struct AppState {
     pub usage: UsageTracker,
     pub usage_accumulator: UsageAccumulator,
     pub config: RushConfig,
-    /// Per-IP login attempt counter for rate limiting: (attempts, window_start).
+    /// Per-axis login attempt counter for rate limiting: (attempts, window_start).
+    /// Keys contain only keyed hashes, never raw usernames or client addresses.
     pub login_limiter: Arc<DashMap<String, (u32, Instant)>>,
+    pub login_account_limit_per_minute: u32,
+    pub login_ip_limit_per_minute: u32,
+    /// Only direct peers in these networks may supply client forwarding headers.
+    pub trusted_proxy_cidrs: Arc<Vec<String>>,
     /// API key resolution cache: key_hash → (tenant_id, cached_at). TTL 60s.
     pub api_key_cache: Arc<DashMap<String, (clickhouse_config::ApiKeyGrant, Instant)>>,
     /// Per ingest-key fixed-window request limiter: key id -> (count, window start).

@@ -1175,6 +1175,24 @@ async fn main() -> anyhow::Result<()> {
     // Build the audit chain before bootstrap tenant mutation so a newly seeded
     // default tenant is recorded like every other tenant creation.
     let audit = std::sync::Arc::new(rush_api::audit::AuditLogger::new(admin_ch.clone()).await);
+    for provider_id in config_db.legacy_sso_client_secret_ids().await? {
+        if !config_db
+            .encrypt_legacy_sso_client_secret(&provider_id)
+            .await?
+        {
+            continue;
+        }
+        audit
+            .log(
+                rush_api::audit::AuditEvent::new("sso.client_secret_encrypt", "system")
+                    .tenant("default")
+                    .resource("sso_provider", provider_id)
+                    .outcome("success")
+                    .changes(serde_json::json!({ "encrypted": true }).to_string())
+                    .description("legacy SSO client secret encrypted during startup"),
+            )
+            .await;
+    }
     let default_tenant_created = config_db.ensure_default_tenant().await?;
     if default_tenant_created {
         let auth_required = rush_api::api_key_auth::default_tenant_auth_required(
@@ -1509,6 +1527,18 @@ async fn main() -> anyhow::Result<()> {
     let usage_accumulator = UsageAccumulator::with_metrics(self_metrics.clone());
     usage_accumulator.spawn_flusher(admin_ch.clone());
 
+    handlers::auth::validate_login_rate_limit_secret()
+        .map_err(|error| anyhow::anyhow!("invalid login rate-limit configuration: {error}"))?;
+    let login_account_limit_per_minute =
+        handlers::auth::login_limit_from_env("RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE", 10)
+            .map_err(|error| anyhow::anyhow!("invalid login rate-limit configuration: {error}"))?;
+    let login_ip_limit_per_minute =
+        handlers::auth::login_limit_from_env("RUSH_LOGIN_IP_LIMIT_PER_MINUTE", 50)
+            .map_err(|error| anyhow::anyhow!("invalid login rate-limit configuration: {error}"))?;
+    let trusted_proxy_cidrs = std::sync::Arc::new(
+        handlers::auth::trusted_proxy_cidrs_from_env()
+            .map_err(|error| anyhow::anyhow!("invalid trusted-proxy configuration: {error}"))?,
+    );
     let login_limiter: std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant)>> =
         std::sync::Arc::new(dashmap::DashMap::new());
 
@@ -1600,6 +1630,9 @@ async fn main() -> anyhow::Result<()> {
         usage_accumulator,
         config: wide_config,
         login_limiter,
+        login_account_limit_per_minute,
+        login_ip_limit_per_minute,
+        trusted_proxy_cidrs,
         api_key_cache,
         ingest_key_limiter,
         audit,
@@ -2143,12 +2176,16 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::sso::create_setup_token),
         )
         .route(
-            "/api/v1/sso/setup-token/{token}/validate",
-            get(handlers::sso::validate_setup_token),
+            "/api/v1/sso/setup-token/exchange",
+            post(handlers::sso::exchange_setup_token),
         )
         .route(
-            "/api/v1/sso/setup-token/{token}/complete",
-            post(handlers::sso::complete_setup_token),
+            "/api/v1/sso/setup-session",
+            get(handlers::sso::validate_setup_session),
+        )
+        .route(
+            "/api/v1/sso/setup-session/complete",
+            post(handlers::sso::complete_setup_session),
         )
         // Auth
         .route("/api/v1/auth/login", post(handlers::auth::login))
