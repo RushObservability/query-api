@@ -9,6 +9,9 @@ on:
       - "deny.toml"
       - "rust-toolchain.toml"
       - "Dockerfile"
+      - "Dockerfile.agent"
+      - "docker-compose.yml"
+      - "scripts/check-container-policy.sh"
       - ".github/workflows/**"
   push:
     branches:
@@ -20,6 +23,9 @@ on:
       - "deny.toml"
       - "rust-toolchain.toml"
       - "Dockerfile"
+      - "Dockerfile.agent"
+      - "docker-compose.yml"
+      - "scripts/check-container-policy.sh"
       - ".github/workflows/**"
   schedule:
     - cron: "17 9 * * 1"
@@ -62,6 +68,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Enforce container deployment policy
+        run: bash scripts/check-container-policy.sh
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious

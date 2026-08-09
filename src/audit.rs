@@ -11,18 +11,27 @@
 //! [`AuditLogger`]-side verification (see `verify` in `handlers::audit`).
 //!
 //! Writes are **serialized** through a single async mutex so `seq` and the
-//! chain link are assigned atomically. The volume is low (security-relevant
-//! events, not telemetry), so serialization is acceptable. Writes are also
-//! **non-blocking on failure**: a DB error is logged and swallowed so a failed
-//! audit write can never fail the caller's underlying operation.
+//! chain link are assigned atomically. Before delivery, every row is fsynced to
+//! a local ordered outbox. ClickHouse outages therefore retain events for later
+//! replay while readiness and metrics expose the degraded state.
 
 use clickhouse::Client;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use axum::http::HeaderMap;
+
+use crate::self_metrics::SelfMetrics;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -36,14 +45,33 @@ pub const AUDIT_TENANT: &str = "_audit";
 struct ChainState {
     last_seq: u64,
     last_hash: String,
+    key_id: String,
+    segment_id: String,
 }
 
 /// Serialized, hash-chaining audit writer. Construct once at startup and share
 /// via `Arc` (it lives on `AppState`).
 pub struct AuditLogger {
     ch: Client,
-    secret: Vec<u8>,
+    current_key_id: String,
+    keys: HashMap<String, Vec<u8>>,
+    spool_dir: PathBuf,
+    spool_max_bytes: u64,
+    degraded: AtomicBool,
+    pending_events: AtomicU64,
+    pending_bytes: AtomicU64,
+    write_failures: AtomicU64,
+    metrics: Arc<SelfMetrics>,
     state: Mutex<ChainState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AuditHealth {
+    pub ready: bool,
+    pub pending_events: u64,
+    pub pending_bytes: u64,
+    pub max_bytes: u64,
+    pub write_failures: u64,
 }
 
 /// One audit event to record. All fields are `String`; use `Default` +
@@ -153,6 +181,10 @@ pub struct AuditRow {
     pub changes: String,
     pub description: String,
     pub metadata: String,
+    /// Selects the HMAC verification key without exposing key material.
+    pub key_id: String,
+    /// Stable for one signing-key segment; changes on planned key rotation.
+    pub segment_id: String,
     pub prev_hash: String,
     pub hash: String,
 }
@@ -211,6 +243,13 @@ fn canonical(row: &AuditRow) -> String {
     out.push_str(&format!("changes={}\n", esc(&row.changes)));
     out.push_str(&format!("description={}\n", esc(&row.description)));
     out.push_str(&format!("metadata={}", esc(&row.metadata)));
+    // Rows written before QAPI-SEC-11 have empty key/segment columns after the
+    // additive schema migration. Preserve their original canonical format so
+    // verification remains valid. New segments bind both identifiers.
+    if !row.key_id.is_empty() || !row.segment_id.is_empty() {
+        out.push_str(&format!("\nkey_id={}", esc(&row.key_id)));
+        out.push_str(&format!("\nsegment_id={}", esc(&row.segment_id)));
+    }
     out
 }
 
@@ -222,61 +261,313 @@ pub fn compute_hash(secret: &[u8], row: &AuditRow) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-impl AuditLogger {
-    /// Build the logger: read the HMAC secret from `RUSH_AUDIT_HMAC_SECRET`
-    /// (warns once if empty/short, mirroring `hash_api_key`) and load the chain
-    /// tail (`last_seq`, `last_hash`) from the table so a restart continues the
-    /// same chain.
-    pub async fn new(ch: Client) -> Self {
-        let secret = std::env::var("RUSH_AUDIT_HMAC_SECRET").unwrap_or_default();
-        if secret.len() < 32 {
-            // An empty/short secret makes the HMAC chain forgeable by anyone who
-            // can guess the (empty) key. Warn once — this is a startup path so a
-            // single warning suffices.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    "RUSH_AUDIT_HMAC_SECRET is not set or shorter than 32 bytes; \
-                     the audit hash chain is not tamper-evident — set a strong random \
-                     secret in production"
-                );
-            });
-        }
+fn is_production_environment(value: Option<&str>) -> bool {
+    !matches!(
+        value
+            .map(|item| item.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("development" | "dev" | "local" | "test")
+    )
+}
 
-        let (last_seq, last_hash) = Self::load_chain_tail(&ch).await;
+fn validate_current_secret(secret: &str, production: bool) -> anyhow::Result<()> {
+    if secret.len() < 32 && production {
+        anyhow::bail!("RUSH_AUDIT_HMAC_SECRET must contain at least 32 bytes in production");
+    }
+    Ok(())
+}
 
-        AuditLogger {
-            ch,
-            secret: secret.into_bytes(),
-            state: Mutex::new(ChainState {
-                last_seq,
-                last_hash,
-            }),
-        }
+fn valid_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn load_key_config() -> anyhow::Result<(String, HashMap<String, Vec<u8>>)> {
+    let environment = std::env::var("RUSH_ENVIRONMENT").ok();
+    let production = is_production_environment(environment.as_deref());
+    let current_key_id =
+        std::env::var("RUSH_AUDIT_HMAC_KEY_ID").unwrap_or_else(|_| "primary".to_string());
+    if !valid_key_id(&current_key_id) || current_key_id == "legacy" {
+        anyhow::bail!(
+            "RUSH_AUDIT_HMAC_KEY_ID must be 1-64 ASCII letters, digits, '.', '_' or '-' and may not be 'legacy'"
+        );
     }
 
-    /// Load the highest `seq` and its `hash` from the table. Returns `(0, "")`
-    /// when the table is empty (fresh chain) or on any read error (so startup
-    /// never blocks on a transient CH issue — the chain simply restarts from 0,
-    /// which verification will treat as a new segment).
-    async fn load_chain_tail(ch: &Client) -> (u64, String) {
+    let current_secret = std::env::var("RUSH_AUDIT_HMAC_SECRET").unwrap_or_default();
+    validate_current_secret(&current_secret, production)?;
+    if current_secret.len() < 32 {
+        tracing::warn!(
+            "RUSH_AUDIT_HMAC_SECRET is absent or weak; audit integrity is development-only"
+        );
+    }
+
+    let mut keys: HashMap<String, Vec<u8>> = match std::env::var("RUSH_AUDIT_HMAC_PREVIOUS_KEYS") {
+        Ok(value) if !value.trim().is_empty() => {
+            let parsed: HashMap<String, String> = serde_json::from_str(&value).map_err(|_| {
+                anyhow::anyhow!(
+                    "RUSH_AUDIT_HMAC_PREVIOUS_KEYS must be a JSON object of key-id to secret"
+                )
+            })?;
+            let mut result = HashMap::new();
+            for (key_id, secret) in parsed {
+                if !valid_key_id(&key_id) {
+                    anyhow::bail!("invalid previous audit HMAC key id '{key_id}'");
+                }
+                if secret.len() < 32 {
+                    anyhow::bail!("previous audit HMAC key '{key_id}' is shorter than 32 bytes");
+                }
+                result.insert(key_id, secret.into_bytes());
+            }
+            result
+        }
+        _ => HashMap::new(),
+    };
+    if keys.contains_key(&current_key_id) {
+        anyhow::bail!("current audit key id must not also appear in previous keys");
+    }
+    keys.insert(current_key_id.clone(), current_secret.into_bytes());
+    Ok((current_key_id, keys))
+}
+
+fn key_for_id<'a>(
+    keys: &'a HashMap<String, Vec<u8>>,
+    current_key_id: &str,
+    row_key_id: &str,
+) -> Option<&'a [u8]> {
+    if row_key_id.is_empty() {
+        keys.get("legacy")
+            .or_else(|| keys.get(current_key_id))
+            .map(Vec::as_slice)
+    } else {
+        keys.get(row_key_id).map(Vec::as_slice)
+    }
+}
+
+fn create_private_directory(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn pending_files(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let candidate = entry.path();
+        if candidate.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            files.push(candidate);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn read_spool_row(path: &Path) -> anyhow::Result<(AuditRow, u64)> {
+    let payload = fs::read(path)?;
+    let row = serde_json::from_slice::<AuditRow>(&payload).map_err(|error| {
+        anyhow::anyhow!("invalid audit outbox file {}: {error}", path.display())
+    })?;
+    Ok((row, payload.len() as u64))
+}
+
+fn spool_usage(path: &Path) -> anyhow::Result<(u64, u64)> {
+    let files = pending_files(path)?;
+    let mut bytes = 0_u64;
+    for file in &files {
+        bytes = bytes.saturating_add(fs::metadata(file)?.len());
+    }
+    Ok((files.len() as u64, bytes))
+}
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+impl AuditLogger {
+    /// Build the logger and recover its ordered durable outbox. A real empty
+    /// table is a fresh chain; every other tail-read error fails startup so the
+    /// process can never silently create a second sequence-zero chain.
+    pub async fn new(ch: Client, metrics: Arc<SelfMetrics>) -> anyhow::Result<Self> {
+        let (current_key_id, keys) = load_key_config()?;
+        let spool_dir = PathBuf::from(
+            std::env::var("RUSH_AUDIT_SPOOL_DIR")
+                .unwrap_or_else(|_| "./data/audit-spool".to_string()),
+        );
+        let spool_max_bytes = std::env::var("RUSH_AUDIT_SPOOL_MAX_BYTES")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("RUSH_AUDIT_SPOOL_MAX_BYTES must be an integer"))?
+            .unwrap_or(256 * 1024 * 1024);
+        if spool_max_bytes < 1024 * 1024 {
+            anyhow::bail!("RUSH_AUDIT_SPOOL_MAX_BYTES must be at least 1048576");
+        }
+        create_private_directory(&spool_dir)?;
+
+        let tail = Self::load_chain_tail(&ch).await?;
+        let required_key_ids = Self::load_required_key_ids(&ch).await?;
+        for key_id in &required_key_ids {
+            if key_for_id(&keys, &current_key_id, key_id).is_none() {
+                anyhow::bail!(
+                    "audit verification key '{}' is unavailable; add it to RUSH_AUDIT_HMAC_PREVIOUS_KEYS before rotating keys",
+                    if key_id.is_empty() { "legacy" } else { &key_id }
+                );
+            }
+        }
+        Self::validate_configured_keys(&ch, &keys, &current_key_id, &required_key_ids).await?;
+
+        let (pending_events, pending_bytes) = spool_usage(&spool_dir)?;
+        let logger = AuditLogger {
+            ch,
+            current_key_id,
+            keys,
+            spool_dir,
+            spool_max_bytes,
+            degraded: AtomicBool::new(pending_events > 0),
+            pending_events: AtomicU64::new(pending_events),
+            pending_bytes: AtomicU64::new(pending_bytes),
+            write_failures: AtomicU64::new(0),
+            metrics,
+            state: Mutex::new(tail),
+        };
+        logger.publish_metrics();
+        logger.recover_spool().await?;
+        if let Err(error) = logger.retry_pending().await {
+            tracing::error!(%error, "audit outbox replay deferred; readiness is degraded");
+        }
+        Ok(logger)
+    }
+
+    async fn load_chain_tail(ch: &Client) -> anyhow::Result<ChainState> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Tail {
             seq: u64,
             hash: String,
+            key_id: String,
+            segment_id: String,
         }
         match ch
-            .query("SELECT seq, hash FROM audit_events ORDER BY seq DESC LIMIT 1")
+            .query(
+                "SELECT seq, hash, key_id, segment_id FROM audit_events ORDER BY seq DESC LIMIT 1",
+            )
             .fetch_one::<Tail>()
             .await
         {
-            Ok(t) => (t.seq, t.hash),
-            Err(clickhouse::error::Error::RowNotFound) => (0, String::new()),
-            Err(e) => {
-                tracing::warn!(error = %e, "audit: failed to load chain tail at startup, starting from seq 0");
-                (0, String::new())
+            Ok(t) => Ok(ChainState {
+                last_seq: t.seq,
+                last_hash: t.hash,
+                key_id: t.key_id,
+                segment_id: t.segment_id,
+            }),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(ChainState {
+                last_seq: 0,
+                last_hash: String::new(),
+                key_id: String::new(),
+                segment_id: String::new(),
+            }),
+            Err(error) => Err(anyhow::anyhow!(
+                "audit chain tail could not be read; refusing to restart the chain: {error}"
+            )),
+        }
+    }
+
+    async fn load_required_key_ids(ch: &Client) -> anyhow::Result<Vec<String>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct KeyRow {
+            key_id: String,
+        }
+        ch.query("SELECT DISTINCT key_id FROM audit_events")
+            .fetch_all::<KeyRow>()
+            .await
+            .map(|rows| rows.into_iter().map(|row| row.key_id).collect())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "audit verification key inventory could not be read; refusing startup: {error}"
+                )
+            })
+    }
+
+    async fn validate_configured_keys(
+        ch: &Client,
+        keys: &HashMap<String, Vec<u8>>,
+        current_key_id: &str,
+        required_key_ids: &[String],
+    ) -> anyhow::Result<()> {
+        const SELECT_ROW: &str = "SELECT id, seq, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events WHERE key_id = ?) ORDER BY seq DESC LIMIT 1";
+        for key_id in required_key_ids {
+            let row = ch
+                .query(SELECT_ROW)
+                .bind(key_id)
+                .fetch_one::<AuditRow>()
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("audit key validation row could not be read: {error}")
+                })?;
+            let secret = key_for_id(keys, current_key_id, key_id)
+                .expect("required audit keys were checked before validation");
+            if compute_hash(secret, &row) != row.hash {
+                anyhow::bail!(
+                    "audit HMAC key '{}' does not verify existing rows",
+                    if key_id.is_empty() { "legacy" } else { key_id }
+                );
             }
         }
+        Ok(())
+    }
+
+    async fn recover_spool(&self) -> anyhow::Result<()> {
+        let files = pending_files(&self.spool_dir)?;
+        let mut state = self.state.lock().await;
+        let mut previous_pending = false;
+        for path in files {
+            let (row, bytes) = read_spool_row(&path)?;
+            if row.seq <= state.last_seq && !previous_pending {
+                #[derive(clickhouse::Row, serde::Deserialize)]
+                struct Existing {
+                    hash: String,
+                }
+                let existing = self
+                    .ch
+                    .query("SELECT hash FROM audit_events WHERE seq = ? LIMIT 1")
+                    .bind(row.seq)
+                    .fetch_optional::<Existing>()
+                    .await?;
+                match existing {
+                    Some(existing) if existing.hash == row.hash => {
+                        self.remove_spool_file(&path, bytes)?;
+                        continue;
+                    }
+                    _ => anyhow::bail!(
+                        "audit outbox row {} conflicts with the persisted chain",
+                        row.seq
+                    ),
+                }
+            }
+            previous_pending = true;
+            if row.seq != state.last_seq + 1 || row.prev_hash != state.last_hash {
+                anyhow::bail!("audit outbox ordering/link failure at sequence {}", row.seq);
+            }
+            let secret = self
+                .secret_for_key(&row.key_id)
+                .ok_or_else(|| anyhow::anyhow!("missing audit key '{}'", row.key_id))?;
+            if compute_hash(secret, &row) != row.hash {
+                anyhow::bail!("audit outbox integrity failure at sequence {}", row.seq);
+            }
+            state.last_seq = row.seq;
+            state.last_hash = row.hash;
+            state.key_id = row.key_id;
+            state.segment_id = row.segment_id;
+        }
+        Ok(())
     }
 
     /// Record an audit event. Serialized via the chain mutex.
@@ -288,6 +579,9 @@ impl AuditLogger {
         let mut state = self.state.lock().await;
         let seq = state.last_seq + 1;
         let prev_hash = state.last_hash.clone();
+        if state.segment_id.is_empty() || state.key_id != self.current_key_id {
+            state.segment_id = uuid::Uuid::new_v4().to_string();
+        }
 
         // Build the row first (id + timestamp fixed) so the canonical string and
         // the inserted row use identical values — required for verification.
@@ -309,32 +603,168 @@ impl AuditLogger {
             changes: ev.changes,
             description: ev.description,
             metadata: ev.metadata,
+            key_id: self.current_key_id.clone(),
+            segment_id: state.segment_id.clone(),
             prev_hash,
             hash: String::new(),
         };
-        row.hash = compute_hash(&self.secret, &row);
+        let secret = self
+            .secret_for_key(&self.current_key_id)
+            .expect("current audit key is always configured");
+        row.hash = compute_hash(secret, &row);
 
-        // Insert via the typed row API (matches the schema column order).
-        let mut insert = match self.ch.insert("audit_events") {
-            Ok(i) => i,
-            Err(e) => {
-                tracing::error!(error = %e, "audit log write failed (insert init)");
-                return;
-            }
-        };
-        if let Err(e) = insert.write(&row).await {
-            tracing::error!(error = %e, "audit log write failed (row write)");
+        if let Err(error) = self.persist_spool_row(&row) {
+            self.mark_failure();
+            tracing::error!(%error, seq, "audit outbox persistence failed; event was not delivered");
             return;
         }
-        if let Err(e) = insert.end().await {
-            tracing::error!(error = %e, "audit log write failed (commit)");
-            return;
-        }
-
-        // Only advance the in-memory chain tail after a successful write so a
-        // failed write doesn't orphan the next row's prev_hash.
+        // The chain advances after durable local persistence, not after remote
+        // delivery. Every later event therefore remains ordered during a CH outage.
         state.last_seq = seq;
-        state.last_hash = row.hash;
+        state.last_hash = row.hash.clone();
+        state.key_id = self.current_key_id.clone();
+
+        if let Err(error) = self.flush_spool_locked().await {
+            self.mark_failure();
+            tracing::error!(%error, "audit delivery failed; durable outbox retained for replay");
+        }
+    }
+
+    fn persist_spool_row(&self, row: &AuditRow) -> anyhow::Result<()> {
+        let payload = serde_json::to_vec(row)?;
+        let projected = self
+            .pending_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(payload.len() as u64);
+        if projected > self.spool_max_bytes {
+            anyhow::bail!(
+                "audit outbox capacity exhausted ({projected} > {})",
+                self.spool_max_bytes
+            );
+        }
+        let name = format!("{:020}-{}.json", row.seq, row.id);
+        let final_path = self.spool_dir.join(&name);
+        let temp_path = self.spool_dir.join(format!(".{name}.tmp"));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, &final_path)?;
+        sync_directory(&self.spool_dir)?;
+        self.pending_events.fetch_add(1, Ordering::Relaxed);
+        self.pending_bytes
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        self.degraded.store(true, Ordering::Relaxed);
+        self.publish_metrics();
+        Ok(())
+    }
+
+    async fn flush_spool_locked(&self) -> anyhow::Result<()> {
+        for path in pending_files(&self.spool_dir)? {
+            let (row, bytes) = read_spool_row(&path)?;
+            #[derive(clickhouse::Row, serde::Deserialize)]
+            struct Existing {
+                hash: String,
+            }
+            if let Some(existing) = self
+                .ch
+                .query("SELECT hash FROM audit_events WHERE seq = ? LIMIT 1")
+                .bind(row.seq)
+                .fetch_optional::<Existing>()
+                .await?
+            {
+                if existing.hash != row.hash {
+                    anyhow::bail!("audit sequence {} already has a different hash", row.seq);
+                }
+                self.remove_spool_file(&path, bytes)?;
+                continue;
+            }
+
+            let mut insert = self.ch.insert("audit_events")?;
+            insert.write(&row).await?;
+            insert.end().await?;
+            self.remove_spool_file(&path, bytes)?;
+        }
+        self.degraded.store(false, Ordering::Relaxed);
+        self.publish_metrics();
+        Ok(())
+    }
+
+    fn remove_spool_file(&self, path: &Path, bytes: u64) -> anyhow::Result<()> {
+        fs::remove_file(path)?;
+        sync_directory(&self.spool_dir)?;
+        self.pending_events.fetch_sub(1, Ordering::Relaxed);
+        self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.publish_metrics();
+        Ok(())
+    }
+
+    async fn retry_pending(&self) -> anyhow::Result<()> {
+        let _state = self.state.lock().await;
+        self.flush_spool_locked().await
+    }
+
+    fn mark_failure(&self) {
+        self.degraded.store(true, Ordering::Relaxed);
+        self.write_failures.fetch_add(1, Ordering::Relaxed);
+        self.publish_metrics();
+    }
+
+    fn publish_metrics(&self) {
+        let health = self.health();
+        self.metrics.set_gauge(
+            "rush_audit_degraded",
+            &[],
+            if health.ready { 0.0 } else { 1.0 },
+        );
+        self.metrics.set_gauge(
+            "rush_audit_outbox_events",
+            &[],
+            health.pending_events as f64,
+        );
+        self.metrics
+            .set_gauge("rush_audit_outbox_bytes", &[], health.pending_bytes as f64);
+        self.metrics
+            .set_gauge("rush_audit_outbox_max_bytes", &[], health.max_bytes as f64);
+        self.metrics.set_gauge(
+            "rush_audit_write_failures_total",
+            &[],
+            health.write_failures as f64,
+        );
+    }
+
+    pub fn health(&self) -> AuditHealth {
+        AuditHealth {
+            ready: !self.degraded.load(Ordering::Relaxed),
+            pending_events: self.pending_events.load(Ordering::Relaxed),
+            pending_bytes: self.pending_bytes.load(Ordering::Relaxed),
+            max_bytes: self.spool_max_bytes,
+            write_failures: self.write_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn spawn_replayer(self: &Arc<Self>) {
+        let logger = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if logger.pending_events.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                if let Err(error) = logger.retry_pending().await {
+                    logger.mark_failure();
+                    tracing::warn!(%error, "audit outbox replay remains degraded");
+                }
+            }
+        });
     }
 
     /// Spawn `log` on the tokio runtime so hot call sites don't await the write.
@@ -347,9 +777,8 @@ impl AuditLogger {
         });
     }
 
-    /// Borrow the HMAC secret (used by the verify endpoint to recompute hashes).
-    pub fn secret(&self) -> &[u8] {
-        &self.secret
+    pub fn secret_for_key(&self, key_id: &str) -> Option<&[u8]> {
+        key_for_id(&self.keys, &self.current_key_id, key_id)
     }
 }
 
@@ -402,6 +831,8 @@ mod tests {
             changes: String::new(),
             description: String::new(),
             metadata: String::new(),
+            key_id: "primary".into(),
+            segment_id: "segment-1".into(),
             prev_hash: prev.into(),
             hash: String::new(),
         }
@@ -461,5 +892,154 @@ mod tests {
         b.actor_name = "alice\nactor_type=user".into();
         b.actor_type = String::new();
         assert_ne!(compute_hash(secret, &a), compute_hash(secret, &b));
+    }
+
+    #[test]
+    fn key_and_segment_identifiers_are_bound_for_new_rows() {
+        let secret = b"0123456789012345678901234567890123456789";
+        let row = sample_row(1, "");
+        let base = compute_hash(secret, &row);
+
+        let mut changed_key = row.clone();
+        changed_key.key_id = "rotated".into();
+        assert_ne!(base, compute_hash(secret, &changed_key));
+
+        let mut changed_segment = row;
+        changed_segment.segment_id = "segment-2".into();
+        assert_ne!(base, compute_hash(secret, &changed_segment));
+    }
+
+    #[test]
+    fn legacy_rows_keep_the_pre_rotation_canonical_format() {
+        let secret = b"0123456789012345678901234567890123456789";
+        let mut row = sample_row(1, "");
+        row.key_id.clear();
+        row.segment_id.clear();
+        let legacy = compute_hash(secret, &row);
+        row.key_id = "primary".into();
+        row.segment_id = "segment-1".into();
+        assert_ne!(legacy, compute_hash(secret, &row));
+    }
+
+    #[test]
+    fn audit_outbox_is_fsynced_before_delivery() {
+        let path = std::env::temp_dir().join(format!("rush-audit-test-{}", uuid::Uuid::new_v4()));
+        create_private_directory(&path).unwrap();
+        let secret = b"0123456789012345678901234567890123456789".to_vec();
+        let mut keys = HashMap::new();
+        keys.insert("primary".to_string(), secret.clone());
+        let logger = AuditLogger {
+            ch: Client::default(),
+            current_key_id: "primary".into(),
+            keys,
+            spool_dir: path.clone(),
+            spool_max_bytes: 1024 * 1024,
+            degraded: AtomicBool::new(false),
+            pending_events: AtomicU64::new(0),
+            pending_bytes: AtomicU64::new(0),
+            write_failures: AtomicU64::new(0),
+            metrics: Arc::new(SelfMetrics::new()),
+            state: Mutex::new(ChainState {
+                last_seq: 0,
+                last_hash: String::new(),
+                key_id: String::new(),
+                segment_id: String::new(),
+            }),
+        };
+        let mut row = sample_row(1, "");
+        row.hash = compute_hash(&secret, &row);
+
+        logger.persist_spool_row(&row).unwrap();
+        let files = pending_files(&path).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(read_spool_row(&files[0]).unwrap().0.hash, row.hash);
+        assert_eq!(logger.health().pending_events, 1);
+        assert!(!logger.health().ready);
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clickhouse_outage_retains_ordered_event_and_degrades_readiness() {
+        let path = std::env::temp_dir().join(format!("rush-audit-test-{}", uuid::Uuid::new_v4()));
+        create_private_directory(&path).unwrap();
+        let secret = b"0123456789012345678901234567890123456789".to_vec();
+        let mut keys = HashMap::new();
+        keys.insert("primary".to_string(), secret);
+        let logger = AuditLogger {
+            ch: Client::default().with_url("http://127.0.0.1:9"),
+            current_key_id: "primary".into(),
+            keys,
+            spool_dir: path.clone(),
+            spool_max_bytes: 1024 * 1024,
+            degraded: AtomicBool::new(false),
+            pending_events: AtomicU64::new(0),
+            pending_bytes: AtomicU64::new(0),
+            write_failures: AtomicU64::new(0),
+            metrics: Arc::new(SelfMetrics::new()),
+            state: Mutex::new(ChainState {
+                last_seq: 0,
+                last_hash: String::new(),
+                key_id: String::new(),
+                segment_id: String::new(),
+            }),
+        };
+
+        logger.log(AuditEvent::new("test.mutation", "system")).await;
+
+        let files = pending_files(&path).unwrap();
+        assert_eq!(files.len(), 1);
+        let row = read_spool_row(&files[0]).unwrap().0;
+        assert_eq!(row.seq, 1);
+        assert_eq!(row.action, "test.mutation");
+        assert_eq!(logger.health().pending_events, 1);
+        assert!(!logger.health().ready);
+        assert_eq!(logger.health().write_failures, 1);
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_outbox_is_fail_open_but_visible() {
+        let path = std::env::temp_dir().join(format!("rush-audit-test-{}", uuid::Uuid::new_v4()));
+        create_private_directory(&path).unwrap();
+        let secret = b"0123456789012345678901234567890123456789".to_vec();
+        let mut keys = HashMap::new();
+        keys.insert("primary".to_string(), secret);
+        let logger = AuditLogger {
+            ch: Client::default(),
+            current_key_id: "primary".into(),
+            keys,
+            spool_dir: path.clone(),
+            spool_max_bytes: 1,
+            degraded: AtomicBool::new(false),
+            pending_events: AtomicU64::new(0),
+            pending_bytes: AtomicU64::new(0),
+            write_failures: AtomicU64::new(0),
+            metrics: Arc::new(SelfMetrics::new()),
+            state: Mutex::new(ChainState {
+                last_seq: 0,
+                last_hash: String::new(),
+                key_id: String::new(),
+                segment_id: String::new(),
+            }),
+        };
+
+        logger.log(AuditEvent::new("test.mutation", "system")).await;
+
+        assert!(pending_files(&path).unwrap().is_empty());
+        assert!(!logger.health().ready);
+        assert_eq!(logger.health().write_failures, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn production_is_secure_by_default_and_rejects_weak_audit_keys() {
+        assert!(is_production_environment(None));
+        assert!(is_production_environment(Some("production")));
+        assert!(!is_production_environment(Some("development")));
+        assert!(validate_current_secret("short", true).is_err());
+        assert!(validate_current_secret("short", false).is_ok());
+        assert!(validate_current_secret("01234567890123456789012345678901", true).is_ok());
     }
 }

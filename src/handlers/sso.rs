@@ -5,18 +5,17 @@ use axum::{
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use dashmap::{DashMap, mapref::entry::Entry};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
 
 use crate::AppState;
 use crate::handlers::users::require_admin;
 use crate::saml;
 
 type HmacSha256 = Hmac<Sha256>;
+type AuthenticatedCaller = (String, String, String, String, String);
 
 const SSO_TRANSACTION_VERSION: u8 = 1;
 const SSO_TRANSACTION_TTL_SECS: i64 = 10 * 60;
@@ -25,6 +24,7 @@ const SSO_TRANSACTION_COOKIE_INSECURE: &str = "rush_sso_tx";
 const SSO_SETUP_COOKIE_SECURE: &str = "__Host-rush_sso_setup";
 const SSO_SETUP_COOKIE_INSECURE: &str = "rush_sso_setup";
 const SSO_SETUP_TTL_SECS: i64 = 30 * 60;
+const OIDC_IAT_FUTURE_SKEW_SECS: i64 = 60;
 
 fn public_sso_internal_error(
     status: StatusCode,
@@ -322,10 +322,11 @@ async fn find_namespaced_external_user(
         .find_user_by_external_id(&identity_key, auth_provider)
         .await
         .map_err(|error| {
-            tracing::error!(%error, "external identity lookup failed");
-            (
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
+                "sso_external_identity_lookup",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
     if existing.is_some() {
@@ -340,10 +341,11 @@ async fn find_namespaced_external_user(
         .find_user_by_external_id(subject, auth_provider)
         .await
         .map_err(|error| {
-            tracing::error!(%error, "legacy external identity lookup failed");
-            (
+            public_sso_internal_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
+                "sso_legacy_identity_lookup",
+                error,
+                "SSO authentication could not be completed",
             )
         })?;
     if let Some(user_id) = legacy {
@@ -352,10 +354,11 @@ async fn find_namespaced_external_user(
             .update_user_external_identity(&user_id, auth_provider, &identity_key)
             .await
             .map_err(|error| {
-                tracing::error!(%error, "external identity migration failed");
-                (
+                public_sso_internal_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
+                    "sso_external_identity_migrate",
+                    error,
+                    "SSO authentication could not be completed",
                 )
             })?;
         state
@@ -380,23 +383,103 @@ async fn find_namespaced_external_user(
     Ok((None, identity_key))
 }
 
-static CONSUMED_SSO_KEYS: OnceLock<DashMap<String, i64>> = OnceLock::new();
+async fn claim_sso_key_once(
+    state: &AppState,
+    key: String,
+    expires_at: i64,
+) -> Result<bool, (StatusCode, String)> {
+    state
+        .config_db
+        .claim_sso_key_once(&key, expires_at)
+        .await
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sso_replay_claim",
+                error,
+                "SSO authentication is temporarily unavailable",
+            )
+        })
+}
 
-/// Atomically consume a transaction/replay key inside this API process. OIDC
-/// authorization codes and the browser-bound transaction cookie provide the
-/// cross-replica backstop; this map closes concurrent replays on one replica.
-fn consume_sso_key_once(key: String, expires_at: i64) -> bool {
-    let now = chrono::Utc::now().timestamp();
-    let consumed = CONSUMED_SSO_KEYS.get_or_init(DashMap::new);
-    if consumed.len() > 10_000 {
-        consumed.retain(|_, expiry| *expiry > now);
+fn provider_session_revocation(
+    is_update: bool,
+    provider_id: &str,
+    enabled: bool,
+    active_provider_id: Option<&str>,
+) -> Option<(String, &'static str)> {
+    if is_update && !enabled {
+        return Some((provider_id.to_string(), "sso_provider_disabled"));
     }
-    match consumed.entry(key) {
-        Entry::Vacant(entry) => {
-            entry.insert(expires_at.max(now + 1));
-            true
+    if enabled {
+        return active_provider_id
+            .filter(|active_id| *active_id != provider_id)
+            .map(|active_id| (active_id.to_string(), "sso_provider_replaced"));
+    }
+    None
+}
+
+async fn revoke_sso_provider_sessions(
+    state: &AppState,
+    headers: &HeaderMap,
+    caller: Option<&AuthenticatedCaller>,
+    provider_id: &str,
+    reason: &'static str,
+) -> Result<(), (StatusCode, String)> {
+    let actor_type = if caller.is_some() {
+        "user"
+    } else {
+        "anonymous"
+    };
+    let tenant = caller
+        .map(|caller| caller.3.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let event = |outcome: &'static str| {
+        crate::audit::AuditEvent::new("session.revoke", actor_type)
+            .tenant(tenant.clone())
+            .resource("sso_provider", provider_id)
+            .outcome(outcome)
+            .changes(
+                serde_json::json!({
+                    "provider_id": provider_id,
+                    "reason": reason,
+                })
+                .to_string(),
+            )
+            .description("sessions issued by an SSO provider revoked")
+            .context(crate::audit::actor_context_from_headers(headers))
+    };
+
+    match state
+        .config_db
+        .revoke_sso_sessions_for_provider(provider_id)
+        .await
+    {
+        Ok(()) => {
+            let event = event("success");
+            let event = if let Some(caller) = caller {
+                event.actor(caller.0.clone(), caller.1.clone())
+            } else {
+                event.actor_name("SSO setup link")
+            };
+            state.audit.log(event).await;
+            Ok(())
         }
-        Entry::Occupied(_) => false,
+        Err(error) => {
+            let event = event("failure");
+            let event = if let Some(caller) = caller {
+                event.actor(caller.0.clone(), caller.1.clone())
+            } else {
+                event.actor_name("SSO setup link")
+            };
+            state.audit.log(event).await;
+            Err(public_sso_internal_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sso_session_revoke",
+                error,
+                "SSO provider change is temporarily unavailable",
+            ))
+        }
     }
 }
 
@@ -605,7 +688,11 @@ fn oidc_string_claim<'a>(claims: &'a serde_json::Value, name: &str) -> Option<&'
 /// even when the token also names another client. Rush has no configured set
 /// of trusted co-audiences, so fail closed on every additional audience and
 /// verify `azp` whenever the provider supplies it.
-fn validate_oidc_client_binding(claims: &serde_json::Value, client_id: &str) -> anyhow::Result<()> {
+fn validate_oidc_client_binding_at(
+    claims: &serde_json::Value,
+    client_id: &str,
+    now: i64,
+) -> anyhow::Result<()> {
     let audiences = match claims.get("aud") {
         Some(serde_json::Value::String(audience)) if !audience.is_empty() => {
             vec![audience.as_str()]
@@ -637,19 +724,28 @@ fn validate_oidc_client_binding(claims: &serde_json::Value, client_id: &str) -> 
         anyhow::bail!("a multi-audience id_token must include 'azp'");
     }
 
-    if claims
+    let issued_at = claims
         .get("iat")
         .and_then(serde_json::Value::as_i64)
-        .is_none()
-        && claims
-            .get("iat")
-            .and_then(serde_json::Value::as_u64)
-            .is_none()
-    {
-        anyhow::bail!("id_token is missing a valid 'iat' claim");
+        .or_else(|| {
+            claims
+                .get("iat")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+        })
+        .ok_or_else(|| anyhow::anyhow!("id_token is missing a valid 'iat' claim"))?;
+    if issued_at < 0 {
+        anyhow::bail!("id_token has an invalid 'iat' claim");
+    }
+    if issued_at > now.saturating_add(OIDC_IAT_FUTURE_SKEW_SECS) {
+        anyhow::bail!("id_token was issued implausibly far in the future");
     }
 
     Ok(())
+}
+
+fn validate_oidc_client_binding(claims: &serde_json::Value, client_id: &str) -> anyhow::Result<()> {
+    validate_oidc_client_binding_at(claims, client_id, chrono::Utc::now().timestamp())
 }
 
 fn extract_oidc_profile(
@@ -711,9 +807,13 @@ pub async fn sso_login(
         .config_db
         .get_enabled_sso_provider()
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "internal error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_login_provider_lookup",
+                error,
+                "SSO is temporarily unavailable",
+            )
         })?
         .ok_or_else(|| {
             (
@@ -984,9 +1084,13 @@ async fn sso_callback_inner(
         .config_db
         .get_enabled_sso_provider()
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "internal error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "oidc_callback_provider_lookup",
+                error,
+                "SSO authentication could not be completed",
+            )
         })?
         .ok_or_else(|| {
             (
@@ -1118,10 +1222,13 @@ async fn sso_callback_inner(
             "SSO identity token is invalid",
         )
     })?;
-    if !consume_sso_key_once(
+    if !claim_sso_key_once(
+        &state,
         format!("oidc:{}", transaction.state),
         transaction.issued_at + SSO_TRANSACTION_TTL_SECS,
-    ) {
+    )
+    .await?
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             "OIDC login transaction was already consumed".to_string(),
@@ -1250,9 +1357,9 @@ async fn sso_callback_inner(
         })?;
 
     // 10. Create a session (same as local auth)
-    let token = state
+    let issued = state
         .config_db
-        .create_session(&user_id)
+        .create_sso_session(&user_id, "oidc", &provider_id)
         .await
         .map_err(|error| {
             public_sso_internal_error(
@@ -1264,7 +1371,7 @@ async fn sso_callback_inner(
         })?;
 
     // 11. Set the rush_session cookie and redirect to /
-    let cookie = crate::handlers::auth::session_cookie(&token, 86400);
+    let cookie = crate::handlers::auth::session_cookie(&issued.token, issued.max_age_seconds);
     let clear_transaction = sso_transaction_cookie("", "oidc", 0).map_err(|error| {
         public_sso_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1311,9 +1418,101 @@ async fn sso_callback_inner(
     Ok((StatusCode::FOUND, headers, ""))
 }
 
+fn oidc_jwk_is_eligible(jwk: &jsonwebtoken::jwk::Jwk, algorithm: jsonwebtoken::Algorithm) -> bool {
+    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, KeyAlgorithm, KeyOperations};
+
+    if jwk
+        .common
+        .public_key_use
+        .as_ref()
+        .is_some_and(|key_use| key_use != &jsonwebtoken::jwk::PublicKeyUse::Signature)
+    {
+        return false;
+    }
+    if jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_some_and(|operations| !operations.contains(&KeyOperations::Verify))
+    {
+        return false;
+    }
+
+    let expected_key_algorithm = match algorithm {
+        Algorithm::RS256 => KeyAlgorithm::RS256,
+        Algorithm::RS384 => KeyAlgorithm::RS384,
+        Algorithm::RS512 => KeyAlgorithm::RS512,
+        Algorithm::PS256 => KeyAlgorithm::PS256,
+        Algorithm::PS384 => KeyAlgorithm::PS384,
+        Algorithm::PS512 => KeyAlgorithm::PS512,
+        Algorithm::ES256 => KeyAlgorithm::ES256,
+        Algorithm::ES384 => KeyAlgorithm::ES384,
+        _ => return false,
+    };
+    if jwk
+        .common
+        .key_algorithm
+        .is_some_and(|declared| declared != expected_key_algorithm)
+    {
+        return false;
+    }
+
+    match (&jwk.algorithm, algorithm) {
+        (
+            AlgorithmParameters::RSA(_),
+            Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512,
+        ) => true,
+        (AlgorithmParameters::EllipticCurve(parameters), Algorithm::ES256) => {
+            parameters.curve == EllipticCurve::P256
+        }
+        (AlgorithmParameters::EllipticCurve(parameters), Algorithm::ES384) => {
+            parameters.curve == EllipticCurve::P384
+        }
+        _ => false,
+    }
+}
+
+fn select_oidc_jwk<'a>(
+    jwks: &'a jsonwebtoken::jwk::JwkSet,
+    kid: Option<&str>,
+    algorithm: jsonwebtoken::Algorithm,
+) -> anyhow::Result<&'a jsonwebtoken::jwk::Jwk> {
+    if let Some(kid) = kid {
+        let matching: Vec<_> = jwks
+            .keys
+            .iter()
+            .filter(|jwk| jwk.common.key_id.as_deref() == Some(kid))
+            .collect();
+        if matching.len() != 1 {
+            anyhow::bail!("OIDC JWKS must contain exactly one key for the token kid");
+        }
+        let jwk = matching[0];
+        if !oidc_jwk_is_eligible(jwk, algorithm) {
+            anyhow::bail!("OIDC JWK is not eligible for this token signature");
+        }
+        return Ok(jwk);
+    }
+
+    let compatible: Vec<_> = jwks
+        .keys
+        .iter()
+        .filter(|jwk| oidc_jwk_is_eligible(jwk, algorithm))
+        .collect();
+    if compatible.len() != 1 {
+        anyhow::bail!("an OIDC token without kid requires exactly one compatible signing key");
+    }
+    Ok(compatible[0])
+}
+
 /// Verify an OIDC id_token JWT signature against the provider's JWKS endpoint and return claims.
 /// Fetches the OIDC discovery document to resolve the JWKS URI, then verifies the signature.
-/// Rejects `alg:none` and any token that fails signature validation.
+/// Rejects `alg:none`, ambiguous keys, unsuitable key metadata, and invalid signatures.
 async fn verify_and_decode_jwt(
     token: &str,
     discovery: &OidcDiscovery,
@@ -1344,20 +1543,16 @@ async fn verify_and_decode_jwt(
     // Fetch the JSON Web Key Set
     let jwks: JwkSet = fetch_bounded_oidc_json(&discovery.jwks_uri, "OIDC JWKS").await?;
 
-    // Select the matching key: prefer by kid, fall back to first key
-    let jwk = if let Some(kid) = header.kid.as_deref() {
-        jwks.find(kid)
-            .ok_or_else(|| anyhow::anyhow!("no JWK found for kid '{kid}'"))?
-    } else {
-        jwks.keys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("JWKS is empty"))?
-    };
+    // A missing `kid` is safe only when the set has one unambiguous key that
+    // is suitable for this exact signature algorithm. Likewise, a named key
+    // must explicitly permit signature verification when metadata is present.
+    let jwk = select_oidc_jwk(&jwks, header.kid.as_deref(), header.alg)?;
 
     let decoding_key = DecodingKey::from_jwk(jwk)
         .map_err(|e| anyhow::anyhow!("failed to build decoding key from JWK: {e}"))?;
 
     let mut validation = Validation::new(header.alg);
+    validation.leeway = OIDC_IAT_FUTURE_SKEW_SECS as u64;
     validation.set_required_spec_claims(&["exp", "iss", "aud", "sub", "iat"]);
     validation.set_issuer(&[issuer_url]);
     // Validate the audience claim against the registered client_id.
@@ -1384,7 +1579,14 @@ pub async fn list_sso_providers(
         .config_db
         .list_sso_providers()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_provider_list",
+                error,
+                "SSO configuration is temporarily unavailable",
+            )
+        })?;
 
     let providers: Vec<SsoProviderResponse> = rows
         .into_iter()
@@ -1508,8 +1710,14 @@ pub async fn save_sso_provider(
                 .config_db
                 .get_sso_provider(&id)
                 .await
-                .ok()
-                .flatten()
+                .map_err(|error| {
+                    public_sso_internal_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "sso_provider_secret_lookup",
+                        error,
+                        "SSO provider could not be saved",
+                    )
+                })?
                 .map(|p| p.5)
                 .unwrap_or_default()
         }
@@ -1585,15 +1793,124 @@ pub async fn save_sso_provider(
     // passed all protocol-specific validation. This lets an administrator fix
     // an invalid certificate or discovery URL without requesting another link.
     if let Some(session) = &setup_session {
-        if !consume_sso_key_once(
-            format!("sso-setup-session:{}", session.session_id),
-            session.issued_at + SSO_SETUP_TTL_SECS,
-        ) {
+        let setup_key = format!("sso-setup-session:{}", session.session_id);
+        let already_revoked = state
+            .config_db
+            .is_sso_setup_session_revoked(&setup_key)
+            .await
+            .map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "sso_setup_revocation_lookup",
+                    error,
+                    "SSO setup is temporarily unavailable",
+                )
+            })?;
+        if already_revoked {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("sso.setup_session_consume", "anonymous")
+                        .actor_name("SSO setup link")
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({
+                                "provider": session.provider,
+                                "reason": "already_revoked",
+                            })
+                            .to_string(),
+                        )
+                        .description("revoked SSO setup session reuse rejected")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
             return Err((
                 StatusCode::CONFLICT,
                 "setup session was already used".to_string(),
             ));
         }
+        if let Err(error) = state
+            .config_db
+            .revoke_sso_setup_session(&setup_key, session.issued_at + SSO_SETUP_TTL_SECS)
+            .await
+        {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("sso.setup_session_revoke", "anonymous")
+                        .actor_name("SSO setup link")
+                        .outcome("failure")
+                        .changes(serde_json::json!({ "provider": session.provider }).to_string())
+                        .description("SSO setup session durable revocation failed")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err(public_sso_internal_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sso_setup_revocation_write",
+                error,
+                "SSO setup is temporarily unavailable",
+            ));
+        }
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.setup_session_revoke", "anonymous")
+                    .actor_name("SSO setup link")
+                    .outcome("success")
+                    .changes(serde_json::json!({ "provider": session.provider }).to_string())
+                    .description("SSO setup session durably revoked before use")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        if !claim_sso_key_once(&state, setup_key, session.issued_at + SSO_SETUP_TTL_SECS).await? {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("sso.setup_session_consume", "anonymous")
+                        .actor_name("SSO setup link")
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({
+                                "provider": session.provider,
+                                "reason": "concurrent_use",
+                            })
+                            .to_string(),
+                        )
+                        .description("concurrent SSO setup session reuse rejected")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::CONFLICT,
+                "setup session was already used".to_string(),
+            ));
+        }
+    }
+
+    let active_before_change = state
+        .config_db
+        .active_sso_provider_id()
+        .await
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sso_active_provider_lookup",
+                error,
+                "SSO provider change is temporarily unavailable",
+            )
+        })?;
+    if let Some((provider_id, reason)) =
+        provider_session_revocation(is_update, &id, enabled, active_before_change.as_deref())
+    {
+        revoke_sso_provider_sessions(
+            &state,
+            &headers,
+            admin_result.as_ref().ok(),
+            &provider_id,
+            reason,
+        )
+        .await?;
     }
 
     let previous_active_provider_id = state
@@ -1621,7 +1938,14 @@ pub async fn save_sso_provider(
             req.saml_sp_entity_id.as_deref().unwrap_or(""),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_provider_save",
+                error,
+                "SSO provider could not be saved",
+            )
+        })?;
     let active_provider_id = if enabled {
         Some(id.clone())
     } else if previous_active_provider_id.as_deref() == Some(id.as_str()) {
@@ -1717,17 +2041,34 @@ pub async fn delete_sso_provider(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
-    let was_active = state
+    let provider = state
         .config_db
         .get_sso_provider(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
-        .is_some_and(|provider| provider.3);
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_provider_lookup_for_delete",
+                error,
+                "SSO provider could not be deleted",
+            )
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "provider not found".to_string()))?;
+    let was_active = provider.3;
+    revoke_sso_provider_sessions(&state, &headers, Some(&caller), &id, "sso_provider_deleted")
+        .await?;
     let deleted = state
         .config_db
         .delete_sso_provider(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_provider_delete",
+                error,
+                "SSO provider could not be deleted",
+            )
+        })?;
 
     if deleted {
         tracing::info!(
@@ -1772,7 +2113,14 @@ pub async fn list_idp_group_mappings(
         .config_db
         .list_idp_group_mappings(None)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_group_mapping_list",
+                error,
+                "SSO configuration is temporarily unavailable",
+            )
+        })?;
 
     let mappings: Vec<IdpGroupMappingResponse> = rows
         .into_iter()
@@ -1803,7 +2151,14 @@ pub async fn create_idp_group_mapping(
         .config_db
         .create_idp_group_mapping(&req.idp_group, &req.rush_group_id, provider_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_group_mapping_create",
+                error,
+                "SSO group mapping could not be created",
+            )
+        })?;
 
     // AUDIT: IdP→group mapping created.
     state
@@ -1843,7 +2198,14 @@ pub async fn update_idp_group_mapping(
         .config_db
         .update_idp_group_mapping(&id, &req.idp_group, &req.rush_group_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_group_mapping_update",
+                error,
+                "SSO group mapping could not be updated",
+            )
+        })?;
 
     let Some((old_idp_group, old_rush_group_id)) = prev else {
         return Err((StatusCode::NOT_FOUND, "mapping not found".to_string()));
@@ -1878,7 +2240,14 @@ pub async fn delete_idp_group_mapping(
         .config_db
         .delete_idp_group_mapping(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_group_mapping_delete",
+                error,
+                "SSO group mapping could not be deleted",
+            )
+        })?;
 
     if deleted {
         // AUDIT: IdP→group mapping deleted.
@@ -1961,9 +2330,13 @@ async fn sso_acs_inner(
         .config_db
         .get_enabled_sso_provider()
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "internal error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "saml_callback_provider_lookup",
+                error,
+                "SSO authentication could not be completed",
+            )
         })?
         .ok_or_else(|| {
             (
@@ -2065,7 +2438,7 @@ async fn sso_acs_inner(
         format!("saml-request:{}", transaction.saml_request_id),
         format!("saml-assertion:{}", assertion.assertion_id),
     ] {
-        if !consume_sso_key_once(replay_key, replay_expiry) {
+        if !claim_sso_key_once(&state, replay_key, replay_expiry).await? {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "SAML response has already been consumed".to_string(),
@@ -2073,7 +2446,13 @@ async fn sso_acs_inner(
         }
     }
     if let Some(response_id) = &assertion.response_id {
-        if !consume_sso_key_once(format!("saml-response:{response_id}"), replay_expiry) {
+        if !claim_sso_key_once(
+            &state,
+            format!("saml-response:{response_id}"),
+            replay_expiry,
+        )
+        .await?
+        {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "SAML response has already been consumed".to_string(),
@@ -2179,9 +2558,9 @@ async fn sso_acs_inner(
             )
         })?;
 
-    let token = state
+    let issued = state
         .config_db
-        .create_session(&user_id)
+        .create_sso_session(&user_id, "saml", &provider_id)
         .await
         .map_err(|error| {
             public_sso_internal_error(
@@ -2219,7 +2598,7 @@ async fn sso_acs_inner(
         )
         .await;
 
-    let cookie = crate::handlers::auth::session_cookie(&token, 86400);
+    let cookie = crate::handlers::auth::session_cookie(&issued.token, issued.max_age_seconds);
     let clear_transaction = sso_transaction_cookie("", "saml", 0).map_err(|error| {
         public_sso_internal_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2263,9 +2642,13 @@ pub async fn sso_metadata(
         .config_db
         .get_enabled_sso_provider()
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "internal error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "saml_metadata_provider_lookup",
+                error,
+                "SSO metadata is temporarily unavailable",
+            )
         })?;
 
     let base_url = resolve_base_url(&headers).map_err(|error| {
@@ -2370,16 +2753,36 @@ pub async fn create_setup_token(
             "unsupported SSO setup link".to_string(),
         ));
     }
-    let base = resolve_base_url(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let base = resolve_base_url(&headers).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "setup_token_base_url",
+            error,
+            "SSO setup is temporarily unavailable",
+        )
+    })?;
     let token = random_urlsafe::<32>();
-    let token_hash =
-        setup_token_hash(&token).map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let token_hash = setup_token_hash(&token).map_err(|error| {
+        public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "setup_token_hash",
+            error,
+            "SSO setup is temporarily unavailable",
+        )
+    })?;
 
     state
         .config_db
         .create_setup_token(&token_hash, purpose, &caller.0, provider, &base)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "setup_token_create",
+                error,
+                "SSO setup is temporarily unavailable",
+            )
+        })?;
     // Keep the bearer token in the fragment so browsers do not send it in the
     // request target, Referer header, reverse-proxy logs, or server access logs.
     let url = format!("{base}/setup/sso#token={token}");
@@ -2445,10 +2848,13 @@ pub async fn exchange_setup_token(
             "setup token is invalid or expired".to_string(),
         )
     })?;
-    if !consume_sso_key_once(
+    if !claim_sso_key_once(
+        &state,
         format!("sso-setup-link:{token_hash}"),
         chrono::Utc::now().timestamp() + SSO_SETUP_TTL_SECS,
-    ) {
+    )
+    .await?
+    {
         return Err((
             StatusCode::CONFLICT,
             "setup token was already used".to_string(),
@@ -2533,13 +2939,68 @@ pub async fn complete_setup_session(
             "setup session is invalid or expired".to_string(),
         )
     })?;
+    // Clearing a browser cookie is not revocation: copied cookies would remain
+    // usable until expiry. Persist a one-way session key in the TTL-backed
+    // revocation ledger, then claim it in the atomic local/Keeper store.
+    // `false` is an idempotent success because saving a provider consumes the
+    // same capability before the UI calls this completion endpoint.
+    let setup_key = format!("sso-setup-session:{}", session.session_id);
+    if let Err(error) = state
+        .config_db
+        .revoke_sso_setup_session(&setup_key, session.issued_at + SSO_SETUP_TTL_SECS)
+        .await
+    {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.setup_session_complete", "anonymous")
+                    .actor_name("SSO setup link")
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "provider": session.provider }).to_string())
+                    .description("SSO setup session durable revocation failed")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err(public_sso_internal_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sso_setup_revocation_write",
+            error,
+            "SSO setup is temporarily unavailable",
+        ));
+    }
+    let revocation_newly_recorded =
+        match claim_sso_key_once(&state, setup_key, session.issued_at + SSO_SETUP_TTL_SECS).await {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("sso.setup_session_complete", "anonymous")
+                            .actor_name("SSO setup link")
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({ "provider": session.provider }).to_string(),
+                            )
+                            .description("SSO setup session atomic revocation failed")
+                            .context(crate::audit::actor_context_from_headers(&headers)),
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
     state
         .audit
         .log(
             crate::audit::AuditEvent::new("sso.setup_session_complete", "anonymous")
                 .actor_name("SSO setup link")
                 .outcome("success")
-                .changes(serde_json::json!({ "provider": session.provider }).to_string())
+                .changes(
+                    serde_json::json!({
+                        "provider": session.provider,
+                        "revocation_newly_recorded": revocation_newly_recorded,
+                    })
+                    .to_string(),
+                )
                 .description("SSO setup session completed")
                 .context(crate::audit::actor_context_from_headers(&headers)),
         )
@@ -2585,6 +3046,36 @@ mod tests {
         assert_eq!(message, "SSO identity token is invalid");
         assert!(!message.contains("signature"));
         assert!(!message.contains("internal-signing-key"));
+    }
+
+    #[test]
+    fn sso_configuration_endpoints_do_not_return_raw_storage_errors() {
+        let source = include_str!("sso.rs");
+        assert!(!source.contains("format!(\"{e}\")"));
+
+        let save = source
+            .split_once("\npub async fn save_sso_provider(")
+            .map(|(_, endpoint)| endpoint)
+            .expect("provider save endpoint must exist")
+            .split("\npub async fn delete_sso_provider(")
+            .next()
+            .expect("provider delete must follow save");
+        assert!(save.contains("sso_provider_secret_lookup"));
+        assert!(!save.contains(".await\n                .ok()"));
+
+        for operation in [
+            "sso_provider_list",
+            "sso_group_mapping_list",
+            "sso_group_mapping_create",
+            "sso_group_mapping_update",
+            "sso_group_mapping_delete",
+            "setup_token_create",
+        ] {
+            assert!(
+                source.contains(operation),
+                "missing sanitized error boundary for {operation}"
+            );
+        }
     }
 
     fn transaction() -> SsoTransaction {
@@ -2657,14 +3148,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_key_is_consumed_only_once() {
-        let key = format!("test:{}", uuid::Uuid::new_v4());
-        let expiry = chrono::Utc::now().timestamp() + 60;
-        assert!(consume_sso_key_once(key.clone(), expiry));
-        assert!(!consume_sso_key_once(key, expiry));
-    }
-
-    #[test]
     fn canonical_base_url_is_an_origin_and_https_in_production() {
         assert_eq!(
             normalize_base_url("https://rush.example.com/", true).unwrap(),
@@ -2723,6 +3206,84 @@ mod tests {
     fn oidc_client_binding_requires_issued_at() {
         let claims = serde_json::json!({ "aud": "rush-client" });
         assert!(validate_oidc_client_binding(&claims, "rush-client").is_err());
+    }
+
+    #[test]
+    fn oidc_client_binding_rejects_implausibly_future_issued_at() {
+        let within_skew = serde_json::json!({
+            "aud": "rush-client",
+            "iat": 1_700_000_000 + OIDC_IAT_FUTURE_SKEW_SECS,
+        });
+        validate_oidc_client_binding_at(&within_skew, "rush-client", 1_700_000_000).unwrap();
+
+        let future = serde_json::json!({
+            "aud": "rush-client",
+            "iat": 1_700_000_000 + OIDC_IAT_FUTURE_SKEW_SECS + 1,
+        });
+        assert!(validate_oidc_client_binding_at(&future, "rush-client", 1_700_000_000).is_err());
+
+        let negative = serde_json::json!({ "aud": "rush-client", "iat": -1 });
+        assert!(validate_oidc_client_binding_at(&negative, "rush-client", 1_700_000_000).is_err());
+    }
+
+    fn oidc_jwks(keys: serde_json::Value) -> jsonwebtoken::jwk::JwkSet {
+        serde_json::from_value(serde_json::json!({ "keys": keys })).unwrap()
+    }
+
+    fn rsa_jwk(kid: &str, key_use: &str, key_ops: &[&str], algorithm: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kty": "RSA",
+            "kid": kid,
+            "use": key_use,
+            "key_ops": key_ops,
+            "alg": algorithm,
+            "n": "AQAB",
+            "e": "AQAB",
+        })
+    }
+
+    #[test]
+    fn oidc_jwk_selection_requires_one_compatible_key_without_kid() {
+        use jsonwebtoken::Algorithm;
+
+        let one = oidc_jwks(serde_json::json!([
+            rsa_jwk("signing", "sig", &["verify"], "RS256"),
+            rsa_jwk("encryption", "enc", &["decrypt"], "RS256"),
+        ]));
+        assert_eq!(
+            select_oidc_jwk(&one, None, Algorithm::RS256)
+                .unwrap()
+                .common
+                .key_id
+                .as_deref(),
+            Some("signing")
+        );
+
+        let ambiguous = oidc_jwks(serde_json::json!([
+            rsa_jwk("first", "sig", &["verify"], "RS256"),
+            rsa_jwk("second", "sig", &["verify"], "RS256"),
+        ]));
+        assert!(select_oidc_jwk(&ambiguous, None, Algorithm::RS256).is_err());
+    }
+
+    #[test]
+    fn oidc_jwk_selection_validates_use_operations_algorithm_and_unique_kid() {
+        use jsonwebtoken::Algorithm;
+
+        for invalid in [
+            rsa_jwk("key", "enc", &["verify"], "RS256"),
+            rsa_jwk("key", "sig", &["sign"], "RS256"),
+            rsa_jwk("key", "sig", &["verify"], "RS384"),
+        ] {
+            let jwks = oidc_jwks(serde_json::json!([invalid]));
+            assert!(select_oidc_jwk(&jwks, Some("key"), Algorithm::RS256).is_err());
+        }
+
+        let duplicate = oidc_jwks(serde_json::json!([
+            rsa_jwk("key", "sig", &["verify"], "RS256"),
+            rsa_jwk("key", "sig", &["verify"], "RS256"),
+        ]));
+        assert!(select_oidc_jwk(&duplicate, Some("key"), Algorithm::RS256).is_err());
     }
 
     #[test]
@@ -2831,6 +3392,90 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn provider_session_revocation_covers_disable_and_replacement() {
+        assert_eq!(
+            provider_session_revocation(true, "provider-a", false, Some("provider-a")),
+            Some(("provider-a".to_string(), "sso_provider_disabled"))
+        );
+        assert_eq!(
+            provider_session_revocation(true, "provider-b", false, Some("provider-a")),
+            Some(("provider-b".to_string(), "sso_provider_disabled"))
+        );
+        assert_eq!(
+            provider_session_revocation(false, "provider-b", true, Some("provider-a")),
+            Some(("provider-a".to_string(), "sso_provider_replaced"))
+        );
+        assert_eq!(
+            provider_session_revocation(true, "provider-a", true, Some("provider-a")),
+            None
+        );
+        assert_eq!(
+            provider_session_revocation(false, "provider-a", false, Some("provider-b")),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_revokes_sessions_before_the_provider_mutation() {
+        let source = include_str!("sso.rs");
+        let save = source
+            .split_once("\npub async fn save_sso_provider(")
+            .map(|(_, endpoint)| endpoint)
+            .expect("provider save endpoint must exist")
+            .split("\npub async fn delete_sso_provider(")
+            .next()
+            .expect("provider delete must follow save");
+        assert!(
+            save.find("revoke_sso_provider_sessions")
+                .expect("save must revoke affected sessions")
+                < save
+                    .find(".upsert_sso_provider(")
+                    .expect("save must persist the provider")
+        );
+
+        let delete = source
+            .split_once("\npub async fn delete_sso_provider(")
+            .map(|(_, endpoint)| endpoint)
+            .expect("provider delete endpoint must exist")
+            .split("\npub async fn list_idp_group_mappings(")
+            .next()
+            .expect("group mappings must follow provider delete");
+        assert!(
+            delete
+                .find("revoke_sso_provider_sessions")
+                .expect("delete must revoke provider sessions")
+                < delete
+                    .find(".delete_sso_provider(&id)")
+                    .expect("delete must persist the provider deletion")
+        );
+    }
+
+    #[test]
+    fn setup_completion_persists_revocation_before_clearing_the_cookie() {
+        let source = include_str!("sso.rs");
+        let endpoint = source
+            .split_once("\npub async fn complete_setup_session(")
+            .map(|(_, endpoint)| endpoint)
+            .expect("setup completion endpoint must exist")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("tests must follow setup completion");
+        let durable_revocation = endpoint
+            .find("revoke_sso_setup_session")
+            .expect("completion must persist durable revocation");
+        let claim = endpoint
+            .find("claim_sso_key_once")
+            .expect("completion must persist a one-time claim");
+        let clear_cookie = endpoint
+            .find("setup_session_cookie(\"\", 0)")
+            .expect("completion must clear the browser cookie");
+        assert!(durable_revocation < claim);
+        assert!(claim < clear_cookie);
+        assert!(endpoint.contains("revocation_newly_recorded"));
+        assert!(endpoint.contains(".outcome(\"failure\")"));
     }
 
     #[test]

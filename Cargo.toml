@@ -89,6 +89,9 @@ hex = "0.4"
 tikv-jemallocator = "0.6"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

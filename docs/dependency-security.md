@@ -51,9 +51,31 @@ Deprecated `serde_yaml` and direct `bincode` usage have been removed from Query
 API. Managed collector configuration is emitted as JSON, which remains valid
 YAML 1.2 input for the collector.
 
-## Release SBOM
+## Container release security
 
-Every tag build generates an SPDX JSON SBOM from the immutable pushed image
-digest (`ghcr.io/<owner>/<repo>@sha256:...`) and stores it as a workflow
-artifact for 90 days. The artifact name includes the release tag, and the SBOM
-source records the same image digest printed by the build step.
+Every tag build publishes a multi-platform image and records its immutable
+`ghcr.io/<owner>/<repo>@sha256:...` coordinate in the workflow summary. The
+release fails when Trivy finds a fixable high or critical vulnerability in that
+digest. BuildKit also publishes maximum-mode provenance and an image SBOM as OCI
+referrers.
+
+The workflow generates an SPDX JSON SBOM directly from the pushed digest,
+stores it in the `rush-api-<tag>-sbom` workflow artifact for 90 days, and
+attests both the build provenance and SBOM with GitHub's OIDC-backed artifact
+attestation service. The same attestations are pushed to GHCR as registry
+referrers. Every third-party action in the release path is pinned to an
+immutable commit SHA.
+
+Copy the image coordinate from the release workflow summary into Helm's
+`queryApi.image.repository` and `queryApi.image.digest` values. Verify the
+published attestation before rollout:
+
+```sh
+gh attestation verify \
+  'oci://ghcr.io/RushObservability/query-api@sha256:<digest>' \
+  --repo RushObservability/query-api
+```
+
+Download the `rush-api-<tag>-sbom` artifact from the same workflow run when an
+offline SPDX record is required. The digest in its package source must match the
+release summary and deployed image.

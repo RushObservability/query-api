@@ -6,6 +6,7 @@ pub mod buffer_topology;
 pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
+pub mod cors;
 pub mod detection_query;
 pub mod eval_state;
 pub mod github_repository_policy;
@@ -211,6 +212,8 @@ pub struct AppState {
     pub usage: UsageTracker,
     pub usage_accumulator: UsageAccumulator,
     pub config: RushConfig,
+    /// Startup-validated exact cross-origin browser allowlist.
+    pub cors_policy: Arc<cors::CorsPolicy>,
     /// Per-axis login attempt counter for rate limiting: (attempts, window_start).
     /// Keys contain only keyed hashes, never raw usernames or client addresses.
     pub login_limiter: Arc<DashMap<String, (u32, Instant)>>,

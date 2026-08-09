@@ -13,6 +13,8 @@ env:
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   security-gate:
@@ -93,6 +95,24 @@ jobs:
           labels: ${{ steps.docker-meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Scan immutable image for fixable high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Attest image build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
       - name: Generate image SBOM from pushed digest
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -106,3 +126,29 @@ jobs:
           upload-artifact: true
           upload-artifact-retention: 90
           upload-release-assets: false
+
+      - name: Attest image SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: rush-api-${{ github.ref_name }}.spdx.json
+          push-to-registry: true
+
+      - name: Record immutable release coordinates
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SBOM_ARTIFACT: rush-api-${{ github.ref_name }}-sbom
+        run: |
+          {
+            echo "### Immutable container release"
+            echo
+            echo "- Image: \`${IMAGE}@${DIGEST}\`"
+            echo "- SBOM artifact: \`${SBOM_ARTIFACT}\` (SPDX JSON, retained 90 days)"
+            echo "- Provenance and SBOM attestations: GitHub artifact attestations and OCI registry referrers"
+            echo
+            echo '```sh'
+            echo "gh attestation verify 'oci://${IMAGE}@${DIGEST}' --repo '${GITHUB_REPOSITORY}'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

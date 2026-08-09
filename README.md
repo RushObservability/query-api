@@ -52,6 +52,12 @@ make up-full  # ClickHouse + query-api
 make up       # ClickHouse only, then: make run
 ```
 
+The bundled Compose file is local-development only. Its published ports are
+bound to `127.0.0.1`, images use explicit versions, and ClickHouse uses a
+nonempty but well-known development credential. Never expose that stack to
+another machine. Use the Rush Helm chart with digest-pinned images and
+orchestrator-managed secrets for production.
+
 Migrations run on startup, so the schema and materialized views are created if they're missing — point a collector at `:8080` and data shows up.
 
 ## Configuration
@@ -64,24 +70,36 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `CLICKHOUSE_READ_USER` / `CLICKHOUSE_READ_PASSWORD` | _(required)_ | distinct SELECT-only identity protected by tenant row policies |
 | `RUSH_ALLOW_INSECURE_TENANT_READS` | `false` | explicit single-tenant development override; never enable in production |
 | `RUSH_ENVIRONMENT` | `production` | use `development`, `local`, or `test` only for deliberate non-production compatibility |
-| `RUSH_BASE_URL` | _(required in production)_ | canonical HTTPS public origin used for OIDC/SAML callbacks; paths, credentials, queries, and fragments are rejected |
-| `RUSH_TRUST_PROXY_HEADERS` | `false` | development-only opt-in for deriving a fallback scheme from `X-Forwarded-Proto`; production always uses `RUSH_BASE_URL` |
+| `RUSH_BASE_URL` | _(required in production)_ | canonical HTTPS public origin used for OIDC/SAML callbacks and production CSRF target-origin validation; paths, credentials, queries, and fragments are rejected |
+| `RUSH_TRUST_PROXY_HEADERS` | `false` | development-only opt-in for deriving a fallback CSRF/SSO origin from forwarded headers; honored only when the direct peer is in `RUSH_TRUSTED_PROXY_CIDRS`, while production always uses `RUSH_BASE_URL` |
 | `RUSH_ALLOW_ANONYMOUS_DEFAULT` | `false` | insecure development-only override for anonymous access to the default tenant |
 | `RUSH_API_KEY_SECRET` | _(empty)_ | HMAC key for API-key hashes — set it in production |
+| `RUSH_SESSION_HMAC_SECRET` | falls back to API-key, then audit HMAC secret | stable 32+ byte HMAC key for one-way browser-session token storage; changing it signs every user out |
 | `RUSH_SSO_TRANSACTION_SECRET` | falls back to `RUSH_API_KEY_SECRET` | stable 32+ byte HMAC key for browser-bound OIDC/SAML login transactions |
+| `RUSH_AUDIT_HMAC_SECRET` | _(required in production)_ | current 32+ byte audit-chain signing key |
+| `RUSH_AUDIT_HMAC_KEY_ID` | `primary` | non-secret identifier written to new audit rows; change it with a planned signing-key rotation |
+| `RUSH_AUDIT_HMAC_PREVIOUS_KEYS` | _(empty)_ | JSON object of prior key IDs to 32+ byte secrets, required to verify historical segments after rotation; use `legacy` for rows predating key IDs |
+| `RUSH_AUDIT_SPOOL_DIR` | `./data/audit-spool` | fsynced ordered audit outbox; use persistent storage in production |
+| `RUSH_AUDIT_SPOOL_MAX_BYTES` | `268435456` | maximum audit outbox bytes before readiness remains degraded and new audit events follow the documented fail-open policy |
+| `RUSH_QUERY_API_REPLICAS` | `1` | positive replica count; values above one require a shared SSO replay store |
+| `RUSH_SSO_REPLAY_STORE` | `auto` | `auto`, `local`, or `keeper`; `auto` selects KeeperMap for multiple replicas and refuses an unsafe local override |
 | `RUSH_CONFIG_ENCRYPTION_KEY` | _(required when SSO secrets exist)_ | stable 32+ byte key for AES-256-GCM encryption of SSO client secrets; rotating it requires re-encrypting stored values |
 | `RUSH_LOGIN_RATE_LIMIT_SECRET` | falls back to SSO/API-key secret | stable 32+ byte HMAC key for privacy-preserving distributed login-limit identifiers |
 | `RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE` | `10` | maximum login attempts against one normalized account per minute across replicas |
 | `RUSH_LOGIN_IP_LIMIT_PER_MINUTE` | `50` | maximum login attempts from one resolved client address per minute across replicas |
+| `RUSH_SESSION_IDLE_TIMEOUT_SECS` | `1800` | inactivity window for browser sessions; accepted range is 60 seconds through 31 days |
+| `RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS` | `86400` | hard browser-session lifetime; must be at least the idle timeout and no more than 31 days |
+| `RUSH_SESSION_RENEWAL_INTERVAL_SECS` | `300` | minimum activity interval before the HttpOnly bearer is rotated; must be 30 seconds or more and less than the idle timeout |
 | `RUSH_TRUSTED_PROXY_CIDRS` | _(empty)_ | comma-separated proxy networks allowed to supply `X-Forwarded-For`/`X-Real-IP`; other peers' forwarding headers are ignored |
 | `RUSH_SSO_ONLY` | `false` | when `true` and an SSO provider is active, reject local sign-in except for the configured admin break-glass account |
 | `RUSH_BREAK_GLASS_USERNAME` | `admin` | canonical username of the local admin retained for emergency access in SSO-only mode; other admins cannot reset its password |
+| `INITIAL_ADMIN_PASSWORD` | _(required for a new database)_ | initial administrator seed supplied through a secret; it is never generated or written to application logs |
 | `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | stable key used to encrypt integration DSNs |
 | `RUSH_COLLECTOR_MANAGER_ENABLED` | `false` | enable API-managed local collector supervision |
 | `RUSH_POSTGRES_COLLECTOR_BIN` | `../postgres-collector/target/debug/postgres-collector` | managed PostgreSQL collector executable |
 | `RUSH_POSTGRES_COLLECTOR_CONFIG` | _(empty)_ | optional bootstrap YAML when no API-managed target exists |
 | `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant-scoped API key for managed collector ingest |
-| `RUSH_ALLOWED_ORIGINS` | _(same-origin)_ | CORS allowlist |
+| `RUSH_ALLOWED_ORIGINS` | _(empty; cross-origin disabled)_ | Comma-separated exact HTTP(S) browser origins. Invalid, `null`, wildcard, credential-bearing, or path-bearing entries stop startup; production browser mutations must still match `RUSH_BASE_URL` |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
 | `RUSH_BUFFER_BACKEND` | `disk` | `disk` or shared `object_store` |
 | `RUSH_BUFFER_REQUIRE_OBJECT_STORE` | `false` | refuse unsafe fallback to disk |
@@ -104,6 +122,61 @@ health. ClickHouse metrics include active queries, merges/mutations, memory,
 disk, insert/select counters, and recent query-log latency, read-volume,
 result-volume, memory, and error aggregates. The endpoint is intended for an
 internal Prometheus path and is not tenant data.
+
+### Browser sessions
+
+Browser sessions have both an idle deadline and a hard absolute deadline.
+Successful authenticated activity renews the idle deadline after the configured
+renewal interval and replaces the opaque bearer in the HttpOnly cookie. Renewal
+never moves the absolute deadline. Password changes, user disablement, logout,
+and manual session revocation are visible immediately because session
+authorization is checked against the current user version on every request.
+Session rows contain only `hmac-sha256:v1` digests keyed by
+`RUSH_SESSION_HMAC_SECRET`; the raw bearer exists only in the issuing response
+and HttpOnly cookie. The first upgrade to keyed storage revokes legacy raw or
+unkeyed-SHA256 session rows because their bearers cannot be safely converted,
+so existing users sign in again once.
+
+Administrators can review and revoke active sessions in **Settings → Users →
+Active sessions**. The inventory shows the user, authentication method, last
+renewal, and both deadlines; it never returns the session bearer or its storage
+hash. Users can also list and revoke their own sessions through
+`GET /api/v1/auth/sessions` and `DELETE /api/v1/auth/sessions/{id}`. Admin-wide
+controls use the corresponding `/api/v1/auth/admin/sessions` routes. Inventory
+reads and revocations are written to the tamper-evident audit log.
+
+### Password policy
+
+Bootstrap, user creation, administrator reset, and self-service password change
+all use one server-side policy. New passwords must contain at least 12 Unicode
+characters and at least one non-whitespace character, may be up to 1,024 UTF-8
+bytes, and must not exactly match the bundled case-insensitive common-password
+denylist. Spaces and Unicode are supported for long passphrases. Existing
+shorter passwords continue to verify, but the policy applies the next time they
+are changed. Rejected password values are never written to logs or audit data.
+
+### Audit delivery and key rotation
+
+Security-sensitive audit calls remain fail-open for the completed business
+mutation, as required by the query-api audit contract. Before `log()` returns,
+however, the event is serialized into the chain and fsynced to the local audit
+outbox. ClickHouse delivery is ordered and retried every five seconds. An
+unavailable database or exhausted/unwritable outbox sets `/readyz` to `503` and
+exports `rush_audit_degraded`, `rush_audit_outbox_events`,
+`rush_audit_outbox_bytes`, `rush_audit_outbox_max_bytes`, and
+`rush_audit_write_failures_total`. Telemetry ingestion does not use this path.
+
+For a planned key rotation, keep the old secret in
+`RUSH_AUDIT_HMAC_PREVIOUS_KEYS`, set a new `RUSH_AUDIT_HMAC_SECRET`, and change
+`RUSH_AUDIT_HMAC_KEY_ID`. The next row starts a new segment linked to the prior
+segment's tail. Do not remove a previous key until the associated audit rows
+have expired. Startup fails instead of resetting the chain if its ClickHouse
+tail cannot be read or a required verification key is missing.
+
+Alert on `rush_audit_degraded == 1` for any sustained period and warn before
+capacity exhaustion with
+`rush_audit_outbox_bytes / rush_audit_outbox_max_bytes > 0.8`. A degraded
+instance is also removed from service by the default `/readyz` probe.
 
 ### HA ingest buffering
 

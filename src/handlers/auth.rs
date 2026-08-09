@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
@@ -37,7 +37,7 @@ pub fn validate_login_rate_limit_secret() -> Result<(), String> {
     login_rate_limit_secret().map(|_| ())
 }
 
-pub(crate) fn sso_only_mode_enabled() -> bool {
+pub fn sso_only_mode_enabled() -> bool {
     std::env::var("RUSH_SSO_ONLY")
         .map(|value| {
             matches!(
@@ -48,7 +48,7 @@ pub(crate) fn sso_only_mode_enabled() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn break_glass_username() -> String {
+pub fn break_glass_username() -> String {
     std::env::var("RUSH_BREAK_GLASS_USERNAME")
         .unwrap_or_else(|_| "admin".to_string())
         .trim()
@@ -211,6 +211,13 @@ pub struct UserInfo {
     pub role: String,
 }
 
+fn credentials_within_bounds(username: &str, password: &str) -> bool {
+    !username.trim().is_empty()
+        && username.len() <= crate::clickhouse_config::MAX_USERNAME_BYTES
+        && !password.is_empty()
+        && password.len() <= crate::clickhouse_config::MAX_PASSWORD_BYTES
+}
+
 /// POST /api/v1/auth/login
 ///
 /// Accepts `{ "username": "...", "password": "..." }`.
@@ -223,6 +230,20 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let client_ip = resolve_login_client_ip(peer.ip(), &headers, &state.trusted_proxy_cidrs);
+    if !credentials_within_bounds(&req.username, &req.password) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                    .actor_name("invalid login input")
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "credential_bounds" }).to_string())
+                    .description("login request rejected before credential processing")
+                    .context(login_audit_context(&headers, client_ip)),
+            )
+            .await;
+        return Err((StatusCode::BAD_REQUEST, "invalid login request".to_string()));
+    }
     let secret = login_rate_limit_secret().map_err(|error| {
         public_auth_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -374,13 +395,13 @@ pub async fn login(
                 ));
             }
         };
-        if let Some((_, username, _, _, role)) = authenticated.as_ref()
+        if let Some((_, username, _, _, role, _)) = authenticated.as_ref()
             && !local_login_allowed(true, sso_enabled, username, role, &break_glass_username())
         {
             authenticated = None;
         }
     }
-    let (user_id, username, display_name, tenant_id, role) = match authenticated {
+    let (user_id, username, display_name, tenant_id, role, user_version) = match authenticated {
         Some(u) => u,
         None => {
             // Only failed credentials consume the account budget. Checking
@@ -500,9 +521,9 @@ pub async fn login(
         }
     };
 
-    let token = state
+    let issued = state
         .config_db
-        .create_session(&user_id)
+        .create_session_at_version(&user_id, user_version)
         .await
         .map_err(|error| {
             public_auth_error(StatusCode::INTERNAL_SERVER_ERROR, "session_create", error)
@@ -531,7 +552,7 @@ pub async fn login(
         )
         .await;
 
-    let cookie = session_cookie(&token, 86400);
+    let cookie = session_cookie(&issued.token, issued.max_age_seconds);
 
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
@@ -553,23 +574,60 @@ pub async fn login(
 /// POST /api/v1/auth/logout
 ///
 /// Reads the `rush_session` cookie, deletes that session, and clears the cookie.
-pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     if let Some(token) = extract_session_cookie(&headers) {
         let caller = state.config_db.get_session_user(&token).await;
-        state.config_db.delete_session(&token).await;
-        if let Some((user_id, username, _, tenant_id, _)) = caller {
+        if let Err(error) = state.config_db.delete_session(&token).await {
+            tracing::error!(operation = "session_revoke", %error, "logout request failed");
+            let event = match caller.as_ref() {
+                Some((user_id, username, _, tenant_id, _)) => {
+                    crate::audit::AuditEvent::new("auth.logout", "user")
+                        .actor(user_id.clone(), username.clone())
+                        .tenant(tenant_id.clone())
+                }
+                None => crate::audit::AuditEvent::new("auth.logout", "anonymous")
+                    .actor_name("unknown session"),
+            };
             state
                 .audit
                 .log(
-                    crate::audit::AuditEvent::new("auth.logout", "user")
-                        .actor(user_id, username)
-                        .tenant(tenant_id)
-                        .outcome("success")
-                        .description("user session ended")
+                    event
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "session_store_unavailable" })
+                                .to_string(),
+                        )
+                        .description("session revocation failed during logout")
                         .context(crate::audit::actor_context_from_headers(&headers)),
                 )
                 .await;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "logout temporarily unavailable; retry the request".to_string(),
+            ));
         }
+
+        let event = match caller {
+            Some((user_id, username, _, tenant_id, _)) => {
+                crate::audit::AuditEvent::new("auth.logout", "user")
+                    .actor(user_id, username)
+                    .tenant(tenant_id)
+            }
+            None => crate::audit::AuditEvent::new("auth.logout", "anonymous")
+                .actor_name("unknown or expired session"),
+        };
+        state
+            .audit
+            .log(
+                event
+                    .outcome("success")
+                    .description("user session ended")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
     }
 
     let clear_cookie = session_cookie("", 0);
@@ -577,7 +635,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::SET_COOKIE, clear_cookie.parse().unwrap());
 
-    (resp_headers, Json(serde_json::json!({ "ok": true })))
+    Ok((resp_headers, Json(serde_json::json!({ "ok": true }))))
 }
 
 /// GET /api/v1/auth/me
@@ -613,6 +671,203 @@ pub async fn me(
     })))
 }
 
+/// GET /api/v1/auth/sessions — active sessions for the current user.
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = crate::handlers::users::require_auth(&state, &headers).await?;
+    let token = extract_session_cookie(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
+    let sessions = state
+        .config_db
+        .list_auth_sessions(Some(&caller.0), &token)
+        .await
+        .map_err(|error| {
+            public_auth_error(StatusCode::SERVICE_UNAVAILABLE, "session_inventory", error)
+        })?;
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+/// GET /api/v1/auth/admin/sessions — active sessions across all users.
+pub async fn list_all_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = crate::handlers::users::require_admin(&state, &headers).await?;
+    let token = extract_session_cookie(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
+    let sessions = match state.config_db.list_auth_sessions(None, &token).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::error!(operation = "admin_session_inventory", %error, "authentication request failed");
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("session.inventory_read", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("session_inventory", "all")
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "session_store_unavailable" })
+                                .to_string(),
+                        )
+                        .description("administrator session inventory read failed")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session inventory temporarily unavailable".to_string(),
+            ));
+        }
+    };
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("session.inventory_read", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("session_inventory", "all")
+                .outcome("success")
+                .changes(serde_json::json!({ "session_count": sessions.len() }).to_string())
+                .description("administrator read active session inventory")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+async fn revoke_session_for_scope(
+    state: AppState,
+    headers: HeaderMap,
+    session_id: String,
+    admin_scope: bool,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let caller = if admin_scope {
+        crate::handlers::users::require_admin(&state, &headers).await?
+    } else {
+        crate::handlers::users::require_auth(&state, &headers).await?
+    };
+    if uuid::Uuid::parse_str(&session_id).is_err() {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("session.revoke", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("session", "invalid")
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "invalid_session_id" }).to_string())
+                    .description("session revocation rejected")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
+    }
+    let token = extract_session_cookie(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
+    let owner = if admin_scope {
+        None
+    } else {
+        Some(caller.0.as_str())
+    };
+    let revoked = match state
+        .config_db
+        .revoke_auth_session(&session_id, owner, &token)
+        .await
+    {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("session.revoke", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("session", session_id)
+                        .outcome("failure")
+                        .changes(serde_json::json!({ "reason": "not_found" }).to_string())
+                        .description("session revocation target was not found")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((StatusCode::NOT_FOUND, "session not found".to_string()));
+        }
+        Err(error) => {
+            tracing::error!(operation = "session_revoke", %error, "authentication request failed");
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("session.revoke", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("session", session_id)
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "session_store_unavailable" })
+                                .to_string(),
+                        )
+                        .description("session revocation failed")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session revocation temporarily unavailable".to_string(),
+            ));
+        }
+    };
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("session.revoke", "user")
+                .actor(caller.0, caller.1)
+                .tenant(revoked.tenant_id.clone())
+                .resource("session", session_id)
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "scope": if admin_scope { "administrator" } else { "self" },
+                        "target_user_id": revoked.user_id,
+                        "auth_method": revoked.auth_method,
+                    })
+                    .to_string(),
+                )
+                .description("active session revoked")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    let mut response = Json(serde_json::json!({ "ok": true })).into_response();
+    if revoked.current {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            session_cookie("", 0)
+                .parse()
+                .expect("session cookie is a valid header"),
+        );
+    }
+    Ok(response)
+}
+
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    revoke_session_for_scope(state, headers, session_id, false).await
+}
+
+pub async fn admin_revoke_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    revoke_session_for_scope(state, headers, session_id, true).await
+}
+
 /// Parse the `rush_session` value out of the Cookie header.
 /// Build the `Set-Cookie` value for the session.
 ///
@@ -622,7 +877,7 @@ pub async fn me(
 /// works over plain HTTP (e.g. `kubectl port-forward`, non-TLS internal access),
 /// where browsers refuse to store `Secure`/`__Host-` cookies. `extract_session_cookie`
 /// reads both names.
-pub(crate) fn session_cookie(token: &str, max_age: i64) -> String {
+pub fn session_cookie(token: &str, max_age: i64) -> String {
     session_cookie_with_mode(token, max_age, insecure_cookies_enabled())
 }
 
@@ -680,12 +935,44 @@ mod tests {
     }
 
     #[test]
+    fn credential_bounds_reject_work_amplification_before_login_processing() {
+        assert!(credentials_within_bounds("admin", "password"));
+        assert!(!credentials_within_bounds("", "password"));
+        assert!(!credentials_within_bounds("admin", ""));
+        assert!(!credentials_within_bounds(
+            &"u".repeat(crate::clickhouse_config::MAX_USERNAME_BYTES + 1),
+            "password"
+        ));
+        assert!(!credentials_within_bounds(
+            "admin",
+            &"p".repeat(crate::clickhouse_config::MAX_PASSWORD_BYTES + 1)
+        ));
+    }
+
+    #[test]
     fn insecure_mode_is_explicitly_http_compatible_but_still_httponly() {
         let cookie = session_cookie_with_mode("session-token", 0, true);
         assert_eq!(
             cookie,
             "rush_session=session-token; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
         );
+    }
+
+    #[test]
+    fn logout_fails_closed_and_audits_revocation_errors() {
+        let source = include_str!("auth.rs");
+        let logout = source
+            .split_once("pub async fn logout")
+            .map(|(_, method)| method)
+            .expect("logout handler must exist")
+            .split("pub async fn me")
+            .next()
+            .expect("session lookup must follow logout");
+        assert!(logout.contains("if let Err(error) = state.config_db.delete_session"));
+        assert!(logout.contains(".outcome(\"failure\")"));
+        assert!(logout.contains("session_store_unavailable"));
+        assert!(logout.contains("StatusCode::SERVICE_UNAVAILABLE"));
+        assert!(logout.contains(".outcome(\"success\")"));
     }
 
     #[test]

@@ -4,18 +4,17 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use anyhow::Context;
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::IntoResponse;
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{extract::ConnectInfo, extract::Request, middleware::Next, response::Response};
 use clickhouse::Client;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
-use url::Url;
 
 use rush_api::AppState;
 use rush_api::TenantContext;
@@ -25,6 +24,7 @@ use rush_api::buffer_topology;
 use rush_api::ch_writer::ChWriter;
 use rush_api::clickhouse_config::ConfigDb;
 use rush_api::config::RushConfig;
+use rush_api::cors::{CorsPolicy, parse_web_origin, same_web_origin};
 use rush_api::handlers;
 use rush_api::migrations;
 use rush_api::monitor_engine;
@@ -128,35 +128,59 @@ fn is_state_changing_method(method: &Method) -> bool {
     )
 }
 
-/// Validate the browser origin for requests authenticated by the session
-/// cookie. API keys are not ambient browser credentials and do not need this
-/// check. The explicit allowlist is required for cross-origin local development
-/// (for example, Vite on :5173 talking to the API on :8080); otherwise the
-/// request must match the origin reconstructed from the trusted proxy headers.
-fn request_origin_allowed(headers: &HeaderMap) -> bool {
-    let Some(origin) = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    if origin == "null" || origin.is_empty() {
-        return false;
-    }
-
-    let configured_allowlist = std::env::var("RUSH_ALLOWED_ORIGINS").ok();
-    let allowlist: Option<Vec<&str>> = configured_allowlist.as_deref().map(|raw| {
-        raw.split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .collect()
-    });
-    request_origin_allowed_with_allowlist(headers, allowlist.as_deref())
+fn trust_forwarded_origin_headers(
+    production: bool,
+    trust_proxy_headers: bool,
+    peer_ip: Option<IpAddr>,
+    trusted_proxy_cidrs: &[String],
+) -> bool {
+    !production
+        && trust_proxy_headers
+        && peer_ip.is_some_and(|ip| {
+            !trusted_proxy_cidrs.is_empty()
+                && rush_api::api_key_auth::source_allowed(ip, trusted_proxy_cidrs)
+        })
 }
 
-fn request_origin_allowed_with_allowlist(
+/// Validate the browser origin for requests authenticated by an ambient
+/// browser credential. Production compares only with the canonical public
+/// origin. Local development may use an explicit allowlist, or reconstruct a
+/// target origin from the direct Host header. Forwarded host/protocol headers
+/// are considered only when the direct peer belongs to a configured trusted
+/// proxy network.
+fn request_origin_allowed(req: &Request, state: &AppState) -> bool {
+    let production = rush_api::api_key_auth::production_mode();
+    let configured_base_url = std::env::var("RUSH_BASE_URL").ok();
+    let canonical_base_url = configured_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0.ip());
+    let trust_forwarded = trust_forwarded_origin_headers(
+        production,
+        rush_api::api_key_auth::env_flag("RUSH_TRUST_PROXY_HEADERS"),
+        peer_ip,
+        &state.trusted_proxy_cidrs,
+    );
+
+    request_origin_allowed_with_policy(
+        req.headers(),
+        production,
+        canonical_base_url,
+        Some(state.cors_policy.as_ref()),
+        trust_forwarded,
+    )
+}
+
+fn request_origin_allowed_with_policy(
     headers: &HeaderMap,
-    configured_allowlist: Option<&[&str]>,
+    production: bool,
+    canonical_base_url: Option<&str>,
+    configured_allowlist: Option<&CorsPolicy>,
+    trust_forwarded: bool,
 ) -> bool {
     let Some(origin) = headers
         .get(header::ORIGIN)
@@ -167,65 +191,127 @@ fn request_origin_allowed_with_allowlist(
     if origin == "null" || origin.is_empty() {
         return false;
     }
-    if let Some(allowlist) = configured_allowlist {
-        if !allowlist.is_empty() {
-            return allowlist.iter().any(|allowed| *allowed == origin);
+    let Some(origin_url) = parse_web_origin(origin) else {
+        return false;
+    };
+
+    if let Some(raw_base_url) = canonical_base_url {
+        let Some(base_url) = parse_web_origin(raw_base_url) else {
+            return false;
+        };
+        if same_web_origin(&origin_url, &base_url) {
+            return true;
+        }
+        if production {
+            return false;
+        }
+    } else if production {
+        // Startup validation already rejects this configuration; retain a
+        // fail-closed request-time guard in case this helper is reused.
+        return false;
+    }
+
+    if let Some(policy) = configured_allowlist {
+        if !policy.is_empty() {
+            return policy.allows(&origin_url);
         }
     }
 
-    let Some(origin_url) = Url::parse(origin).ok() else {
+    let host_header = if trust_forwarded {
+        headers
+            .get("x-forwarded-host")
+            .or_else(|| headers.get(header::HOST))
+    } else {
+        headers.get(header::HOST)
+    };
+    let host = host_header
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(','));
+    let scheme = if trust_forwarded {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.contains(',') && matches!(*value, "http" | "https"))
+            .unwrap_or("http")
+    } else {
+        "http"
+    };
+    let Some(host) = host else { return false };
+    let Some(request_url) = parse_web_origin(&format!("{scheme}://{host}")) else {
         return false;
     };
-    if !matches!(origin_url.scheme(), "http" | "https")
-        || origin_url.host_str().is_none()
-        || origin_url.path() != "/"
-        || origin_url.query().is_some()
-        || origin_url.fragment().is_some()
-    {
+
+    same_web_origin(&origin_url, &request_url)
+}
+
+fn requires_csrf_origin(method: &Method, path: &str, credential: Option<&CredentialKind>) -> bool {
+    if !is_state_changing_method(method) {
         return false;
     }
+    if credential.is_some_and(|kind| *kind == CredentialKind::Session) {
+        return true;
+    }
 
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim);
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| matches!(*value, "http" | "https"))
-        .unwrap_or("http");
-    let Some(host) = host else { return false };
-    let Ok(request_url) = Url::parse(&format!("{scheme}://{host}/")) else {
-        return false;
-    };
-
-    origin_url.scheme() == request_url.scheme()
-        && origin_url.host_str() == request_url.host_str()
-        && origin_url.port_or_known_default() == request_url.port_or_known_default()
+    // These mutations establish or use ambient browser credentials before a
+    // normal Rush session exists. They therefore need the same Origin policy
+    // even though tenant resolution classifies them as anonymous.
+    method == Method::POST
+        && matches!(
+            path,
+            "/api/v1/auth/login"
+                | "/api/v1/sso/setup-token/exchange"
+                | "/api/v1/sso/setup-session/complete"
+                | "/api/v1/sso/providers"
+        )
 }
 
 /// SameSite=Lax protects normal cross-site form traffic, while this Origin
-/// check covers same-site subdomain attacks and defense-in-depth for browsers
-/// that send cookies on an unsafe request. Login/SSO and API-key traffic are
-/// intentionally outside this cookie-authenticated mutation boundary.
-async fn csrf_protection_middleware(req: Request, next: Next) -> Response {
-    let protected_session = req
-        .extensions()
-        .get::<TenantResolution>()
-        .is_some_and(|resolution| resolution.credential == CredentialKind::Session);
-    if protected_session
-        && is_state_changing_method(req.method())
-        && !request_origin_allowed(req.headers())
+/// check covers same-site subdomain attacks and login/setup-session mutations
+/// that establish or consume ambient browser credentials.
+async fn csrf_protection_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let resolution = req.extensions().get::<TenantResolution>().cloned();
+    let path = req.uri().path().to_string();
+    if requires_csrf_origin(
+        req.method(),
+        &path,
+        resolution.as_ref().map(|value| &value.credential),
+    ) && !request_origin_allowed(&req, &state)
     {
         tracing::warn!(
             method = %req.method(),
-            path = %req.uri().path(),
-            "session-authenticated request rejected by origin policy"
+            path = %path,
+            "browser mutation rejected by origin policy"
         );
+        state
+            .audit
+            .log(
+                rush_api::audit::AuditEvent::new("security.csrf_rejection", "anonymous")
+                    .actor_name("browser request")
+                    .tenant(
+                        resolution
+                            .as_ref()
+                            .map(|value| value.tenant_id.as_str())
+                            .unwrap_or("default"),
+                    )
+                    .resource("http_route", path.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "method": req.method().as_str(),
+                            "reason": "origin_not_allowed",
+                        })
+                        .to_string(),
+                    )
+                    .description("browser mutation rejected by CSRF origin policy")
+                    .context(rush_api::audit::actor_context_from_headers(req.headers())),
+            )
+            .await;
         return (
             axum::http::StatusCode::FORBIDDEN,
             "request origin is not allowed",
@@ -305,6 +391,26 @@ async fn http_metrics_middleware(
 /// Open `GET /metrics` handler: renders the self-metrics registry as Prometheus text
 /// exposition (version 0.0.4). No auth — same posture as `/healthz`.
 async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let audit = state.audit.health();
+    state.self_metrics.set_gauge(
+        "rush_audit_degraded",
+        &[],
+        if audit.ready { 0.0 } else { 1.0 },
+    );
+    state
+        .self_metrics
+        .set_gauge("rush_audit_outbox_events", &[], audit.pending_events as f64);
+    state
+        .self_metrics
+        .set_gauge("rush_audit_outbox_bytes", &[], audit.pending_bytes as f64);
+    state
+        .self_metrics
+        .set_gauge("rush_audit_outbox_max_bytes", &[], audit.max_bytes as f64);
+    state.self_metrics.set_gauge(
+        "rush_audit_write_failures_total",
+        &[],
+        audit.write_failures as f64,
+    );
     let body = state.self_metrics.render_prometheus();
     (
         [(
@@ -382,15 +488,88 @@ async fn tenant_middleware(
         .map(|s| s.to_owned())
         .or(url_tenant);
     let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
+    let session_audit_context = rush_api::audit::actor_context_from_headers(req.headers());
+    let request_path = req.uri().path().to_string();
 
-    let resolution =
-        resolve_tenant_from_headers(&state, auth_header, agent_key, rush_tenant, session_token)
-            .await;
+    let resolution = resolve_tenant_from_headers(
+        &state,
+        auth_header,
+        agent_key,
+        rush_tenant,
+        session_token.clone(),
+    )
+    .await;
+    let session_authenticated = resolution.credential == CredentialKind::Session;
+    let resolved_tenant = resolution.tenant_id.clone();
     req.extensions_mut().insert(TenantContext {
         tenant_id: resolution.tenant_id.clone(),
     });
     req.extensions_mut().insert(resolution);
-    next.run(req).await
+    let mut response = next.run(req).await;
+
+    // Rotate only after a downstream handler successfully validated and used
+    // the old session. Login/logout and SSO callback responses manage their own
+    // cookies and must never receive a second competing session cookie.
+    let manages_own_session_cookie = matches!(
+        request_path.as_str(),
+        "/api/v1/auth/login" | "/api/v1/auth/logout" | "/auth/sso/callback" | "/auth/sso/acs"
+    );
+    if session_authenticated
+        && response.status().as_u16() < 400
+        && !manages_own_session_cookie
+        && let Some(token) = session_token
+    {
+        match state.config_db.rotate_session_if_due(&token).await {
+            Ok(Some(rotated)) => {
+                let cookie = handlers::auth::session_cookie(
+                    &rotated.issued.token,
+                    rotated.issued.max_age_seconds,
+                );
+                if let Ok(value) = HeaderValue::from_str(&cookie) {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                    state
+                        .audit
+                        .log(
+                            rush_api::audit::AuditEvent::new("session.rotate", "user")
+                                .actor(rotated.user_id, rotated.username)
+                                .tenant(rotated.tenant_id)
+                                .resource("session", rotated.session_id)
+                                .outcome("success")
+                                .changes(
+                                    serde_json::json!({
+                                        "idle_timeout_seconds": rotated.issued.max_age_seconds,
+                                    })
+                                    .to_string(),
+                                )
+                                .description("active session bearer rotated")
+                                .context(session_audit_context.clone()),
+                        )
+                        .await;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "session renewal failed");
+                state
+                    .audit
+                    .log(
+                        rush_api::audit::AuditEvent::new("session.rotate", "anonymous")
+                            .actor_name("existing session")
+                            .tenant(resolved_tenant)
+                            .resource("session", "unknown")
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({ "reason": "session_store_unavailable" })
+                                    .to_string(),
+                            )
+                            .description("active session bearer rotation failed")
+                            .context(session_audit_context),
+                    )
+                    .await;
+            }
+        }
+    }
+    response
 }
 
 fn explicit_ingest_tenant(path: &str) -> Option<String> {
@@ -417,6 +596,15 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
     let setup_validation_token = path
         .strip_prefix("/api/v1/sso/setup-token/")
         .and_then(|rest| rest.strip_suffix("/validate"));
+    let scoped_setup_session = (method == axum::http::Method::GET
+        && path == "/api/v1/sso/setup-session")
+        || (method == axum::http::Method::POST
+            && matches!(
+                path,
+                "/api/v1/sso/setup-token/exchange"
+                    | "/api/v1/sso/setup-session/complete"
+                    | "/api/v1/sso/providers"
+            ));
 
     matches!(
         path,
@@ -431,7 +619,8 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
             | "/auth/sso/callback"
             | "/auth/sso/acs"
             | "/auth/sso/metadata"
-    ) || setup_validation_token.is_some_and(|token| !token.is_empty() && !token.contains('/'))
+    ) || scoped_setup_session
+        || setup_validation_token.is_some_and(|token| !token.is_empty() && !token.contains('/'))
 }
 
 /// Once shutdown starts, readiness is already false and this gate prevents new
@@ -1050,6 +1239,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let cors_policy = Arc::new(
+        CorsPolicy::from_env()
+            .map_err(|error| anyhow::anyhow!("invalid CORS configuration: {error}"))?,
+    );
+    if cors_policy.is_empty() {
+        tracing::info!(
+            "RUSH_ALLOWED_ORIGINS is unset or empty; cross-origin browser access is disabled"
+        );
+    }
+
     let clickhouse_url =
         std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
     let clickhouse_db =
@@ -1172,9 +1371,35 @@ async fn main() -> anyhow::Result<()> {
 
     let config_db =
         Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
+    // Shared system-health registry is created before the audit writer so
+    // outbox degradation is visible even if no one has scraped `/metrics` yet.
+    let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
+        std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
     // Build the audit chain before bootstrap tenant mutation so a newly seeded
     // default tenant is recorded like every other tenant creation.
-    let audit = std::sync::Arc::new(rush_api::audit::AuditLogger::new(admin_ch.clone()).await);
+    let audit = std::sync::Arc::new(
+        rush_api::audit::AuditLogger::new(admin_ch.clone(), self_metrics.clone())
+            .await
+            .context("audit logger initialization failed")?,
+    );
+    audit.spawn_replayer();
+    let invalidated_sessions = config_db.invalidate_legacy_session_tokens().await?;
+    if invalidated_sessions > 0 {
+        audit
+            .log(
+                rush_api::audit::AuditEvent::new("session.legacy_tokens_invalidate", "system")
+                    .tenant("default")
+                    .resource("session", "legacy-storage-migration")
+                    .changes(
+                        serde_json::json!({ "invalidated_count": invalidated_sessions })
+                            .to_string(),
+                    )
+                    .description(
+                        "sessions using pre-HMAC token storage were invalidated during startup",
+                    ),
+            )
+            .await;
+    }
     let sso_reconciliation = config_db.reconcile_active_sso_provider().await?;
     if sso_reconciliation.changed {
         if !sso_reconciliation.ambiguous_provider_ids.is_empty() {
@@ -1259,8 +1484,65 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
     }
-    config_db.ensure_default_admin().await?;
+    let bootstrap_admin = match config_db.ensure_default_admin().await {
+        Ok(admin_id) => admin_id,
+        Err(error) => {
+            let (reason, policy_code) = error
+                .downcast_ref::<rush_api::clickhouse_config::PasswordPolicyError>()
+                .map(|policy| ("password_policy", Some(policy.code())))
+                .unwrap_or(("bootstrap_store_unavailable", None));
+            audit
+                .log(
+                    rush_api::audit::AuditEvent::new("user.create", "system")
+                        .actor_name("query-api bootstrap")
+                        .tenant("default")
+                        .resource("user", "initial-admin")
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({
+                                "username": "admin",
+                                "bootstrap": true,
+                                "reason": reason,
+                                "policy_code": policy_code,
+                            })
+                            .to_string(),
+                        )
+                        .description("initial administrator creation failed"),
+                )
+                .await;
+            return Err(error);
+        }
+    };
+    if let Some(admin_id) = bootstrap_admin {
+        audit
+            .log(
+                rush_api::audit::AuditEvent::new("user.create", "system")
+                    .actor_name("query-api bootstrap")
+                    .tenant("default")
+                    .resource("user", admin_id)
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "username": "admin",
+                            "role": "admin",
+                            "auth_provider": "local",
+                            "bootstrap": true,
+                        })
+                        .to_string(),
+                    )
+                    .description("initial administrator created from configured secret"),
+            )
+            .await;
+    }
     config_db.ensure_default_groups().await?;
+    handlers::auth::validate_sso_only_config()
+        .map_err(|error| anyhow::anyhow!("invalid SSO-only configuration: {error}"))?;
+    if handlers::auth::sso_only_mode_enabled() {
+        config_db
+            .validate_break_glass_account(&handlers::auth::break_glass_username())
+            .await
+            .map_err(|error| anyhow::anyhow!("invalid SSO-only break-glass account: {error}"))?;
+    }
     config_db.ensure_default_templates().await?;
     let tenants = config_db.list_tenants().await?;
     let anonymous_query_tenants = tenants
@@ -1343,8 +1625,6 @@ async fn main() -> anyhow::Result<()> {
     // open `/metrics` Prometheus endpoint AND the self-ingested series the stats engine
     // writes into our own metrics tables. Constructed before engine spawns + middleware
     // so the same Arc is shared everywhere.
-    let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
-        std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
     rush_api::process_metrics::sample(&self_metrics);
     rush_api::process_metrics::spawn(self_metrics.clone());
     let instance_id = rush_api::stats_engine::configured_instance_id();
@@ -1554,14 +1834,6 @@ async fn main() -> anyhow::Result<()> {
 
     handlers::auth::validate_login_rate_limit_secret()
         .map_err(|error| anyhow::anyhow!("invalid login rate-limit configuration: {error}"))?;
-    handlers::auth::validate_sso_only_config()
-        .map_err(|error| anyhow::anyhow!("invalid SSO-only configuration: {error}"))?;
-    if handlers::auth::sso_only_mode_enabled() {
-        config_db
-            .validate_break_glass_account(&handlers::auth::break_glass_username())
-            .await
-            .context("invalid SSO-only break-glass account")?;
-    }
     let login_account_limit_per_minute =
         handlers::auth::login_limit_from_env("RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE", 10)
             .map_err(|error| anyhow::anyhow!("invalid login rate-limit configuration: {error}"))?;
@@ -1662,6 +1934,7 @@ async fn main() -> anyhow::Result<()> {
         usage,
         usage_accumulator,
         config: wide_config,
+        cors_policy,
         login_limiter,
         login_account_limit_per_minute,
         login_ip_limit_per_minute,
@@ -2224,6 +2497,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route("/api/v1/auth/logout", post(handlers::auth::logout))
         .route("/api/v1/auth/me", get(handlers::auth::me))
+        .route(
+            "/api/v1/auth/sessions",
+            get(handlers::auth::list_sessions),
+        )
+        .route(
+            "/api/v1/auth/sessions/{id}",
+            delete(handlers::auth::revoke_session),
+        )
+        .route(
+            "/api/v1/auth/admin/sessions",
+            get(handlers::auth::list_all_sessions),
+        )
+        .route(
+            "/api/v1/auth/admin/sessions/{id}",
+            delete(handlers::auth::admin_revoke_session),
+        )
         // Tamper-evident audit log (admin only)
         .route("/api/v1/audit", get(handlers::audit::list_audit))
         .route("/api/v1/audit/verify", get(handlers::audit::verify_audit))
@@ -2250,60 +2539,11 @@ async fn main() -> anyhow::Result<()> {
             state.clone(),
             enforce_tenant_auth_middleware,
         ))
-        .layer(axum::middleware::from_fn(csrf_protection_middleware))
-        .layer({
-            let origins = std::env::var("RUSH_ALLOWED_ORIGINS")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.split(',')
-                        .filter_map(|o| o.trim().parse::<HeaderValue>().ok())
-                        .collect::<Vec<_>>()
-                });
-            match origins {
-                Some(list) => CorsLayer::new()
-                    .allow_origin(AllowOrigin::list(list))
-                    .allow_methods([
-                        axum::http::Method::GET,
-                        axum::http::Method::POST,
-                        axum::http::Method::PUT,
-                        axum::http::Method::DELETE,
-                        axum::http::Method::PATCH,
-                        axum::http::Method::OPTIONS,
-                    ])
-                    .allow_headers([
-                        header::CONTENT_TYPE,
-                        header::AUTHORIZATION,
-                        header::HeaderName::from_static("x-rush-tenant"),
-                        header::HeaderName::from_static("dd-api-key"),
-                    ])
-                    .allow_credentials(true),
-                None => {
-                    // No RUSH_ALLOWED_ORIGINS set — restrict to same-origin only.
-                    // Set RUSH_ALLOWED_ORIGINS=http://localhost:5173 for local dev.
-                    tracing::warn!(
-                        "RUSH_ALLOWED_ORIGINS not set; CORS restricted to same-origin. \
-                         Set this variable for cross-origin access."
-                    );
-                    CorsLayer::new()
-                        .allow_origin(AllowOrigin::exact(HeaderValue::from_static("null")))
-                        .allow_methods([
-                            axum::http::Method::GET,
-                            axum::http::Method::POST,
-                            axum::http::Method::PUT,
-                            axum::http::Method::DELETE,
-                            axum::http::Method::PATCH,
-                            axum::http::Method::OPTIONS,
-                        ])
-                        .allow_headers([
-                            header::CONTENT_TYPE,
-                            header::AUTHORIZATION,
-                            header::HeaderName::from_static("x-rush-tenant"),
-                            header::HeaderName::from_static("dd-api-key"),
-                        ])
-                }
-            }
-        })
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            csrf_protection_middleware,
+        ))
+        .layer(state.cors_policy.layer())
         .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(security_headers_middleware))
         // API RED self-metrics (rush_http_*). Applied as a router layer so the
@@ -2456,11 +2696,13 @@ mod tenant_auth_tests {
     use super::{
         CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
         credential_route_denial, explicit_ingest_tenant, ingest_signal_for_route,
-        is_state_changing_method, request_origin_allowed_with_allowlist,
-        should_reject_for_tenant_auth,
+        is_state_changing_method, request_origin_allowed_with_policy, requires_csrf_origin,
+        should_reject_for_tenant_auth, trust_forwarded_origin_headers,
     };
     use axum::http::{HeaderMap, HeaderValue, Method, header};
     use rush_api::clickhouse_config::ApiKeyGrant;
+    use rush_api::cors::CorsPolicy;
+    use std::net::{IpAddr, Ipv4Addr};
 
     const INGEST_ROUTES: &[(&str, &str)] = &[
         ("/v1/logs", "logs"),
@@ -2528,6 +2770,37 @@ mod tenant_auth_tests {
     }
 
     #[test]
+    fn csrf_covers_login_and_every_setup_session_mutation() {
+        for path in [
+            "/api/v1/auth/login",
+            "/api/v1/sso/setup-token/exchange",
+            "/api/v1/sso/setup-session/complete",
+            "/api/v1/sso/providers",
+        ] {
+            assert!(requires_csrf_origin(
+                &Method::POST,
+                path,
+                Some(&CredentialKind::Anonymous),
+            ));
+        }
+        assert!(requires_csrf_origin(
+            &Method::DELETE,
+            "/api/v1/users/user-1",
+            Some(&CredentialKind::Session),
+        ));
+        assert!(!requires_csrf_origin(
+            &Method::POST,
+            "/auth/sso/acs",
+            Some(&CredentialKind::Anonymous),
+        ));
+        assert!(!requires_csrf_origin(
+            &Method::GET,
+            "/api/v1/sso/setup-session",
+            Some(&CredentialKind::Anonymous),
+        ));
+    }
+
+    #[test]
     fn csrf_accepts_exactly_configured_frontend_origins() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2536,20 +2809,70 @@ mod tenant_auth_tests {
         );
         headers.insert(header::HOST, HeaderValue::from_static("localhost:8080"));
 
-        assert!(!request_origin_allowed_with_allowlist(&headers, None));
-        assert!(request_origin_allowed_with_allowlist(
+        assert!(!request_origin_allowed_with_policy(
+            &headers, false, None, None, false,
+        ));
+        let policy = CorsPolicy::parse(Some("http://localhost:5173")).unwrap();
+        assert!(request_origin_allowed_with_policy(
             &headers,
-            Some(&["http://localhost:5173"]),
+            false,
+            None,
+            Some(&policy),
+            false,
         ));
     }
 
     #[test]
-    fn csrf_rejects_null_and_mismatched_origins_by_default() {
+    fn csrf_production_uses_only_the_canonical_origin() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("rush.example.com"));
+        headers.insert(header::HOST, HeaderValue::from_static("internal:8080"));
+        let attacker_policy = CorsPolicy::parse(Some("https://attacker.example.com")).unwrap();
+        headers.insert(
+            header::HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("attacker.example.com"),
+        );
+        headers.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://rush.example.com"),
+        );
+        assert!(request_origin_allowed_with_policy(
+            &headers,
+            true,
+            Some("https://rush.example.com"),
+            Some(&attacker_policy),
+            true,
+        ));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example.com"),
+        );
+        assert!(!request_origin_allowed_with_policy(
+            &headers,
+            true,
+            Some("https://rush.example.com"),
+            Some(&attacker_policy),
+            true,
+        ));
+        assert!(!request_origin_allowed_with_policy(
+            &headers, true, None, None, false,
+        ));
+    }
+
+    #[test]
+    fn csrf_rejects_null_and_untrusted_forwarded_origins() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("rush.internal:8080"));
 
         headers.insert(header::ORIGIN, HeaderValue::from_static("null"));
-        assert!(!request_origin_allowed_with_allowlist(&headers, None));
+        assert!(!request_origin_allowed_with_policy(
+            &headers, false, None, None, false,
+        ));
 
         headers.insert(
             header::ORIGIN,
@@ -2559,13 +2882,57 @@ mod tenant_auth_tests {
             header::HeaderName::from_static("x-forwarded-proto"),
             HeaderValue::from_static("https"),
         );
-        assert!(!request_origin_allowed_with_allowlist(&headers, None));
+        headers.insert(
+            header::HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("attacker.example.com"),
+        );
+        assert!(!request_origin_allowed_with_policy(
+            &headers, false, None, None, false,
+        ));
 
         headers.insert(
             header::ORIGIN,
-            HeaderValue::from_static("https://rush.example.com"),
+            HeaderValue::from_static("https://edge.example.com"),
         );
-        assert!(request_origin_allowed_with_allowlist(&headers, None));
+        headers.insert(
+            header::HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("edge.example.com"),
+        );
+        assert!(request_origin_allowed_with_policy(
+            &headers, false, None, None, true,
+        ));
+    }
+
+    #[test]
+    fn csrf_trusts_forwarded_origin_only_from_configured_development_proxy() {
+        let trusted = vec!["10.42.0.0/16".to_string()];
+        let trusted_peer = Some(IpAddr::V4(Ipv4Addr::new(10, 42, 1, 9)));
+        let untrusted_peer = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+
+        assert!(trust_forwarded_origin_headers(
+            false,
+            true,
+            trusted_peer,
+            &trusted,
+        ));
+        assert!(!trust_forwarded_origin_headers(
+            false,
+            true,
+            untrusted_peer,
+            &trusted,
+        ));
+        assert!(!trust_forwarded_origin_headers(
+            true,
+            true,
+            trusted_peer,
+            &trusted,
+        ));
+        assert!(!trust_forwarded_origin_headers(
+            false,
+            false,
+            trusted_peer,
+            &trusted,
+        ));
     }
 
     #[test]
@@ -2589,6 +2956,10 @@ mod tenant_auth_tests {
             (Method::POST, "/auth/sso/acs"),
             (Method::GET, "/auth/sso/metadata"),
             (Method::GET, "/api/v1/sso/setup-token/example/validate"),
+            (Method::POST, "/api/v1/sso/setup-token/exchange"),
+            (Method::GET, "/api/v1/sso/setup-session"),
+            (Method::POST, "/api/v1/sso/setup-session/complete"),
+            (Method::POST, "/api/v1/sso/providers"),
             (Method::GET, "/healthz"),
             (Method::GET, "/readyz"),
             (Method::GET, "/metrics"),

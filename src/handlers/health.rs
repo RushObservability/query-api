@@ -91,7 +91,8 @@ async fn authentication_posture(state: &AppState) -> AuthenticationPosture {
 
 pub async fn healthz(State(state): State<AppState>) -> Json<Value> {
     let auth = authentication_posture(&state).await;
-    let secure = crate::row_policy_supported() && auth.secure();
+    let audit = state.audit.health();
+    let secure = crate::row_policy_supported() && auth.secure() && audit.ready;
     Json(json!({
         "status": "ok",
         "tenant_isolation": crate::tenant_isolation_status(),
@@ -101,14 +102,22 @@ pub async fn healthz(State(state): State<AppState>) -> Json<Value> {
             "anonymous_query_tenants": auth.anonymous_query_tenants,
             "anonymous_ingest_tenants": auth.anonymous_ingest_tenants,
         },
+        "audit": {
+            "status": if audit.ready { "ok" } else { "degraded" },
+            "pending_events": audit.pending_events,
+            "pending_bytes": audit.pending_bytes,
+            "max_bytes": audit.max_bytes,
+            "write_failures": audit.write_failures,
+        },
         "secure": secure,
     }))
 }
 
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let auth = authentication_posture(&state).await;
+    let audit = state.audit.health();
     let shutting_down = state.shutdown.is_requested();
-    let ready = !shutting_down && crate::tenant_isolation_ready() && auth.ready();
+    let ready = !shutting_down && crate::tenant_isolation_ready() && auth.ready() && audit.ready;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -126,7 +135,14 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
                 "anonymous_query_tenants": auth.anonymous_query_tenants,
                 "anonymous_ingest_tenants": auth.anonymous_ingest_tenants,
             },
-            "secure": crate::row_policy_supported() && auth.secure(),
+            "audit": {
+                "status": if audit.ready { "ok" } else { "degraded" },
+                "pending_events": audit.pending_events,
+                "pending_bytes": audit.pending_bytes,
+                "max_bytes": audit.max_bytes,
+                "write_failures": audit.write_failures,
+            },
+            "secure": crate::row_policy_supported() && auth.secure() && audit.ready,
         })),
     )
 }

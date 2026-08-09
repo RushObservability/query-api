@@ -850,6 +850,8 @@ async fn create_audit_table(client: &Client) -> anyhow::Result<()> {
   changes String DEFAULT '',
   description String DEFAULT '',
   metadata String DEFAULT '',
+  key_id String DEFAULT '',
+  segment_id String DEFAULT '',
   prev_hash String DEFAULT '', hash String DEFAULT ''
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(timestamp)
@@ -860,6 +862,16 @@ SETTINGS index_granularity = 8192"
 
     tracing::info!(retention_days, "creating audit_events table");
     client.query(&ddl).execute().await?;
+    // Additive migration for QAPI-SEC-11. Empty identifiers preserve the
+    // canonical format and verification behavior of pre-rotation rows.
+    client
+        .query("ALTER TABLE observability.audit_events ADD COLUMN IF NOT EXISTS key_id String DEFAULT '' AFTER metadata")
+        .execute()
+        .await?;
+    client
+        .query("ALTER TABLE observability.audit_events ADD COLUMN IF NOT EXISTS segment_id String DEFAULT '' AFTER key_id")
+        .execute()
+        .await?;
     Ok(())
 }
 

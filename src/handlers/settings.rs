@@ -421,6 +421,19 @@ pub async fn get_runtime_config(
         config_entry("RUSH_COLLECTOR_TENANT", Some("default"), false, false),
         config_entry("RUSH_SPOOL_DIR", Some("./data/spool"), false, false),
         config_entry("RUSH_BUFFER_BACKEND", Some("disk"), false, false),
+        config_entry("RUSH_SESSION_IDLE_TIMEOUT_SECS", Some("1800"), false, false),
+        config_entry(
+            "RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS",
+            Some("86400"),
+            false,
+            false,
+        ),
+        config_entry(
+            "RUSH_SESSION_RENEWAL_INTERVAL_SECS",
+            Some("300"),
+            false,
+            false,
+        ),
         config_entry("RUSH_LOG_FORMAT", Some("pretty"), false, false),
     ];
     runtime.extend([

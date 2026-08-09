@@ -1,9 +1,15 @@
+# Local-development stack only. Published ports stay on loopback and the
+# credentials below are deliberately nonempty local defaults.
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:26.6.1.1193
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-rushdev}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-rush-local-clickhouse-password}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     ulimits:
@@ -11,7 +17,7 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      test: ["CMD-SHELL", "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -21,12 +27,12 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - CLICKHOUSE_URL=http://clickhouse:8123
       - CLICKHOUSE_DATABASE=observability
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-rushdev}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-rush-local-clickhouse-password}
       # Local single-tenant compatibility only. Production must configure the
       # distinct CLICKHOUSE_READ_* principal and verified row policies.
       - RUSH_ALLOW_INSECURE_TENANT_READS=true
@@ -49,12 +55,12 @@ services:
       context: .
       dockerfile: Dockerfile.agent
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     environment:
       - CLICKHOUSE_URL=http://clickhouse:8123
       - CLICKHOUSE_DATABASE=observability
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-rushdev}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-rush-local-clickhouse-password}
       - SRE_AGENT_PORT=8081
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com}
       - OPENAI_API_KEY=${OPENAI_API_KEY}

@@ -117,7 +117,7 @@ pub async fn list_audit(
     let sql = format!(
         "SELECT id, seq, ts AS timestamp, tenant_id, \
          actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
-         ip_address, user_agent, request_id, changes, description, metadata, prev_hash, hash \
+         ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
          FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events {where_clause}) \
          ORDER BY seq DESC LIMIT {limit} OFFSET {offset}"
     );
@@ -159,7 +159,7 @@ pub async fn verify_audit(
 
     let sql = "SELECT id, seq, ts AS timestamp, tenant_id, \
          actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
-         ip_address, user_agent, request_id, changes, description, metadata, prev_hash, hash \
+         ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
          FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY seq ASC";
 
     let rows = state
@@ -175,7 +175,6 @@ pub async fn verify_audit(
             )
         })?;
 
-    let secret = state.audit.secret();
     let mut checked: u64 = 0;
     let mut first_broken_seq: Option<u64> = None;
     let mut expected_prev = String::new();
@@ -188,6 +187,10 @@ pub async fn verify_audit(
             break;
         }
         // Integrity check: recompute this row's hash from its fields.
+        let Some(secret) = state.audit.secret_for_key(&row.key_id) else {
+            first_broken_seq = Some(row.seq);
+            break;
+        };
         let recomputed = compute_hash(secret, row);
         if recomputed != row.hash {
             first_broken_seq = Some(row.seq);
@@ -225,6 +228,8 @@ fn audit_row_json(row: &AuditRow) -> serde_json::Value {
         "changes": row.changes,
         "description": row.description,
         "metadata": row.metadata,
+        "key_id": row.key_id,
+        "segment_id": row.segment_id,
         "prev_hash": row.prev_hash,
         "hash": row.hash,
     })

@@ -5,16 +5,227 @@ use argon2::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clickhouse::Client;
 use dashmap::DashMap;
+use hmac::{Hmac, Mac};
 use openssl::symm::Cipher;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 /// (user_id, username, display_name, tenant_id, role) — the require_auth tuple.
 type SessionUser = (String, String, String, String, String);
 /// (id, name, enabled, auth_required) for a tenant; None = tenant not found.
 type TenantFlags = Option<(String, String, bool, bool)>;
+
+/// Credential bounds are enforced both at the HTTP boundary and immediately
+/// before database/Argon2 work. They are byte limits, which is what controls
+/// memory and hashing cost for UTF-8 input.
+pub const MAX_USERNAME_BYTES: usize = 100;
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+pub const MIN_PASSWORD_CHARS: usize = 12;
+
+/// Stable, client-safe password-policy failures. These messages describe the
+/// proposed password only and never reveal whether an account exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PasswordPolicyError {
+    #[error("password must be at least {MIN_PASSWORD_CHARS} characters")]
+    TooShort,
+    #[error("password must not exceed {MAX_PASSWORD_BYTES} bytes")]
+    TooLong,
+    #[error("password must contain at least one non-whitespace character")]
+    WhitespaceOnly,
+    #[error("password is too common; choose a less predictable passphrase")]
+    Common,
+}
+
+impl PasswordPolicyError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::TooShort => "too_short",
+            Self::TooLong => "too_long",
+            Self::WhitespaceOnly => "whitespace_only",
+            Self::Common => "common_password",
+        }
+    }
+}
+
+/// Apply one policy to every new password while leaving verification of
+/// existing legacy hashes compatible. The byte cap is checked first, before
+/// character counting or Argon2 work, and spaces remain valid in passphrases.
+pub fn validate_password_policy(password: &str) -> Result<(), PasswordPolicyError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(PasswordPolicyError::TooLong);
+    }
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(PasswordPolicyError::TooShort);
+    }
+    if password.chars().all(char::is_whitespace) {
+        return Err(PasswordPolicyError::WhitespaceOnly);
+    }
+
+    const COMMON_PASSWORDS: &[&str] = &[
+        "123456789012",
+        "administrator",
+        "changeme12345",
+        "letmeinletmein",
+        "password1234",
+        "password12345",
+        "qwertyuiop12",
+        "welcome12345",
+    ];
+    let normalized = password.to_lowercase();
+    if COMMON_PASSWORDS.contains(&normalized.as_str()) {
+        return Err(PasswordPolicyError::Common);
+    }
+    Ok(())
+}
+
+const SESSION_IDLE_TIMEOUT_ENV: &str = "RUSH_SESSION_IDLE_TIMEOUT_SECS";
+const SESSION_ABSOLUTE_TIMEOUT_ENV: &str = "RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS";
+const SESSION_RENEWAL_INTERVAL_ENV: &str = "RUSH_SESSION_RENEWAL_INTERVAL_SECS";
+const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: i64 = 30 * 60;
+const DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 24 * 60 * 60;
+const DEFAULT_SESSION_RENEWAL_INTERVAL_SECS: i64 = 5 * 60;
+const MAX_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 31 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPolicy {
+    pub idle_timeout_secs: i64,
+    pub absolute_timeout_secs: i64,
+    pub renewal_interval_secs: i64,
+}
+
+impl SessionPolicy {
+    fn new(
+        idle_timeout_secs: i64,
+        absolute_timeout_secs: i64,
+        renewal_interval_secs: i64,
+    ) -> anyhow::Result<Self> {
+        if !(60..=MAX_SESSION_ABSOLUTE_TIMEOUT_SECS).contains(&idle_timeout_secs) {
+            anyhow::bail!(
+                "{SESSION_IDLE_TIMEOUT_ENV} must be between 60 and {MAX_SESSION_ABSOLUTE_TIMEOUT_SECS} seconds"
+            );
+        }
+        if !(idle_timeout_secs..=MAX_SESSION_ABSOLUTE_TIMEOUT_SECS).contains(&absolute_timeout_secs)
+        {
+            anyhow::bail!(
+                "{SESSION_ABSOLUTE_TIMEOUT_ENV} must be at least the idle timeout and no more than {MAX_SESSION_ABSOLUTE_TIMEOUT_SECS} seconds"
+            );
+        }
+        if !(30..idle_timeout_secs).contains(&renewal_interval_secs) {
+            anyhow::bail!(
+                "{SESSION_RENEWAL_INTERVAL_ENV} must be at least 30 seconds and less than the idle timeout"
+            );
+        }
+        Ok(Self {
+            idle_timeout_secs,
+            absolute_timeout_secs,
+            renewal_interval_secs,
+        })
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        fn parse(name: &str, default: i64) -> anyhow::Result<i64> {
+            std::env::var(name)
+                .ok()
+                .map(|value| {
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| anyhow::anyhow!("{name} must be an integer number of seconds"))
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(default))
+        }
+
+        Self::new(
+            parse(SESSION_IDLE_TIMEOUT_ENV, DEFAULT_SESSION_IDLE_TIMEOUT_SECS)?,
+            parse(
+                SESSION_ABSOLUTE_TIMEOUT_ENV,
+                DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECS,
+            )?,
+            parse(
+                SESSION_RENEWAL_INTERVAL_ENV,
+                DEFAULT_SESSION_RENEWAL_INTERVAL_SECS,
+            )?,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IssuedSession {
+    pub token: String,
+    pub max_age_seconds: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuthSessionInfo {
+    pub session_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub tenant_id: String,
+    pub auth_method: String,
+    pub provider_id: String,
+    pub created_at: String,
+    pub last_seen_at: String,
+    pub idle_expires_at: String,
+    pub absolute_expires_at: String,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RotatedSession {
+    pub issued: IssuedSession,
+    pub session_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub tenant_id: String,
+}
+
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct AuthSessionRow {
+    session_id: String,
+    user_id: String,
+    username: String,
+    tenant_id: String,
+    auth_method: String,
+    provider_id: String,
+    created_at: String,
+    last_seen_at: String,
+    expires_at: String,
+    absolute_expires_at: String,
+    token: String,
+}
+
+impl AuthSessionRow {
+    fn into_info(self, session_hmac_secret: &[u8], current_token: &str) -> AuthSessionInfo {
+        fn utc_api_time(value: String) -> String {
+            if value.ends_with('Z') {
+                value
+            } else {
+                format!("{}Z", value.replace(' ', "T"))
+            }
+        }
+        AuthSessionInfo {
+            session_id: self.session_id,
+            user_id: self.user_id,
+            username: self.username,
+            tenant_id: self.tenant_id,
+            auth_method: self.auth_method,
+            provider_id: self.provider_id,
+            created_at: utc_api_time(self.created_at),
+            last_seen_at: utc_api_time(self.last_seen_at),
+            idle_expires_at: utc_api_time(self.expires_at),
+            absolute_expires_at: utc_api_time(self.absolute_expires_at),
+            current: openssl::memcmp::eq(
+                self.token.as_bytes(),
+                session_storage_key(session_hmac_secret, current_token).as_bytes(),
+            ),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("username is already in use")]
@@ -45,6 +256,72 @@ pub struct ApiKeyGrant {
 /// after at most this long. Keep it short — these exist to absorb the
 /// per-request auth fan-out, not to be a long-lived cache.
 const CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
+
+const SSO_CLAIM_STORE_ENV: &str = "RUSH_SSO_REPLAY_STORE";
+const QUERY_API_REPLICAS_ENV: &str = "RUSH_QUERY_API_REPLICAS";
+const SSO_CLAIM_KEEPER_TABLE: &str = "config_sso_one_time_claims";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SsoClaimStoreMode {
+    Local,
+    Keeper,
+}
+
+fn sso_claim_store_mode(raw: Option<&str>, replicas: usize) -> anyhow::Result<SsoClaimStoreMode> {
+    let mode = raw.unwrap_or("auto").trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "auto" if replicas > 1 => Ok(SsoClaimStoreMode::Keeper),
+        "auto" => Ok(SsoClaimStoreMode::Local),
+        "local" if replicas > 1 => anyhow::bail!(
+            "{SSO_CLAIM_STORE_ENV}=local is unsafe with {QUERY_API_REPLICAS_ENV}={replicas}; use keeper"
+        ),
+        "local" => Ok(SsoClaimStoreMode::Local),
+        "keeper" => Ok(SsoClaimStoreMode::Keeper),
+        _ => anyhow::bail!("{SSO_CLAIM_STORE_ENV} must be one of: auto, local, keeper"),
+    }
+}
+
+fn configured_sso_claim_store_mode() -> anyhow::Result<SsoClaimStoreMode> {
+    let replicas = std::env::var(QUERY_API_REPLICAS_ENV)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{QUERY_API_REPLICAS_ENV} must be a positive integer")
+                })
+        })
+        .transpose()?
+        .unwrap_or(1);
+    sso_claim_store_mode(std::env::var(SSO_CLAIM_STORE_ENV).ok().as_deref(), replicas)
+}
+
+fn sso_claim_storage_key(key: &str) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(key.as_bytes())))
+}
+
+fn consume_local_sso_claim(
+    claims: &DashMap<String, i64>,
+    claim_key: String,
+    expires_at: i64,
+    now: i64,
+) -> bool {
+    if expires_at <= now {
+        return false;
+    }
+    if claims.len() > 10_000 {
+        claims.retain(|_, expiry| *expiry > now);
+    }
+    match claims.entry(claim_key) {
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(expires_at);
+            true
+        }
+        dashmap::mapref::entry::Entry::Occupied(_) => false,
+    }
+}
 
 /// SLO history is an incident timeline, not an evaluation log. Keep one breach
 /// followed by one recovery and discard no-data or duplicate state rows. Input
@@ -77,6 +354,160 @@ fn normalize_slo_incident_events(
 #[cfg(test)]
 mod auth_storage_tests {
     use super::*;
+
+    #[test]
+    fn session_policy_enforces_idle_absolute_and_rotation_relationships() {
+        assert_eq!(
+            SessionPolicy::new(1_800, 86_400, 300).unwrap(),
+            SessionPolicy {
+                idle_timeout_secs: 1_800,
+                absolute_timeout_secs: 86_400,
+                renewal_interval_secs: 300,
+            }
+        );
+        assert!(SessionPolicy::new(59, 86_400, 30).is_err());
+        assert!(SessionPolicy::new(1_800, 1_799, 300).is_err());
+        assert!(SessionPolicy::new(1_800, 86_400, 1_800).is_err());
+    }
+
+    #[test]
+    fn password_policy_covers_boundaries_unicode_whitespace_and_common_values() {
+        let exact_minimum = "a".repeat(MIN_PASSWORD_CHARS);
+        assert_eq!(validate_password_policy(&exact_minimum), Ok(()));
+        assert_eq!(
+            validate_password_policy(&"a".repeat(MIN_PASSWORD_CHARS - 1)),
+            Err(PasswordPolicyError::TooShort)
+        );
+
+        let unicode = "🔐".repeat(MIN_PASSWORD_CHARS);
+        assert_eq!(unicode.chars().count(), MIN_PASSWORD_CHARS);
+        assert_eq!(validate_password_policy(&unicode), Ok(()));
+
+        assert_eq!(
+            validate_password_policy(&" ".repeat(MIN_PASSWORD_CHARS)),
+            Err(PasswordPolicyError::WhitespaceOnly)
+        );
+        assert_eq!(
+            validate_password_policy("  a long passphrase is valid  "),
+            Ok(())
+        );
+        assert_eq!(
+            validate_password_policy("Password12345"),
+            Err(PasswordPolicyError::Common)
+        );
+
+        assert_eq!(
+            validate_password_policy(&"z".repeat(MAX_PASSWORD_BYTES)),
+            Ok(())
+        );
+        let oversized = "x".repeat(MAX_PASSWORD_BYTES + 1);
+        assert_eq!(
+            validate_password_policy(&oversized),
+            Err(PasswordPolicyError::TooLong)
+        );
+        assert!(!verify_password(&oversized, dummy_password_hash()));
+    }
+
+    #[test]
+    fn password_hashing_uses_the_shared_policy_but_legacy_hashes_still_verify() {
+        let accepted = "new secure passphrase";
+        let hash = hash_password(accepted).unwrap();
+        assert!(verify_password(accepted, &hash));
+
+        let salt = SaltString::encode_b64(b"rush-legacy-password-salt")
+            .expect("static legacy salt must be valid");
+        let legacy_hash = Argon2::default()
+            .hash_password(b"short", &salt)
+            .unwrap()
+            .to_string();
+        assert!(verify_password("short", &legacy_hash));
+        assert_eq!(
+            validate_password_policy("short"),
+            Err(PasswordPolicyError::TooShort)
+        );
+    }
+
+    #[test]
+    fn every_password_setting_path_reaches_the_shared_policy() {
+        let source = include_str!("clickhouse_config.rs");
+        let hasher = source
+            .split_once("\nfn hash_password(password: &str)")
+            .map(|(_, body)| body)
+            .expect("password hasher must exist")
+            .split("fn canonical_username")
+            .next()
+            .unwrap();
+        assert!(hasher.contains("validate_password_policy(password)?"));
+
+        for function in [
+            "pub async fn ensure_default_admin",
+            "pub async fn create_user",
+            "pub async fn change_password",
+        ] {
+            let marker = format!("\n    {function}");
+            let body = source
+                .split_once(&marker)
+                .map(|(_, body)| body)
+                .expect("password-setting function must exist")
+                .split("\n    pub async fn")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("hash_password("),
+                "{function} bypasses policy"
+            );
+        }
+    }
+
+    #[test]
+    fn session_storage_tracks_both_deadlines_and_rotates_without_exposing_bearers() {
+        let source = include_str!("clickhouse_config.rs");
+        let migration = source
+            .rsplit_once("CREATE TABLE IF NOT EXISTS config_sessions")
+            .map(|(_, migration)| migration)
+            .expect("session schema must exist")
+            .split("CREATE TABLE IF NOT EXISTS config_login_attempts")
+            .next()
+            .expect("login-attempt schema must follow sessions");
+        assert!(migration.contains("session_id"));
+        assert!(migration.contains("last_seen_at"));
+        assert!(migration.contains("absolute_expires_at"));
+        assert!(migration.contains("DELETE WHERE session_id = ''"));
+        assert!(migration.contains("CREATE TABLE IF NOT EXISTS config_session_revocations"));
+
+        let rotation = source
+            .rsplit_once("pub async fn rotate_session_if_due")
+            .map(|(_, method)| method)
+            .expect("session rotation must exist")
+            .split("pub async fn delete_session")
+            .next()
+            .expect("logout deletion must follow rotation");
+        let delete_position = rotation
+            .find("DELETE FROM config_sessions WHERE token = ?")
+            .expect("rotation must revoke the old bearer");
+        let insert_position = rotation
+            .find("INSERT INTO config_sessions")
+            .expect("rotation must write the replacement bearer");
+        assert!(delete_position < insert_position);
+        assert!(rotation.contains("session_storage_key(&self.session_hmac_secret, token)"));
+        assert!(rotation.contains("config_session_revocations"));
+        assert!(!rotation.contains(".bind(token)"));
+
+        let logout = source
+            .rsplit_once("pub async fn delete_session(&self")
+            .map(|(_, method)| method)
+            .expect("logout session deletion must exist")
+            .split("pub async fn record_login_ip_attempt")
+            .next()
+            .expect("login attempt storage must follow logout deletion");
+        let tombstone = logout
+            .find("INSERT INTO config_session_revocations")
+            .expect("logout must persist a session tombstone");
+        let delete = logout
+            .find("DELETE FROM config_sessions WHERE session_id = ?")
+            .expect("logout must delete every bearer for the public session id");
+        assert!(tombstone < delete);
+    }
 
     #[test]
     fn legacy_sso_provider_reconciliation_adopts_only_one_enabled_provider() {
@@ -143,11 +574,159 @@ mod auth_storage_tests {
     #[test]
     fn session_storage_uses_a_one_way_key_not_the_bearer_value() {
         let raw = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let stored = session_storage_key(raw);
-        assert!(stored.starts_with("sha256:"));
-        assert_eq!(stored, session_storage_key(raw));
+        let secret = b"01234567890123456789012345678901";
+        let stored = session_storage_key(secret, raw);
+        assert!(stored.starts_with(SESSION_HMAC_PREFIX));
+        assert_eq!(stored, session_storage_key(secret, raw));
         assert_ne!(stored, raw);
         assert!(!stored.contains(raw));
+
+        let other_secret = b"abcdefghijklmnopqrstuvwxyzABCDEF";
+        assert_ne!(stored, session_storage_key(other_secret, raw));
+
+        let source = include_str!("clickhouse_config.rs");
+        let migration = source
+            .rsplit_once("pub async fn invalidate_legacy_session_tokens")
+            .map(|(_, method)| method)
+            .expect("legacy session migration must exist")
+            .split("async fn insert_session")
+            .next()
+            .expect("session insertion must follow migration");
+        assert!(migration.contains("NOT startsWith(token, ?)"));
+        assert!(migration.contains("lightweight_deletes_sync"));
+    }
+
+    #[test]
+    fn session_lookup_and_deletion_never_send_the_raw_bearer_to_storage() {
+        let source = include_str!("clickhouse_config.rs");
+        let validation = source
+            .split_once("\n    pub async fn get_session_user(")
+            .map(|(_, method)| method)
+            .expect("session validation must exist")
+            .split("\n    pub async fn delete_session(")
+            .next()
+            .expect("session deletion must follow validation");
+        assert!(validation.contains("session_storage_key(&self.session_hmac_secret, token)"));
+        assert!(validation.contains(".bind(&stored_token)"));
+        assert!(!validation.contains(".bind(token)"));
+        assert!(!validation.contains("Rolling-upgrade compatibility"));
+
+        let deletion = source
+            .split_once("\n    pub async fn delete_session(")
+            .map(|(_, method)| method)
+            .expect("session deletion must exist")
+            .split("\n    pub async fn record_login_ip_attempt(")
+            .next()
+            .expect("login attempt storage must follow session deletion");
+        assert!(deletion.contains("session_storage_key(&self.session_hmac_secret, token)"));
+        assert!(deletion.contains("WHERE token = ?"));
+        assert!(deletion.contains(".bind(&stored_token)"));
+        assert!(!deletion.contains("OR token"));
+        assert!(!deletion.contains(".bind(token)"));
+    }
+
+    #[test]
+    fn sso_claim_store_requires_shared_coordination_for_multiple_replicas() {
+        assert_eq!(
+            sso_claim_store_mode(Some("auto"), 1).unwrap(),
+            SsoClaimStoreMode::Local
+        );
+        assert_eq!(
+            sso_claim_store_mode(Some("auto"), 2).unwrap(),
+            SsoClaimStoreMode::Keeper
+        );
+        assert!(sso_claim_store_mode(Some("local"), 2).is_err());
+        assert_eq!(
+            sso_claim_store_mode(Some("keeper"), 1).unwrap(),
+            SsoClaimStoreMode::Keeper
+        );
+    }
+
+    #[test]
+    fn sso_claim_keys_are_one_way_and_domain_separated_by_the_caller() {
+        let raw = "saml-assertion:assertion-secret-id";
+        let stored = sso_claim_storage_key(raw);
+        assert!(stored.starts_with("sha256:"));
+        assert_eq!(stored, sso_claim_storage_key(raw));
+        assert_ne!(stored, raw);
+        assert!(!stored.contains("assertion-secret-id"));
+        assert_ne!(
+            stored,
+            sso_claim_storage_key("saml-response:assertion-secret-id")
+        );
+    }
+
+    #[test]
+    fn setup_session_revocations_are_persistent_and_store_only_one_way_keys() {
+        let source = include_str!("clickhouse_config.rs");
+        assert!(source.contains("CREATE TABLE IF NOT EXISTS config_sso_setup_revocations"));
+        assert!(source.contains("TTL toDateTime(expires_at)"));
+
+        let write = source
+            .split_once("\n    pub async fn revoke_sso_setup_session(")
+            .map(|(_, method)| method)
+            .expect("durable setup revocation write must exist")
+            .split("\n    pub async fn is_sso_setup_session_revoked(")
+            .next()
+            .expect("revocation lookup must follow the write");
+        assert!(write.contains("INSERT INTO config_sso_setup_revocations"));
+        assert!(write.contains(".bind(sso_claim_storage_key(key))"));
+        assert!(!write.contains(".bind(key)"));
+
+        let lookup = source
+            .split_once("\n    pub async fn is_sso_setup_session_revoked(")
+            .map(|(_, method)| method)
+            .expect("durable setup revocation lookup must exist")
+            .split("\n    async fn ensure_username_available(")
+            .next()
+            .expect("username validation must follow revocation lookup");
+        assert!(lookup.contains("expires_at > ?"));
+        assert!(lookup.contains(".bind(sso_claim_storage_key(key))"));
+        assert!(!lookup.contains(".bind(key)"));
+    }
+
+    #[test]
+    fn local_sso_claims_are_consumed_once_and_expired_input_fails_closed() {
+        let claims = DashMap::new();
+        assert!(consume_local_sso_claim(
+            &claims,
+            "claim-a".to_string(),
+            1_100,
+            1_000,
+        ));
+        assert!(!consume_local_sso_claim(
+            &claims,
+            "claim-a".to_string(),
+            1_100,
+            1_001,
+        ));
+        assert!(!consume_local_sso_claim(
+            &claims,
+            "claim-expired".to_string(),
+            999,
+            1_000,
+        ));
+    }
+
+    #[test]
+    fn bootstrap_logging_never_interpolates_the_initial_password() {
+        let source = include_str!("clickhouse_config.rs");
+        let bootstrap = source
+            .rsplit_once("pub async fn ensure_default_admin")
+            .map(|(_, method)| method)
+            .expect("default-admin bootstrap method must exist")
+            .split("pub async fn authenticate")
+            .next()
+            .expect("authentication must follow bootstrap");
+        assert!(bootstrap.contains("INITIAL_ADMIN_PASSWORD is required"));
+        let logging = bootstrap
+            .split_once("tracing::warn!")
+            .map(|(_, logging)| logging)
+            .expect("bootstrap creation must leave an operational log");
+        assert!(
+            !logging.contains("initial_password"),
+            "bootstrap logging must never reference the password variable"
+        );
     }
 
     #[test]
@@ -177,9 +756,7 @@ mod auth_storage_tests {
             .split("async fn derive_user_role")
             .next()
             .expect("role derivation must follow authentication");
-        assert!(authentication.contains(
-            "lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?))"
-        ));
+        assert!(authentication.contains("lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?))"));
         assert!(authentication.contains("LIMIT 2"));
         assert!(authentication.contains("dummy_password_hash()"));
         assert!(authentication.contains("if rows.len() > 1"));
@@ -199,6 +776,8 @@ mod auth_storage_tests {
         assert!(password_change.contains("PasswordChangeOutcome::SsoManaged"));
         assert!(password_change.contains(".bind(&row.auth_provider)"));
         assert!(password_change.contains(".bind(&row.external_id)"));
+        assert!(password_change.contains("sessions are already invalid"));
+        assert!(password_change.contains("if let Err(error)"));
 
         let enabled_change = source
             .rsplit_once("pub async fn set_user_enabled")
@@ -209,6 +788,76 @@ mod auth_storage_tests {
             .expect("username lookup must follow enabled mutation");
         assert!(enabled_change.contains(".bind(&row.auth_provider)"));
         assert!(enabled_change.contains(".bind(&row.external_id)"));
+    }
+
+    #[test]
+    fn sessions_are_bound_to_the_authenticated_user_version() {
+        let source = include_str!("clickhouse_config.rs");
+        let session_create = source
+            .rsplit_once("async fn insert_session")
+            .map(|(_, method)| method)
+            .expect("session insertion method must exist")
+            .split("pub async fn get_session_user")
+            .next()
+            .expect("session validation must follow session insertion");
+        assert!(session_create.contains("user_version"));
+        assert!(session_create.contains("create_session_at_version"));
+
+        let session_validation = source
+            .rsplit_once("pub async fn get_session_user")
+            .map(|(_, method)| method)
+            .expect("session validation method must exist")
+            .split("pub async fn delete_session")
+            .next()
+            .expect("session deletion must follow validation");
+        assert!(session_validation.contains("s.user_version = u.version"));
+
+        let migration = source
+            .rsplit_once("async fn run_migrations")
+            .map(|(_, method)| method)
+            .expect("config migrations must exist")
+            .split("// ── Helpers")
+            .next()
+            .expect("migration list must precede helpers");
+        assert!(migration.contains("ADD COLUMN IF NOT EXISTS user_version"));
+        assert!(migration.contains("DELETE WHERE user_version = 0"));
+    }
+
+    #[test]
+    fn sessions_are_bound_to_their_authentication_provider() {
+        let source = include_str!("clickhouse_config.rs");
+        let session_create = source
+            .rsplit_once("async fn insert_session")
+            .map(|(_, method)| method)
+            .expect("session insertion method must exist")
+            .split("pub async fn get_session_user")
+            .next()
+            .expect("session validation must follow insertion");
+        assert!(session_create.contains("auth_method"));
+        assert!(session_create.contains("provider_id"));
+        assert!(session_create.contains("create_sso_session"));
+        assert!(session_create.contains("\"local\", \"\""));
+
+        let validation = source
+            .rsplit_once("pub async fn get_session_user")
+            .map(|(_, method)| method)
+            .expect("session validation must exist")
+            .split("pub async fn delete_session")
+            .next()
+            .expect("session deletion must follow validation");
+        assert!(validation.contains("effective_active_sso_provider_id"));
+        assert!(validation.contains("active_provider_id.as_deref()"));
+        assert!(validation.contains("_ => return None"));
+
+        let migration = source
+            .rsplit_once("async fn run_migrations")
+            .map(|(_, method)| method)
+            .expect("config migrations must exist")
+            .split("// ── Helpers")
+            .next()
+            .expect("migration list must precede helpers");
+        assert!(migration.contains("ADD COLUMN IF NOT EXISTS auth_method"));
+        assert!(migration.contains("ADD COLUMN IF NOT EXISTS provider_id"));
     }
 
     #[test]
@@ -325,6 +974,7 @@ mod slo_event_tests {
 }
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
+    validate_password_policy(password)?;
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -352,6 +1002,9 @@ fn dummy_password_hash() -> &'static str {
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {
+    if password.is_empty() || password.len() > MAX_PASSWORD_BYTES {
+        return false;
+    }
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
@@ -364,8 +1017,30 @@ const ENCRYPTED_SECRET_PREFIX: &str = "enc:v1:";
 const CONFIG_ENCRYPTION_CONTEXT: &[u8] = b"rush-config-encryption-v1\0";
 const SSO_SECRET_AAD: &[u8] = b"rush-sso-client-secret-v1";
 
-fn session_storage_key(token: &str) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())))
+const SESSION_HMAC_PREFIX: &str = "hmac-sha256:v1:";
+
+fn session_hmac_secret_from_env() -> anyhow::Result<Vec<u8>> {
+    let secret = std::env::var("RUSH_SESSION_HMAC_SECRET")
+        .or_else(|_| std::env::var("RUSH_API_KEY_SECRET"))
+        .or_else(|_| std::env::var("RUSH_AUDIT_HMAC_SECRET"))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "RUSH_SESSION_HMAC_SECRET is required (API-key or audit HMAC secrets are accepted as compatibility fallbacks)"
+            )
+        })?;
+    if secret.len() < 32 {
+        anyhow::bail!("RUSH_SESSION_HMAC_SECRET must contain at least 32 bytes");
+    }
+    Ok(secret.into_bytes())
+}
+
+fn session_storage_key(secret: &[u8], token: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(token.as_bytes());
+    format!(
+        "{SESSION_HMAC_PREFIX}{}",
+        hex::encode(mac.finalize().into_bytes())
+    )
 }
 
 fn config_encryption_key_from_secret(secret: &str) -> anyhow::Result<[u8; 32]> {
@@ -655,6 +1330,15 @@ pub struct ConfigDb {
     /// Authentication also fails closed if separately racing replicas ever
     /// produce a collision.
     username_mutation_lock: tokio::sync::Mutex<()>,
+    /// One-time SAML/setup claims. Keeper mode gives every API replica the same
+    /// linearizable keyspace; local mode is accepted only for a single replica.
+    sso_claim_store_mode: SsoClaimStoreMode,
+    local_sso_claims: DashMap<String, i64>,
+    sso_claim_cleanup_counter: AtomicU64,
+    session_policy: SessionPolicy,
+    /// Dedicated key for one-way session bearer storage. The raw bearer exists
+    /// only in the issuing response/cookie and is never sent to ClickHouse.
+    session_hmac_secret: Vec<u8>,
 }
 
 /// A metric firewall rule (storage + API shape). `enabled`/`*_regex` are 0/1.
@@ -717,6 +1401,9 @@ impl GlobalRetention {
 
 impl ConfigDb {
     pub async fn open(url: &str, user: &str, password: &str) -> anyhow::Result<Self> {
+        let sso_claim_store_mode = configured_sso_claim_store_mode()?;
+        let session_policy = SessionPolicy::from_env()?;
+        let session_hmac_secret = session_hmac_secret_from_env()?;
         let client = Client::default()
             .with_url(url)
             .with_user(user)
@@ -728,13 +1415,44 @@ impl ConfigDb {
             perms_cache: DashMap::new(),
             signal_cache: DashMap::new(),
             username_mutation_lock: tokio::sync::Mutex::new(()),
+            sso_claim_store_mode,
+            local_sso_claims: DashMap::new(),
+            sso_claim_cleanup_counter: AtomicU64::new(0),
+            session_policy,
+            session_hmac_secret,
         };
         db.run_migrations().await?;
+        db.initialize_sso_claim_store().await?;
         // Do this at startup so the first unknown-user login has no one-time
         // initialization cost that could become a timing signal.
         let _ = dummy_password_hash();
         db.validate_unique_usernames().await?;
         Ok(db)
+    }
+
+    async fn initialize_sso_claim_store(&self) -> anyhow::Result<()> {
+        if self.sso_claim_store_mode == SsoClaimStoreMode::Local {
+            tracing::info!("SSO replay protection uses the single-replica in-process claim store");
+            return Ok(());
+        }
+
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {SSO_CLAIM_KEEPER_TABLE} (\
+                 claim_key String,\
+                 expires_at Int64,\
+                 claimed_at Int64\
+             ) ENGINE = KeeperMap('sso_one_time_claims') PRIMARY KEY claim_key"
+        );
+        self.client.query(&ddl).execute().await.map_err(|error| {
+            anyhow::anyhow!(
+                "shared SSO replay store initialization failed; configure ClickHouse Keeper and keeper_map_path_prefix, or run exactly one query-api replica: {error}"
+            )
+        })?;
+        tracing::info!(
+            table = SSO_CLAIM_KEEPER_TABLE,
+            "SSO replay protection uses the shared ClickHouse Keeper claim store"
+        );
+        Ok(())
     }
 
     /// Drop all config-plane caches. Called by every tenant/user/group mutation:
@@ -806,11 +1524,43 @@ impl ConfigDb {
             // ── Sessions ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_sessions (
                 token      String,
+                session_id String,
                 user_id    String,
+                user_version UInt64,
+                auth_method String DEFAULT '',
+                provider_id String DEFAULT '',
                 created_at String DEFAULT toString(now()),
-                expires_at String
+                last_seen_at String,
+                expires_at String,
+                absolute_expires_at String
             ) ENGINE = MergeTree()
             ORDER BY (token)
+            TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
+            // Bind every session to the exact user row that issued it. Existing
+            // unversioned sessions are revoked during the rolling upgrade;
+            // subsequent password/user rewrites invalidate sessions atomically.
+            "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS user_version UInt64 DEFAULT 0 AFTER user_id",
+            // Session provenance is authorization data, not just metadata. Empty
+            // defaults deliberately fail closed for sessions minted before this
+            // migration; current local and SSO login paths always set both fields.
+            "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS auth_method String DEFAULT '' AFTER user_version",
+            "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS provider_id String DEFAULT '' AFTER auth_method",
+            "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS session_id String DEFAULT '' AFTER token",
+            "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS last_seen_at String DEFAULT created_at AFTER created_at",
+            "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS absolute_expires_at String DEFAULT expires_at AFTER expires_at",
+            "ALTER TABLE config_sessions DELETE WHERE user_version = 0 SETTINGS mutations_sync = 2",
+            // Legacy rows have no stable public identifier or absolute deadline.
+            // Revoke them once during migration rather than silently treating
+            // their old 24-hour expiry as the new policy.
+            "ALTER TABLE config_sessions DELETE WHERE session_id = '' SETTINGS mutations_sync = 2",
+            // Durable tombstones make logout/admin revocation win over a token
+            // rotation that was already in flight on another API replica.
+            "CREATE TABLE IF NOT EXISTS config_session_revocations (
+                session_id String,
+                expires_at String,
+                revoked_at String
+            ) ENGINE = MergeTree()
+            ORDER BY (session_id)
             TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
             // Shared login-attempt ledger. Identifiers are keyed hashes, never
             // raw usernames or addresses, and expire after one day. IP rows
@@ -875,6 +1625,16 @@ impl ConfigDb {
                 version     UInt64
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (slot)",
+            // Persistent setup-session revocations survive a single-replica API
+            // restart. The atomic local/Keeper claim store still arbitrates
+            // concurrent use; this ledger closes the restart window.
+            "CREATE TABLE IF NOT EXISTS config_sso_setup_revocations (
+                claim_key  String,
+                expires_at Int64,
+                revoked_at Int64
+            ) ENGINE = MergeTree()
+            ORDER BY (claim_key)
+            TTL toDateTime(expires_at)",
             // ── IdP group mappings ────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_idp_group_mappings (
                 id            String,
@@ -1447,6 +2207,129 @@ impl ConfigDb {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64
+    }
+
+    /// Atomically claim a one-time SSO key until `expires_at` (Unix seconds).
+    ///
+    /// Keeper mode relies on KeeperMap's strict insert semantics: creating an
+    /// existing primary key fails atomically across every query-api replica.
+    /// An ambiguous insert failure is checked by key and always fails closed.
+    /// Local mode uses the same contract inside the sole permitted replica.
+    pub async fn claim_sso_key_once(&self, key: &str, expires_at: i64) -> anyhow::Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        if expires_at <= now {
+            return Ok(false);
+        }
+        let claim_key = sso_claim_storage_key(key);
+
+        if self.sso_claim_store_mode == SsoClaimStoreMode::Local {
+            return Ok(consume_local_sso_claim(
+                &self.local_sso_claims,
+                claim_key,
+                expires_at,
+                now,
+            ));
+        }
+
+        // KeeperMap has no TTL clause. Amortize deletion so expired claim keys
+        // do not accumulate indefinitely without putting a scan on every login.
+        if self
+            .sso_claim_cleanup_counter
+            .fetch_add(1, Ordering::Relaxed)
+            % 256
+            == 0
+        {
+            let cleanup = format!("DELETE FROM {SSO_CLAIM_KEEPER_TABLE} WHERE expires_at <= ?");
+            if let Err(error) = self
+                .client
+                .query(&cleanup)
+                .with_option("keeper_map_strict_mode", "1")
+                .bind(now)
+                .execute()
+                .await
+            {
+                // Cleanup does not affect the atomic insertion below. Keep the
+                // request available and surface the operational issue in logs.
+                tracing::warn!(%error, "failed to remove expired SSO replay claims");
+            }
+        }
+
+        let insert = format!(
+            "INSERT INTO {SSO_CLAIM_KEEPER_TABLE} (claim_key, expires_at, claimed_at) \
+             VALUES (?, ?, ?)"
+        );
+        match self
+            .client
+            .query(&insert)
+            .with_option("keeper_map_strict_mode", "1")
+            .bind(&claim_key)
+            .bind(expires_at)
+            .bind(now)
+            .execute()
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(insert_error) => {
+                #[derive(clickhouse::Row, serde::Deserialize)]
+                struct ClaimCount {
+                    count: u64,
+                }
+                let lookup = format!(
+                    "SELECT count() AS count FROM {SSO_CLAIM_KEEPER_TABLE} WHERE claim_key = ?"
+                );
+                match self
+                    .client
+                    .query(&lookup)
+                    .bind(&claim_key)
+                    .fetch_one::<ClaimCount>()
+                    .await
+                {
+                    Ok(row) if row.count > 0 => Ok(false),
+                    Ok(_) => Err(insert_error.into()),
+                    Err(lookup_error) => Err(anyhow::anyhow!(
+                        "SSO replay claim failed and its outcome could not be verified: insert={insert_error}; lookup={lookup_error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Persistently revoke a scoped SSO setup capability. Keys use the same
+    /// one-way representation as replay claims, so session identifiers are not
+    /// recoverable from ClickHouse or its query logs.
+    pub async fn revoke_sso_setup_session(&self, key: &str, expires_at: i64) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        if expires_at <= now {
+            anyhow::bail!("cannot revoke an expired SSO setup session");
+        }
+        self.client
+            .query(
+                "INSERT INTO config_sso_setup_revocations (claim_key, expires_at, revoked_at) VALUES (?, ?, ?)",
+            )
+            .bind(sso_claim_storage_key(key))
+            .bind(expires_at)
+            .bind(now)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn is_sso_setup_session_revoked(&self, key: &str) -> anyhow::Result<bool> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct ClaimCount {
+            count: u64,
+        }
+
+        let row = self
+            .client
+            .query(
+                "SELECT count() AS count FROM config_sso_setup_revocations WHERE claim_key = ? AND expires_at > ?",
+            )
+            .bind(sso_claim_storage_key(key))
+            .bind(chrono::Utc::now().timestamp())
+            .fetch_one::<ClaimCount>()
+            .await?;
+        Ok(row.count > 0)
     }
 
     async fn ensure_username_available(&self, username: &str) -> anyhow::Result<()> {
@@ -2187,7 +3070,7 @@ impl ConfigDb {
 
     // ── User & session operations ──────────────────────────────────────────────
 
-    pub async fn ensure_default_admin(&self) -> anyhow::Result<()> {
+    pub async fn ensure_default_admin(&self) -> anyhow::Result<Option<String>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Count {
             n: u64,
@@ -2198,16 +3081,17 @@ impl ConfigDb {
             .fetch_one::<Count>()
             .await?;
         if row.n > 0 {
-            return Ok(());
+            return Ok(None);
         }
 
-        let initial_password = std::env::var("INITIAL_ADMIN_PASSWORD").unwrap_or_else(|_| {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            (0..24)
-                .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
-                .collect()
-        });
+        let initial_password = std::env::var("INITIAL_ADMIN_PASSWORD")
+            .ok()
+            .filter(|password| !password.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "INITIAL_ADMIN_PASSWORD is required when creating the initial admin; provide it through a secret"
+                )
+            })?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let password_hash = hash_password(&initial_password)?;
@@ -2228,18 +3112,23 @@ impl ConfigDb {
 
         tracing::warn!(
             username = "admin",
-            "Rush initial admin credentials — Username: admin, Password: {initial_password} — \
-             Change this password immediately after first login."
+            "initial administrator created; retrieve the password from the configured secret and change it after first login"
         );
-        tracing::info!("default admin user created");
-        Ok(())
+        Ok(Some(id))
     }
 
     pub async fn authenticate(
         &self,
         username: &str,
         password: &str,
-    ) -> anyhow::Result<Option<(String, String, String, String, String)>> {
+    ) -> anyhow::Result<Option<(String, String, String, String, String, u64)>> {
+        if username.trim().is_empty()
+            || username.len() > MAX_USERNAME_BYTES
+            || password.is_empty()
+            || password.len() > MAX_PASSWORD_BYTES
+        {
+            return Ok(None);
+        }
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String,
@@ -2248,10 +3137,11 @@ impl ConfigDb {
             display_name: String,
             tenant_id: String,
             auth_provider: String,
+            version: u64,
         }
 
         let mut rows = self.client
-            .query("SELECT id, username, password_hash, display_name, tenant_id, auth_provider FROM config_users FINAL WHERE lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?)) AND enabled = 1 AND is_deleted = 0 ORDER BY id LIMIT 2")
+            .query("SELECT id, username, password_hash, display_name, tenant_id, auth_provider, version FROM config_users FINAL WHERE lowerUTF8(trimBoth(username)) = lowerUTF8(trimBoth(?)) AND enabled = 1 AND is_deleted = 0 ORDER BY id LIMIT 2")
             .bind(username)
             .fetch_all::<Row>()
             .await?;
@@ -2287,6 +3177,7 @@ impl ConfigDb {
             row.display_name,
             row.tenant_id,
             role,
+            row.version,
         )))
     }
 
@@ -2317,7 +3208,41 @@ impl ConfigDb {
         Ok("viewer".to_string())
     }
 
-    pub async fn create_session(&self, user_id: &str) -> anyhow::Result<String> {
+    /// Invalidate session rows created before keyed HMAC storage was enabled.
+    /// Their raw bearers are intentionally unavailable, so conversion is not
+    /// possible. Startup calls this before serving HTTP and audits the count.
+    pub async fn invalidate_legacy_session_tokens(&self) -> anyhow::Result<u64> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct CountRow {
+            count: u64,
+        }
+
+        let row = self
+            .client
+            .query("SELECT count() AS count FROM config_sessions WHERE NOT startsWith(token, ?)")
+            .bind(SESSION_HMAC_PREFIX)
+            .fetch_one::<CountRow>()
+            .await?;
+        if row.count == 0 {
+            return Ok(0);
+        }
+
+        self.client
+            .query("DELETE FROM config_sessions WHERE NOT startsWith(token, ?)")
+            .with_option("lightweight_deletes_sync", "1")
+            .bind(SESSION_HMAC_PREFIX)
+            .execute()
+            .await?;
+        Ok(row.count)
+    }
+
+    async fn insert_session(
+        &self,
+        user_id: &str,
+        user_version: u64,
+        auth_method: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<IssuedSession> {
         let token: String = {
             use rand::Rng;
             let mut rng = rand::rng();
@@ -2325,27 +3250,78 @@ impl ConfigDb {
             bytes.iter().map(|b| format!("{b:02x}")).collect()
         };
 
-        let created_at = Self::now_str();
-        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(24))
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let created_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let absolute_expires =
+            now + chrono::Duration::seconds(self.session_policy.absolute_timeout_secs);
+        let idle_expires = now + chrono::Duration::seconds(self.session_policy.idle_timeout_secs);
+        let expires_at = idle_expires
+            .min(absolute_expires)
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        let stored_token = session_storage_key(&token);
+        let absolute_expires_at = absolute_expires.format("%Y-%m-%d %H:%M:%S").to_string();
+        let stored_token = session_storage_key(&self.session_hmac_secret, &token);
         self.client
-            .query("INSERT INTO config_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
+            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&stored_token)
+            .bind(&session_id)
             .bind(user_id)
+            .bind(user_version)
+            .bind(auth_method)
+            .bind(provider_id)
+            .bind(&created_at)
             .bind(&created_at)
             .bind(&expires_at)
+            .bind(&absolute_expires_at)
             .execute()
             .await?;
-        Ok(token)
+        Ok(IssuedSession {
+            token,
+            max_age_seconds: self.session_policy.idle_timeout_secs,
+        })
+    }
+
+    /// Create a session for an SSO-authenticated identity using its latest user
+    /// row. Local password authentication uses `create_session_at_version` so a
+    /// concurrent password change cannot mint a session from stale credentials.
+    pub async fn create_sso_session(
+        &self,
+        user_id: &str,
+        auth_method: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<IssuedSession> {
+        if !matches!(auth_method, "oidc" | "saml") || provider_id.is_empty() {
+            anyhow::bail!("invalid SSO session provenance");
+        }
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            version: u64,
+        }
+        let row = self
+            .client
+            .query("SELECT version FROM config_users FINAL WHERE id = ? AND enabled = 1 AND is_deleted = 0 LIMIT 1")
+            .bind(user_id)
+            .fetch_one::<Row>()
+            .await?;
+        self.insert_session(user_id, row.version, auth_method, provider_id)
+            .await
+    }
+
+    pub async fn create_session_at_version(
+        &self,
+        user_id: &str,
+        authenticated_user_version: u64,
+    ) -> anyhow::Result<IssuedSession> {
+        self.insert_session(user_id, authenticated_user_version, "local", "")
+            .await
     }
 
     pub async fn get_session_user(
         &self,
         token: &str,
     ) -> Option<(String, String, String, String, String)> {
-        let stored_token = session_storage_key(token);
+        let stored_token = session_storage_key(&self.session_hmac_secret, token);
         // Session authorization is deliberately not cached. Password changes,
         // user disables, and logout must become visible to every API replica
         // without a per-process cache grace period.
@@ -2358,32 +3334,32 @@ impl ConfigDb {
             tenant_id: String,
             expires_at: String,
             user_id: String,
+            auth_method: String,
+            provider_id: String,
         }
         let now = Self::now_str();
-        let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id, s.expires_at, s.user_id FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? LIMIT 1";
-        let result = self
+        let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id, s.expires_at, s.user_id, s.auth_method, s.provider_id FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1";
+        let row = self
             .client
             .query(sql)
             .bind(&stored_token)
             .bind(&now)
+            .bind(&now)
+            .bind(&now)
             .fetch_one::<Row>()
-            .await;
-        let row = match result {
-            Ok(row) => row,
-            Err(clickhouse::error::Error::RowNotFound) => {
-                // Rolling-upgrade compatibility: only send the raw bearer to
-                // ClickHouse after its hashed lookup misses. Legacy rows expire
-                // under their original 24-hour TTL and are never recreated.
-                self.client
-                    .query(sql)
-                    .bind(token)
-                    .bind(&now)
-                    .fetch_one::<Row>()
-                    .await
-                    .ok()?
+            .await
+            .ok()?;
+        match row.auth_method.as_str() {
+            "local" if row.provider_id.is_empty() => {}
+            "oidc" | "saml" => {
+                let active_provider_id = self.effective_active_sso_provider_id().await.ok()?;
+                if active_provider_id.as_deref() != Some(row.provider_id.as_str()) {
+                    return None;
+                }
             }
-            Err(_) => return None,
-        };
+            // Sessions issued before provenance binding fail closed.
+            _ => return None,
+        }
         let role = self
             .derive_user_role(&row.id)
             .await
@@ -2392,17 +3368,254 @@ impl ConfigDb {
         Some(user)
     }
 
-    pub async fn delete_session(&self, token: &str) {
-        let stored_token = session_storage_key(token);
-        // Lightweight DELETE instead of a heavyweight ALTER ... DELETE mutation:
-        // marks rows via a mask column instead of rewriting parts.
-        let _ = self
-            .client
-            .query("DELETE FROM config_sessions WHERE token = ? OR token = ?")
-            .bind(&stored_token)
-            .bind(token)
+    pub async fn list_auth_sessions(
+        &self,
+        user_id: Option<&str>,
+        current_token: &str,
+    ) -> anyhow::Result<Vec<AuthSessionInfo>> {
+        let now = Self::now_str();
+        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?)";
+        let rows = if let Some(user_id) = user_id {
+            self.client
+                .query(&format!(
+                    "{base} AND s.user_id = ? ORDER BY s.last_seen_at DESC LIMIT 100"
+                ))
+                .bind(&now)
+                .bind(&now)
+                .bind(&now)
+                .bind(user_id)
+                .fetch_all::<AuthSessionRow>()
+                .await?
+        } else {
+            self.client
+                .query(&format!("{base} ORDER BY s.last_seen_at DESC LIMIT 1000"))
+                .bind(&now)
+                .bind(&now)
+                .bind(&now)
+                .fetch_all::<AuthSessionRow>()
+                .await?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|row| row.into_info(&self.session_hmac_secret, current_token))
+            .collect())
+    }
+
+    /// Revoke one public session id. When `user_id` is provided, ownership is
+    /// part of the lookup and delete so a user can never target another account.
+    pub async fn revoke_auth_session(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+        current_token: &str,
+    ) -> anyhow::Result<Option<AuthSessionInfo>> {
+        uuid::Uuid::parse_str(session_id)
+            .map_err(|_| anyhow::anyhow!("invalid session identifier"))?;
+        let now = Self::now_str();
+        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id = ? AND s.expires_at > ? AND s.absolute_expires_at > ?";
+        let row = if let Some(user_id) = user_id {
+            self.client
+                .query(&format!("{base} AND s.user_id = ? LIMIT 1"))
+                .bind(session_id)
+                .bind(&now)
+                .bind(&now)
+                .bind(user_id)
+                .fetch_optional::<AuthSessionRow>()
+                .await?
+        } else {
+            self.client
+                .query(&format!("{base} LIMIT 1"))
+                .bind(session_id)
+                .bind(&now)
+                .bind(&now)
+                .fetch_optional::<AuthSessionRow>()
+                .await?
+        };
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let absolute_expires_at = row.absolute_expires_at.clone();
+        let info = row.into_info(&self.session_hmac_secret, current_token);
+        self.client
+            .query("INSERT INTO config_session_revocations (session_id, expires_at, revoked_at) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(&absolute_expires_at)
+            .bind(Self::now_str())
             .execute()
-            .await;
+            .await?;
+        let mut delete = self
+            .client
+            .query(if user_id.is_some() {
+                "DELETE FROM config_sessions WHERE session_id = ? AND user_id = ?"
+            } else {
+                "DELETE FROM config_sessions WHERE session_id = ?"
+            })
+            .with_option("lightweight_deletes_sync", "1")
+            .bind(session_id);
+        if let Some(user_id) = user_id {
+            delete = delete.bind(user_id);
+        }
+        delete.execute().await?;
+        Ok(Some(info))
+    }
+
+    /// Renew an active session by replacing its bearer. The absolute deadline
+    /// and public session id are preserved, so renewal cannot create an
+    /// immortal session or make inventory entries jump around.
+    pub async fn rotate_session_if_due(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<RotatedSession>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            session_id: String,
+            user_id: String,
+            user_version: u64,
+            username: String,
+            tenant_id: String,
+            auth_method: String,
+            provider_id: String,
+            created_at: String,
+            last_seen_unix: i64,
+            expires_unix: i64,
+            absolute_expires_unix: i64,
+            absolute_expires_at: String,
+        }
+
+        let now = chrono::Utc::now();
+        let now_unix = now.timestamp();
+        let now_string = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let stored_token = session_storage_key(&self.session_hmac_secret, token);
+        let row = self
+            .client
+            .query("SELECT s.session_id, s.user_id, s.user_version, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.last_seen_at))) AS last_seen_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.expires_at))) AS expires_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.absolute_expires_at))) AS absolute_expires_unix, s.absolute_expires_at FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1")
+            .bind(&stored_token)
+            .bind(&now_string)
+            .bind(&now_string)
+            .bind(&now_string)
+            .fetch_optional::<Row>()
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if now_unix.saturating_sub(row.last_seen_unix) < self.session_policy.renewal_interval_secs {
+            return Ok(None);
+        }
+        match row.auth_method.as_str() {
+            "local" if row.provider_id.is_empty() => {}
+            "oidc" | "saml" => {
+                let active_provider_id = self.effective_active_sso_provider_id().await?;
+                if active_provider_id.as_deref() != Some(row.provider_id.as_str()) {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+
+        let claim_expiry = row.expires_unix.min(row.absolute_expires_unix);
+        if !self
+            .claim_sso_key_once(&format!("session-rotation:{stored_token}"), claim_expiry)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let remaining_absolute = row.absolute_expires_unix.saturating_sub(now_unix);
+        if remaining_absolute <= 0 {
+            return Ok(None);
+        }
+        let max_age_seconds = self
+            .session_policy
+            .idle_timeout_secs
+            .min(remaining_absolute);
+        let expires_at = (now + chrono::Duration::seconds(max_age_seconds))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let new_token: String = {
+            use rand::Rng;
+            let bytes: [u8; 32] = rand::rng().random();
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        let new_stored_token = session_storage_key(&self.session_hmac_secret, &new_token);
+
+        // Delete first and wait: if the replacement insert fails, the request
+        // that just succeeded remains successful but the caller must sign in
+        // again. That is safer than leaving both old and new bearers valid.
+        self.client
+            .query("DELETE FROM config_sessions WHERE token = ?")
+            .with_option("lightweight_deletes_sync", "1")
+            .bind(&stored_token)
+            .execute()
+            .await?;
+        self.client
+            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&new_stored_token)
+            .bind(&row.session_id)
+            .bind(&row.user_id)
+            .bind(row.user_version)
+            .bind(&row.auth_method)
+            .bind(&row.provider_id)
+            .bind(&row.created_at)
+            .bind(&now_string)
+            .bind(&expires_at)
+            .bind(&row.absolute_expires_at)
+            .execute()
+            .await?;
+
+        Ok(Some(RotatedSession {
+            issued: IssuedSession {
+                token: new_token,
+                max_age_seconds,
+            },
+            session_id: row.session_id,
+            user_id: row.user_id,
+            username: row.username,
+            tenant_id: row.tenant_id,
+        }))
+    }
+
+    pub async fn delete_session(&self, token: &str) -> anyhow::Result<()> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            session_id: String,
+            absolute_expires_at: String,
+        }
+        let stored_token = session_storage_key(&self.session_hmac_secret, token);
+        let row = self
+            .client
+            .query("SELECT session_id, absolute_expires_at FROM config_sessions WHERE token = ? AND session_id != '' LIMIT 1")
+            .bind(&stored_token)
+            .fetch_optional::<Row>()
+            .await?;
+        if let Some(row) = row {
+            // Persist the tombstone before deleting the bearer. Any concurrent
+            // rotation that inserts afterward remains invalid on every lookup.
+            self.client
+                .query("INSERT INTO config_session_revocations (session_id, expires_at, revoked_at) VALUES (?, ?, ?)")
+                .bind(&row.session_id)
+                .bind(&row.absolute_expires_at)
+                .bind(Self::now_str())
+                .execute()
+                .await?;
+            self.client
+                .query("DELETE FROM config_sessions WHERE session_id = ?")
+                .with_option("lightweight_deletes_sync", "1")
+                .bind(&row.session_id)
+                .execute()
+                .await?;
+            return Ok(());
+        }
+        // Lightweight DELETE instead of a heavyweight ALTER ... DELETE mutation:
+        // marks rows via a mask column instead of rewriting parts. Waiting for
+        // completion ensures a successful logout response means the bearer is
+        // no longer accepted by any subsequent request.
+        self.client
+            .query("DELETE FROM config_sessions WHERE token = ?")
+            .with_option("lightweight_deletes_sync", "1")
+            .bind(&stored_token)
+            .execute()
+            .await?;
+        Ok(())
     }
 
     pub async fn record_login_ip_attempt(&self, ip_hash: &str) -> anyhow::Result<()> {
@@ -2632,7 +3845,13 @@ impl ConfigDb {
             .bind(ver)
             .execute()
             .await?;
-        self.delete_sessions_for_user(user_id).await?;
+        // The new user `version` is stored in the same row as the password
+        // hash, so all older sessions are already invalid at this point. Row
+        // deletion is only storage cleanup and cannot make this operation
+        // partially succeed from an authorization perspective.
+        if let Err(error) = self.delete_sessions_for_user(user_id).await {
+            tracing::warn!(user_id, %error, "failed to clean up sessions invalidated by password change");
+        }
         Ok(PasswordChangeOutcome::Updated)
     }
 
@@ -2640,6 +3859,21 @@ impl ConfigDb {
         self.client
             .query("DELETE FROM config_sessions WHERE user_id = ?")
             .bind(user_id)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Revoke every session issued by an SSO provider. The second predicate
+    /// removes pre-provenance SSO sessions during rolling upgrades without
+    /// affecting legacy local users.
+    pub async fn revoke_sso_sessions_for_provider(&self, provider_id: &str) -> anyhow::Result<()> {
+        self.client
+            .query(
+                "DELETE FROM config_sessions WHERE provider_id = ? OR (provider_id = '' AND user_id IN (SELECT id FROM config_users FINAL WHERE auth_provider IN ('oidc', 'saml') AND is_deleted = 0))",
+            )
+            .with_option("lightweight_deletes_sync", "1")
+            .bind(provider_id)
             .execute()
             .await?;
         Ok(())
@@ -2749,15 +3983,11 @@ impl ConfigDb {
             .fetch_all::<Row>()
             .await?;
         if rows.len() != 1 {
-            anyhow::bail!(
-                "RUSH_BREAK_GLASS_USERNAME must identify exactly one active user"
-            );
+            anyhow::bail!("RUSH_BREAK_GLASS_USERNAME must identify exactly one active user");
         }
         let row = &rows[0];
         if row.auth_provider != "local" || row.enabled == 0 {
-            anyhow::bail!(
-                "RUSH_BREAK_GLASS_USERNAME must identify an enabled local user"
-            );
+            anyhow::bail!("RUSH_BREAK_GLASS_USERNAME must identify an enabled local user");
         }
         if self.derive_user_role(&row.id).await? != "admin" {
             anyhow::bail!("RUSH_BREAK_GLASS_USERNAME must identify an administrator");
@@ -3288,6 +4518,12 @@ impl ConfigDb {
             );
         }
         Ok(resolution.active_provider_id)
+    }
+
+    /// Return the active provider identifier without loading or decrypting any
+    /// provider configuration secrets.
+    pub async fn active_sso_provider_id(&self) -> anyhow::Result<Option<String>> {
+        self.effective_active_sso_provider_id().await
     }
 
     /// Lightweight SSO policy check that does not decrypt provider secrets.

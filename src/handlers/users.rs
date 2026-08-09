@@ -123,24 +123,38 @@ pub async fn create_user(
             "username must not be empty".to_string(),
         ));
     }
-    if username.len() > 100 {
+    if username.len() > crate::clickhouse_config::MAX_USERNAME_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
-            "username must not exceed 100 characters".to_string(),
+            format!(
+                "username must not exceed {} bytes",
+                crate::clickhouse_config::MAX_USERNAME_BYTES
+            ),
         ));
     }
     let password = req.password.clone();
-    if password.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "password must not be empty".to_string(),
-        ));
-    }
-    if password.len() > 1024 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "password must not exceed 1024 characters".to_string(),
-        ));
+    if let Err(error) = crate::clickhouse_config::validate_password_policy(&password) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.create", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", "password-policy-rejection")
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "username": username,
+                            "reason": "password_policy",
+                            "policy_code": error.code(),
+                        })
+                        .to_string(),
+                    )
+                    .description("user creation rejected by password policy")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((StatusCode::BAD_REQUEST, error.to_string()));
     }
 
     let display_name = req.display_name.as_deref().unwrap_or("").to_string();
@@ -157,6 +171,16 @@ pub async fn create_user(
         .await
     {
         Ok(id) => id,
+        Err(error)
+            if error
+                .downcast_ref::<crate::clickhouse_config::PasswordPolicyError>()
+                .is_some() =>
+        {
+            let policy = *error
+                .downcast_ref::<crate::clickhouse_config::PasswordPolicyError>()
+                .expect("guard checked password policy error");
+            return Err((StatusCode::BAD_REQUEST, policy.to_string()));
+        }
         Err(error)
             if error
                 .downcast_ref::<crate::clickhouse_config::UsernameAlreadyExists>()
@@ -311,6 +335,33 @@ pub async fn change_password(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_auth(&state, &headers).await?;
 
+    if req
+        .current_password
+        .as_deref()
+        .is_some_and(|password| password.len() > crate::clickhouse_config::MAX_PASSWORD_BYTES)
+    {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.password_change", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", id.clone())
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "credential_bounds" }).to_string())
+                    .description("password change rejected before credential processing")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "current_password must not exceed {} bytes",
+                crate::clickhouse_config::MAX_PASSWORD_BYTES
+            ),
+        ));
+    }
+
     // Admin can change any user's password; non-admin can only change their own.
     if caller.4 != "admin" && caller.0 != id {
         return Err((
@@ -319,11 +370,27 @@ pub async fn change_password(
         ));
     }
 
-    if req.password.len() < 12 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "password must be at least 12 characters".to_string(),
-        ));
+    if let Err(error) = crate::clickhouse_config::validate_password_policy(&req.password) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.password_change", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", id.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "reason": "password_policy",
+                            "policy_code": error.code(),
+                        })
+                        .to_string(),
+                    )
+                    .description("password change rejected by password policy")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((StatusCode::BAD_REQUEST, error.to_string()));
     }
 
     let (target_username, auth_provider) = state
@@ -446,14 +513,42 @@ pub async fn change_password(
         }
     }
 
-    let outcome = state
-        .config_db
-        .change_password(&id, &req.password)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "internal error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-        })?;
+    let outcome = match state.config_db.change_password(&id, &req.password).await {
+        Ok(outcome) => outcome,
+        Err(error)
+            if error
+                .downcast_ref::<crate::clickhouse_config::PasswordPolicyError>()
+                .is_some() =>
+        {
+            let policy = *error
+                .downcast_ref::<crate::clickhouse_config::PasswordPolicyError>()
+                .expect("guard checked password policy error");
+            return Err((StatusCode::BAD_REQUEST, policy.to_string()));
+        }
+        Err(error) => {
+            tracing::error!(%error, "password change failed");
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("user.password_change", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("user", id.clone())
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "password_store_unavailable" })
+                                .to_string(),
+                        )
+                        .description("password change failed before session version advanced")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "password change temporarily unavailable".to_string(),
+            ));
+        }
+    };
 
     match outcome {
         crate::clickhouse_config::PasswordChangeOutcome::Updated => {}
@@ -496,7 +591,13 @@ pub async fn change_password(
                 .actor(caller.0.clone(), caller.1.clone())
                 .tenant(caller.3.clone())
                 .resource("user", id.clone())
-                .changes(serde_json::json!({ "sessions_revoked": true }).to_string())
+                .changes(
+                    serde_json::json!({
+                        "sessions_revoked": true,
+                        "revocation_method": "user_version",
+                    })
+                    .to_string(),
+                )
                 .description(if caller.4 == "admin" && caller.0 != id {
                     "password reset by admin"
                 } else {
