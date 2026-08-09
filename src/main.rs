@@ -623,6 +623,19 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
         || setup_validation_token.is_some_and(|token| !token.is_empty() && !token.contains('/'))
 }
 
+/// Natural-language parsing can create metered provider cost, so a tenant's
+/// open-query policy must never authorize it. Only an interactive browser
+/// session is accepted; query API keys and anonymous tenant selection are not.
+fn should_reject_interactive_llm(
+    method: &axum::http::Method,
+    path: &str,
+    credential: &CredentialKind,
+) -> bool {
+    *method == axum::http::Method::POST
+        && matches!(path, "/api/v1/parse-query" | "/api/v1/parse-promql")
+        && *credential != CredentialKind::Session
+}
+
 /// Once shutdown starts, readiness is already false and this gate prevents new
 /// application/ingest work from entering while existing requests drain.
 async fn shutdown_gate_middleware(
@@ -825,6 +838,43 @@ async fn enforce_tenant_auth_middleware(
     // the config store is temporarily unavailable.
     if allows_unauthenticated_tenant_request(&method, &path) {
         return next.run(req).await;
+    }
+
+    if should_reject_interactive_llm(&method, &path, &resolution.credential) {
+        tracing::warn!(
+            event = "llm.auth_denied",
+            tenant_id = %tenant_id,
+            path = %path,
+            "LLM request requires an interactive session"
+        );
+        let mut event = rush_api::audit::AuditEvent::new(
+            "llm.auth_denied",
+            if resolution.api_key.is_some() {
+                "api_key"
+            } else {
+                "anonymous"
+            },
+        )
+        .tenant(tenant_id.clone())
+        .resource("http_route", path.clone())
+        .outcome("failure")
+        .changes(
+            serde_json::json!({
+                "reason": "interactive_session_required",
+            })
+            .to_string(),
+        )
+        .description("LLM request rejected without an interactive session")
+        .context(rush_api::audit::actor_context_from_headers(req.headers()));
+        if let Some(grant) = resolution.api_key.as_ref() {
+            event = event.actor(grant.id.clone(), "API key");
+        }
+        state.audit.log(event).await;
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "interactive authentication required for LLM features",
+        )
+            .into_response();
     }
 
     let ingest_signal = ingest_signal_for_route(&method, &path);
@@ -1375,6 +1425,12 @@ async fn main() -> anyhow::Result<()> {
     // outbox degradation is visible even if no one has scraped `/metrics` yet.
     let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
         std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    let llm_gateway = rush_api::llm_gateway::LlmGateway::from_env(self_metrics.clone())
+        .await
+        .context("LLM gateway configuration is invalid")?;
+    if llm_gateway.is_configured() {
+        tracing::info!("bounded LLM gateway configured");
+    }
     // Build the audit chain before bootstrap tenant mutation so a newly seeded
     // default tenant is recorded like every other tenant creation.
     let audit = std::sync::Arc::new(
@@ -1943,6 +1999,7 @@ async fn main() -> anyhow::Result<()> {
         ingest_key_limiter,
         audit,
         self_metrics,
+        llm_gateway,
         collectors,
         shutdown: shutdown_controller.clone(),
     };
@@ -2567,6 +2624,9 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             tenant_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            rush_api::api_error::public_error_middleware,
         ));
     let shutdown_writer = state.writer.clone();
 
@@ -2697,7 +2757,8 @@ mod tenant_auth_tests {
         CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
         credential_route_denial, explicit_ingest_tenant, ingest_signal_for_route,
         is_state_changing_method, request_origin_allowed_with_policy, requires_csrf_origin,
-        should_reject_for_tenant_auth, trust_forwarded_origin_headers,
+        should_reject_for_tenant_auth, should_reject_interactive_llm,
+        trust_forwarded_origin_headers,
     };
     use axum::http::{HeaderMap, HeaderValue, Method, header};
     use rush_api::clickhouse_config::ApiKeyGrant;
@@ -2982,8 +3043,31 @@ mod tenant_auth_tests {
             "/api/v1/sso/setup-token/example/complete",
             "/api/v1/sso/setup-token/example/complete/validate",
             "/api/v1/audit",
+            "/api/v1/parse-query",
+            "/api/v1/parse-promql",
         ] {
             assert!(!allows_unauthenticated_tenant_request(&Method::GET, path));
+        }
+    }
+
+    #[test]
+    fn open_query_tenants_still_require_interactive_auth_for_llm_parsing() {
+        for path in ["/api/v1/parse-query", "/api/v1/parse-promql"] {
+            assert!(should_reject_interactive_llm(
+                &Method::POST,
+                path,
+                &CredentialKind::Anonymous,
+            ));
+            assert!(should_reject_interactive_llm(
+                &Method::POST,
+                path,
+                &CredentialKind::QueryKey,
+            ));
+            assert!(!should_reject_interactive_llm(
+                &Method::POST,
+                path,
+                &CredentialKind::Session,
+            ));
         }
     }
 

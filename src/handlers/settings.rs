@@ -1514,42 +1514,24 @@ pub async fn list_sre_agent_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let fallback = || {
         Json(serde_json::json!({ "models": SRE_AGENT_MODEL_SUGGESTIONS, "source": "suggestions" }))
     };
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let api_key = match api_key {
-        Some(k) => k,
-        None => return Ok(fallback()),
+    if !state.llm_gateway.is_configured() {
+        return Ok(fallback());
+    }
+    let mut models = match state
+        .llm_gateway
+        .list_models(&crate::llm_gateway::LlmCaller::new(caller.0, caller.3))
+        .await
+    {
+        Ok(models) => models
+            .into_iter()
+            .filter(|id| is_chat_model(id))
+            .collect::<Vec<_>>(),
+        Err(_) => return Ok(fallback()),
     };
-    let base_url =
-        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
-    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
-        .await;
-    let v: serde_json::Value = match resp {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(v) => v,
-            Err(_) => return Ok(fallback()),
-        },
-        _ => return Ok(fallback()),
-    };
-    let mut models: Vec<String> = v["data"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str())
-                .filter(|id| is_chat_model(id))
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
     models.sort();
     models.dedup();
     if models.is_empty() {

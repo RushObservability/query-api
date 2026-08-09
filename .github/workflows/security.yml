@@ -12,6 +12,8 @@ on:
       - "Dockerfile.agent"
       - "docker-compose.yml"
       - "scripts/check-container-policy.sh"
+      - "scripts/check-public-errors.sh"
+      - "scripts/check-llm-gateway.sh"
       - ".github/workflows/**"
   push:
     branches:
@@ -26,6 +28,8 @@ on:
       - "Dockerfile.agent"
       - "docker-compose.yml"
       - "scripts/check-container-policy.sh"
+      - "scripts/check-public-errors.sh"
+      - "scripts/check-llm-gateway.sh"
       - ".github/workflows/**"
   schedule:
     - cron: "17 9 * * 1"
@@ -71,6 +75,12 @@ jobs:
 
       - name: Enforce container deployment policy
         run: bash scripts/check-container-policy.sh
+
+      - name: Prevent raw internal API errors
+        run: bash scripts/check-public-errors.sh
+
+      - name: Enforce bounded LLM gateway usage
+        run: bash scripts/check-llm-gateway.sh
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious

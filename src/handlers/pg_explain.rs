@@ -64,12 +64,7 @@ pub async fn submit(
         .config_db
         .create_explain_job(&tenant.tenant_id, body.server.trim(), body.db.trim(), query)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to create job: {e}"),
-            )
-        })?;
+        .map_err(|e| crate::api_error::internal_legacy("postgres_explain.create", e))?;
     state
         .audit
         .log(
@@ -100,7 +95,7 @@ pub async fn get_job(
             "status": status, "db": db, "plan_json": plan_json, "error": error,
         }))),
         Ok(None) => Err((StatusCode::NOT_FOUND, "job not found".into())),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
+        Err(e) => Err(crate::api_error::internal_legacy("postgres_explain.get", e)),
     }
 }
 
@@ -160,7 +155,7 @@ pub async fn poll(
             Json(serde_json::json!({ "id": id, "db": db, "query": query })).into_response()
         }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+        Err(e) => crate::api_error::internal_legacy("postgres_explain.poll", e).into_response(),
     }
 }
 
@@ -184,7 +179,7 @@ pub async fn post_result(
         .config_db
         .complete_explain_job(&tenant.tenant_id, &id, &body.plan_json, &body.error)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+        .map_err(|e| crate::api_error::internal_legacy("postgres_explain.complete", e))?;
     state
         .audit
         .log(

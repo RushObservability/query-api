@@ -35,7 +35,7 @@ pub async fn list_windows(
         .config_db
         .list_maintenance_windows()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?;
     let windows: Vec<MaintenanceWindowResponse> = rows
         .into_iter()
         .map(|r| MaintenanceWindowResponse {
@@ -77,7 +77,7 @@ pub async fn create_window(
         .config_db
         .create_maintenance_window(&id, &req.name, &scope, &req.starts_at, &req.ends_at)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": id, "ok": true })),
@@ -94,7 +94,7 @@ pub async fn delete_window(
         .config_db
         .delete_maintenance_window(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "window not found".to_string()));
     }

@@ -276,7 +276,7 @@ pub async fn ingest_v04(
             StatusCode::TOO_MANY_REQUESTS,
             "ingest backpressure: clickhouse unavailable, spool full".to_string(),
         ),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
     })?;
 
     // Record usage for per-tenant ingest metering
@@ -444,7 +444,7 @@ pub async fn ingest_agent(
                     StatusCode::TOO_MANY_REQUESTS,
                     "ingest backpressure: clickhouse unavailable, spool full".to_string(),
                 ),
-                WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+                WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
             })?;
 
             // Record usage for per-tenant ingest metering (protobuf path)
@@ -502,7 +502,7 @@ pub async fn ingest_agent(
                     StatusCode::TOO_MANY_REQUESTS,
                     "ingest backpressure: clickhouse unavailable, spool full".to_string(),
                 ),
-                WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+                WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
             })?;
 
             // Record usage for per-tenant ingest metering (msgpack fallback path)

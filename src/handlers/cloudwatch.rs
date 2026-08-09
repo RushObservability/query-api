@@ -373,7 +373,7 @@ async fn ingest_firehose_inner(
                 StatusCode::TOO_MANY_REQUESTS,
                 "ingest backpressure: clickhouse unavailable, spool full".to_string(),
             ),
-            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("cloudwatch.write", s),
         };
         return (status, firehose_response(&request_id, Some(&msg)));
     }

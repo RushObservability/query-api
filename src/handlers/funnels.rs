@@ -101,7 +101,7 @@ pub async fn list_funnels(
         .config_db
         .list_funnels(&tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("funnels", e))?;
     let funnels: Vec<FunnelResponse> = rows
         .into_iter()
         .filter_map(|(id, name, steps_json, created_at)| {
@@ -152,7 +152,7 @@ pub async fn create_funnel(
         .config_db
         .create_funnel(&id, &req.name, &steps_json, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("funnels", e))?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": id, "ok": true })),
@@ -170,7 +170,7 @@ pub async fn delete_funnel(
         .config_db
         .delete_funnel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("funnels", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "funnel not found".to_string()));
     }
@@ -189,11 +189,11 @@ pub async fn run_funnel(
         .config_db
         .get_funnel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("funnels", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "funnel not found".to_string()))?;
 
     let steps: Vec<FunnelStep> = serde_json::from_str(&row.2)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("funnels", e))?;
 
     // Build all SQL strings up front, then fire all step queries in parallel.
     let sqls: Vec<String> = steps

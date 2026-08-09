@@ -20,7 +20,7 @@ pub async fn list_channels(
         .config_db
         .list_channels(&tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
     let responses: Vec<NotificationChannelResponse> = channels
         .into_iter()
         .map(NotificationChannelResponse::from)
@@ -81,13 +81,13 @@ pub async fn create_channel(
             &config,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
 
     let channel = state
         .config_db
         .get_channel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -128,7 +128,7 @@ pub async fn update_channel(
         .config_db
         .get_channel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "channel not found".to_string()))?;
     let existing_config = serde_json::from_str(&existing.config).map_err(|_| {
         (
@@ -145,7 +145,7 @@ pub async fn update_channel(
         .config_db
         .update_channel(&id, &tenant.tenant_id, &req.name, &config, req.enabled)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "channel not found".to_string()));
     }
@@ -154,7 +154,7 @@ pub async fn update_channel(
         .config_db
         .get_channel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -190,7 +190,7 @@ pub async fn delete_channel(
         .config_db
         .delete_channel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "channel not found".to_string()));
     }
@@ -218,7 +218,7 @@ pub async fn test_channel(
         .config_db
         .get_channel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "channel not found".to_string()))?;
 
     let test_message = format!(
@@ -284,7 +284,11 @@ pub async fn test_channel(
         Ok(()) => Ok(Json(
             serde_json::json!({ "ok": true, "message": "Test notification sent successfully" }),
         )),
-        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+        Err(e) => Err(crate::api_error::internal_legacy_with_status(
+            StatusCode::BAD_GATEWAY,
+            "alerts.test_notification",
+            e,
+        )),
     }
 }
 
@@ -300,11 +304,11 @@ pub async fn notify_channel(
         .config_db
         .get_channel(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "channel not found".to_string()))?;
 
     let config: serde_json::Value = serde_json::from_str(&channel.config)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
     let url = config
         .get("url")
         .or_else(|| config.get("webhook_url"))
@@ -322,7 +326,13 @@ pub async fn notify_channel(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        .map_err(|e| {
+            crate::api_error::internal_legacy_with_status(
+                StatusCode::BAD_GATEWAY,
+                "alerts.notify_channel",
+                e,
+            )
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -337,7 +347,7 @@ pub async fn list_notification_log(
         .config_db
         .list_notification_log(&tenant.tenant_id, 200)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 

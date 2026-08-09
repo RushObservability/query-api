@@ -47,12 +47,7 @@ pub async fn decompress_body(
     {
         tokio::task::spawn_blocking(move || decompress_body_sync(&encoding, body))
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("decompress task failed: {e}"),
-                )
-            })?
+            .map_err(|e| crate::api_error::internal_legacy("datadog.decompress_task", e))?
     } else {
         Ok(body.to_vec())
     }

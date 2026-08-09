@@ -48,7 +48,7 @@ fn map_write_err(e: WriteError) -> (StatusCode, String) {
             StatusCode::TOO_MANY_REQUESTS,
             "ingest backpressure: clickhouse unavailable, spool full".to_string(),
         ),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        WriteError::Fatal(s) => crate::api_error::internal_legacy("otlp.write", s),
     }
 }
 
@@ -91,12 +91,7 @@ async fn decode_proto<T: Message + Default + Send + 'static>(
         // the blocking pool. `Bytes` is cheap to move across threads.
         tokio::task::spawn_blocking(move || decode_proto_sync::<T>(gzip, &body))
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("decode task failed: {e}"),
-                )
-            })?
+            .map_err(|e| crate::api_error::internal_legacy("otlp.decode_task", e))?
     } else {
         decode_proto_sync::<T>(gzip, &body)
     }

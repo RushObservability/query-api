@@ -71,9 +71,10 @@ fn scopes_for_role(role: &str) -> serde_json::Value {
 }
 
 fn unavailable(e: impl std::fmt::Display) -> (StatusCode, String) {
-    (
+    crate::api_error::internal_legacy_with_status(
         StatusCode::SERVICE_UNAVAILABLE,
-        format!("SRE agent unavailable: {e}"),
+        "sre_agent.proxy",
+        e,
     )
 }
 
@@ -189,7 +190,7 @@ pub async fn investigate(
         .header(axum::http::header::CACHE_CONTROL, "no-cache")
         .header("X-Accel-Buffering", "no")
         .body(body)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("sre_proxy", e))?
         .into_response())
 }
 

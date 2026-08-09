@@ -58,7 +58,7 @@ pub async fn create_deploy(
             &req.deployed_by,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("deploys", e))?;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
@@ -75,6 +75,6 @@ pub async fn list_deploys(
             query.to.as_deref(),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("deploys", e))?;
     Ok(Json(serde_json::json!({ "deploys": markers })))
 }

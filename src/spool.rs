@@ -271,9 +271,9 @@ fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> std::io::Result<Option<
 // `IngestBuffer` is the backend the durable write path (`ChWriter`) writes
 // through. `Disk` is the default and needs no object store — it wraps the
 // segmented `Spool` above and preserves today's behavior exactly. An
-// `ObjectStore` variant (MinIO/S3 + manifest) is added later (see
-// docs/PRD-object-store-ingest-buffer.md); the replayer stays backend-agnostic
-// by going through `next_batch()` / `commit()`.
+// `ObjectStore` variant (MinIO/S3 + manifest) can be added without changing the
+// replayer, which stays backend-agnostic by going through `next_batch()` /
+// `commit()`.
 
 /// A unit of spooled work for the replayer: the records to insert plus an opaque
 /// handle used to `commit` (remove/ack) them once successfully written to CH.

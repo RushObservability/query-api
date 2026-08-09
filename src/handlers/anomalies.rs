@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::users::{require_auth, require_write};
+use crate::llm_gateway::{LlmCaller, LlmOperation, MAX_ANOMALY_ADDITIONAL_CONTEXT_BYTES};
 use crate::models::anomaly::*;
 
 pub async fn analyze_anomaly_event(
@@ -18,15 +19,23 @@ pub async fn analyze_anomaly_event(
     Path(event_id): Path<String>,
     Json(req): Json<AnalyzeAnomalyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
+    if req.additional_context.len() > MAX_ANOMALY_ADDITIONAL_CONTEXT_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "additional context must not exceed {MAX_ANOMALY_ADDITIONAL_CONTEXT_BYTES} bytes"
+            ),
+        ));
+    }
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     // 1. Look up event
     let event = state
         .config_db
         .get_anomaly_event(&event_id, tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
 
     // 2. Look up rule
@@ -34,7 +43,7 @@ pub async fn analyze_anomaly_event(
         .config_db
         .get_anomaly_rule(&event.rule_id, tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly rule not found".to_string()))?;
 
     // 3. Fetch correlations (services + logs)
@@ -128,15 +137,8 @@ pub async fn analyze_anomaly_event(
         }
     }
 
-    // 4. Read LLM config from env
-    let base_url =
-        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
-    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "OPENAI_API_KEY environment variable not set".to_string(),
-        )
-    })?;
+    // 4. Select the model; provider configuration and credentials remain in
+    // the shared LLM gateway.
     let model = "gpt-5".to_string();
 
     // 5. Build system prompt
@@ -193,10 +195,11 @@ pub async fn analyze_anomaly_event(
 
     if !corr_logs.is_empty() {
         user_msg.push_str("\n## Sample Logs (most recent 50)\n");
-        for log in &corr_logs {
+        for log in corr_logs.iter().take(20) {
+            let bounded_body = log.body.chars().take(1_024).collect::<String>();
             user_msg.push_str(&format!(
                 "- [{}] [{}] **{}**: {}\n",
-                log.timestamp, log.severity_text, log.service_name, log.body
+                log.timestamp, log.severity_text, log.service_name, bounded_body
             ));
         }
     }
@@ -208,70 +211,21 @@ pub async fn analyze_anomaly_event(
         ));
     }
 
-    // 7. Call LLM
-    let client = reqwest::Client::new();
-    let llm_url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-
-    let llm_body = serde_json::json!({
-        "model": model,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_msg }
-        ],
-        "max_completion_tokens": 16384
-    });
-
-    let llm_resp = client
-        .post(&llm_url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&llm_body)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("LLM request failed: {}", e),
-            )
-        })?;
-
-    if !llm_resp.status().is_success() {
-        let status = llm_resp.status();
-        let body = llm_resp.text().await.unwrap_or_default();
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("LLM returned {}: {}", status, body),
-        ));
-    }
-
-    let resp_text = llm_resp.text().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to read LLM response: {}", e),
+    // 7. Call the bounded shared gateway. The requested token count is
+    // intentionally above the default cap to preserve quality where operators
+    // raise the cap; the gateway always enforces its configured hard bound.
+    let analysis = state
+        .llm_gateway
+        .chat(
+            LlmOperation::AnalyzeAnomaly,
+            &LlmCaller::new(caller.0, tenant_id),
+            &model,
+            system_prompt,
+            &user_msg,
+            16_384,
+            None,
         )
-    })?;
-
-    tracing::debug!("LLM response: {}", &resp_text[..resp_text.len().min(500)]);
-
-    let llm_json: serde_json::Value = serde_json::from_str(&resp_text).map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to parse LLM response: {}", e),
-        )
-    })?;
-
-    let analysis = llm_json["choices"][0]["message"]["content"]
-        .as_str()
-        .or_else(|| llm_json["output"].as_str())
-        .unwrap_or("No analysis returned from the model")
-        .to_string();
-
-    if analysis == "No analysis returned from the model" {
-        tracing::warn!(
-            "LLM response had no extractable content. Keys: {:?}",
-            llm_json.as_object().map(|o| o.keys().collect::<Vec<_>>())
-        );
-    }
+        .await?;
 
     Ok(Json(AnalyzeAnomalyResponse { analysis, model }))
 }
@@ -286,7 +240,7 @@ pub async fn list_anomaly_rules(
         .config_db
         .list_anomaly_rules(&tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?;
     let responses: Vec<AnomalyRuleResponse> =
         rules.into_iter().map(AnomalyRuleResponse::from).collect();
     Ok(Json(serde_json::json!({ "rules": responses })))
@@ -334,13 +288,13 @@ pub async fn create_anomaly_rule(
             &channel_ids,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?;
 
     let rule = state
         .config_db
         .get_anomaly_rule(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -373,13 +327,13 @@ pub async fn get_anomaly_rule(
         .config_db
         .get_anomaly_rule(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly rule not found".to_string()))?;
     let events = state
         .config_db
         .list_anomaly_events(&id, &tenant.tenant_id, 20)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?;
 
     Ok(Json(serde_json::json!({
         "rule": AnomalyRuleResponse::from(rule),
@@ -429,7 +383,7 @@ pub async fn update_anomaly_rule(
             &channel_ids,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "anomaly rule not found".to_string()));
     }
@@ -438,7 +392,7 @@ pub async fn update_anomaly_rule(
         .config_db
         .get_anomaly_rule(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -471,7 +425,7 @@ pub async fn delete_anomaly_rule(
         .config_db
         .delete_anomaly_rule(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "anomaly rule not found".to_string()));
     }
@@ -502,7 +456,7 @@ pub async fn list_all_anomaly_events(
         .config_db
         .list_all_anomaly_events(&tenant.tenant_id, 200)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }
 
@@ -517,7 +471,7 @@ pub async fn get_anomaly_event(
         .config_db
         .get_anomaly_event(&event_id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
     Ok(Json(event))
 }
@@ -536,7 +490,7 @@ pub async fn get_event_correlations(
         .config_db
         .get_anomaly_event(&event_id, tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
 
     // 2. Parse status code from metric string
@@ -565,12 +519,7 @@ pub async fn get_event_correlations(
         .or_else(|_| {
             chrono::NaiveDateTime::parse_from_str(&event.created_at, "%Y-%m-%dT%H:%M:%S%.fZ")
         })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("bad event timestamp: {e}"),
-            )
-        })?;
+        .map_err(|e| crate::api_error::internal_legacy("anomalies.event_timestamp", e))?;
     let from = event_ts - chrono::Duration::minutes(5);
     let to = event_ts + chrono::Duration::minutes(5);
     let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -594,7 +543,7 @@ pub async fn get_event_correlations(
         crate::tenant_query(&state.ch, &bucket_query, tenant_id)
             .fetch_all()
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?;
 
     // 5. Group by service, compute totals, take top 10
     let mut svc_map: HashMap<String, Vec<ServiceBucket>> = HashMap::new();
@@ -656,7 +605,7 @@ pub async fn get_event_correlations(
         crate::tenant_query(&state.ch, &log_query, tenant_id)
             .fetch_all::<CorrelationLog>()
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| crate::api_error::internal_legacy("anomalies", e))?
     } else {
         vec![]
     };

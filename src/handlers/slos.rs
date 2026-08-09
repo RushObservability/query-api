@@ -25,7 +25,7 @@ pub async fn list_slos(
         .config_db
         .list_slos(&tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
     let responses: Vec<SloResponse> = slos.into_iter().map(SloResponse::from).collect();
     Ok(Json(serde_json::json!({ "slos": responses })))
 }
@@ -141,13 +141,13 @@ pub async fn create_slo(
             &channel_ids,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
 
     let slo = state
         .config_db
         .get_slo(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -180,13 +180,13 @@ pub async fn get_slo(
         .config_db
         .get_slo(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "slo not found".to_string()))?;
     let events = state
         .config_db
         .list_slo_events(&id, &tenant.tenant_id, 20)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
 
     Ok(Json(serde_json::json!({
         "slo": SloResponse::from(slo),
@@ -300,7 +300,7 @@ pub async fn update_slo(
             &channel_ids,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "slo not found".to_string()));
     }
@@ -309,7 +309,7 @@ pub async fn update_slo(
         .config_db
         .get_slo(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -342,7 +342,7 @@ pub async fn delete_slo(
         .config_db
         .delete_slo(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "slo not found".to_string()));
     }
@@ -374,6 +374,6 @@ pub async fn list_slo_events(
         .config_db
         .list_slo_events(&id, &tenant.tenant_id, 100)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }

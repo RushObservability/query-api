@@ -1,5 +1,6 @@
 pub mod alert_engine;
 pub mod anomaly_engine;
+pub mod api_error;
 pub mod api_key_auth;
 pub mod audit;
 pub mod buffer_topology;
@@ -13,6 +14,7 @@ pub mod github_repository_policy;
 pub mod handlers;
 pub mod integrations;
 pub mod license;
+pub mod llm_gateway;
 pub mod metric_firewall;
 pub mod migrations;
 pub mod models;
@@ -231,6 +233,9 @@ pub struct AppState {
     /// the ingest path, and engine loops; rendered at the open `GET /metrics` endpoint
     /// and self-ingested into our own metrics tables by the stats engine each tick.
     pub self_metrics: Arc<self_metrics::SelfMetrics>,
+    /// Startup-validated, rate-limited outbound LLM client. Handlers never
+    /// receive provider credentials or construct their own LLM HTTP clients.
+    pub llm_gateway: llm_gateway::LlmGateway,
     /// API-managed integration collector supervisor. The community build keeps
     /// this disabled unless a collector feature and manager setting are present.
     pub collectors: Arc<integrations::CollectorManager>,

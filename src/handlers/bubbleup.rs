@@ -393,7 +393,7 @@ pub async fn bubbleup(
 
     let totals = totals_result.map_err(|e| {
         tracing::error!(error = %e, signal = %req.signal, handler = "bubbleup", "totals query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("totals query failed: {e}"))
+        crate::api_error::internal_legacy("bubbleup.totals", e)
     })?;
 
     let selection_count = totals.selection_count;
@@ -401,7 +401,7 @@ pub async fn bubbleup(
 
     let dimension_rows = dimension_result.map_err(|e| {
         tracing::error!(error = %e, signal = %req.signal, handler = "bubbleup", "dimensions query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("dimensions query failed: {e}"))
+        crate::api_error::internal_legacy("bubbleup.dimensions", e)
     })?;
 
     // Bucket rows back into per-dimension lists (rows arrive ordered by dim_idx).

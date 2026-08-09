@@ -32,8 +32,7 @@ fn public_sso_internal_error(
     error: impl std::fmt::Display,
     public_message: &'static str,
 ) -> (StatusCode, String) {
-    tracing::error!(operation, error = %error, "SSO request failed");
-    (status, public_message.to_string())
+    crate::api_error::internal_legacy_with_message(status, operation, error, public_message)
 }
 
 fn public_sso_rejection(

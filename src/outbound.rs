@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::Url;
 
-fn blocked_address(ip: IpAddr) -> bool {
+pub(crate) fn blocked_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             ip.is_private()

@@ -18,8 +18,12 @@ fn public_auth_error(
     operation: &'static str,
     error: impl std::fmt::Display,
 ) -> (StatusCode, String) {
-    tracing::error!(operation, error = %error, "authentication request failed");
-    (status, "authentication temporarily unavailable".to_string())
+    crate::api_error::internal_legacy_with_message(
+        status,
+        operation,
+        error,
+        "authentication temporarily unavailable",
+    )
 }
 
 fn login_rate_limit_secret() -> Result<Vec<u8>, String> {

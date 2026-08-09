@@ -43,7 +43,7 @@ pub async fn list_detection_rules(
         .config_db
         .list_detection_rules(Some(&tenant.tenant_id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?;
     let responses: Vec<DetectionRuleResponse> =
         rules.into_iter().map(DetectionRuleResponse::from).collect();
     Ok(Json(serde_json::json!({ "rules": responses })))
@@ -123,13 +123,13 @@ pub async fn create_detection_rule(
             &caller.1, // created_by: username from session
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?;
 
     let rule = state
         .config_db
         .get_detection_rule(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -164,7 +164,7 @@ pub async fn get_detection_rule(
         .config_db
         .get_detection_rule(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -238,7 +238,7 @@ pub async fn update_detection_rule(
         .config_db
         .get_detection_rule(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -270,7 +270,7 @@ pub async fn update_detection_rule(
             &channels,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?;
     if !updated {
         return Err((
             StatusCode::NOT_FOUND,
@@ -282,7 +282,7 @@ pub async fn update_detection_rule(
         .config_db
         .get_detection_rule(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -318,7 +318,7 @@ pub async fn delete_detection_rule(
         .config_db
         .get_detection_rule(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -336,7 +336,7 @@ pub async fn delete_detection_rule(
         .config_db
         .delete_detection_rule(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?;
     if !deleted {
         return Err((
             StatusCode::NOT_FOUND,
@@ -374,7 +374,7 @@ pub async fn test_detection_rule(
         .config_db
         .get_detection_rule(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -436,6 +436,6 @@ pub async fn list_detection_events(
         .config_db
         .list_detection_events(&tenant.tenant_id, params.limit)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("detection", e))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }

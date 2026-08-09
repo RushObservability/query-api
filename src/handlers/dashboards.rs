@@ -45,7 +45,7 @@ pub async fn list_dashboards(
         .config_db
         .list_dashboards(&tenant.tenant_id, &user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     Ok(Json(serde_json::json!({ "dashboards": dashboards })))
 }
 
@@ -107,12 +107,12 @@ pub async fn create_dashboard(
             &vars_json,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     let dashboard = state
         .config_db
         .get_dashboard(&id, &tenant.tenant_id, &user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -151,13 +151,13 @@ pub async fn get_dashboard(
         .config_db
         .get_dashboard(&id, &tenant.tenant_id, &user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
     let widgets = state
         .config_db
         .list_widgets(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     let widget_responses: Vec<WidgetResponse> =
         widgets.into_iter().map(WidgetResponse::from).collect();
     Ok(Json(DashboardWithWidgets {
@@ -195,7 +195,7 @@ pub async fn update_dashboard(
             &role,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "dashboard not found".to_string()));
     }
@@ -203,7 +203,7 @@ pub async fn update_dashboard(
         .config_db
         .get_dashboard(&id, &tenant.tenant_id, &user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -243,7 +243,7 @@ pub async fn delete_dashboard(
         .config_db
         .delete_dashboard(&id, &tenant.tenant_id, &user_id, &role)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "dashboard not found".to_string()));
     }
@@ -281,7 +281,7 @@ pub async fn create_widget(
         .config_db
         .get_dashboard(&dashboard_id, &tenant.tenant_id, &user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
 
     let valid_types = ["timeseries", "bar", "table", "counter"];
@@ -312,14 +312,14 @@ pub async fn create_widget(
             &display_config,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
 
     // Read back the created widget
     let widgets = state
         .config_db
         .list_widgets(&dashboard_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     let widget = widgets.into_iter().find(|w| w.id == id).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -364,7 +364,7 @@ pub async fn update_widget(
             &display_config,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "widget not found".to_string()));
     }
@@ -373,7 +373,7 @@ pub async fn update_widget(
         .config_db
         .list_widgets(&dashboard_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     let widget = widgets
         .into_iter()
         .find(|w| w.id == widget_id)
@@ -397,7 +397,7 @@ pub async fn delete_widget(
         .config_db
         .delete_widget(&widget_id, &dashboard_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "widget not found".to_string()));
     }
@@ -418,7 +418,7 @@ pub async fn export_dashboard(
         .config_db
         .export_dashboard(&id, &tenant.tenant_id, &user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
     Ok(Json(export))
 }
@@ -450,7 +450,7 @@ pub async fn list_dashboard_templates(
         .config_db
         .list_dashboard_templates()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     Ok(Json(serde_json::json!({ "templates": templates })))
 }
 
@@ -468,7 +468,7 @@ pub async fn create_from_template(
         .config_db
         .get_dashboard_template(&template_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "template not found".to_string()))?;
 
     // Parse template_json to get widgets
@@ -507,29 +507,29 @@ pub async fn create_from_template(
             &vars,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
 
     // Create widgets from template
     for w in &widget_exports {
         let wid = uuid::Uuid::new_v4().to_string();
         let qc = serde_json::to_string(&w.query_config)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
         let pos = serde_json::to_string(&w.position)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
         let dc = serde_json::to_string(&w.display_config)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
         state
             .config_db
             .create_widget(&wid, &dash_id, &w.title, &w.widget_type, &qc, &pos, &dc)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
     }
 
     let dashboard = state
         .config_db
         .get_dashboard(&dash_id, &tenant.tenant_id, &user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -32,7 +32,7 @@ pub async fn list_monitors(
         .config_db
         .list_monitors(&tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
     let responses: Vec<MonitorResponse> = monitors.into_iter().map(MonitorResponse::from).collect();
     Ok(Json(serde_json::json!({ "monitors": responses })))
 }
@@ -137,13 +137,13 @@ pub async fn create_monitor(
             &req.created_by,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
 
     let monitor = state
         .config_db
         .get_monitor(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -177,14 +177,14 @@ pub async fn get_monitor(
         .config_db
         .get_monitor(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "monitor not found".to_string()))?;
 
     let events = state
         .config_db
         .list_monitor_events(&id, 20)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
 
     Ok(Json(serde_json::json!({
         "monitor": MonitorResponse::from(monitor),
@@ -285,7 +285,7 @@ pub async fn update_monitor(
             &composite_monitor_ids,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
@@ -295,7 +295,7 @@ pub async fn update_monitor(
         .config_db
         .get_monitor(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -329,7 +329,7 @@ pub async fn delete_monitor(
         .config_db
         .delete_monitor(&id, &tenant.tenant_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
     }
@@ -362,7 +362,7 @@ pub async fn list_monitor_events(
         .config_db
         .list_monitor_events(&id, params.limit)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
     Ok(Json(serde_json::json!({ "events": events })))
 }
 
@@ -386,7 +386,7 @@ pub async fn preview_monitor(
         &group_by,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
 
     Ok(Json(serde_json::json!({
         "current_value": result.current_value,
@@ -407,7 +407,7 @@ pub async fn mute_monitor(
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, false)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
     }
@@ -426,7 +426,7 @@ pub async fn unmute_monitor(
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, true)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
     }

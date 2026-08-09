@@ -1,8 +1,15 @@
-use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Extension, Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::handlers::users::require_auth;
+use crate::llm_gateway::{LlmCaller, LlmOperation, MAX_NATURAL_LANGUAGE_QUERY_BYTES};
 
 #[derive(Debug, Deserialize)]
 pub struct ParseQueryRequest {
@@ -26,25 +33,21 @@ pub struct ParseQueryResponse {
 /// POST /api/v1/parse-query
 ///
 /// Accepts a natural-language query string and returns structured filters using an LLM.
-/// Requires OPENAI_API_KEY to be set; returns 501 otherwise so the frontend can fall back
-/// to its rule-based parser gracefully.
+/// Requires an interactive user session. Returns 501 when the shared LLM
+/// gateway is disabled so the frontend can fall back to its rule-based parser.
 pub async fn parse_query(
-    State(_state): State<AppState>,
-    Extension(_tenant): Extension<TenantContext>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<ParseQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let base_url =
-        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
-    let api_key = match std::env::var("OPENAI_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            return Err((
-                StatusCode::NOT_IMPLEMENTED,
-                "LLM not configured: OPENAI_API_KEY not set".to_string(),
-            ));
-        }
-    };
-    let model = "gpt-4o-mini".to_string();
+    let caller = require_auth(&state, &headers).await?;
+    if req.query.is_empty() || req.query.len() > MAX_NATURAL_LANGUAGE_QUERY_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("query must be between 1 and {MAX_NATURAL_LANGUAGE_QUERY_BYTES} bytes"),
+        ));
+    }
 
     let system_prompt = r#"You are a query parser for an observability platform. Convert the user's natural language query into structured search filters.
 
@@ -87,51 +90,18 @@ Output: {"filters":[],"search":"database connection timeout","confidence":0.6}
 Input: "show me warnings from the api-gateway on pod web-1"
 Output: {"filters":[{"field":"service_name","op":"=","value":"api-gateway"},{"field":"level","op":"=","value":"warn"},{"field":"host","op":"=","value":"web-1"}],"search":"","confidence":0.9}"#;
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": req.query}
-        ],
-        "temperature": 0.1,
-        "max_tokens": 400,
-    });
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("LLM request failed: {e}")))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("LLM error {status}: {text}"),
-        ));
-    }
-
-    let json: serde_json::Value = resp.json().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("LLM response parse failed: {e}"),
+    let content = state
+        .llm_gateway
+        .chat(
+            LlmOperation::ParseQuery,
+            &LlmCaller::new(caller.0, tenant.tenant_id),
+            "gpt-4o-mini",
+            system_prompt,
+            &req.query,
+            400,
+            Some(0.1),
         )
-    })?;
-
-    let content = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("{}");
+        .await?;
 
     // Strip any markdown code fences the model may have added despite instructions
     let cleaned = content

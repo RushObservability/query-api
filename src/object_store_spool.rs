@@ -1,6 +1,6 @@
-//! Object-store backend for the durable ingest buffer (PRD Phase 2).
+//! Object-store backend for the durable ingest buffer.
 //!
-//! Design (deliberately simple — see docs/PRD-object-store-ingest-buffer.md):
+//! The design is deliberately simple:
 //! one object per spilled batch under a prefix, keyed by a sortable
 //! `{unix_millis:013}-{seq:08}.batch` so listing yields oldest-first. Drain =
 //! list → get oldest → (caller inserts) → delete. No shared manifest, no CAS:

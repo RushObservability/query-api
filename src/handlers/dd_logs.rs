@@ -186,7 +186,7 @@ async fn ingest_logs_inner(
                 StatusCode::TOO_MANY_REQUESTS,
                 "ingest backpressure: clickhouse unavailable, spool full".to_string(),
             ),
-            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_logs.write", s),
         })?;
 
     // Record usage for per-tenant ingest metering

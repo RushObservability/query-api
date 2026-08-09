@@ -231,7 +231,7 @@ pub async fn ingest_v1(
             StatusCode::TOO_MANY_REQUESTS,
             "ingest backpressure: clickhouse unavailable, spool full".to_string(),
         ),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_metrics.write", s),
     };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
@@ -379,7 +379,7 @@ pub async fn ingest_v2(
             StatusCode::TOO_MANY_REQUESTS,
             "ingest backpressure: clickhouse unavailable, spool full".to_string(),
         ),
-        WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_metrics.write", s),
     };
     let gauge_fut = async {
         if !gauge_rows.is_empty() {
@@ -490,7 +490,7 @@ pub async fn check_run(
                 StatusCode::TOO_MANY_REQUESTS,
                 "ingest backpressure: clickhouse unavailable, spool full".to_string(),
             ),
-            WriteError::Fatal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_metrics.write", s),
         })?;
 
     // Record usage for per-tenant ingest metering
