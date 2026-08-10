@@ -2075,6 +2075,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/count", post(handlers::query::count_query))
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
+        .route("/api/v1/explore/search", post(handlers::explore::search))
         // Export current query + results (CSV/JSON), capped by export_max_rows
         .route("/api/v1/query/export", post(handlers::query::export_query))
         // BubbleUp comparison analysis
@@ -2877,6 +2878,12 @@ mod tenant_auth_tests {
         assert!(should_reject_for_tenant_auth(
             &Method::POST,
             "/v1/traces",
+            true,
+            false,
+        ));
+        assert!(should_reject_for_tenant_auth(
+            &Method::POST,
+            "/api/v1/explore/search",
             true,
             false,
         ));

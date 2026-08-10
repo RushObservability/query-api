@@ -6,7 +6,7 @@ Individual control-plane handlers add `require_auth`, `require_write`, or
 
 | Surface | Anonymous/open tenant | Anonymous/locked tenant | Browser session | Query key | Ingest key |
 |---|---|---|---|---|---|
-| Query, logs, traces, services, PromQL, Jaeger | Allow | Deny | Allow | Allow for bound tenant | Deny |
+| Query, coordinated Explore search, logs, traces, services, PromQL, Jaeger | Allow | Deny | Allow | Allow for bound tenant | Deny |
 | Export | Allow only when query access is explicitly open | Deny | Allow and audit | Allow for bound tenant and audit | Deny |
 | Telemetry ingest with `ingest_auth_required=false` | Allow | Route-specific | Deny as the wrong credential | Deny as the wrong credential | Allow |
 | Telemetry ingest with `ingest_auth_required=true` | Deny | Deny | Deny as the wrong credential | Deny as the wrong credential | Allow for key tenant/signal/source |

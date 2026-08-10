@@ -49,6 +49,25 @@ pub const RESULT_COUNT_BUCKETS: [f64; 10] = [
 pub const QUERY_LEN_BUCKETS: [f64; 10] =
     [0.0, 1.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0];
 
+/// Logical matched/response byte buckets for coordinated Explore searches.
+/// These are deliberately broad because payloads range from tiny needle searches
+/// to multi-megabyte result pages. ClickHouse physical bytes-read remain available
+/// through its query log; this metric tracks the bounded logical work returned by
+/// the coordinator without adding a third instrumentation query.
+pub const EXPLORE_BYTES_BUCKETS: [f64; 11] = [
+    1_024.0,
+    4_096.0,
+    16_384.0,
+    65_536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+    268_435_456.0,
+    1_073_741_824.0,
+];
+
 /// Allowlisted operation names used by operation-level query metrics. Keep this list
 /// intentionally small: operation names become Prometheus label values and must never
 /// be derived from raw URLs, SQL, tenant IDs, or user input.
@@ -456,6 +475,89 @@ impl SelfMetrics {
     ) {
         self.record_search(signal, query_len, result_rows, duration_ms, ok);
         self.record_query(operation, signal, result_rows, duration_ms, ok);
+    }
+
+    /// Record one of the two fixed ClickHouse stages used by the Explore
+    /// coordinator. Both labels are normalized to finite allowlists.
+    pub fn record_explore_stage(
+        &self,
+        signal: &'static str,
+        stage: &'static str,
+        result_rows: u64,
+        duration_ms: u64,
+        ok: bool,
+    ) {
+        let signal = bounded_query_signal(signal);
+        let stage = match stage {
+            "rows" | "summary" => stage,
+            _ => "other",
+        };
+        let outcome = if ok { "ok" } else { "error" };
+        self.inc_counter(
+            "rush_explore_clickhouse_queries_total",
+            &[("outcome", outcome), ("signal", signal), ("stage", stage)],
+            1,
+        );
+        self.observe_histogram_with(
+            "rush_explore_clickhouse_query_duration_ms",
+            &[("signal", signal), ("stage", stage)],
+            duration_ms as f64,
+            &SEARCH_LATENCY_BUCKETS_MS,
+        );
+        self.observe_histogram_with(
+            "rush_explore_clickhouse_result_rows",
+            &[("signal", signal), ("stage", stage)],
+            result_rows as f64,
+            &RESULT_COUNT_BUCKETS,
+        );
+    }
+
+    /// Record the request-level outcomes users perceive from the coordinated
+    /// Explore endpoint. No tenant, query text, field, or other unbounded label is
+    /// admitted. `matched_logical_bytes` is derived during the summary scan; physical
+    /// ClickHouse bytes read remain observable in `system.query_log` by query ID.
+    pub fn record_explore_coordinator(
+        &self,
+        signal: &'static str,
+        clickhouse_queries: u64,
+        matched_rows: u64,
+        matched_logical_bytes: u64,
+        time_to_first_results_ms: u64,
+    ) {
+        let labels = [("signal", bounded_query_signal(signal))];
+        self.observe_histogram_with(
+            "rush_explore_clickhouse_queries",
+            &labels,
+            clickhouse_queries as f64,
+            &RESULT_COUNT_BUCKETS,
+        );
+        self.observe_histogram_with(
+            "rush_explore_matched_rows",
+            &labels,
+            matched_rows as f64,
+            &RESULT_COUNT_BUCKETS,
+        );
+        self.observe_histogram_with(
+            "rush_explore_matched_logical_bytes",
+            &labels,
+            matched_logical_bytes as f64,
+            &EXPLORE_BYTES_BUCKETS,
+        );
+        self.observe_histogram_with(
+            "rush_explore_time_to_first_results_ms",
+            &labels,
+            time_to_first_results_ms as f64,
+            &SEARCH_LATENCY_BUCKETS_MS,
+        );
+    }
+
+    pub fn record_explore_response_bytes(&self, signal: &'static str, response_bytes: u64) {
+        self.observe_histogram_with(
+            "rush_explore_response_bytes",
+            &[("signal", bounded_query_signal(signal))],
+            response_bytes as f64,
+            &EXPLORE_BYTES_BUCKETS,
+        );
     }
 
     // ── Output 1: Prometheus text exposition (0.0.4) ──────────────────────────────
@@ -1067,5 +1169,22 @@ mod tests {
         assert!(text.contains("rush_query_empty_total{operation=\"other\",signal=\"other\"} 1"));
         assert!(!text.contains("untrusted-operation"));
         assert!(!text.contains("untrusted-signal"));
+    }
+
+    #[test]
+    fn explore_coordinator_metrics_have_only_bounded_labels() {
+        let metrics = SelfMetrics::new();
+        metrics.record_explore_stage("untrusted-signal", "untrusted-stage", 12, 30, false);
+        metrics.record_explore_coordinator("logs", 2, 42, 4096, 25);
+        metrics.record_explore_response_bytes("logs", 8192);
+
+        let text = metrics.render_prometheus();
+        assert!(text.contains("rush_explore_clickhouse_queries_total{outcome=\"error\",signal=\"other\",stage=\"other\"} 1"));
+        assert!(text.contains("rush_explore_clickhouse_queries_count{signal=\"logs\"} 1"));
+        assert!(text.contains("rush_explore_matched_logical_bytes_count{signal=\"logs\"} 1"));
+        assert!(text.contains("rush_explore_time_to_first_results_ms_count{signal=\"logs\"} 1"));
+        assert!(text.contains("rush_explore_response_bytes_count{signal=\"logs\"} 1"));
+        assert!(!text.contains("untrusted-signal"));
+        assert!(!text.contains("untrusted-stage"));
     }
 }

@@ -14,6 +14,7 @@ pub mod dd_metrics;
 pub mod dd_traces;
 pub mod deploys;
 pub mod detection;
+pub mod explore;
 pub mod export;
 pub mod fluxcd;
 pub mod funnels;

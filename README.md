@@ -131,6 +131,14 @@ disk, insert/select counters, and recent query-log latency, read-volume,
 result-volume, memory, and error aggregates. The endpoint is intended for an
 internal Prometheus path and is not tenant data.
 
+Coordinated Explore requests expose fixed-label
+`rush_explore_clickhouse_queries_total`, query-duration/result-row histograms,
+matched-row/logical-byte and response-byte histograms, and
+`rush_explore_time_to_first_results_ms`. Physical ClickHouse `read_rows` and
+`read_bytes` can be correlated in `system.query_log` using the emitted
+`rush-explore-<request UUID>-{rows,summary}` query IDs. No tenant, filter, or
+search text is used as a metric label.
+
 Ingest limit failures are exposed as
 `rush_ingest_limit_rejections_total{source,reason}`. Both labels are fixed
 allowlists. `reason` distinguishes `compressed_bytes`, `decompressed_bytes`,

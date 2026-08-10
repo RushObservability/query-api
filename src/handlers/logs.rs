@@ -13,7 +13,7 @@ use crate::query_builder::{QueryClauses, build_log_search_sql, format_value, san
 
 /// Resolve a log field name to a ClickHouse column expression.
 /// Uses materialized columns for common resource attributes (avoids Map lookups).
-fn resolve_log_field(field: &str) -> String {
+pub(crate) fn resolve_log_field(field: &str) -> String {
     match field {
         "service_name" | "ServiceName" => "ServiceName".to_string(),
         "severity" | "severity_text" | "SeverityText" => "SeverityText".to_string(),
@@ -49,7 +49,7 @@ fn resolve_log_field(field: &str) -> String {
 /// Build PREWHERE-optimized query clauses for logs.
 /// tenant_id + time range go into PREWHERE (evaluated at granule level before decompression);
 /// column filters and full-text search go into WHERE.
-fn build_log_where(
+pub(crate) fn build_log_where(
     filters: &[Filter],
     from: &str,
     to: &str,
@@ -148,7 +148,7 @@ fn default_limit() -> u64 {
     100
 }
 
-const LOG_LIST_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
+pub(crate) const LOG_LIST_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
     SeverityNumber, ServiceName, Body, toString(toUnixTimestamp64Nano(Timestamp)) AS TimestampNs, \
     toString(_block_number) AS BlockNumber, toString(_block_offset) AS BlockOffset, \
     toString(cityHash64(Body)) AS BodyHash";
