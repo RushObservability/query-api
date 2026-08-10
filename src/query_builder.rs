@@ -297,7 +297,11 @@ fn tokenize_search(input: &str) -> Vec<String> {
 /// Parse a search string into a boolean expression tree.
 fn parse_search_expr(input: &str) -> Option<SearchExpr> {
     let input = input.trim();
-    if input.is_empty() {
+    if input.is_empty()
+        || input
+            .chars()
+            .any(|character| character.is_control() && !character.is_whitespace())
+    {
         return None;
     }
 
@@ -942,14 +946,22 @@ impl KeysetCursor {
     /// than erroring, keeping a stale/garbage cursor non-fatal.
     pub fn decode(token: &str) -> Option<KeysetCursor> {
         use base64::Engine;
+        // Avoid decoding attacker-controlled, arbitrarily large cursor strings.
+        if token.len() > 256 {
+            return None;
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(token.as_bytes())
             .ok()?;
         let s = String::from_utf8(bytes).ok()?;
         let (ts_str, span_id) = s.split_once(':')?;
         let timestamp: i64 = ts_str.parse().ok()?;
-        // span_id must be hex (16 chars for OTel, but accept any hex length defensively).
-        if span_id.is_empty() || !span_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        // OTel span IDs are 16 hex characters. A bounded legacy range keeps
+        // older imported data usable without allowing cursor amplification.
+        if span_id.is_empty()
+            || span_id.len() > 64
+            || !span_id.chars().all(|c| c.is_ascii_hexdigit())
+        {
             return None;
         }
         Some(KeysetCursor {
@@ -1008,6 +1020,15 @@ mod keyset_tests {
         // a span_id with a SQL-injection attempt is rejected at decode (non-hex chars).
         let inj = base64::engine::general_purpose::STANDARD.encode(b"123:' OR 1=1 --");
         assert!(KeysetCursor::decode(&inj).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_tokens_and_span_ids() {
+        use base64::Engine;
+        assert!(KeysetCursor::decode(&"A".repeat(257)).is_none());
+        let oversized =
+            base64::engine::general_purpose::STANDARD.encode(format!("123:{}", "a".repeat(65)));
+        assert!(KeysetCursor::decode(&oversized).is_none());
     }
 
     #[test]
@@ -1289,5 +1310,40 @@ mod bucket_interval_tests {
         let got = clamp_bucket_interval("1s", "2016-06-10T00:00:00Z", "2026-06-10T00:00:00Z", 2000)
             .unwrap();
         assert_eq!(got, "1d");
+    }
+}
+
+#[cfg(test)]
+mod adversarial_search_parser_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(192))]
+
+        #[test]
+        fn arbitrary_filter_text_never_panics_or_builds_unbounded_sql(input in ".{0,512}") {
+            for sql in [build_log_search_sql(&input), build_span_search_sql(&input)]
+                .into_iter()
+                .flatten()
+            {
+                // Each input byte expands through a fixed number of predicates
+                // and escaping characters; guard against accidental exponential
+                // parser expansion.
+                prop_assert!(sql.len() <= input.len().saturating_mul(48).saturating_add(1024));
+                prop_assert!(!sql.contains('\0'));
+            }
+        }
+
+        #[test]
+        fn arbitrary_cursor_tokens_never_panic_or_escape_the_sql_literal(token in ".{0,300}") {
+            if let Some(cursor) = KeysetCursor::decode(&token) {
+                prop_assert!(cursor.span_id.len() <= 64);
+                prop_assert!(cursor.span_id.chars().all(|c| c.is_ascii_hexdigit()));
+                let predicate = cursor.before_predicate();
+                prop_assert!(!predicate.contains("--"));
+                prop_assert!(!predicate.contains("/*"));
+            }
+        }
     }
 }

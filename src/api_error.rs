@@ -226,6 +226,7 @@ pub async fn public_error_middleware(mut req: Request, next: Next) -> Response {
 mod tests {
     use super::*;
     use axum::{Router, routing::get};
+    use proptest::prelude::*;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
     use tracing::{Event, Subscriber, field::Visit};
@@ -362,5 +363,25 @@ mod tests {
             .unwrap();
         assert!(Uuid::parse_str(value).is_ok());
         assert_ne!(value, "invalid request id");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn arbitrary_internal_causes_never_enter_public_error_json(cause in ".{1,512}") {
+            let sensitive = format!("SENSITIVE_CAUSE_BEGIN:{cause}:SENSITIVE_CAUSE_END");
+            let error = ApiError::internal("property.internal", &sensitive);
+            let json = serde_json::to_string(&ErrorEnvelope {
+                error: ErrorDetail {
+                    code: error.code,
+                    message: error.message,
+                    request_id: &error.request_id,
+                },
+            }).unwrap();
+            prop_assert_eq!(error.code, "internal_error");
+            prop_assert_eq!(error.message, "request could not be completed");
+            prop_assert!(!json.contains(&sensitive));
+        }
     }
 }

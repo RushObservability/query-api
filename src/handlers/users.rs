@@ -62,7 +62,7 @@ pub(crate) async fn require_admin(
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
     let caller = require_auth(state, headers).await?;
-    if caller.4 != "admin" {
+    if !role_allows_admin(&caller.4) {
         return Err((StatusCode::FORBIDDEN, "admin role required".to_string()));
     }
     Ok(caller)
@@ -74,10 +74,18 @@ pub(crate) async fn require_write(
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
     let caller = require_auth(state, headers).await?;
-    if caller.4 != "admin" && caller.4 != "write" {
+    if !role_allows_write(&caller.4) {
         return Err((StatusCode::FORBIDDEN, "write role required".to_string()));
     }
     Ok(caller)
+}
+
+fn role_allows_admin(role: &str) -> bool {
+    role == "admin"
+}
+
+fn role_allows_write(role: &str) -> bool {
+    matches!(role, "admin" | "write")
 }
 
 fn user_response(row: (String, String, String, String, bool, String)) -> UserResponse {
@@ -657,4 +665,22 @@ pub async fn toggle_user(
         .await;
 
     Ok(Json(user_response(row)))
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::{role_allows_admin, role_allows_write};
+
+    #[test]
+    fn session_role_matrix_is_fail_closed() {
+        assert!(role_allows_admin("admin"));
+        assert!(!role_allows_admin("write"));
+        assert!(!role_allows_admin("viewer"));
+        assert!(role_allows_write("admin"));
+        assert!(role_allows_write("write"));
+        assert!(!role_allows_write("viewer"));
+        assert!(!role_allows_write("Admin"));
+        assert!(!role_allows_write(""));
+        assert!(!role_allows_write("unknown"));
+    }
 }

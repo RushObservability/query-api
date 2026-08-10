@@ -14,6 +14,8 @@ on:
       - "scripts/check-container-policy.sh"
       - "scripts/check-public-errors.sh"
       - "scripts/check-llm-gateway.sh"
+      - "scripts/check-security-regressions.sh"
+      - "security/**"
       - ".github/workflows/**"
   push:
     branches:
@@ -30,6 +32,8 @@ on:
       - "scripts/check-container-policy.sh"
       - "scripts/check-public-errors.sh"
       - "scripts/check-llm-gateway.sh"
+      - "scripts/check-security-regressions.sh"
+      - "security/**"
       - ".github/workflows/**"
   schedule:
     - cron: "17 9 * * 1"
@@ -82,11 +86,17 @@ jobs:
       - name: Enforce bounded LLM gateway usage
         run: bash scripts/check-llm-gateway.sh
 
+      - name: Enforce adversarial parser and authorization coverage
+        run: bash scripts/check-security-regressions.sh
+
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
 
       - name: Run tests
         run: cargo test --all-targets --all-features
+        env:
+          # PRs stay bounded; the weekly schedule exercises a much larger corpus.
+          PROPTEST_CASES: ${{ github.event_name == 'schedule' && '4096' || '256' }}
 
       - name: Build release targets
         run: cargo build --release --all-features

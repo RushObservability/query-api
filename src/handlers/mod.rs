@@ -5,6 +5,7 @@ pub mod audit;
 pub mod auth;
 pub mod bubbleup;
 pub mod cloudwatch;
+pub mod csp_reports;
 pub mod custom_skills;
 pub mod dashboards;
 pub mod dd_common;

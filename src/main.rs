@@ -614,6 +614,7 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
         "/healthz"
             | "/readyz"
             | "/metrics"
+            | "/api/v1/security/csp-report"
             | "/shutdown"
             | "/api/v1/auth/login"
             | "/api/v1/auth/logout"
@@ -2511,6 +2512,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/rum/replay/ingest", post(handlers::rum::ingest_replay))
         .route("/api/v1/rum/replay/available/{app_name}", get(handlers::rum::list_replay_sessions))
         .route("/api/v1/rum/replay/{id}", get(handlers::rum::get_replay))
+        // Browser CSP telemetry is intentionally public so login/SSO violations
+        // can report before a session exists. Its body has a tighter route cap.
+        .route(
+            "/api/v1/security/csp-report",
+            post(handlers::csp_reports::ingest_csp_report).layer(
+                DefaultBodyLimit::max(handlers::csp_reports::MAX_CSP_REPORT_BYTES),
+            ),
+        )
         // ArgoCD integration
         .route("/api/v1/argocd/applications", get(handlers::argocd::list_applications))
         .route("/api/v1/argocd/applications/{name}", get(handlers::argocd::get_application))
@@ -3106,6 +3115,7 @@ mod tenant_auth_tests {
             (Method::GET, "/healthz"),
             (Method::GET, "/readyz"),
             (Method::GET, "/metrics"),
+            (Method::POST, "/api/v1/security/csp-report"),
             (Method::OPTIONS, "/api/v1/query"),
         ] {
             assert!(
@@ -3275,5 +3285,54 @@ mod tenant_auth_tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn exports_follow_the_same_open_or_locked_query_boundary() {
+        for path in ["/api/v1/query/export", "/api/v1/logs/export"] {
+            assert!(!should_reject_for_tenant_auth(
+                &Method::POST,
+                path,
+                false,
+                false,
+            ));
+            assert!(should_reject_for_tenant_auth(
+                &Method::POST,
+                path,
+                true,
+                false,
+            ));
+            assert!(!should_reject_for_tenant_auth(
+                &Method::POST,
+                path,
+                true,
+                true,
+            ));
+            assert_eq!(
+                credential_route_denial(&CredentialKind::IngestKey, false, false),
+                Some("query_not_allowed")
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_administrative_reads_keep_explicit_admin_guards() {
+        for (name, source) in [
+            ("audit", include_str!("handlers/audit.rs")),
+            (
+                "SSO provider configuration",
+                include_str!("handlers/sso.rs"),
+            ),
+            ("tenant administration", include_str!("handlers/tenants.rs")),
+            (
+                "API key administration",
+                include_str!("handlers/settings.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains("require_admin"),
+                "{name} lost its explicit admin authorization guard"
+            );
+        }
     }
 }
