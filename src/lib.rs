@@ -12,6 +12,7 @@ pub mod detection_query;
 pub mod eval_state;
 pub mod github_repository_policy;
 pub mod handlers;
+pub mod ingest_limits;
 pub mod integrations;
 pub mod license;
 pub mod llm_gateway;
@@ -233,6 +234,8 @@ pub struct AppState {
     /// the ingest path, and engine loops; rendered at the open `GET /metrics` endpoint
     /// and self-ingested into our own metrics tables by the stats engine each tick.
     pub self_metrics: Arc<self_metrics::SelfMetrics>,
+    /// Startup-validated byte/entity limits and bounded blocking decode admission.
+    pub ingest_limits: ingest_limits::IngestLimits,
     /// Startup-validated, rate-limited outbound LLM client. Handlers never
     /// receive provider credentials or construct their own LLM HTTP clients.
     pub llm_gateway: llm_gateway::LlmGateway,

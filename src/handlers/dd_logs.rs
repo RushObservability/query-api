@@ -72,21 +72,30 @@ async fn ingest_logs_inner(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_api_key(&headers)?;
 
-    let raw = decompress_body(&headers, body).await?;
+    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
 
     // The DD agent sends either a JSON array or a single object
     let entries: Vec<DdLogEntry> = if raw.first() == Some(&b'[') {
-        serde_json::from_slice(&raw)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON array: {e}")))?
+        serde_json::from_slice(&raw).map_err(|_| {
+            state
+                .ingest_limits
+                .malformed("datadog", "invalid Datadog logs payload")
+        })?
     } else {
-        let single: DdLogEntry = serde_json::from_slice(&raw)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
+        let single: DdLogEntry = serde_json::from_slice(&raw).map_err(|_| {
+            state
+                .ingest_limits
+                .malformed("datadog", "invalid Datadog logs payload")
+        })?;
         vec![single]
     };
 
     if entries.is_empty() {
         return Ok(Json(serde_json::json!({})));
     }
+    state
+        .ingest_limits
+        .check_entities("datadog", entries.len())?;
 
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 

@@ -279,8 +279,13 @@ pub async fn ingest(
     if !rum_enabled(&state).await {
         return Err((StatusCode::FORBIDDEN, "RUM ingestion is disabled".into()));
     }
+    state.ingest_limits.check_body("rum", &body)?;
+    state.ingest_limits.check_decompressed("rum", body.len())?;
     let payload: RumIngestPayload = serde_json::from_slice(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid RUM payload: {e}")))?;
+        .map_err(|_| state.ingest_limits.malformed("rum", "invalid RUM payload"))?;
+    state
+        .ingest_limits
+        .check_entities("rum", payload.events.len())?;
     let tenant_id = &tenant.tenant_id;
     let meta = &payload.meta;
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -766,17 +771,29 @@ struct ReplaySessionRow {
 pub async fn ingest_replay(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
-    Json(payload): Json<ReplayIngestPayload>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !rum_enabled(&state).await {
         return Err((StatusCode::FORBIDDEN, "RUM ingestion is disabled".into()));
     }
+    state.ingest_limits.check_body("rum", &body)?;
+    state.ingest_limits.check_decompressed("rum", body.len())?;
+    let payload: ReplayIngestPayload = serde_json::from_slice(&body).map_err(|_| {
+        state
+            .ingest_limits
+            .malformed("rum", "invalid RUM replay payload")
+    })?;
     if payload.session_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
     }
+    let event_count = payload.events.as_array().map(Vec::len).unwrap_or(1);
+    state.ingest_limits.check_entities("rum", event_count)?;
 
-    let events_json = serde_json::to_string(&payload.events)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid events: {e}")))?;
+    let events_json = serde_json::to_string(&payload.events).map_err(|_| {
+        state
+            .ingest_limits
+            .malformed("rum", "invalid RUM replay events")
+    })?;
 
     let chunk_ts = chrono::Utc::now().timestamp_millis();
 

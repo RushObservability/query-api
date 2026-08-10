@@ -90,6 +90,7 @@ tikv-jemallocator = "0.6"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [dev-dependencies]
+proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]

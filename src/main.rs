@@ -8,7 +8,10 @@ use anyhow::Context;
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::IntoResponse;
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
-use axum::{extract::ConnectInfo, extract::Request, middleware::Next, response::Response};
+use axum::{
+    extract::ConnectInfo, extract::DefaultBodyLimit, extract::Request, middleware::Next,
+    response::Response,
+};
 use clickhouse::Client;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -720,6 +723,54 @@ fn ingest_signal_for_route(method: &axum::http::Method, path: &str) -> Option<&'
     None
 }
 
+fn ingest_source_for_route(path: &str) -> &'static str {
+    if path == "/prom/api/v1/write" {
+        "prometheus"
+    } else if path.starts_with("/datadog/") || path.starts_with("/api/v2/logs") {
+        "datadog"
+    } else if path.starts_with("/cloudwatch/firehose/") {
+        "cloudwatch"
+    } else if path.starts_with("/api/v1/rum/") {
+        "rum"
+    } else if matches!(
+        path,
+        "/v1/logs" | "/v1/traces" | "/v1/metrics" | "/api/v1/ingest/logs"
+    ) {
+        "otlp"
+    } else {
+        "other"
+    }
+}
+
+/// Reject a declared oversized ingest body before axum buffers it for a `Bytes`
+/// extractor. `DefaultBodyLimit` below independently enforces the same ceiling
+/// for chunked bodies whose final size is not known from Content-Length.
+async fn ingest_content_length_limit_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if ingest_signal_for_route(req.method(), path).is_some()
+        && let Some(length) = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+        && length > state.ingest_limits.max_compressed_bytes
+    {
+        state
+            .ingest_limits
+            .record_rejection(ingest_source_for_route(path), "compressed_bytes");
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "compressed ingest payload exceeds configured limit",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 fn consume_ingest_rate_limit(state: &AppState, key_id: &str, limit: u64) -> bool {
     let now = std::time::Instant::now();
     let mut entry = state
@@ -1425,6 +1476,9 @@ async fn main() -> anyhow::Result<()> {
     // outbox degradation is visible even if no one has scraped `/metrics` yet.
     let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
         std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    let ingest_limits = rush_api::ingest_limits::IngestLimits::from_env(self_metrics.clone())
+        .map_err(anyhow::Error::msg)
+        .context("ingest limit configuration is invalid")?;
     let llm_gateway = rush_api::llm_gateway::LlmGateway::from_env(self_metrics.clone())
         .await
         .context("LLM gateway configuration is invalid")?;
@@ -1999,6 +2053,7 @@ async fn main() -> anyhow::Result<()> {
         ingest_key_limiter,
         audit,
         self_metrics,
+        ingest_limits: ingest_limits.clone(),
         llm_gateway,
         collectors,
         shutdown: shutdown_controller.clone(),
@@ -2607,6 +2662,14 @@ async fn main() -> anyhow::Result<()> {
         // MatchedPath (templated route) is populated by routing before it runs.
         .layer(axum::middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
         .layer(TraceLayer::new_for_http())
+        // Override axum's fixed 2 MiB default with the startup-validated compressed
+        // ingest ceiling. Handlers still check the actual body and record the
+        // protocol/reason-specific rejection metric before decoding.
+        .layer(DefaultBodyLimit::max(ingest_limits.max_compressed_bytes))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ingest_content_length_limit_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             shutdown_gate_middleware,
@@ -2878,6 +2941,25 @@ mod tenant_auth_tests {
             &headers,
             false,
             None,
+            Some(&policy),
+            false,
+        ));
+    }
+
+    #[test]
+    fn csrf_development_allows_local_ui_beside_a_public_sso_base_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:5173"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:8080"));
+        let policy = CorsPolicy::parse(Some("http://localhost:5173")).unwrap();
+
+        assert!(request_origin_allowed_with_policy(
+            &headers,
+            false,
+            Some("https://rush-dev.example.com"),
             Some(&policy),
             false,
         ));

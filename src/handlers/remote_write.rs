@@ -84,6 +84,7 @@ pub async fn prom_remote_write(
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
+    state.ingest_limits.check_body("prometheus", &body)?;
     // Verify content type (optional — some clients don't set it)
     if let Some(ct) = headers.get("content-type") {
         let ct_str = ct.to_str().unwrap_or("");
@@ -111,29 +112,16 @@ pub async fn prom_remote_write(
     // blocking pool so large remote_write batches don't stall a tokio worker.
     // If decompression fails and content-encoding isn't snappy, treat as raw
     // protobuf (for flexibility with custom senders).
+    let decode_permit = state.ingest_limits.acquire_decode("prometheus").await?;
+    let limits = state.ingest_limits.clone();
     let (write_req, decompressed_len) = tokio::task::spawn_blocking(move || {
-        let decompressed = match snap::raw::Decoder::new().decompress_vec(&body) {
-            Ok(data) => data,
-            Err(_) if !is_snappy => body.to_vec(),
-            Err(e) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("snappy decompression failed: {e}"),
-                ));
-            }
-        };
-        let len = decompressed.len();
-        WriteRequest::decode(decompressed.as_slice())
-            .map(|req| (req, len))
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("protobuf decode failed: {e}"),
-                )
-            })
+        let _decode_permit = decode_permit;
+        decode_write_request(&limits, is_snappy, &body)
     })
     .await
     .map_err(|e| crate::api_error::internal_legacy("remote_write.decode_task", e))??;
+
+    validate_write_request(&state.ingest_limits, &write_req)?;
 
     if write_req.timeseries.is_empty() {
         return Ok(StatusCode::NO_CONTENT);
@@ -251,4 +239,175 @@ pub async fn prom_remote_write(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn decode_write_request(
+    limits: &crate::ingest_limits::IngestLimits,
+    is_snappy: bool,
+    body: &[u8],
+) -> Result<(WriteRequest, usize), (StatusCode, String)> {
+    let decompressed = match snap::raw::decompress_len(body) {
+        Ok(claimed_len) => {
+            // Snappy embeds the uncompressed length. Check it before
+            // `decompress_vec` allocates the claimed output buffer.
+            limits.check_decompressed("prometheus", claimed_len)?;
+            snap::raw::Decoder::new()
+                .decompress_vec(body)
+                .map_err(|_| limits.malformed("prometheus", "invalid Snappy ingest payload"))?
+        }
+        Err(_) if !is_snappy => {
+            limits.check_decompressed("prometheus", body.len())?;
+            body.to_vec()
+        }
+        Err(_) => {
+            return Err(limits.malformed("prometheus", "invalid Snappy ingest payload"));
+        }
+    };
+    let len = decompressed.len();
+    limits.check_decompressed("prometheus", len)?;
+    WriteRequest::decode(decompressed.as_slice())
+        .map(|request| (request, len))
+        .map_err(|_| limits.malformed("prometheus", "invalid Prometheus remote-write payload"))
+}
+
+fn validate_write_request(
+    limits: &crate::ingest_limits::IngestLimits,
+    request: &WriteRequest,
+) -> Result<(), (StatusCode, String)> {
+    limits.check_count("prometheus", request.timeseries.len(), limits.max_series)?;
+    limits.check_count("prometheus", request.metadata.len(), limits.max_metadata)?;
+
+    let mut samples = 0usize;
+    let mut labels = 0usize;
+    for series in &request.timeseries {
+        limits.check_count(
+            "prometheus",
+            series.labels.len(),
+            limits.max_labels_per_series,
+        )?;
+        samples = samples
+            .checked_add(series.samples.len())
+            .ok_or_else(|| limits.check_entities("prometheus", usize::MAX).unwrap_err())?;
+        labels = labels
+            .checked_add(series.labels.len())
+            .ok_or_else(|| limits.check_entities("prometheus", usize::MAX).unwrap_err())?;
+        for label in &series.labels {
+            limits.check_label("prometheus", &label.name, &label.value)?;
+        }
+    }
+    limits.check_count("prometheus", samples, limits.max_samples)?;
+    let total = request
+        .timeseries
+        .len()
+        .checked_add(request.metadata.len())
+        .and_then(|count| count.checked_add(samples))
+        .and_then(|count| count.checked_add(labels))
+        .ok_or_else(|| limits.check_entities("prometheus", usize::MAX).unwrap_err())?;
+    limits.check_entities("prometheus", total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+
+    fn limits() -> crate::ingest_limits::IngestLimits {
+        crate::ingest_limits::IngestLimits::for_test(Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ))
+    }
+
+    #[test]
+    fn remote_write_rejects_oversized_series_labels_and_samples() {
+        let limits = limits();
+        let too_many_series = WriteRequest {
+            timeseries: (0..11).map(|_| TimeSeries::default()).collect(),
+            metadata: Vec::new(),
+        };
+        assert_eq!(
+            validate_write_request(&limits, &too_many_series)
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let long_label = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![Label {
+                    name: "x".repeat(33),
+                    value: "ok".into(),
+                }],
+                samples: vec![],
+            }],
+            metadata: Vec::new(),
+        };
+        assert_eq!(
+            validate_write_request(&limits, &long_label).unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn malformed_snappy_and_protobuf_have_stable_public_errors() {
+        let limits = limits();
+        let err = snap::raw::decompress_len(&[0xff, 0xff, 0xff])
+            .map_err(|_| limits.malformed("prometheus", "invalid Snappy ingest payload"))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid Snappy ingest payload".into()
+            )
+        );
+
+        let err = WriteRequest::decode([0xff, 0xff, 0xff].as_slice())
+            .map_err(|_| limits.malformed("prometheus", "invalid Prometheus remote-write payload"))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid Prometheus remote-write payload".into()
+            )
+        );
+    }
+
+    #[test]
+    fn snappy_claimed_output_is_rejected_before_decompression() {
+        let limits = limits();
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&vec![0_u8; 4097])
+            .unwrap();
+        assert!(compressed.len() < limits.max_compressed_bytes);
+        let error = decode_write_request(&limits, true, &compressed).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error.1,
+            "decompressed ingest payload exceeds configured limit"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_snappy_and_protobuf_never_panic_or_leak_decoder_details(
+            body in proptest::collection::vec(any::<u8>(), 0..2048),
+            declared_snappy in any::<bool>(),
+        ) {
+            let limits = limits();
+            let result = limits
+                .check_compressed("prometheus", body.len())
+                .and_then(|_| decode_write_request(&limits, declared_snappy, &body))
+                .and_then(|(request, len)| {
+                    validate_write_request(&limits, &request).map(|_| (request, len))
+                });
+            if let Err((status, message)) = result {
+                prop_assert!(matches!(status, StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE));
+                prop_assert!(!message.contains("prost"));
+                prop_assert!(!message.contains("snappy::"));
+                prop_assert!(!message.contains("failed to"));
+            }
+        }
+    }
 }

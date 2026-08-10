@@ -55,22 +55,34 @@ struct CwlEvent {
     message: String,
 }
 
-/// Maximum decompressed CloudWatch payload size: 32 MB. Guards against
-/// decompression bombs (a tiny gzip blob expanding to gigabytes).
-const MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
-
 /// Gunzip a buffer with a hard size cap.
-fn gunzip_capped(input: &[u8]) -> Result<Vec<u8>, String> {
+async fn gunzip_capped(
+    limits: &crate::ingest_limits::IngestLimits,
+    input: Vec<u8>,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    limits.check_compressed("cloudwatch", input.len())?;
+    let permit = limits.acquire_decode("cloudwatch").await?;
+    let limits = limits.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        gunzip_capped_sync(&limits, &input)
+    })
+    .await
+    .map_err(|e| crate::api_error::internal_legacy("cloudwatch.decode_task", e))?
+}
+
+fn gunzip_capped_sync(
+    limits: &crate::ingest_limits::IngestLimits,
+    input: &[u8],
+) -> Result<Vec<u8>, (StatusCode, String)> {
     use std::io::Read;
     let decoder = flate2::read::GzDecoder::new(input);
     let mut out = Vec::new();
     decoder
-        .take(MAX_DECOMPRESSED_BYTES)
+        .take(limits.max_decompressed_bytes as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|e| format!("gzip decompression failed: {e}"))?;
-    if out.len() as u64 >= MAX_DECOMPRESSED_BYTES {
-        return Err("decompressed body exceeds 32 MB limit".into());
-    }
+        .map_err(|_| limits.malformed("cloudwatch", "invalid compressed CloudWatch payload"))?;
+    limits.check_decompressed("cloudwatch", out.len())?;
     Ok(out)
 }
 
@@ -220,6 +232,9 @@ async fn ingest_firehose_inner(
             firehose_response(&request_id, Some("CloudWatch ingest is disabled")),
         );
     }
+    if let Err((status, message)) = state.ingest_limits.check_body("cloudwatch", &body) {
+        return (status, firehose_response(&request_id, Some(&message)));
+    }
 
     // The outer Firehose body may be gzip-compressed (Content-Encoding: gzip).
     let gzipped = headers
@@ -229,13 +244,10 @@ async fn ingest_firehose_inner(
         .unwrap_or(false);
     let raw_len = body.len() as u64;
     let outer: Vec<u8> = if gzipped {
-        match gunzip_capped(&body) {
+        match gunzip_capped(&state.ingest_limits, body.to_vec()).await {
             Ok(b) => b,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    firehose_response(&request_id, Some(&e)),
-                );
+            Err((status, message)) => {
+                return (status, firehose_response(&request_id, Some(&message)));
             }
         }
     } else {
@@ -245,10 +257,10 @@ async fn ingest_firehose_inner(
     // Parse the outer Firehose envelope.
     let req: FirehoseRequest = match serde_json::from_slice(&outer) {
         Ok(r) => r,
-        Err(e) => {
+        Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                firehose_response(&request_id, Some(&format!("invalid Firehose JSON: {e}"))),
+                firehose_response(&request_id, Some("invalid Firehose JSON payload")),
             );
         }
     };
@@ -268,40 +280,56 @@ async fn ingest_firehose_inner(
     let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
 
     let mut rows: Vec<LogInsertRow> = Vec::new();
+    let mut decoded_entities = req.records.len();
+    let mut decompressed_total = outer.len();
+    if let Err((status, message)) = state
+        .ingest_limits
+        .check_entities("cloudwatch", decoded_entities)
+    {
+        return (status, firehose_response(&request_id, Some(&message)));
+    }
 
     for record in &req.records {
         // Each record's data is base64 → gzip → CloudWatch Logs JSON.
         let decoded = match base64::engine::general_purpose::STANDARD.decode(record.data.as_bytes())
         {
             Ok(d) => d,
-            Err(e) => {
+            Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    firehose_response(&request_id, Some(&format!("invalid base64 record: {e}"))),
+                    firehose_response(&request_id, Some("invalid base64 Firehose record")),
                 );
             }
         };
-        let inflated = match gunzip_capped(&decoded) {
+        let inflated = match gunzip_capped(&state.ingest_limits, decoded).await {
             Ok(b) => b,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    firehose_response(&request_id, Some(&e)),
-                );
+            Err((status, message)) => {
+                return (status, firehose_response(&request_id, Some(&message)));
             }
         };
+        decompressed_total = decompressed_total.saturating_add(inflated.len());
+        if let Err((status, message)) = state
+            .ingest_limits
+            .check_decompressed("cloudwatch", decompressed_total)
+        {
+            return (status, firehose_response(&request_id, Some(&message)));
+        }
         let payload: CwlPayload = match serde_json::from_slice(&inflated) {
             Ok(p) => p,
-            Err(e) => {
+            Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    firehose_response(
-                        &request_id,
-                        Some(&format!("invalid CloudWatch Logs JSON: {e}")),
-                    ),
+                    firehose_response(&request_id, Some("invalid CloudWatch Logs JSON payload")),
                 );
             }
         };
+        decoded_entities = decoded_entities.saturating_add(payload.log_events.len());
+        if let Err((status, message)) = state
+            .ingest_limits
+            .check_entities("cloudwatch", decoded_entities)
+        {
+            return (status, firehose_response(&request_id, Some(&message)));
+        }
 
         // CONTROL_MESSAGE records are CWL/Firehose health checks — skip them.
         if payload.message_type == "CONTROL_MESSAGE" {

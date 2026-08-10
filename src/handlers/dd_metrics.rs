@@ -175,10 +175,13 @@ pub async fn ingest_v1(
     let tenant_id = &tenant.tenant_id;
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
-    let raw = decompress_body(&headers, body).await?;
+    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
 
-    let payload: V1SeriesPayload = serde_json::from_slice(&raw)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
+    let payload: V1SeriesPayload = serde_json::from_slice(&raw).map_err(|_| {
+        state
+            .ingest_limits
+            .malformed("datadog", "invalid Datadog metrics payload")
+    })?;
 
     if payload.series.is_empty() {
         return Ok((
@@ -186,6 +189,28 @@ pub async fn ingest_v1(
             Json(serde_json::json!({"status": "ok"})),
         ));
     }
+    state.ingest_limits.check_count(
+        "datadog",
+        payload.series.len(),
+        state.ingest_limits.max_series,
+    )?;
+    let entity_count = payload
+        .series
+        .iter()
+        .try_fold(payload.series.len(), |count, series| {
+            count
+                .checked_add(series.points.len())
+                .and_then(|count| count.checked_add(series.tags.len()))
+        })
+        .ok_or_else(|| {
+            state
+                .ingest_limits
+                .check_entities("datadog", usize::MAX)
+                .unwrap_err()
+        })?;
+    state
+        .ingest_limits
+        .check_entities("datadog", entity_count)?;
 
     // Group by target table
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
@@ -292,7 +317,7 @@ pub async fn ingest_v2(
     let tenant_id = &tenant.tenant_id;
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
-    let raw = decompress_body(&headers, body).await?;
+    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
 
     // DD agent v7 sends protobuf by default for v2/series.
     // Try JSON first; if it fails, accept gracefully (protobuf support TODO).
@@ -322,6 +347,28 @@ pub async fn ingest_v2(
             Json(serde_json::json!({"status": "ok"})),
         ));
     }
+    state.ingest_limits.check_count(
+        "datadog",
+        payload.series.len(),
+        state.ingest_limits.max_series,
+    )?;
+    let entity_count = payload
+        .series
+        .iter()
+        .try_fold(payload.series.len(), |count, series| {
+            count
+                .checked_add(series.points.len())
+                .and_then(|count| count.checked_add(series.tags.len()))
+        })
+        .ok_or_else(|| {
+            state
+                .ingest_limits
+                .check_entities("datadog", usize::MAX)
+                .unwrap_err()
+        })?;
+    state
+        .ingest_limits
+        .check_entities("datadog", entity_count)?;
 
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
@@ -437,7 +484,7 @@ pub async fn check_run(
     let tenant_id = &tenant.tenant_id;
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
-    let raw = decompress_body(&headers, body).await?;
+    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
 
     // Agent may send null or non-array — handle gracefully
     let checks: Vec<ServiceCheck> = match serde_json::from_slice(&raw) {
@@ -461,6 +508,9 @@ pub async fn check_run(
     if checks.is_empty() {
         return Ok(Json(serde_json::json!({"status": "ok"})));
     }
+    state
+        .ingest_limits
+        .check_entities("datadog", checks.len())?;
 
     let now_s = chrono::Utc::now().timestamp();
 

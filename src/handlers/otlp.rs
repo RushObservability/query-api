@@ -52,21 +52,15 @@ fn map_write_err(e: WriteError) -> (StatusCode, String) {
     }
 }
 
-/// Max inflated OTLP body (decompression-bomb guard). Real OTLP batches are well
-/// under this; the OTel Collector's otlphttp exporter caps payloads far lower.
-const MAX_OTLP_BODY: usize = 64 * 1024 * 1024; // 64 MiB
-
-/// Bodies larger than this (or any compressed body) are decompressed/decoded on
-/// the blocking pool so multi-hundred-ms CPU work never stalls a tokio worker.
-const OFFLOAD_THRESHOLD: usize = 256 * 1024;
-
 /// Decode an incoming request body as protobuf, returning 415 for JSON and
 /// 400 for other decode failures. Honors `Content-Encoding: gzip` (the OTel
 /// Collector's otlphttp exporter compresses by default), bounded by MAX_OTLP_BODY.
 async fn decode_proto<T: Message + Default + Send + 'static>(
+    limits: &crate::ingest_limits::IngestLimits,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<T, (StatusCode, String)> {
+    limits.check_body("otlp", &body)?;
     let ct = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -86,55 +80,40 @@ async fn decode_proto<T: Message + Default + Send + 'static>(
         .to_ascii_lowercase()
         .contains("gzip");
 
-    if gzip || body.len() > OFFLOAD_THRESHOLD {
-        // Decompression + protobuf decode are synchronous CPU work; run them on
-        // the blocking pool. `Bytes` is cheap to move across threads.
-        tokio::task::spawn_blocking(move || decode_proto_sync::<T>(gzip, &body))
-            .await
-            .map_err(|e| crate::api_error::internal_legacy("otlp.decode_task", e))?
-    } else {
-        decode_proto_sync::<T>(gzip, &body)
-    }
+    let permit = limits.acquire_decode("otlp").await?;
+    let limits = limits.clone();
+    // Protobuf decode is synchronous CPU work even for identity bodies. Always
+    // admit it through the dedicated semaphore and blocking pool.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_proto_sync::<T>(&limits, gzip, &body)
+    })
+    .await
+    .map_err(|e| crate::api_error::internal_legacy("otlp.decode_task", e))?
 }
 
 fn decode_proto_sync<T: Message + Default>(
+    limits: &crate::ingest_limits::IngestLimits,
     gzip: bool,
     body: &[u8],
 ) -> Result<T, (StatusCode, String)> {
     let decoded: std::borrow::Cow<[u8]> = if gzip {
         use std::io::Read;
-        // Read at most MAX_OTLP_BODY+1 so an over-large inflation is detected and
+        // Read at most the configured cap+1 so an over-large inflation is detected and
         // rejected rather than exhausting memory (decompression-bomb guard).
         let mut out = Vec::new();
         flate2::read::GzDecoder::new(body)
-            .take(MAX_OTLP_BODY as u64 + 1)
+            .take(limits.max_decompressed_bytes as u64 + 1)
             .read_to_end(&mut out)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("gzip decompress failed: {e}"),
-                )
-            })?;
-        if out.len() > MAX_OTLP_BODY {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "decompressed OTLP body exceeds {} byte limit",
-                    MAX_OTLP_BODY
-                ),
-            ));
-        }
+            .map_err(|_| limits.malformed("otlp", "invalid compressed OTLP payload"))?;
+        limits.check_decompressed("otlp", out.len())?;
         std::borrow::Cow::Owned(out)
     } else {
+        limits.check_decompressed("otlp", body.len())?;
         std::borrow::Cow::Borrowed(body)
     };
 
-    T::decode(decoded.as_ref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("protobuf decode failed: {e}"),
-        )
-    })
+    T::decode(decoded.as_ref()).map_err(|_| limits.malformed("otlp", "invalid OTLP payload"))
 }
 
 /// Convert an OTLP AnyValue to a String for storage as a span/log attribute value.
@@ -264,6 +243,95 @@ fn status_code_name(code: i32) -> &'static str {
     }
 }
 
+fn add_entities(total: &mut usize, amount: usize) {
+    *total = total.saturating_add(amount);
+}
+
+fn validate_trace_entities(
+    limits: &crate::ingest_limits::IngestLimits,
+    request: &ExportTraceServiceRequest,
+) -> Result<(), (StatusCode, String)> {
+    let mut total = request.resource_spans.len();
+    for resource in &request.resource_spans {
+        if let Some(value) = &resource.resource {
+            add_entities(&mut total, value.attributes.len());
+        }
+        add_entities(&mut total, resource.scope_spans.len());
+        for scope in &resource.scope_spans {
+            if let Some(value) = &scope.scope {
+                add_entities(&mut total, value.attributes.len());
+            }
+            add_entities(&mut total, scope.spans.len());
+            for span in &scope.spans {
+                add_entities(&mut total, span.attributes.len());
+                add_entities(&mut total, span.events.len());
+                add_entities(&mut total, span.links.len());
+                for event in &span.events {
+                    add_entities(&mut total, event.attributes.len());
+                }
+                for link in &span.links {
+                    add_entities(&mut total, link.attributes.len());
+                }
+            }
+        }
+    }
+    limits.check_entities("otlp", total)
+}
+
+fn validate_log_entities(
+    limits: &crate::ingest_limits::IngestLimits,
+    request: &ExportLogsServiceRequest,
+) -> Result<(), (StatusCode, String)> {
+    let mut total = request.resource_logs.len();
+    for resource in &request.resource_logs {
+        if let Some(value) = &resource.resource {
+            add_entities(&mut total, value.attributes.len());
+        }
+        add_entities(&mut total, resource.scope_logs.len());
+        for scope in &resource.scope_logs {
+            if let Some(value) = &scope.scope {
+                add_entities(&mut total, value.attributes.len());
+            }
+            add_entities(&mut total, scope.log_records.len());
+            for record in &scope.log_records {
+                add_entities(&mut total, record.attributes.len());
+            }
+        }
+    }
+    limits.check_entities("otlp", total)
+}
+
+fn validate_metric_entities(
+    limits: &crate::ingest_limits::IngestLimits,
+    request: &ExportMetricsServiceRequest,
+) -> Result<(), (StatusCode, String)> {
+    let mut total = request.resource_metrics.len();
+    for resource in &request.resource_metrics {
+        if let Some(value) = &resource.resource {
+            add_entities(&mut total, value.attributes.len());
+        }
+        add_entities(&mut total, resource.scope_metrics.len());
+        for scope in &resource.scope_metrics {
+            if let Some(value) = &scope.scope {
+                add_entities(&mut total, value.attributes.len());
+            }
+            add_entities(&mut total, scope.metrics.len());
+            for metric in &scope.metrics {
+                let points = match &metric.data {
+                    Some(MetricData::Gauge(value)) => value.data_points.len(),
+                    Some(MetricData::Sum(value)) => value.data_points.len(),
+                    Some(MetricData::Histogram(value)) => value.data_points.len(),
+                    Some(MetricData::ExponentialHistogram(value)) => value.data_points.len(),
+                    Some(MetricData::Summary(value)) => value.data_points.len(),
+                    None => 0,
+                };
+                add_entities(&mut total, points);
+            }
+        }
+    }
+    limits.check_entities("otlp", total)
+}
+
 // ─── POST /v1/traces ──────────────────────────────────────────────────────────
 
 pub async fn ingest_otlp_traces(
@@ -274,7 +342,9 @@ pub async fn ingest_otlp_traces(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
 
-    let req: ExportTraceServiceRequest = decode_proto(&headers, body.clone()).await?;
+    let req: ExportTraceServiceRequest =
+        decode_proto(&state.ingest_limits, &headers, body.clone()).await?;
+    validate_trace_entities(&state.ingest_limits, &req)?;
 
     let mut rows: Vec<TraceInsertRow> = Vec::new();
 
@@ -446,7 +516,9 @@ pub async fn ingest_otlp_logs(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
 
-    let req: ExportLogsServiceRequest = decode_proto(&headers, body.clone()).await?;
+    let req: ExportLogsServiceRequest =
+        decode_proto(&state.ingest_limits, &headers, body.clone()).await?;
+    validate_log_entities(&state.ingest_limits, &req)?;
 
     let mut rows: Vec<LogInsertRow> = Vec::new();
 
@@ -559,7 +631,9 @@ pub async fn ingest_otlp_metrics(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
 
-    let req: ExportMetricsServiceRequest = decode_proto(&headers, body.clone()).await?;
+    let req: ExportMetricsServiceRequest =
+        decode_proto(&state.ingest_limits, &headers, body.clone()).await?;
+    validate_metric_entities(&state.ingest_limits, &req)?;
 
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
@@ -984,22 +1058,29 @@ pub async fn ingest_vector_logs(
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
+    state.ingest_limits.check_body("otlp", &body)?;
+    state.ingest_limits.check_decompressed("otlp", body.len())?;
 
     // Framing-agnostic: Vector's http sink may send a JSON array, a single
     // object, or newline/whitespace-separated JSON depending on version and
     // framing config. Handle all three.
     let first_non_ws = body.iter().find(|b| !b.is_ascii_whitespace()).copied();
     let entries: Vec<VectorLogEntry> = if first_non_ws == Some(b'[') {
-        serde_json::from_slice(&body)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON array: {e}")))?
+        serde_json::from_slice(&body).map_err(|_| {
+            state
+                .ingest_limits
+                .malformed("otlp", "invalid Vector log payload")
+        })?
     } else {
         // Stream of concatenated/NDJSON objects (also covers a single object).
         let mut out = Vec::new();
         let mut stream = serde_json::Deserializer::from_slice(&body).into_iter::<VectorLogEntry>();
         for item in &mut stream {
-            out.push(
-                item.map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON object: {e}")))?,
-            );
+            out.push(item.map_err(|_| {
+                state
+                    .ingest_limits
+                    .malformed("otlp", "invalid Vector log payload")
+            })?);
         }
         out
     };
@@ -1007,6 +1088,20 @@ pub async fn ingest_vector_logs(
     if entries.is_empty() {
         return Ok(StatusCode::OK);
     }
+    let entity_count = entries
+        .iter()
+        .try_fold(entries.len(), |count, entry| {
+            count
+                .checked_add(entry.resource_attributes.len())
+                .and_then(|count| count.checked_add(entry.log_attributes.len()))
+        })
+        .ok_or_else(|| {
+            state
+                .ingest_limits
+                .check_entities("otlp", usize::MAX)
+                .unwrap_err()
+        })?;
+    state.ingest_limits.check_entities("otlp", entity_count)?;
 
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
@@ -1067,4 +1162,48 @@ pub async fn ingest_vector_logs(
     );
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    fn limits() -> crate::ingest_limits::IngestLimits {
+        crate::ingest_limits::IngestLimits::for_test(Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ))
+    }
+
+    #[test]
+    fn otlp_gzip_bomb_is_bounded_and_returns_413() {
+        let limits = limits();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![0_u8; 4097]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < limits.max_compressed_bytes);
+
+        let error =
+            decode_proto_sync::<ExportLogsServiceRequest>(&limits, true, &compressed).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error.1,
+            "decompressed ingest payload exceeds configured limit"
+        );
+    }
+
+    #[test]
+    fn malformed_otlp_error_is_stable() {
+        let limits = limits();
+        let error =
+            decode_proto_sync::<ExportLogsServiceRequest>(&limits, false, &[0xff, 0xff, 0xff])
+                .unwrap_err();
+        assert_eq!(
+            error,
+            (StatusCode::BAD_REQUEST, "invalid OTLP payload".into())
+        );
+    }
 }

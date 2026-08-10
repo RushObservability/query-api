@@ -23,18 +23,16 @@ pub fn validate_api_key(headers: &HeaderMap) -> Result<(), (StatusCode, String)>
     Ok(())
 }
 
-/// Maximum decompressed body size: 32 MB.  Prevents decompression bombs where a
-/// small compressed payload expands to gigabytes, exhausting server memory.
-const MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
-
 /// Decompress body based on Content-Encoding header (gzip, deflate, zstd, or identity).
 /// Compressed bodies are inflated on the blocking pool — decompression is
 /// synchronous CPU work that would otherwise stall a tokio worker for the
 /// duration (tens to hundreds of ms on large agent payloads).
 pub async fn decompress_body(
+    limits: &crate::ingest_limits::IngestLimits,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
+    limits.check_body("datadog", &body)?;
     let encoding = headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
@@ -45,71 +43,51 @@ pub async fn decompress_body(
         || encoding.contains("zstd")
         || encoding.contains("zstandard")
     {
-        tokio::task::spawn_blocking(move || decompress_body_sync(&encoding, body))
-            .await
-            .map_err(|e| crate::api_error::internal_legacy("datadog.decompress_task", e))?
+        let permit = limits.acquire_decode("datadog").await?;
+        let limits = limits.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            decompress_body_sync(&limits, &encoding, body)
+        })
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("datadog.decompress_task", e))?
     } else {
+        limits.check_decompressed("datadog", body.len())?;
         Ok(body.to_vec())
     }
 }
 
-fn decompress_body_sync(encoding: &str, body: Bytes) -> Result<Vec<u8>, (StatusCode, String)> {
+fn decompress_body_sync(
+    limits: &crate::ingest_limits::IngestLimits,
+    encoding: &str,
+    body: Bytes,
+) -> Result<Vec<u8>, (StatusCode, String)> {
     if encoding.contains("gzip") {
-        use std::io::Read;
         let decoder = flate2::read::GzDecoder::new(body.as_ref());
-        let mut out = Vec::new();
-        decoder
-            .take(MAX_DECOMPRESSED_BYTES)
-            .read_to_end(&mut out)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("gzip decompression failed: {e}"),
-                )
-            })?;
-        if out.len() as u64 >= MAX_DECOMPRESSED_BYTES {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "decompressed body exceeds 32 MB limit".into(),
-            ));
-        }
-        Ok(out)
+        read_capped(limits, decoder)
     } else if encoding.contains("deflate") {
-        use std::io::Read;
         let decoder = flate2::read::DeflateDecoder::new(body.as_ref());
-        let mut out = Vec::new();
-        decoder
-            .take(MAX_DECOMPRESSED_BYTES)
-            .read_to_end(&mut out)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("deflate decompression failed: {e}"),
-                )
-            })?;
-        if out.len() as u64 >= MAX_DECOMPRESSED_BYTES {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "decompressed body exceeds 32 MB limit".into(),
-            ));
-        }
-        Ok(out)
+        read_capped(limits, decoder)
     } else {
         // zstd / zstandard (only reachable for these encodings via the async wrapper)
-        let out = zstd::decode_all(body.as_ref()).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("zstd decompression failed: {e}"),
-            )
-        })?;
-        if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "decompressed body exceeds 32 MB limit".into(),
-            ));
-        }
-        Ok(out)
+        let decoder = zstd::stream::read::Decoder::new(body.as_ref())
+            .map_err(|_| limits.malformed("datadog", "invalid compressed Datadog payload"))?;
+        read_capped(limits, decoder)
     }
+}
+
+fn read_capped<R: std::io::Read>(
+    limits: &crate::ingest_limits::IngestLimits,
+    reader: R,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    reader
+        .take(limits.max_decompressed_bytes as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|_| limits.malformed("datadog", "invalid compressed Datadog payload"))?;
+    limits.check_decompressed("datadog", out.len())?;
+    Ok(out)
 }
 
 /// Parse Datadog tags ("key:value" strings) into key-value pairs.
@@ -155,4 +133,42 @@ pub async fn validate(
 /// Catch-all stub for metadata endpoints the agent calls but we don't need.
 pub async fn stub_ok() -> impl IntoResponse {
     Json(serde_json::json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    fn limits() -> crate::ingest_limits::IngestLimits {
+        crate::ingest_limits::IngestLimits::for_test(Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ))
+    }
+
+    #[test]
+    fn datadog_gzip_bomb_is_bounded_and_returns_413() {
+        let limits = limits();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![0_u8; 4097]).unwrap();
+        let compressed = Bytes::from(encoder.finish().unwrap());
+        let error = decompress_body_sync(&limits, "gzip", compressed).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn malformed_datadog_compression_error_is_stable() {
+        let error =
+            decompress_body_sync(&limits(), "gzip", Bytes::from_static(b"bad")).unwrap_err();
+        assert_eq!(
+            error,
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid compressed Datadog payload".into()
+            )
+        );
+    }
 }

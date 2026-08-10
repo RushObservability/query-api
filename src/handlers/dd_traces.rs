@@ -233,17 +233,19 @@ pub async fn ingest_v04(
     // but we still accept it if present
     let _ = validate_api_key(&headers);
 
-    let raw = decompress_body(&headers, body).await?;
+    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
 
     // Decode msgpack: Vec<Vec<DdSpan>> (array of traces, each trace is array of spans)
-    let traces: Vec<Vec<DdSpan>> = rmp_serde::from_slice(&raw).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("msgpack decode failed: {e}"),
-        )
+    let traces: Vec<Vec<DdSpan>> = rmp_serde::from_slice(&raw).map_err(|_| {
+        state
+            .ingest_limits
+            .malformed("datadog", "invalid Datadog traces payload")
     })?;
 
     let span_count: usize = traces.iter().map(|t| t.len()).sum();
+    state
+        .ingest_limits
+        .check_entities("datadog", span_count.saturating_add(traces.len()))?;
     if span_count == 0 {
         return Ok(Json(serde_json::json!({"rate_by_service": {}})));
     }
@@ -323,7 +325,7 @@ pub async fn ingest_agent(
     // Arc refactor: tenant_id is shared across every span in this request.
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     let _ = validate_api_key(&headers);
-    let raw = decompress_body(&headers, body).await?;
+    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
 
     // Log content-type for debugging
     let ct = headers
@@ -416,6 +418,8 @@ pub async fn ingest_agent(
                 }
             }
 
+            state.ingest_limits.check_entities("datadog", span_count)?;
+
             if span_count == 0 {
                 return Ok(Json(serde_json::json!({"rate_by_service": {}})));
             }
@@ -472,6 +476,9 @@ pub async fn ingest_agent(
     match rmp_serde::from_slice::<Vec<Vec<DdSpan>>>(&raw) {
         Ok(traces) => {
             let span_count: usize = traces.iter().map(|t| t.len()).sum();
+            state
+                .ingest_limits
+                .check_entities("datadog", span_count.saturating_add(traces.len()))?;
             if span_count == 0 {
                 return Ok(Json(serde_json::json!({"rate_by_service": {}})));
             }
