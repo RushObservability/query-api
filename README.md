@@ -100,6 +100,14 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_POSTGRES_COLLECTOR_CONFIG` | _(empty)_ | optional bootstrap YAML when no API-managed target exists |
 | `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant-scoped API key for managed collector ingest |
 | `RUSH_ALLOWED_ORIGINS` | _(empty; cross-origin disabled)_ | Comma-separated exact HTTP(S) browser origins. Invalid, `null`, wildcard, credential-bearing, or path-bearing entries stop startup; production browser mutations must still match `RUSH_BASE_URL` |
+| `RUSH_INGEST_MAX_COMPRESSED_BYTES` | `8388608` | maximum wire body accepted by an ingest endpoint before decoding |
+| `RUSH_INGEST_MAX_DECOMPRESSED_BYTES` | `33554432` | maximum inflated bytes per ingest request, including cumulative nested CloudWatch records |
+| `RUSH_INGEST_MAX_ENTITIES` | `200000` | maximum combined decoded records, points, attributes, labels, and container entities |
+| `RUSH_INGEST_MAX_SERIES` / `RUSH_INGEST_MAX_SAMPLES` | `20000` / `200000` | Prometheus and Datadog series/point limits |
+| `RUSH_INGEST_MAX_METADATA` | `10000` | Prometheus remote-write metadata-record limit |
+| `RUSH_INGEST_MAX_LABELS_PER_SERIES` | `128` | maximum labels on one Prometheus series |
+| `RUSH_INGEST_MAX_LABEL_NAME_BYTES` / `RUSH_INGEST_MAX_LABEL_VALUE_BYTES` | `256` / `4096` | UTF-8 byte limits for Prometheus label names and values |
+| `RUSH_INGEST_DECODE_CONCURRENCY` | `4` | process-wide CPU-heavy ingest decode slots; excess requests receive retryable 429 responses |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
 | `RUSH_BUFFER_BACKEND` | `disk` | `disk` or shared `object_store` |
 | `RUSH_BUFFER_REQUIRE_OBJECT_STORE` | `false` | refuse unsafe fallback to disk |
@@ -122,6 +130,12 @@ health. ClickHouse metrics include active queries, merges/mutations, memory,
 disk, insert/select counters, and recent query-log latency, read-volume,
 result-volume, memory, and error aggregates. The endpoint is intended for an
 internal Prometheus path and is not tenant data.
+
+Ingest limit failures are exposed as
+`rush_ingest_limit_rejections_total{source,reason}`. Both labels are fixed
+allowlists. `reason` distinguishes `compressed_bytes`, `decompressed_bytes`,
+`entity_count`, `decode_concurrency`, and `malformed`; it never includes tenant
+names, payload data, or decoder errors.
 
 ### Browser sessions
 
