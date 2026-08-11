@@ -443,11 +443,11 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
 ///    URL form lets external tools (e.g. Grafana datasources) carry the tenant
 ///    in the base URL; the header takes precedence when both are present.
 /// 4. Fall back to the `"default"` tenant (backward compatible).
-async fn tenant_middleware(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+async fn tenant_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    rush_api::request_auth::scope(tenant_middleware_scoped(state, req, next)).await
+}
+
+async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next) -> Response {
     // ── URL-based tenant: /t/{tenant}/<rest> ──
     // Strip the prefix so downstream routes match unchanged, and carry the
     // extracted tenant through the same path as the X-Rush-Tenant header.
@@ -1163,11 +1163,22 @@ async fn enforce_tenant_auth_middleware(
     }
 
     let ingest_signal = ingest_signal_for_route(&method, &path);
-    let stored_auth_required = match state
+    let policy_started = std::time::Instant::now();
+    let policy_result = state
         .config_db
         .tenant_auth_required_checked(&tenant_id)
-        .await
-    {
+        .await;
+    state.self_metrics.record_auth_lookup(
+        "tenant_policy",
+        policy_started.elapsed().as_secs_f64() * 1_000.0,
+        u64::from(matches!(policy_result, Ok(Some(_)))),
+        match &policy_result {
+            Ok(Some(_)) => "ok",
+            Ok(None) => "not_found",
+            Err(_) => "error",
+        },
+    );
+    let stored_auth_required = match policy_result {
         Ok(Some(required)) => required,
         Ok(None) => {
             tracing::error!(tenant_id = %tenant_id, "resolved tenant has no policy record");
@@ -1190,11 +1201,22 @@ async fn enforce_tenant_auth_middleware(
         tenant_id == "default" && rush_api::api_key_auth::allow_anonymous_default();
     let auth_required = stored_auth_required && !default_compatibility;
     let ingest_auth_required = if ingest_signal.is_some() {
-        match state
+        let ingest_policy_started = std::time::Instant::now();
+        let ingest_policy_result = state
             .config_db
             .tenant_ingest_auth_required_checked(&tenant_id)
-            .await
-        {
+            .await;
+        state.self_metrics.record_auth_lookup(
+            "tenant_ingest_policy",
+            ingest_policy_started.elapsed().as_secs_f64() * 1_000.0,
+            u64::from(matches!(ingest_policy_result, Ok(Some(_)))),
+            match &ingest_policy_result {
+                Ok(Some(_)) => "ok",
+                Ok(None) => "not_found",
+                Err(_) => "error",
+            },
+        );
+        match ingest_policy_result {
             Ok(Some(required)) => required && !default_compatibility,
             Ok(None) => {
                 tracing::error!(tenant_id = %tenant_id, "resolved tenant has no ingest policy record");
@@ -1373,20 +1395,20 @@ async fn resolve_api_key_credential(state: &AppState, key: &str) -> Option<Tenan
         return None;
     }
     let key_hash = handlers::settings::hash_api_key(key);
-    if let Some(entry) = state.api_key_cache.get(&key_hash) {
-        let (grant, cached_at) = entry.value();
-        if cached_at.elapsed() < std::time::Duration::from_secs(60) {
-            return Some(TenantResolution::api_key(grant.clone()));
-        }
-    }
-
-    match state.config_db.resolve_api_key(&key_hash).await {
-        Ok(Some(grant)) => {
-            state
-                .api_key_cache
-                .insert(key_hash, (grant.clone(), std::time::Instant::now()));
-            Some(TenantResolution::api_key(grant))
-        }
+    let started = std::time::Instant::now();
+    let result = state.config_db.resolve_api_key(&key_hash).await;
+    state.self_metrics.record_auth_lookup(
+        "api_key_grant",
+        started.elapsed().as_secs_f64() * 1_000.0,
+        u64::from(matches!(result, Ok(Some(_)))),
+        match &result {
+            Ok(Some(_)) => "ok",
+            Ok(None) => "not_found",
+            Err(_) => "error",
+        },
+    );
+    match result {
+        Ok(Some(grant)) => Some(TenantResolution::api_key(grant)),
         Ok(None) => None,
         Err(error) => {
             tracing::warn!(%error, "API key resolution failed");
@@ -1451,21 +1473,40 @@ async fn resolve_tenant_inner(
                 "attempt to select reserved '_audit' tenant via public API — rejected"
             );
         } else if !tenant.is_empty() {
-            if state.config_db.is_tenant_enabled(&tenant).await {
+            let tenant_started = std::time::Instant::now();
+            let tenant_enabled = state.config_db.is_tenant_enabled(&tenant).await;
+            state.self_metrics.record_auth_lookup(
+                "tenant_policy",
+                tenant_started.elapsed().as_secs_f64() * 1_000.0,
+                u64::from(tenant_enabled),
+                if tenant_enabled { "ok" } else { "not_found" },
+            );
+            if tenant_enabled {
                 // If the request carries a session cookie, validate the user has
                 // group-based access to the requested tenant.
                 if let Some(token) = &session_token {
                     if let Some((user_id, _username, _display_name, _tid, role)) =
-                        state.config_db.get_session_user(token).await
+                        rush_api::request_auth::resolve_session_user(state, token).await
                     {
                         if role == "admin" {
                             // Admins can access any enabled tenant
                             return TenantResolution::session(tenant);
                         }
                         // Non-admins: resolve accessible tenant IDs and check
-                        if let Ok((_, _, accessible_ids)) =
-                            state.config_db.resolve_user_permissions(&user_id).await
-                        {
+                        let permissions_started = std::time::Instant::now();
+                        let permissions = state.config_db.resolve_user_permissions(&user_id).await;
+                        state.self_metrics.record_auth_lookup(
+                            "user_permissions",
+                            permissions_started.elapsed().as_secs_f64() * 1_000.0,
+                            permissions
+                                .as_ref()
+                                .map(|(scopes, permissions, tenants)| {
+                                    (scopes.len() + permissions.len() + tenants.len()) as u64
+                                })
+                                .unwrap_or(0),
+                            if permissions.is_ok() { "ok" } else { "error" },
+                        );
+                        if let Ok((_, _, accessible_ids)) = permissions {
                             // accessible_ids are UUIDs; resolve the requested
                             // tenant name to an ID for comparison
                             if let Ok(Some(tenant_id)) =
@@ -1510,7 +1551,7 @@ async fn resolve_tenant_inner(
     // before the tenant switcher initializes).
     if let Some(token) = session_token {
         if let Some((_user_id, _username, _display_name, tenant_id, _role)) =
-            state.config_db.get_session_user(&token).await
+            rush_api::request_auth::resolve_session_user(state, &token).await
         {
             return TenantResolution::session(tenant_id);
         }
@@ -2232,30 +2273,8 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let api_key_cache: std::sync::Arc<
-        dashmap::DashMap<String, (rush_api::clickhouse_config::ApiKeyGrant, std::time::Instant)>,
-    > = std::sync::Arc::new(dashmap::DashMap::new());
     let ingest_key_limiter: std::sync::Arc<dashmap::DashMap<String, (u64, std::time::Instant)>> =
         std::sync::Arc::new(dashmap::DashMap::new());
-
-    // Spawn background task to evict expired API key cache entries (TTL 60s)
-    {
-        let cache_clone = api_key_cache.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                // Hard cap: more keys than any real deployment should have.
-                if cache_clone.len() > 50_000 {
-                    cache_clone
-                        .retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(10));
-                } else {
-                    cache_clone
-                        .retain(|_, (_, ts)| ts.elapsed() < std::time::Duration::from_secs(60));
-                }
-            }
-        });
-    }
 
     {
         let limiter = ingest_key_limiter.clone();
@@ -2305,7 +2324,6 @@ async fn main() -> anyhow::Result<()> {
         login_account_limit_per_minute,
         login_ip_limit_per_minute,
         trusted_proxy_cidrs,
-        api_key_cache,
         ingest_key_limiter,
         audit,
         self_metrics,
@@ -3656,6 +3674,21 @@ mod tenant_auth_tests {
                 Some("query_not_allowed")
             );
         }
+    }
+
+    #[test]
+    fn api_key_revocation_has_no_process_local_cache_grace_period() {
+        let source = include_str!("main.rs");
+        let resolver = source
+            .split_once("async fn resolve_api_key_credential")
+            .expect("API key resolver must exist")
+            .1
+            .split("async fn resolve_tenant_inner")
+            .next()
+            .expect("tenant resolver must follow API key resolver");
+        assert!(resolver.contains("config_db.resolve_api_key"));
+        assert!(!resolver.contains("api_key_cache"));
+        assert!(!include_str!("lib.rs").contains("pub api_key_cache"));
     }
 
     #[test]

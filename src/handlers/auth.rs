@@ -583,7 +583,7 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if let Some(token) = extract_session_cookie(&headers) {
-        let caller = state.config_db.get_session_user(&token).await;
+        let caller = crate::request_auth::resolve_session_user(&state, &token).await;
         if let Err(error) = state.config_db.delete_session(&token).await {
             tracing::error!(operation = "session_revoke", %error, "logout request failed");
             let event = match caller.as_ref() {
@@ -653,16 +653,15 @@ pub async fn me(
     let token = extract_session_cookie(&headers)
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
 
-    let (user_id, username, display_name, tenant_id, role) = state
-        .config_db
-        .get_session_user(&token)
-        .await
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                "session expired or invalid".to_string(),
-            )
-        })?;
+    let (user_id, username, display_name, tenant_id, role) =
+        crate::request_auth::resolve_session_user(&state, &token)
+            .await
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "session expired or invalid".to_string(),
+                )
+            })?;
 
     Ok(Json(serde_json::json!({
         "user": UserInfo {

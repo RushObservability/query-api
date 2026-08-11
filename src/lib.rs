@@ -27,6 +27,7 @@ pub mod process_metrics;
 pub mod promql;
 pub mod query_builder;
 pub mod query_governor;
+pub mod request_auth;
 pub mod retention_enforcer;
 pub mod rollup;
 pub mod saml;
@@ -251,8 +252,6 @@ pub struct AppState {
     pub login_ip_limit_per_minute: u32,
     /// Only direct peers in these networks may supply client forwarding headers.
     pub trusted_proxy_cidrs: Arc<Vec<String>>,
-    /// API key resolution cache: key_hash → (tenant_id, cached_at). TTL 60s.
-    pub api_key_cache: Arc<DashMap<String, (clickhouse_config::ApiKeyGrant, Instant)>>,
     /// Per ingest-key fixed-window request limiter: key id -> (count, window start).
     pub ingest_key_limiter: Arc<DashMap<String, (u64, Instant)>>,
     /// Tamper-evident audit log writer (hash-chained, serialized). Shared.

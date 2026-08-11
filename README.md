@@ -139,6 +139,14 @@ matched-row/logical-byte and response-byte histograms, and
 `rush-explore-<request UUID>-{rows,summary}` query IDs. No tenant, filter, or
 search text is used as a metric label.
 
+Authorization hot-path metrics expose fixed-label
+`rush_auth_lookup_duration_ms`, `rush_auth_lookup_result_rows`,
+`rush_auth_lookups_total`, and `rush_auth_cache_total`. Histogram snapshots add
+p50/p95/p99 series. Labels identify only the bounded lookup category and
+outcome; user IDs, tenants, bearer fingerprints, routes, and grants are never
+included. See [Authorization hot-path performance](docs/authorization-performance.md)
+for queries and interpretation.
+
 Ingest limit failures are exposed as
 `rush_ingest_limit_rejections_total{source,reason}`. Both labels are fixed
 allowlists. `reason` distinguishes `compressed_bytes`, `decompressed_bytes`,

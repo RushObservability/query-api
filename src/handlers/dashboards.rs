@@ -20,7 +20,7 @@ async fn resolve_caller(
     tenant: &TenantContext,
 ) -> (String, String, String, String, String) {
     if let Some(token) = extract_session_cookie(headers) {
-        if let Some(info) = state.config_db.get_session_user(&token).await {
+        if let Some(info) = crate::request_auth::resolve_session_user(state, &token).await {
             return info;
         }
     }

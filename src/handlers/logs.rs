@@ -763,9 +763,7 @@ pub async fn export_logs(
     // sensitive values) — only a has_search boolean and the row cap.
     {
         let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
-            Some(tok) => state
-                .config_db
-                .get_session_user(&tok)
+            Some(tok) => crate::request_auth::resolve_session_user(&state, &tok)
                 .await
                 .map(|c| (c.0, c.1))
                 .unwrap_or_default(),

@@ -1717,7 +1717,6 @@ pub async fn delete_api_key(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     }
-    state.api_key_cache.retain(|_, (grant, _)| grant.id != id);
     state.ingest_key_limiter.remove(&id);
     tracing::info!(
         event = "api_key_deleted",

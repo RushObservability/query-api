@@ -16,9 +16,7 @@ async fn require_auth(
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
     let token = extract_session_cookie(headers)
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
-    state
-        .config_db
-        .get_session_user(&token)
+    crate::request_auth::resolve_session_user(state, &token)
         .await
         .ok_or_else(|| {
             (

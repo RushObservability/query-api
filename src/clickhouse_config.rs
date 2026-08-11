@@ -16,7 +16,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 /// (user_id, username, display_name, tenant_id, role) — the require_auth tuple.
-type SessionUser = (String, String, String, String, String);
+pub type SessionUser = (String, String, String, String, String);
 /// (id, name, enabled, auth_required) for a tenant; None = tenant not found.
 type TenantFlags = Option<(String, String, bool, bool)>;
 
@@ -1404,6 +1404,13 @@ impl ConfigDb {
     /// The secret never leaves the process or appears in cursor payloads/logs.
     pub(crate) fn cursor_hmac_secret(&self) -> &[u8] {
         &self.session_hmac_secret
+    }
+
+    /// One-way, process-stable identity for a session bearer. Request-scoped
+    /// authorization reuse keys by this value so the raw cookie never enters a
+    /// cache, metric, log, or trace.
+    pub(crate) fn session_request_key(&self, token: &str) -> String {
+        session_storage_key(&self.session_hmac_secret, token)
     }
 
     pub async fn open(url: &str, user: &str, password: &str) -> anyhow::Result<Self> {
@@ -3188,6 +3195,12 @@ impl ConfigDb {
     }
 
     async fn derive_user_role(&self, user_id: &str) -> anyhow::Result<String> {
+        self.derive_user_role_with_rows(user_id)
+            .await
+            .map(|(role, _)| role)
+    }
+
+    async fn derive_user_role_with_rows(&self, user_id: &str) -> anyhow::Result<(String, u64)> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             permissions: String,
@@ -3200,18 +3213,18 @@ impl ConfigDb {
         for row in &rows {
             if let Ok(perms) = serde_json::from_str::<Vec<String>>(&row.permissions) {
                 if perms.contains(&"admin".to_string()) {
-                    return Ok("admin".to_string());
+                    return Ok(("admin".to_string(), rows.len() as u64));
                 }
             }
         }
         for row in &rows {
             if let Ok(perms) = serde_json::from_str::<Vec<String>>(&row.permissions) {
                 if perms.contains(&"write".to_string()) {
-                    return Ok("write".to_string());
+                    return Ok(("write".to_string(), rows.len() as u64));
                 }
             }
         }
-        Ok("viewer".to_string())
+        Ok(("viewer".to_string(), rows.len() as u64))
     }
 
     /// Invalidate session rows created before keyed HMAC storage was enabled.
@@ -3327,6 +3340,24 @@ impl ConfigDb {
         &self,
         token: &str,
     ) -> Option<(String, String, String, String, String)> {
+        self.get_session_user_inner(token, None).await
+    }
+
+    /// Session validation with bounded self-metrics for the constituent user
+    /// and role lookups. The authorization result is unchanged.
+    pub async fn get_session_user_observed(
+        &self,
+        token: &str,
+        metrics: &crate::self_metrics::SelfMetrics,
+    ) -> Option<SessionUser> {
+        self.get_session_user_inner(token, Some(metrics)).await
+    }
+
+    async fn get_session_user_inner(
+        &self,
+        token: &str,
+        metrics: Option<&crate::self_metrics::SelfMetrics>,
+    ) -> Option<SessionUser> {
         let stored_token = session_storage_key(&self.session_hmac_secret, token);
         // Session authorization is deliberately not cached. Password changes,
         // user disables, and logout must become visible to every API replica
@@ -3345,7 +3376,8 @@ impl ConfigDb {
         }
         let now = Self::now_str();
         let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id, s.expires_at, s.user_id, s.auth_method, s.provider_id FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1";
-        let row = self
+        let user_started = Instant::now();
+        let result = self
             .client
             .query(sql)
             .bind(&stored_token)
@@ -3353,8 +3385,20 @@ impl ConfigDb {
             .bind(&now)
             .bind(&now)
             .fetch_one::<Row>()
-            .await
-            .ok()?;
+            .await;
+        if let Some(metrics) = metrics {
+            metrics.record_auth_lookup(
+                "user",
+                user_started.elapsed().as_secs_f64() * 1_000.0,
+                u64::from(result.is_ok()),
+                match &result {
+                    Ok(_) => "ok",
+                    Err(clickhouse::error::Error::RowNotFound) => "not_found",
+                    Err(_) => "error",
+                },
+            );
+        }
+        let row = result.ok()?;
         match row.auth_method.as_str() {
             "local" if row.provider_id.is_empty() => {}
             "oidc" | "saml" => {
@@ -3366,9 +3410,18 @@ impl ConfigDb {
             // Sessions issued before provenance binding fail closed.
             _ => return None,
         }
-        let role = self
-            .derive_user_role(&row.id)
-            .await
+        let role_started = Instant::now();
+        let role_result = self.derive_user_role_with_rows(&row.id).await;
+        if let Some(metrics) = metrics {
+            metrics.record_auth_lookup(
+                "role",
+                role_started.elapsed().as_secs_f64() * 1_000.0,
+                role_result.as_ref().map(|(_, rows)| *rows).unwrap_or(0),
+                if role_result.is_ok() { "ok" } else { "error" },
+            );
+        }
+        let role = role_result
+            .map(|(role, _)| role)
             .unwrap_or_else(|_| "viewer".to_string());
         let user: SessionUser = (row.id, row.username, row.display_name, row.tenant_id, role);
         Some(user)

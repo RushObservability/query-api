@@ -45,6 +45,11 @@ pub const RESULT_COUNT_BUCKETS: [f64; 10] = [
     0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0,
 ];
 
+/// Logical rows returned by bounded authorization/config lookups. Most
+/// credential and policy resolutions return zero or one row; role and group
+/// permission lookups may return a small bounded set.
+pub const AUTH_LOOKUP_ROWS_BUCKETS: [f64; 8] = [0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0];
+
 /// Free-text query-length bucket bounds (characters), for `rush_search_query_length_chars`.
 pub const QUERY_LEN_BUCKETS: [f64; 10] =
     [0.0, 1.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0];
@@ -341,6 +346,50 @@ impl SelfMetrics {
                 .or_insert_with(|| Histogram::new(bounds))
                 .observe(value);
         }
+    }
+
+    /// Record a security-sensitive authorization/config lookup. Both label
+    /// values are collapsed to fixed allowlists so these hot-path metrics can
+    /// never acquire user, tenant, token, route, or query cardinality.
+    pub fn record_auth_lookup(
+        &self,
+        lookup: &'static str,
+        duration_ms: f64,
+        result_rows: u64,
+        outcome: &'static str,
+    ) {
+        let lookup = bounded_auth_lookup(lookup);
+        let outcome = bounded_auth_outcome(outcome);
+        self.inc_counter(
+            "rush_auth_lookups_total",
+            &[("lookup", lookup), ("outcome", outcome)],
+            1,
+        );
+        self.observe_histogram(
+            "rush_auth_lookup_duration_ms",
+            &[("lookup", lookup)],
+            duration_ms,
+        );
+        self.observe_histogram_with(
+            "rush_auth_lookup_result_rows",
+            &[("lookup", lookup)],
+            result_rows as f64,
+            &AUTH_LOOKUP_ROWS_BUCKETS,
+        );
+    }
+
+    /// Record cache behavior for authorization data. The request-session cache
+    /// is scoped to one HTTP request; config caches are bounded and explicitly
+    /// invalidated by local mutations.
+    pub fn record_auth_cache(&self, lookup: &'static str, outcome: &'static str) {
+        self.inc_counter(
+            "rush_auth_cache_total",
+            &[
+                ("lookup", bounded_auth_lookup(lookup)),
+                ("outcome", bounded_auth_cache_outcome(outcome)),
+            ],
+            1,
+        );
     }
 
     /// Convenience: record one engine-loop cycle's outcome.
@@ -723,6 +772,33 @@ fn bounded_query_signal(signal: &'static str) -> &'static str {
     match signal {
         "logs" | "spans" | "metrics" => signal,
         _ => "other",
+    }
+}
+
+fn bounded_auth_lookup(lookup: &'static str) -> &'static str {
+    match lookup {
+        "session"
+        | "user"
+        | "role"
+        | "tenant_policy"
+        | "tenant_ingest_policy"
+        | "user_permissions"
+        | "api_key_grant" => lookup,
+        _ => "other",
+    }
+}
+
+fn bounded_auth_outcome(outcome: &'static str) -> &'static str {
+    match outcome {
+        "ok" | "not_found" | "error" => outcome,
+        _ => "error",
+    }
+}
+
+fn bounded_auth_cache_outcome(outcome: &'static str) -> &'static str {
+    match outcome {
+        "hit" | "miss" | "stale_invalidation" => outcome,
+        _ => "miss",
     }
 }
 
@@ -1188,5 +1264,34 @@ mod tests {
         assert!(text.contains("rush_explore_response_bytes_count{signal=\"logs\"} 1"));
         assert!(!text.contains("untrusted-signal"));
         assert!(!text.contains("untrusted-stage"));
+    }
+
+    #[test]
+    fn authorization_metrics_emit_quantiles_rows_and_bounded_cache_labels() {
+        let metrics = SelfMetrics::new();
+        metrics.record_auth_lookup("session", 2.5, 1, "ok");
+        metrics.record_auth_lookup("attacker-controlled", 8.0, 0, "unexpected");
+        metrics.record_auth_cache("session", "hit");
+        metrics.record_auth_cache("attacker-controlled", "unexpected");
+
+        let text = metrics.render_prometheus();
+        assert!(text.contains("rush_auth_lookups_total{lookup=\"session\",outcome=\"ok\"} 1"));
+        assert!(text.contains("rush_auth_lookup_duration_ms_count{lookup=\"session\"} 1"));
+        assert!(text.contains("rush_auth_lookup_result_rows_sum{lookup=\"session\"} 1"));
+        assert!(text.contains("rush_auth_cache_total{lookup=\"session\",outcome=\"hit\"} 1"));
+        assert!(text.contains("rush_auth_cache_total{lookup=\"other\",outcome=\"miss\"} 1"));
+        assert!(!text.contains("attacker-controlled"));
+        assert!(!text.contains("unexpected"));
+
+        let snapshot = metrics.snapshot_series();
+        for quantile in ["p50", "p95", "p99"] {
+            assert!(snapshot.iter().any(|point| {
+                point.name == format!("rush_auth_lookup_duration_ms_{quantile}")
+                    && point
+                        .labels
+                        .iter()
+                        .any(|(key, value)| *key == "lookup" && value == "session")
+            }));
+        }
     }
 }
