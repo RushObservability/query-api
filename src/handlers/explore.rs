@@ -119,6 +119,8 @@ struct ExploreQueryStats {
 struct ExploreSearchResponse<T: Serialize> {
     signal: ExploreSignal,
     rows: Vec<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
     count: ExploreCount,
     summary: ExploreSummary,
     errors: ExploreErrors,
@@ -223,12 +225,34 @@ async fn execute_spans(
         true,
     );
 
+    let next_cursor = (rows.len() as u64 == req.limit.clamp(1, MAX_ROWS)).then(|| {
+        let row = rows.last().expect("non-empty full page");
+        let scope = crate::pagination::query_scope(
+            tenant_id,
+            "spans",
+            "wide",
+            &req.time_range,
+            &req.filters,
+            req.search.as_deref(),
+        );
+        crate::pagination::encode(
+            &state.config_db,
+            "spans",
+            &scope,
+            crate::pagination::CursorPosition {
+                timestamp_ns: row.timestamp,
+                tie: vec![row.span_id.clone()],
+            },
+        )
+    });
+
     finish_response(
         state,
         tenant_id,
         req,
         plan.interval_secs,
         rows,
+        next_cursor,
         summary_result,
         rows_ready_ms,
         started,
@@ -272,12 +296,39 @@ async fn execute_logs(
         .self_metrics
         .record_explore_stage("logs", "rows", rows.len() as u64, rows_ready_ms, true);
 
+    let next_cursor = (rows.len() as u64 == req.limit.clamp(1, MAX_ROWS)).then(|| {
+        let row = rows.last().expect("non-empty full page");
+        let scope = crate::pagination::query_scope(
+            tenant_id,
+            "logs",
+            "slim",
+            &req.time_range,
+            &req.filters,
+            req.search.as_deref(),
+        );
+        crate::pagination::encode(
+            &state.config_db,
+            "logs",
+            &scope,
+            crate::pagination::CursorPosition {
+                timestamp_ns: row.timestamp,
+                tie: vec![
+                    row.service_name.clone(),
+                    row.trace_id.clone(),
+                    row.span_id.clone(),
+                    row.cursor_hash.clone(),
+                ],
+            },
+        )
+    });
+
     finish_response(
         state,
         tenant_id,
         req,
         plan.interval_secs,
         rows,
+        next_cursor,
         summary_result,
         rows_ready_ms,
         started,
@@ -290,6 +341,7 @@ fn finish_response<T: Serialize>(
     req: &ExploreSearchRequest,
     interval_secs: u64,
     rows: Vec<T>,
+    next_cursor: Option<String>,
     summary_result: Result<
         Result<Vec<SummaryRow>, clickhouse::error::Error>,
         tokio::time::error::Elapsed,
@@ -389,6 +441,7 @@ fn finish_response<T: Serialize>(
     let mut response = ExploreSearchResponse {
         signal: req.signal,
         rows,
+        next_cursor,
         count,
         summary,
         errors,
@@ -535,7 +588,9 @@ fn build_span_plan(
     )
     .with_prewhere_prefix(&format!("tenant_id = '{tenant}'"));
     let predicate = clauses.to_sql();
-    let rows_sql = format!("SELECT * FROM spans {predicate} ORDER BY timestamp DESC LIMIT {limit}");
+    let rows_sql = format!(
+        "SELECT * FROM spans {predicate} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}"
+    );
     let group_expr = req
         .group_by
         .as_deref()
@@ -570,7 +625,7 @@ fn build_log_plan(
     );
     let predicate = clauses.to_sql();
     let rows_sql = format!(
-        "SELECT {} FROM logs {predicate} ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+        "SELECT {} FROM logs {predicate} ORDER BY Timestamp DESC, ServiceName DESC, TraceId DESC, SpanId DESC, hex(SHA256(Body)) DESC LIMIT {limit}",
         super::logs::LOG_LIST_SELECT_COLS
     );
     let group_expr = req

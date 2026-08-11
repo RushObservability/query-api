@@ -65,4 +65,8 @@ pub struct LogListRecord {
     pub block_offset: String,
     #[serde(rename = "BodyHash")]
     pub body_hash: String,
+    /// Deterministic pagination tie-breaker. Separate from BodyHash because the
+    /// latter is the compact cityHash locator used by lazy detail lookup.
+    #[serde(rename = "CursorHash")]
+    pub cursor_hash: String,
 }

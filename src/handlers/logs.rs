@@ -137,6 +137,9 @@ pub struct LogQueryRequest {
     pub limit: u64,
     #[serde(default)]
     pub offset: u64,
+    /// Authenticated keyset cursor returned by the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub search: Option<String>,
     /// Omit large attribute maps and return lazy-detail locators.
@@ -151,7 +154,7 @@ fn default_limit() -> u64 {
 pub(crate) const LOG_LIST_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
     SeverityNumber, ServiceName, Body, toString(toUnixTimestamp64Nano(Timestamp)) AS TimestampNs, \
     toString(_block_number) AS BlockNumber, toString(_block_offset) AS BlockOffset, \
-    toString(cityHash64(Body)) AS BodyHash";
+    toString(cityHash64(Body)) AS BodyHash, hex(SHA256(Body)) AS CursorHash";
 
 const LOG_DETAIL_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
     SeverityNumber, ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
@@ -169,6 +172,89 @@ impl LogQueryRows {
             Self::Full(rows) => rows.len(),
             Self::Slim(rows) => rows.len(),
         }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Full(rows) => rows.truncate(len),
+            Self::Slim(rows) => rows.truncate(len),
+        }
+    }
+
+    fn last_position(&self) -> Option<crate::pagination::CursorPosition> {
+        use sha2::{Digest, Sha256};
+        match self {
+            Self::Full(rows) => rows.last().map(|row| crate::pagination::CursorPosition {
+                timestamp_ns: row.timestamp,
+                tie: vec![
+                    row.service_name.clone(),
+                    row.trace_id.clone(),
+                    row.span_id.clone(),
+                    hex::encode_upper(Sha256::digest(row.body.as_bytes())),
+                ],
+            }),
+            Self::Slim(rows) => rows.last().map(|row| crate::pagination::CursorPosition {
+                timestamp_ns: row.timestamp,
+                tie: vec![
+                    row.service_name.clone(),
+                    row.trace_id.clone(),
+                    row.span_id.clone(),
+                    row.cursor_hash.clone(),
+                ],
+            }),
+        }
+    }
+}
+
+const LOG_ORDER: &str =
+    "Timestamp DESC, ServiceName DESC, TraceId DESC, SpanId DESC, hex(SHA256(Body)) DESC";
+
+fn invalid_cursor() -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        "invalid or expired pagination cursor".to_string(),
+    )
+}
+
+fn log_before_predicate(
+    position: &crate::pagination::CursorPosition,
+) -> Result<String, (StatusCode, String)> {
+    let [service, trace_id, span_id, body_hash] = position.tie.as_slice() else {
+        return Err(invalid_cursor());
+    };
+    if body_hash.len() != 64
+        || !body_hash
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(invalid_cursor());
+    }
+    let service = crate::query_builder::escape_string_literal(service);
+    let trace_id = crate::query_builder::escape_string_literal(trace_id);
+    let span_id = crate::query_builder::escape_string_literal(span_id);
+    Ok(format!(
+        "(Timestamp, ServiceName, TraceId, SpanId, hex(SHA256(Body))) < \
+         (fromUnixTimestamp64Nano({}), '{}', '{}', '{}', '{}')",
+        position.timestamp_ns, service, trace_id, span_id, body_hash,
+    ))
+}
+
+async fn fetch_log_rows(
+    state: &AppState,
+    sql: &str,
+    tenant_id: &str,
+    slim: bool,
+) -> Result<LogQueryRows, clickhouse::error::Error> {
+    if slim {
+        crate::tenant_query(&state.ch, sql, tenant_id)
+            .fetch_all::<LogListRecord>()
+            .await
+            .map(LogQueryRows::Slim)
+    } else {
+        crate::tenant_query(&state.ch, sql, tenant_id)
+            .fetch_all::<LogRecord>()
+            .await
+            .map(LogQueryRows::Full)
     }
 }
 
@@ -190,8 +276,9 @@ pub async fn query_logs(
             ));
         }
     }
-    let offset = req.offset.min(100_000);
-    let limit = req.limit.min(1000);
+    let offset = req.offset.min(10_000);
+    let limit = req.limit.clamp(1, 1000);
+    let fetch_limit = limit + 1;
     let select_cols = if req.slim {
         LOG_LIST_SELECT_COLS
     } else {
@@ -210,7 +297,22 @@ pub async fn query_logs(
         tenant_id,
     );
 
-    let (rows, total) = if req.offset == 0 {
+    let scope = crate::pagination::query_scope(
+        tenant_id,
+        "logs",
+        if req.slim { "slim" } else { "wide" },
+        &req.time_range,
+        &req.filters,
+        req.search.as_deref(),
+    );
+    let position = req
+        .cursor
+        .as_deref()
+        .map(|token| crate::pagination::decode(&state.config_db, token, "logs", &scope))
+        .transpose()
+        .map_err(|_| invalid_cursor())?;
+
+    let (mut rows, mut has_more) = if position.is_none() && offset == 0 {
         // Progressive fast path (applies to browse AND free-text search): try a narrow
         // recent window first and ONLY scan the full range when the narrow one doesn't
         // fill the page.
@@ -249,21 +351,11 @@ pub async fn query_logs(
             );
             let narrow_sql = format!(
                 "SELECT {select_cols} FROM logs {} \
-                 ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+                 ORDER BY {LOG_ORDER} LIMIT {fetch_limit}",
                 narrow_clauses.to_sql(),
             );
-            let result = if req.slim {
-                crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
-                    .fetch_all::<LogListRecord>()
-                    .await
-                    .map(LogQueryRows::Slim)
-            } else {
-                crate::tenant_query(&state.ch, &narrow_sql, tenant_id)
-                    .fetch_all::<LogRecord>()
-                    .await
-                    .map(LogQueryRows::Full)
-            };
-            result
+            fetch_log_rows(&state, &narrow_sql, tenant_id, req.slim)
+                .await
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "narrow query failed");
                     state.self_metrics.record_query_and_search("explore_logs", "logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
@@ -278,43 +370,44 @@ pub async fn query_logs(
         };
 
         if worth_probing && (narrow_rows.len() as u64) >= limit {
-            let total = narrow_rows.len() as u64;
-            (narrow_rows, total)
+            // Even exactly `limit` recent rows imply older rows may exist in the
+            // requested window, so retain a continuation cursor.
+            (narrow_rows, true)
         } else {
             // Narrow window didn't fill the page (or the range was already narrow):
             // scan the full requested range.
             let full_sql = format!(
                 "SELECT {select_cols} FROM logs {} \
-                 ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
+                 ORDER BY {LOG_ORDER} LIMIT {fetch_limit}",
                 clauses.to_sql(),
             );
-            let result = if req.slim {
-                crate::tenant_query(&state.ch, &full_sql, tenant_id)
-                    .fetch_all::<LogListRecord>()
-                    .await
-                    .map(LogQueryRows::Slim)
-            } else {
-                crate::tenant_query(&state.ch, &full_sql, tenant_id)
-                    .fetch_all::<LogRecord>()
-                    .await
-                    .map(LogQueryRows::Full)
-            };
-            let rows = result
+            let rows = fetch_log_rows(&state, &full_sql, tenant_id, req.slim)
+                .await
                 .map_err(|e| {
                     tracing::error!(error = %e, signal = "logs", handler = "query_logs", "full-range query failed");
                     state.self_metrics.record_query_and_search("explore_logs", "logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
                 })?;
-            let total = rows.len() as u64;
-            (rows, total)
+            let has_more = rows.len() as u64 > limit;
+            (rows, has_more)
         }
     } else {
-        // Search or pagination: use full range
+        // Cursor continuation is keyset-based and never scans/discards previous
+        // pages. OFFSET is retained only as a capped compatibility path.
+        let paged_clauses = if let Some(ref position) = position {
+            clauses.with_where_extra(&log_before_predicate(position)?)
+        } else {
+            clauses
+        };
+        let offset_clause = if position.is_none() && offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
         let sql = format!(
             "SELECT {select_cols} FROM logs {} \
-             ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit} OFFSET {}",
-            clauses.to_sql(),
-            offset,
+             ORDER BY {LOG_ORDER} LIMIT {fetch_limit}{offset_clause}",
+            paged_clauses.to_sql(),
         );
         if req.search.is_some() {
             tracing::debug!(
@@ -323,26 +416,28 @@ pub async fn query_logs(
                 "log search query executing"
             );
         }
-        let result = if req.slim {
-            crate::tenant_query(&state.ch, &sql, tenant_id)
-                .fetch_all::<LogListRecord>()
-                .await
-                .map(LogQueryRows::Slim)
-        } else {
-            crate::tenant_query(&state.ch, &sql, tenant_id)
-                .fetch_all::<LogRecord>()
-                .await
-                .map(LogQueryRows::Full)
-        };
-        let rows = result
+        let rows = fetch_log_rows(&state, &sql, tenant_id, req.slim)
+            .await
             .map_err(|e| {
                 tracing::error!(error = %e, signal = "logs", handler = "query_logs", "search query failed");
                 state.self_metrics.record_query_and_search("explore_logs", "logs", req.search.as_ref().map(|s| s.chars().count()), 0, start.elapsed().as_millis() as u64, false);
                 (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
-        let total = rows.len() as u64;
-        (rows, total)
+        let has_more = rows.len() as u64 > limit;
+        (rows, has_more)
     };
+
+    rows.truncate(limit as usize);
+    let next_cursor = if has_more {
+        rows.last_position()
+            .map(|position| crate::pagination::encode(&state.config_db, "logs", &scope, position))
+    } else {
+        None
+    };
+    // Compatibility hint for old clients. Cursor-aware clients use has_more and
+    // next_cursor because exact counts intentionally do not rescan the range.
+    let total = offset + rows.len() as u64 + u64::from(has_more);
+    has_more &= next_cursor.is_some();
 
     tracing::info!(
         signal = "logs",
@@ -387,8 +482,16 @@ pub async fn query_logs(
     struct Resp {
         rows: LogQueryRows,
         total: u64,
+        has_more: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
     }
-    Ok(Json(Resp { rows, total }))
+    Ok(Json(Resp {
+        rows,
+        total,
+        has_more,
+        next_cursor,
+    }))
 }
 
 /// Locator returned with a slim list row and posted back when the row is opened.
@@ -501,6 +604,118 @@ pub async fn get_log_detail(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "log detail no longer available".into()))?;
 
     Ok(Json(stable_row))
+}
+
+/// Identity of the selected log used to center a context stream. Unlike the
+/// lazy-detail locator this also works for span-event logs that do not have
+/// ClickHouse block coordinates.
+#[derive(Debug, serde::Deserialize)]
+pub struct LogContextAnchor {
+    pub timestamp_ns: String,
+    #[serde(default)]
+    pub service_name: String,
+    #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
+    pub span_id: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LogContextRequest {
+    pub time_range: TimeRange,
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    #[serde(default)]
+    pub search: Option<String>,
+    pub anchor: LogContextAnchor,
+    #[serde(default = "default_context_side")]
+    pub before: u64,
+    #[serde(default = "default_context_side")]
+    pub after: u64,
+}
+
+fn default_context_side() -> u64 {
+    100
+}
+
+fn context_anchor_tuple(anchor: &LogContextAnchor) -> Result<String, (StatusCode, String)> {
+    let timestamp = anchor.timestamp_ns.parse::<i64>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid context anchor".to_string(),
+        )
+    })?;
+    if anchor.service_name.len() > 1024
+        || anchor.trace_id.len() > 128
+        || anchor.span_id.len() > 128
+        || anchor.body.len() > 65_536
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid context anchor".into()));
+    }
+    let service = crate::query_builder::escape_string_literal(&anchor.service_name);
+    let trace = crate::query_builder::escape_string_literal(&anchor.trace_id);
+    let span = crate::query_builder::escape_string_literal(&anchor.span_id);
+    let body = crate::query_builder::escape_string_literal(&anchor.body);
+    Ok(format!(
+        "(fromUnixTimestamp64Nano({timestamp}), '{service}', '{trace}', '{span}', hex(SHA256('{body}')))"
+    ))
+}
+
+/// Return one bounded stream centered on a selected record in a single
+/// ClickHouse request. Each UNION leg walks away from the anchor using the same
+/// deterministic tuple as pagination, so dense windows do not require repeated
+/// shrinking retries from the browser.
+pub async fn get_log_context(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(req): Json<LogContextRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _query_guard = state.self_metrics.query_guard("explore_logs", "logs");
+    if req
+        .search
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 512)
+    {
+        return Err((StatusCode::BAD_REQUEST, "search query too long".into()));
+    }
+    let anchor = context_anchor_tuple(&req.anchor)?;
+    let before = req.before.clamp(1, 250);
+    let after = req.after.clamp(1, 250);
+    let clauses = build_log_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        req.search.as_deref(),
+        &tenant.tenant_id,
+    );
+    let tuple = "(Timestamp, ServiceName, TraceId, SpanId, hex(SHA256(Body)))";
+    let newer = clauses.with_where_extra(&format!("{tuple} > {anchor}"));
+    let older = clauses.with_where_extra(&format!("{tuple} <= {anchor}"));
+    let ascending =
+        "Timestamp ASC, ServiceName ASC, TraceId ASC, SpanId ASC, hex(SHA256(Body)) ASC";
+    let sql = format!(
+        "SELECT * FROM (\
+           (SELECT {LOG_LIST_SELECT_COLS} FROM logs {} ORDER BY {ascending} LIMIT {before}) \
+           UNION ALL \
+           (SELECT {LOG_LIST_SELECT_COLS} FROM logs {} ORDER BY {LOG_ORDER} LIMIT {after})\
+         ) ORDER BY {LOG_ORDER}",
+        newer.to_sql(),
+        older.to_sql(),
+    );
+    let rows = crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
+        .fetch_all::<LogListRecord>()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, signal = "logs", handler = "get_log_context", "context query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "context query failed".to_string(),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
 /// Log export request — same shape as a log query plus output format and an
@@ -925,5 +1140,39 @@ mod tests {
         assert!(stable.contains("ServiceName = 'api''edge'"));
         assert!(stable.contains("cityHash64(Body) = 99"));
         assert!(stable.contains("TraceId = 'abc' AND SpanId = 'def'"));
+    }
+
+    #[test]
+    fn log_cursor_uses_the_complete_deterministic_ordering_tuple() {
+        let predicate = log_before_predicate(&crate::pagination::CursorPosition {
+            timestamp_ns: 1_749_600_000_123_456_789,
+            tie: vec!["gateway".into(), "abc".into(), "def".into(), "A".repeat(64)],
+        })
+        .unwrap();
+        assert!(LOG_ORDER.starts_with("Timestamp DESC, ServiceName DESC"));
+        assert!(predicate.contains("fromUnixTimestamp64Nano(1749600000123456789)"));
+        assert!(predicate.contains("'gateway', 'abc', 'def'"));
+        assert!(predicate.contains("hex(SHA256(Body))"));
+    }
+
+    #[test]
+    fn log_cursor_rejects_an_incomplete_or_non_hex_tie_breaker() {
+        for tie in [
+            vec!["gateway".into()],
+            vec![
+                "gateway".into(),
+                "abc".into(),
+                "def".into(),
+                "not-hex".into(),
+            ],
+        ] {
+            assert!(
+                log_before_predicate(&crate::pagination::CursorPosition {
+                    timestamp_ns: 1,
+                    tie,
+                })
+                .is_err()
+            );
+        }
     }
 }

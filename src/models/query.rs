@@ -38,20 +38,20 @@ fn default_limit() -> u64 {
     100
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TimeRange {
     pub from: String,
     pub to: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Filter {
     pub field: String,
     pub op: FilterOp,
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum FilterOp {
     #[serde(rename = "=")]
     Eq,

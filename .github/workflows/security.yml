@@ -74,6 +74,15 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
 
+      # The policy scripts intentionally use ripgrep's multiline/PCRE-compatible
+      # matching. ubuntu-latest does not guarantee that `rg` is preinstalled, so
+      # install an explicit version instead of letting a missing binary turn into
+      # a misleading policy failure.
+      - name: Install policy search tool
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: ripgrep@14.1.1
+
       - name: Check formatting
         run: cargo fmt --check
 

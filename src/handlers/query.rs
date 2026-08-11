@@ -12,7 +12,35 @@ use crate::models::query::{
     TimeseriesBucket, TimeseriesRequest,
 };
 use crate::models::trace::WideEvent;
+use crate::pagination::{CursorPosition, query_scope};
 use crate::query_builder::{build_where_clause_with_search, resolve_field};
+
+fn invalid_cursor() -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        "invalid or expired pagination cursor".to_string(),
+    )
+}
+
+fn span_before_predicate(position: &CursorPosition) -> Result<String, (StatusCode, String)> {
+    let [span_id] = position.tie.as_slice() else {
+        return Err(invalid_cursor());
+    };
+    if span_id.is_empty()
+        || span_id.len() > 64
+        || !span_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(invalid_cursor());
+    }
+    let span_id = crate::query_builder::escape_string_literal(span_id);
+    Ok(format!(
+        "(timestamp < fromUnixTimestamp64Nano({timestamp}) OR \
+         (timestamp = fromUnixTimestamp64Nano({timestamp}) AND span_id < '{span_id}'))",
+        timestamp = position.timestamp_ns,
+    ))
+}
 
 /// Execute a structured query against spans.
 pub async fn execute_query(
@@ -33,10 +61,10 @@ pub async fn execute_query(
             ));
         }
     }
-    // Deep OFFSET pagination materializes and discards full wide rows server-side, so
-    // cap how deep a client can page (50k rows ≈ 500 pages at the default page size).
-    let offset = req.offset.min(50_000);
-    let limit = req.limit.min(1000);
+    // OFFSET remains temporarily available to older clients, but is deliberately
+    // shallow. Cursor-aware clients have constant query complexity at any depth.
+    let offset = req.offset.min(10_000);
+    let limit = req.limit.clamp(1, 1000);
 
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
     let clauses = build_where_clause_with_search(
@@ -47,18 +75,6 @@ pub async fn execute_query(
     )
     .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
-    // ── Additive pagination mode ──
-    // Keyset (cursor) pagination is opt-in: when the client sends a `cursor`, page via a
-    // bound `(timestamp, span_id)` WHERE predicate + `ORDER BY timestamp DESC, span_id
-    // DESC` (aligns with the (tenant,timestamp,...,span_id) sort key) instead of OFFSET,
-    // so deep pages don't scan+discard rows. A malformed/garbage cursor decodes to None
-    // and falls back to the offset path (non-fatal). When `cursor` is absent the SQL is
-    // byte-identical to the original offset query — existing callers see no change.
-    let keyset = req
-        .cursor
-        .as_deref()
-        .and_then(crate::query_builder::KeysetCursor::decode);
-
     // Slim projection is opt-in via `columns: "list"`: select only the ~10 columns the
     // Explore table renders. Default (absent/other) returns the full wide `SELECT *`.
     let slim = req.columns.as_deref() == Some("list");
@@ -66,17 +82,31 @@ pub async fn execute_query(
          http_status_code, duration_ns, status, trace_id, span_id";
 
     let projection = if slim { SLIM_COLS } else { "*" };
-    let sql = if let Some(ref cur) = keyset {
-        // Keyset path: no OFFSET; deterministic (timestamp, span_id) ordering.
+    let scope = query_scope(
+        tenant_id,
+        "spans",
+        if slim { "slim" } else { "wide" },
+        &req.time_range,
+        &req.filters,
+        req.search.as_deref(),
+    );
+    let position = req
+        .cursor
+        .as_deref()
+        .map(|token| crate::pagination::decode(&state.config_db, token, "spans", &scope))
+        .transpose()
+        .map_err(|_| invalid_cursor())?;
+    let sql = if let Some(ref position) = position {
+        let paged = clauses.with_where_extra(&span_before_predicate(position)?);
         format!(
-            "SELECT {projection} FROM spans {} AND {} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}",
-            clauses.to_sql(),
-            cur.before_predicate(),
+            "SELECT {projection} FROM spans {} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}",
+            paged.to_sql(),
         )
     } else {
-        // Offset path: unchanged from the original behavior (ORDER BY timestamp DESC).
+        // First pages also use deterministic ordering so new arrivals cannot move
+        // equal-timestamp rows across page boundaries.
         format!(
-            "SELECT {projection} FROM spans {} ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}",
+            "SELECT {projection} FROM spans {} ORDER BY timestamp DESC, span_id DESC LIMIT {limit} OFFSET {offset}",
             clauses.to_sql(),
         )
     };
@@ -107,12 +137,17 @@ pub async fn execute_query(
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
-        let next = rows.last().map(|r| {
-            crate::query_builder::KeysetCursor {
-                timestamp: r.timestamp,
-                span_id: r.span_id.clone(),
-            }
-            .encode()
+        let next = (rows.len() as u64 == limit).then(|| {
+            let row = rows.last().expect("non-empty full page");
+            crate::pagination::encode(
+                &state.config_db,
+                "spans",
+                &scope,
+                CursorPosition {
+                    timestamp_ns: row.timestamp,
+                    tie: vec![row.span_id.clone()],
+                },
+            )
         });
         emit_usage_and_log(&state, tenant_id, &req, total, rows.len(), start);
         (serde_json::json!({ "rows": rows, "total": total }), next)
@@ -127,12 +162,17 @@ pub async fn execute_query(
             (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
         })?;
         let total = count_result.map(|r| r.count).unwrap_or(0);
-        let next = rows.last().map(|r| {
-            crate::query_builder::KeysetCursor {
-                timestamp: r.timestamp,
-                span_id: r.span_id.clone(),
-            }
-            .encode()
+        let next = (rows.len() as u64 == limit).then(|| {
+            let row = rows.last().expect("non-empty full page");
+            crate::pagination::encode(
+                &state.config_db,
+                "spans",
+                &scope,
+                CursorPosition {
+                    timestamp_ns: row.timestamp,
+                    tie: vec![row.span_id.clone()],
+                },
+            )
         });
         emit_usage_and_log(&state, tenant_id, &req, total, rows.len(), start);
         (serde_json::json!({ "rows": rows, "total": total }), next)
@@ -651,5 +691,33 @@ pub async fn timeseries_query(
         Ok(Json(
             serde_json::json!({ "buckets": buckets, "grouped": false }),
         ))
+    }
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    #[test]
+    fn span_cursor_orders_duplicate_timestamps_by_span_id() {
+        let predicate = span_before_predicate(&CursorPosition {
+            timestamp_ns: 1_749_600_000_123_456_789,
+            tie: vec!["abcdef0123456789".into()],
+        })
+        .unwrap();
+        assert!(predicate.contains("timestamp < fromUnixTimestamp64Nano(1749600000123456789)"));
+        assert!(predicate.contains("timestamp = fromUnixTimestamp64Nano(1749600000123456789)"));
+        assert!(predicate.contains("span_id < 'abcdef0123456789'"));
+    }
+
+    #[test]
+    fn new_arrivals_are_outside_a_continuation_page() {
+        let cursor = CursorPosition {
+            timestamp_ns: 1_000,
+            tie: vec!["ff".into()],
+        };
+        let predicate = span_before_predicate(&cursor).unwrap();
+        assert!(predicate.starts_with("(timestamp <"));
+        assert!(!predicate.contains("timestamp >"));
     }
 }

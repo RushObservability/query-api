@@ -1400,6 +1400,12 @@ impl GlobalRetention {
 }
 
 impl ConfigDb {
+    /// Internal key material for domain-separated query cursor signatures.
+    /// The secret never leaves the process or appears in cursor payloads/logs.
+    pub(crate) fn cursor_hmac_secret(&self) -> &[u8] {
+        &self.session_hmac_secret
+    }
+
     pub async fn open(url: &str, user: &str, password: &str) -> anyhow::Result<Self> {
         let sso_claim_store_mode = configured_sso_claim_store_mode()?;
         let session_policy = SessionPolicy::from_env()?;
