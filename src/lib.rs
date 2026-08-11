@@ -25,6 +25,7 @@ pub mod outbound;
 pub mod process_metrics;
 pub mod promql;
 pub mod query_builder;
+pub mod query_governor;
 pub mod retention_enforcer;
 pub mod rollup;
 pub mod saml;
@@ -169,30 +170,55 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
     // Memory guardrails: cap CH-side working memory for a single query and let
     // heavy GROUP BY / ORDER BY spill to disk instead of OOMing the server. These
     // complement the row cap below (which bounds rows streamed back to us).
+    let active_budget = query_governor::active_budget()
+        .or_else(|| query_governor::global().map(|governor| governor.config().background));
     let guards = query_guards();
-    let q = ch
+    let max_result_rows = active_budget
+        .as_ref()
+        .map(|budget| budget.max_result_rows.to_string())
+        .unwrap_or_else(|| "500000".to_string());
+    let max_memory_usage = active_budget
+        .as_ref()
+        .map(|budget| budget.max_memory_usage.to_string())
+        .unwrap_or_else(|| guards.max_memory_usage.clone());
+    let spill_threshold = active_budget
+        .as_ref()
+        .map(|budget| budget.spill_threshold_bytes.to_string())
+        .unwrap_or_else(|| guards.max_bytes_external.clone());
+    let mut q = ch
         .query(sql)
-        .with_option("max_result_rows", "500000")
-        .with_option("result_overflow_mode", "break")
-        .with_option("max_memory_usage", guards.max_memory_usage.as_str())
+        .with_option("max_result_rows", max_result_rows.as_str())
+        .with_option("result_overflow_mode", "throw")
+        .with_option("max_memory_usage", max_memory_usage.as_str())
         .with_option(
             "max_bytes_before_external_group_by",
-            guards.max_bytes_external.as_str(),
+            spill_threshold.as_str(),
         )
-        .with_option(
-            "max_bytes_before_external_sort",
-            guards.max_bytes_external.as_str(),
-        )
+        .with_option("max_bytes_before_external_sort", spill_threshold.as_str())
+        // Dropping the HTTP handler future (client disconnect, navigation, or
+        // request timeout) closes the ClickHouse response and cancels its
+        // read-only query rather than leaving server work detached.
+        .with_option("cancel_http_readonly_queries_on_client_close", "1")
         // ClickHouse 26.2 query condition cache: caches the per-granule match bitset
         // for a WHERE predicate so repeated identical predicates (dashboard refreshes,
         // the count+list+histogram+timeseries siblings of one Explore search, monitor/
         // detection eval re-runs, service-map polls) skip re-evaluating skip indexes and
         // re-reading granules. Safe on these MergeTree reads (no FINAL on the read path).
         .with_option("use_query_condition_cache", "1");
-    let q = match &guards.max_threads {
-        Some(n) => q.with_option("max_threads", n.as_str()),
-        None => q,
-    };
+    if let Some(budget) = &active_budget {
+        let max_execution_time = budget.max_execution_time_secs.to_string();
+        let max_rows_to_read = budget.max_rows_to_read.to_string();
+        let max_bytes_to_read = budget.max_bytes_to_read.to_string();
+        let max_threads = budget.max_threads.to_string();
+        q = q
+            .with_option("max_execution_time", max_execution_time.as_str())
+            .with_option("max_rows_to_read", max_rows_to_read.as_str())
+            .with_option("read_overflow_mode", "throw")
+            .with_option("max_bytes_to_read", max_bytes_to_read.as_str())
+            .with_option("max_threads", max_threads.as_str());
+    } else if let Some(n) = &guards.max_threads {
+        q = q.with_option("max_threads", n.as_str());
+    }
     if TENANT_ISOLATION_STATE.load(Ordering::SeqCst) == 2 {
         q
     } else {
@@ -234,6 +260,8 @@ pub struct AppState {
     /// the ingest path, and engine loops; rendered at the open `GET /metrics` endpoint
     /// and self-ingested into our own metrics tables by the stats engine each tick.
     pub self_metrics: Arc<self_metrics::SelfMetrics>,
+    /// Live-reconfigurable workload admission and ClickHouse query budgets.
+    pub query_governor: Arc<query_governor::QueryGovernor>,
     /// Startup-validated byte/entity limits and bounded blocking decode admission.
     pub ingest_limits: ingest_limits::IngestLimits,
     /// Startup-validated, rate-limited outbound LLM client. Handlers never

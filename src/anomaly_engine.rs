@@ -200,10 +200,19 @@ async fn eval_anomaly_rules(
     // Prefetch every due rule's data concurrently — the fetches are independent
     // reads, so the tick pays for the slowest fetch instead of the sum of all.
     let fetched = futures_util::future::join_all(due_rules.iter().map(|rule| async move {
-        match rule.source.as_str() {
-            "apm" => Some(fetch_apm_data(read_ch, rule, &now).await),
-            "prometheus" => Some(fetch_prom_data(http_client, prom_base_url, rule, &now).await),
-            _ => None,
+        let fetched = crate::query_governor::run_background(&rule.tenant_id, async {
+            match rule.source.as_str() {
+                "apm" => Some(fetch_apm_data(read_ch, rule, &now).await),
+                "prometheus" => Some(fetch_prom_data(http_client, prom_base_url, rule, &now).await),
+                _ => None,
+            }
+        })
+        .await;
+        match fetched {
+            Ok(result) => result,
+            Err(error) => Some(Err(anyhow::anyhow!(
+                "background admission rejected: {error:?}"
+            ))),
         }
     }))
     .await;

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::handlers::users::{require_admin, require_auth};
+use crate::query_governor::{QUERY_LIMITS_SETTING_KEY, QueryGovernorConfig};
 use crate::{AppState, TenantContext};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -835,6 +836,85 @@ pub async fn set_export_max_rows(
         .await;
 
     Ok(Json(serde_json::json!({ "export_max_rows": value })))
+}
+
+/// GET /api/v1/settings/query-limits — admin only.
+/// Returns the effective live workload policy and factory defaults so the UI
+/// can offer a safe reset without duplicating defaults in TypeScript.
+pub async fn get_query_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(serde_json::json!({
+        "limits": state.query_governor.config(),
+        "defaults": QueryGovernorConfig::default(),
+    })))
+}
+
+/// PUT /api/v1/settings/query-limits — admin only.
+/// Persists and activates the complete policy atomically for new work. Queries
+/// that already hold permits finish against the previous admission pool.
+pub async fn set_query_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(config): Json<QueryGovernorConfig>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_admin(&state, &headers).await?;
+    config
+        .validate()
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+
+    let before = state.query_governor.config();
+    let encoded = serde_json::to_string(&config).map_err(|error| {
+        tracing::error!(%error, "failed to encode query workload limits");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to save setting".to_string(),
+        )
+    })?;
+    state
+        .config_db
+        .set_setting(QUERY_LIMITS_SETTING_KEY, &encoded)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to persist query workload limits");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save setting".to_string(),
+            )
+        })?;
+    state
+        .query_governor
+        .reconfigure(config.clone())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+
+    // AUDIT: query limit mutation. These are operational limits only; no
+    // credentials or secrets are present in either snapshot.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("settings.update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("setting", QUERY_LIMITS_SETTING_KEY)
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "key": QUERY_LIMITS_SETTING_KEY,
+                        "before": before,
+                        "after": config,
+                    })
+                    .to_string(),
+                )
+                .description("query workload limits updated")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    Ok(Json(
+        serde_json::json!({ "limits": state.query_governor.config() }),
+    ))
 }
 
 /// Defaults + clamps for the SRE agent's per-investigation cost budget. Must

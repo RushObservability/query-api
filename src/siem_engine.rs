@@ -76,25 +76,38 @@ async fn run_detection_cycle(
 
     let outcomes: Vec<(String, bool, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
-            match evaluate_rule(
-                ch,
-                config_db,
-                http_client,
-                &rule,
-                &now,
-                now_str_ref,
-                should_flush,
+            let evaluated = crate::query_governor::run_background(
+                &rule.tenant_id,
+                evaluate_rule(
+                    ch,
+                    config_db,
+                    http_client,
+                    &rule,
+                    &now,
+                    now_str_ref,
+                    should_flush,
+                ),
             )
-            .await
-            {
-                Ok((did_fire, persisted)) => (rule.id, did_fire, persisted),
-                Err(e) => {
+            .await;
+            match evaluated {
+                Ok(Ok((did_fire, persisted))) => (rule.id, did_fire, persisted),
+                Ok(Err(e)) => {
                     tracing::warn!(
                         error = %e,
                         engine = "siem",
                         rule_name = %rule.name,
                         rule_id = %rule.id,
                         "rule evaluation failed"
+                    );
+                    (rule.id, false, false)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        engine = "siem",
+                        rule_name = %rule.name,
+                        rule_id = %rule.id,
+                        "rule evaluation admission rejected"
                     );
                     (rule.id, false, false)
                 }

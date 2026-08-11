@@ -85,6 +85,16 @@ async fn main() -> anyhow::Result<()> {
     // The standalone engine has no /metrics endpoint; give it a private registry so the
     // engine-loop instrumentation still works (record_engine just updates in-memory atomics).
     let self_metrics = Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    let query_limits = config_db
+        .get_setting(rush_api::query_governor::QUERY_LIMITS_SETTING_KEY)
+        .await?
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let query_governor = Arc::new(
+        rush_api::query_governor::QueryGovernor::new(query_limits, self_metrics.clone())
+            .map_err(anyhow::Error::msg)?,
+    );
+    rush_api::query_governor::install_global(query_governor);
     anomaly_engine::run_anomaly_engine(
         config_db,
         read_ch,

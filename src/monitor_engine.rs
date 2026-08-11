@@ -146,18 +146,25 @@ async fn run_evaluation_cycle(
 
     let outcomes: Vec<(String, u64, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
-            let result = evaluate_monitor(
-                ch,
-                config_db,
-                &monitor,
-                now_str_ref,
-                http_client,
-                smtp_config,
-                smtp_transport,
-                monitor_states_ref,
-                should_flush,
+            let result = match crate::query_governor::run_background(
+                &monitor.tenant_id,
+                evaluate_monitor(
+                    ch,
+                    config_db,
+                    &monitor,
+                    now_str_ref,
+                    http_client,
+                    smtp_config,
+                    smtp_transport,
+                    monitor_states_ref,
+                    should_flush,
+                ),
             )
-            .await;
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("background admission rejected: {error:?}")),
+            };
             let (changes, persisted) = match result {
                 Ok(cp) => cp,
                 Err(e) => {

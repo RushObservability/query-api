@@ -353,21 +353,28 @@ async fn eval_slos(
     let now_str_ref = now_str.as_str();
     let outcomes: Vec<(String, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(slo, should_flush)| async move {
-            let persisted = match eval_one_slo(
-                config_db,
-                read_ch,
-                write_ch,
-                http_client,
-                &slo,
-                now,
-                now_str_ref,
-                should_flush,
+            let evaluated = crate::query_governor::run_background(
+                &slo.tenant_id,
+                eval_one_slo(
+                    config_db,
+                    read_ch,
+                    write_ch,
+                    http_client,
+                    &slo,
+                    now,
+                    now_str_ref,
+                    should_flush,
+                ),
             )
-            .await
-            {
-                Ok(p) => p,
-                Err(e) => {
+            .await;
+            let persisted = match evaluated {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
                     tracing::warn!("slo {}: evaluation error: {e}", slo.id);
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!("slo {}: background admission rejected: {e:?}", slo.id);
                     false
                 }
             };

@@ -15,6 +15,7 @@ use axum::{
 use clickhouse::Client;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -31,6 +32,10 @@ use rush_api::cors::{CorsPolicy, parse_web_origin, same_web_origin};
 use rush_api::handlers;
 use rush_api::migrations;
 use rush_api::monitor_engine;
+use rush_api::query_governor::{
+    AdmissionError, QUERY_LIMITS_SETTING_KEY, QueryGovernor, QueryGovernorConfig, TimeRangeError,
+    ValidatedTimeRange, WorkloadClass,
+};
 use rush_api::retention_enforcer;
 use rush_api::siem_engine;
 use rush_api::slo_engine;
@@ -663,6 +668,234 @@ async fn shutdown_gate_middleware(
             .into_response();
     }
     next.run(req).await
+}
+
+/// Query endpoints participate in workload admission. Ingestion, health,
+/// shutdown, authentication/settings mutations, and the long-lived SRE SSE
+/// stream keep their purpose-built policies instead of inheriting a generic
+/// query timeout.
+fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
+    let path = req.uri().path();
+    if ingest_signal_for_route(req.method(), path).is_some()
+        || matches!(path, "/healthz" | "/readyz" | "/metrics" | "/shutdown")
+        || path == "/api/v1/investigate"
+    {
+        return None;
+    }
+
+    if path.contains("/export") {
+        return Some(WorkloadClass::Export);
+    }
+    if path.starts_with("/jaeger/")
+        || path.starts_with("/api/v1/integrations/")
+        || path.starts_with("/api/v1/argocd")
+        || path.starts_with("/api/v1/flux")
+        || path.starts_with("/api/v1/kubernetes")
+    {
+        return Some(WorkloadClass::Integration);
+    }
+
+    let managed = path.starts_with("/api/v1/query")
+        || path.starts_with("/api/v1/explore/")
+        || path.starts_with("/api/v1/logs")
+        || path.starts_with("/api/v1/traces")
+        || path.starts_with("/api/v1/services")
+        || path.starts_with("/api/v1/bubbleup")
+        || path.starts_with("/api/v1/suggest")
+        || path.starts_with("/api/v1/stats")
+        || path.starts_with("/api/v1/rum/")
+        || path.starts_with("/prom/api/v1/query")
+        || path.starts_with("/prom/api/v1/series")
+        || path.starts_with("/prom/api/v1/labels")
+        || path.starts_with("/prom/api/v1/label/")
+        || path.starts_with("/api/v1/monitors/") && path.ends_with("/preview")
+        || path.starts_with("/api/v1/detection-rules/") && path.ends_with("/test");
+    if !managed {
+        return None;
+    }
+
+    if req
+        .headers()
+        .get("x-rush-workload")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("dashboard"))
+    {
+        Some(WorkloadClass::Dashboard)
+    } else {
+        Some(WorkloadClass::Interactive)
+    }
+}
+
+fn time_range_error_response(error: TimeRangeError) -> Response {
+    let (code, message) = match error {
+        TimeRangeError::Malformed => (
+            "invalid_time_range",
+            "time range must contain valid RFC3339 timestamps or Unix seconds",
+        ),
+        TimeRangeError::Reversed => (
+            "reversed_time_range",
+            "time range start must be before or equal to its end",
+        ),
+        TimeRangeError::TooLarge { .. } => (
+            "time_range_too_large",
+            "time range exceeds the configured workload limit",
+        ),
+    };
+    rush_api::api_error::ApiError::public(axum::http::StatusCode::BAD_REQUEST, code, message)
+        .into_response()
+}
+
+fn validate_range_pair(from: &str, to: &str, max_seconds: u64) -> Result<(), Response> {
+    ValidatedTimeRange::parse(from, to, max_seconds)
+        .map(|_| ())
+        .map_err(time_range_error_response)
+}
+
+fn json_time_range(value: &serde_json::Value) -> Result<Option<(String, String)>, TimeRangeError> {
+    let Some(range) = value.get("time_range") else {
+        return Ok(None);
+    };
+    let from = range
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TimeRangeError::Malformed)?;
+    let to = range
+        .get("to")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TimeRangeError::Malformed)?;
+    Ok(Some((from.to_string(), to.to_string())))
+}
+
+async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Result<(), Response> {
+    if let Some(query) = req.uri().query() {
+        let values = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let from_to_present = values.contains_key("from") || values.contains_key("to");
+        let start_end_present = values.contains_key("start") || values.contains_key("end");
+        let pair = if from_to_present {
+            Some(
+                values
+                    .get("from")
+                    .zip(values.get("to"))
+                    .ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?,
+            )
+        } else if start_end_present {
+            Some(
+                values
+                    .get("start")
+                    .zip(values.get("end"))
+                    .ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?,
+            )
+        } else {
+            None
+        };
+        if let Some((from, to)) = pair {
+            validate_range_pair(from, to, max_seconds)?;
+        }
+    }
+
+    if matches!(*req.method(), Method::POST | Method::PUT) {
+        const MAX_QUERY_BODY_BYTES: usize = 512 * 1024;
+        let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
+        let bytes = match axum::body::to_bytes(body, MAX_QUERY_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(rush_api::api_error::ApiError::public(
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "query_body_too_large",
+                    "query request body exceeds the configured limit",
+                )
+                .into_response());
+            }
+        };
+        *req.body_mut() = axum::body::Body::from(bytes.clone());
+        if !bytes.is_empty()
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            if let Some((from, to)) = json_time_range(&value).map_err(time_range_error_response)? {
+                validate_range_pair(&from, &to, max_seconds)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn admission_error_response(error: AdmissionError) -> Response {
+    let retry_after = error.retry_after_secs();
+    let (status, code, message) = match error {
+        AdmissionError::TenantBusy { .. } => (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "tenant_query_capacity_exhausted",
+            "tenant query capacity is busy; retry shortly",
+        ),
+        AdmissionError::GlobalBusy { .. } => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "query_capacity_exhausted",
+            "query capacity is busy; retry shortly",
+        ),
+    };
+    let mut response = rush_api::api_error::ApiError::public(status, code, message).into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+async fn query_policy_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let Some(class) = query_workload_for_request(&req) else {
+        return next.run(req).await;
+    };
+    let tenant = req
+        .extensions()
+        .get::<TenantContext>()
+        .map(|context| context.tenant_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let guard = match state.query_governor.admit(class, &tenant).await {
+        Ok(guard) => guard,
+        Err(error) => return admission_error_response(error),
+    };
+    let budget = guard.budget().clone();
+    if let Err(response) = validate_request_time_range(&mut req, budget.max_time_range_secs).await {
+        return response;
+    }
+    let label = class.label();
+    let result = rush_api::query_governor::with_budget(
+        budget.clone(),
+        tokio::time::timeout(
+            Duration::from_secs(budget.request_timeout_secs),
+            next.run(req),
+        ),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(response) => {
+            state.self_metrics.inc_counter(
+                "rush_query_requests_total",
+                &[("workload", label), ("outcome", "completed")],
+                1,
+            );
+            response
+        }
+        Err(_) => {
+            state.self_metrics.inc_counter(
+                "rush_query_requests_total",
+                &[("workload", label), ("outcome", "timeout")],
+                1,
+            );
+            rush_api::api_error::ApiError::public(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                "query_timeout",
+                "query exceeded its configured workload time budget",
+            )
+            .into_response()
+        }
+    }
 }
 
 fn should_reject_for_tenant_auth(
@@ -1477,6 +1710,28 @@ async fn main() -> anyhow::Result<()> {
     // outbox degradation is visible even if no one has scraped `/metrics` yet.
     let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
         std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    let query_governor_config = match config_db.get_setting(QUERY_LIMITS_SETTING_KEY).await? {
+        Some(raw) => match serde_json::from_str::<QueryGovernorConfig>(&raw) {
+            Ok(config) => match config.validate() {
+                Ok(()) => config,
+                Err(error) => {
+                    tracing::error!(%error, "stored query workload limits are invalid; using safe defaults");
+                    QueryGovernorConfig::default()
+                }
+            },
+            Err(error) => {
+                tracing::error!(%error, "stored query workload limits cannot be decoded; using safe defaults");
+                QueryGovernorConfig::default()
+            }
+        },
+        None => QueryGovernorConfig::default(),
+    };
+    let query_governor = Arc::new(
+        QueryGovernor::new(query_governor_config, self_metrics.clone())
+            .map_err(anyhow::Error::msg)
+            .context("query workload configuration is invalid")?,
+    );
+    rush_api::query_governor::install_global(query_governor.clone());
     let ingest_limits = rush_api::ingest_limits::IngestLimits::from_env(self_metrics.clone())
         .map_err(anyhow::Error::msg)
         .context("ingest limit configuration is invalid")?;
@@ -2054,6 +2309,7 @@ async fn main() -> anyhow::Result<()> {
         ingest_key_limiter,
         audit,
         self_metrics,
+        query_governor,
         ingest_limits: ingest_limits.clone(),
         llm_gateway,
         collectors,
@@ -2357,6 +2613,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/integrations/postgres/explain/{id}/result", post(handlers::pg_explain::post_result))
         // Export row cap (admin-only setter; value also exposed via /features)
         .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
+        .route(
+            "/api/v1/settings/query-limits",
+            get(handlers::settings::get_query_limits).put(handlers::settings::set_query_limits),
+        )
         .route("/api/v1/settings/config", get(handlers::settings::get_runtime_config))
         .route(
             "/api/v1/settings/sre-agent",
@@ -2659,6 +2919,10 @@ async fn main() -> anyhow::Result<()> {
         // so the CORS/security/metrics layers below still wrap rejected requests.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            query_policy_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             enforce_tenant_auth_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
@@ -2829,11 +3093,12 @@ mod tenant_auth_tests {
     use super::{
         CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
         credential_route_denial, explicit_ingest_tenant, ingest_signal_for_route,
-        is_state_changing_method, request_origin_allowed_with_policy, requires_csrf_origin,
-        should_reject_for_tenant_auth, should_reject_interactive_llm,
-        trust_forwarded_origin_headers,
+        is_state_changing_method, query_workload_for_request, request_origin_allowed_with_policy,
+        requires_csrf_origin, should_reject_for_tenant_auth, should_reject_interactive_llm,
+        trust_forwarded_origin_headers, validate_request_time_range,
     };
-    use axum::http::{HeaderMap, HeaderValue, Method, header};
+    use axum::body::Body;
+    use axum::http::{HeaderMap, HeaderValue, Method, Request, header};
     use rush_api::clickhouse_config::ApiKeyGrant;
     use rush_api::cors::CorsPolicy;
     use std::net::{IpAddr, Ipv4Addr};
@@ -2866,6 +3131,76 @@ mod tenant_auth_tests {
         ("/datadog/intake/", "control"),
         ("/datadog/intake", "control"),
     ];
+
+    #[test]
+    fn workload_policy_classifies_queries_and_preserves_explicit_bypasses() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&request),
+            Some(rush_api::query_governor::WorkloadClass::Interactive)
+        );
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query/timeseries")
+            .header("x-rush-workload", "dashboard")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&request),
+            Some(rush_api::query_governor::WorkloadClass::Dashboard)
+        );
+
+        for (method, path) in [
+            (Method::POST, "/v1/traces"),
+            (Method::GET, "/healthz"),
+            (Method::POST, "/shutdown"),
+            (Method::POST, "/api/v1/investigate"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(query_workload_for_request(&request), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_time_validation_rejects_partial_and_oversized_ranges() {
+        let mut partial = Request::builder()
+            .method(Method::GET)
+            .uri("/prom/api/v1/query_range?start=100")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            validate_request_time_range(&mut partial, 60)
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+
+        let mut oversized = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"time_range":{"from":"2026-08-10T00:00:00Z","to":"2026-08-10T00:02:00Z"}}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            validate_request_time_range(&mut oversized, 60)
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn locked_tenant_rejects_unauthenticated_data_requests() {
