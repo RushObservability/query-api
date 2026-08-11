@@ -1,4 +1,4 @@
-# Explore coordinator query-count fixture
+# Explore coordinator benchmark
 
 QFP-PERF-03 replaces the default Explore fan-out with a fixed two-query plan:
 
@@ -17,12 +17,40 @@ Run the deterministic contract fixture with:
 cargo test handlers::explore::tests::query_count_fixture
 ```
 
+Run the focused ClickHouse before/after benchmark with:
+
+```bash
+./perf/explore-benchmark.sh
+```
+
+The benchmark anchors a one-hour request window to the newest span for the
+selected tenant, warms both plans, alternates their execution order, and runs
+their component queries concurrently just as the browser interaction did. Set
+`PERF03_TENANT`, `PERF03_RUNS`, `PERF03_WARMUPS`, or
+`PERF03_WINDOW_MINUTES` to override its safe defaults. Connection settings use
+the normal `CLICKHOUSE_*` environment variables.
+
 The response includes `query_stats.clickhouse_queries`, matched rows, bounded
 logical matched bytes, response bytes, and time to first results. Query IDs use
 the `rush-explore-<request UUID>-{rows,summary}` form, allowing physical
 `read_rows` and `read_bytes` to be correlated from ClickHouse `system.query_log`
 without adding an instrumentation query to the user request.
 
-Production p95 and physical bytes-read comparisons require the deterministic
-data fixture tracked by QFP-PERF-01. Until that fixture exists, this document
-makes only the directly enforced query-count claim.
+## Acceptance result
+
+The checked-in 2026-08-10 warm-cache comparison used ClickHouse 26.6.1.1193,
+20 measured interactions per plan, and 333,250 spans from six services. The
+coordinated plan improved:
+
+| Measure | Legacy | Coordinated | Improvement |
+|---|---:|---:|---:|
+| ClickHouse queries / interaction | 6 | 2 | 66.7% |
+| p95 first-results readiness | 93 ms | 66 ms | 29.0% |
+| p95 full interaction | 93 ms | 81 ms | 12.9% |
+| Average physical rows read | 1,391,388 | 362,767 | 73.9% |
+| Average physical bytes read | 15,980,421 | 11,817,751 | 26.0% |
+
+The raw machine-readable result is in
+`perf/results/explore-20260810T233944Z59793.json`. QFP-PERF-01 will broaden
+this focused comparison into the shared multi-tenant regression suite; it is
+no longer required to establish PERF-03's acceptance result.

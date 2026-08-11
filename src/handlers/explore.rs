@@ -230,6 +230,7 @@ async fn execute_spans(
         plan.interval_secs,
         rows,
         summary_result,
+        rows_ready_ms,
         started,
     )
 }
@@ -278,6 +279,7 @@ async fn execute_logs(
         plan.interval_secs,
         rows,
         summary_result,
+        rows_ready_ms,
         started,
     )
 }
@@ -292,6 +294,7 @@ fn finish_response<T: Serialize>(
         Result<Vec<SummaryRow>, clickhouse::error::Error>,
         tokio::time::error::Elapsed,
     >,
+    rows_ready_ms: u64,
     started: Instant,
 ) -> Result<ExploreSearchResponse<T>, (StatusCode, String)> {
     let row_count = rows.len() as u64;
@@ -349,7 +352,7 @@ fn finish_response<T: Serialize>(
         COORDINATED_QUERY_COUNT,
         count.value,
         matched_bytes,
-        elapsed_ms,
+        rows_ready_ms,
     );
     state.self_metrics.record_query_and_search(
         req.signal.operation(),
@@ -393,7 +396,7 @@ fn finish_response<T: Serialize>(
             clickhouse_queries: COORDINATED_QUERY_COUNT,
             matched_rows,
             matched_logical_bytes: matched_bytes,
-            time_to_first_results_ms: elapsed_ms,
+            time_to_first_results_ms: rows_ready_ms,
             response_bytes: 0,
         },
     };
@@ -662,11 +665,11 @@ fn summary_sql(
     grouping_sets.push("()");
 
     format!(
-        "SELECT \
+        "SELECT kind, bucket_value AS bucket, key, count, error_count, matched_bytes FROM (SELECT \
          multiIf(grouping(bucket) = 0, 'histogram', \
                   grouping(service_key) = 0, 'service', \
                   grouping(status_key) = 0, 'status'{method_kind}{requested_kind}, 'total') AS kind, \
-         if(grouping(bucket) = 0, toString(bucket), '') AS bucket, \
+         if(grouping(bucket) = 0, toString(bucket), '') AS bucket_value, \
          multiIf(grouping(service_key) = 0, service_key, \
                   grouping(status_key) = 0, status_key{method_key}{requested_key}, '') AS key, \
          count() AS count, countIf(is_error) AS error_count, sum(logical_bytes) AS matched_bytes \
@@ -675,7 +678,7 @@ fn summary_sql(
                       toString({method}) AS method_key, ({is_error}) AS is_error, \
                       toUInt64({matched_bytes}) AS logical_bytes{requested_select} \
                FROM {table} {predicate}) \
-         GROUP BY GROUPING SETS ({grouping_sets}) \
+         GROUP BY GROUPING SETS ({grouping_sets})) \
          ORDER BY kind ASC, count DESC \
          LIMIT {MAX_SUMMARY_ROWS_PER_KIND} BY kind",
         grouping_sets = grouping_sets.join(", "),
@@ -735,6 +738,15 @@ mod tests {
             assert!(sql.contains("%post%"));
         }
         assert!(plan.summary_sql.contains("GROUP BY GROUPING SETS"));
+        // Keep the GROUPING() expression under a distinct alias. ClickHouse
+        // 26.6 otherwise expands `AS bucket` back into GROUP BY and rejects the
+        // query with ILLEGAL_AGGREGATION even though sqlparser accepts it.
+        assert!(plan.summary_sql.contains("bucket_value AS bucket"));
+        assert!(
+            !plan
+                .summary_sql
+                .contains("toString(bucket), '') AS bucket,")
+        );
         assert_clickhouse_sql_parses(&plan.rows_sql);
         assert_clickhouse_sql_parses(&plan.summary_sql);
         assert_eq!(COORDINATED_QUERY_COUNT, 2);

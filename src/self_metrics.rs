@@ -514,8 +514,10 @@ impl SelfMetrics {
 
     /// Record the request-level outcomes users perceive from the coordinated
     /// Explore endpoint. No tenant, query text, field, or other unbounded label is
-    /// admitted. `matched_logical_bytes` is derived during the summary scan; physical
-    /// ClickHouse bytes read remain observable in `system.query_log` by query ID.
+    /// admitted. `time_to_first_results_ms` is the row-stage readiness time, not
+    /// summary completion. `matched_logical_bytes` is derived during the summary
+    /// scan; physical ClickHouse bytes read remain observable in `system.query_log`
+    /// by query ID.
     pub fn record_explore_coordinator(
         &self,
         signal: &'static str,
