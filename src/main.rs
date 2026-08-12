@@ -3197,6 +3197,31 @@ mod tenant_auth_tests {
             Some(rush_api::query_governor::WorkloadClass::Dashboard)
         );
 
+        let export = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/logs/export")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&export),
+            Some(rush_api::query_governor::WorkloadClass::Export)
+        );
+        let status = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/exports/job-id")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(query_workload_for_request(&status), None);
+        let download = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/exports/job-id/download")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&download),
+            Some(rush_api::query_governor::WorkloadClass::Export)
+        );
+
         for (method, path) in [
             (Method::POST, "/v1/traces"),
             (Method::GET, "/healthz"),

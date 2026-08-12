@@ -274,6 +274,16 @@ pub async fn export_query(
         }
     }
 
+    if req
+        .query_text
+        .as_ref()
+        .is_some_and(|value| value.len() > 8192)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "export query metadata too long (max 8192 bytes)".into(),
+        ));
+    }
     let cap = export::read_export_max_rows(&state).await;
     let limit = export::effective_limit(req.limit, cap);
     let max_bytes = export::max_export_bytes();
@@ -516,9 +526,17 @@ pub async fn export_query(
 
             let cursor = crate::tenant_query(&state.ch, &sql, tenant_id)
                 .fetch::<WideEvent>()
-                .map_err(|e| {
-                    tracing::error!(error = %e, signal = "traces", handler = "export_query", "export stream init failed");
-                    (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
+                .map_err(|_error| {
+                    tracing::error!(
+                        reason = "cursor_init",
+                        signal = "traces",
+                        handler = "export_query",
+                        "export stream init failed"
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "export query failed".into(),
+                    )
                 })?;
 
             let fmt_row = |r: &WideEvent| -> String {
@@ -552,9 +570,17 @@ pub async fn export_query(
         export::ExportFormat::Json => {
             let cursor = crate::tenant_query(&state.ch, &sql, tenant_id)
                 .fetch::<WideEvent>()
-                .map_err(|e| {
-                    tracing::error!(error = %e, signal = "traces", handler = "export_query", "export stream init failed");
-                    (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
+                .map_err(|_error| {
+                    tracing::error!(
+                        reason = "cursor_init",
+                        signal = "traces",
+                        handler = "export_query",
+                        "export stream init failed"
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "export query failed".into(),
+                    )
                 })?;
             let prelude = export::json_query_preamble(serde_json::json!({
                 "signal": "spans",

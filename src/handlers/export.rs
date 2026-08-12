@@ -265,7 +265,12 @@ impl ExportJobs {
 
     pub async fn mark_running(&self, id: &str) {
         if let Some(job) = self.jobs.get(id) {
-            job.mutable.lock().expect("export job lock poisoned").state = ExportJobState::Running;
+            if !job.cancelled.load(Ordering::Acquire) {
+                let mut state = job.mutable.lock().expect("export job lock poisoned");
+                if state.state == ExportJobState::Queued {
+                    state.state = ExportJobState::Running;
+                }
+            }
         }
     }
 
@@ -311,6 +316,9 @@ impl ExportJobs {
             .get(id)
             .map(|job| job.clone())
             .ok_or_else(|| anyhow::anyhow!("export job no longer exists"))?;
+        if job.cancelled.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("export job cancelled"));
+        }
         self.mark_running(id).await;
         let temporary = part_path(&job.path);
         let mut file = tokio::fs::OpenOptions::new()
@@ -341,9 +349,20 @@ impl ExportJobs {
             return Err(anyhow::anyhow!("export job cancelled"));
         }
         tokio::fs::rename(&temporary, &job.path).await?;
-        let mut state = job.mutable.lock().expect("export job lock poisoned");
-        state.state = ExportJobState::Completed;
-        state.error = None;
+        let completed = {
+            let mut state = job.mutable.lock().expect("export job lock poisoned");
+            if job.cancelled.load(Ordering::Acquire) {
+                false
+            } else {
+                state.state = ExportJobState::Completed;
+                state.error = None;
+                true
+            }
+        };
+        if !completed {
+            let _ = tokio::fs::remove_file(&job.path).await;
+            return Err(anyhow::anyhow!("export job cancelled"));
+        }
         Ok(())
     }
 
@@ -756,9 +775,10 @@ where
             Ok(Some(row)) => {
                 let mut chunk = match (state.encode_row)(&row) {
                     Ok(chunk) => chunk,
-                    Err(error) => {
+                    Err(_error) => {
+                        tracing::error!(reason = "row_serialization", "export stream failed");
                         state.done = true;
-                        return Some((Err(std::io::Error::other(error)), state));
+                        return Some((Err(std::io::Error::other("export stream failed")), state));
                     }
                 };
                 if matches!(state.kind, StreamKind::Json) && state.progress.rows > 0 {
@@ -780,9 +800,10 @@ where
                 Some((Ok(Bytes::from(chunk)), state))
             }
             Ok(None) => state.finish_chunk().map(|chunk| (Ok(chunk), state)),
-            Err(error) => {
+            Err(_error) => {
+                tracing::error!(reason = "cursor_read", "export stream failed");
                 state.done = true;
-                Some((Err(std::io::Error::other(error)), state))
+                Some((Err(std::io::Error::other("export stream failed")), state))
             }
         }
     });
@@ -943,6 +964,33 @@ mod tests {
             "private, no-store"
         );
         drop(response);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_cannot_be_restarted_or_publish_an_object() {
+        let root =
+            std::env::temp_dir().join(format!("rush-export-cancel-test-{}", uuid::Uuid::new_v4()));
+        let jobs = ExportJobs::with_root(root.clone(), Duration::from_secs(60)).unwrap();
+        let status = jobs.create(
+            "tenant-a",
+            "spans",
+            ExportFormat::Csv,
+            "spans.csv".to_string(),
+            10,
+        );
+        jobs.cancel("tenant-a", &status.id).await.unwrap();
+        assert!(
+            jobs.write_response(&status.id, Response::new(Body::from("row\n")))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            jobs.status("tenant-a", &status.id).await.unwrap().state,
+            ExportJobState::Cancelled
+        );
+        let job = jobs.job_for_tenant("tenant-a", &status.id).unwrap();
+        assert!(!job.path.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }

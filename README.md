@@ -108,6 +108,10 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_INGEST_MAX_LABELS_PER_SERIES` | `128` | maximum labels on one Prometheus series |
 | `RUSH_INGEST_MAX_LABEL_NAME_BYTES` / `RUSH_INGEST_MAX_LABEL_VALUE_BYTES` | `256` / `4096` | UTF-8 byte limits for Prometheus label names and values |
 | `RUSH_INGEST_DECODE_CONCURRENCY` | `4` | process-wide CPU-heavy ingest decode slots; excess requests receive retryable 429 responses |
+| `RUSH_EXPORT_SYNC_MAX_ROWS` | `50000` | synchronous streaming ceiling; larger allowed exports become expiring jobs |
+| `RUSH_EXPORT_MAX_BYTES` | `268435456` | hard byte cap for synchronous downloads and asynchronous export objects |
+| `RUSH_EXPORT_JOB_TTL_SECONDS` | `3600` | lifetime for protected asynchronous export jobs and objects |
+| `RUSH_EXPORT_DIR` | OS temp `rush-exports` directory | private export-object directory; never expose it directly |
 | `RUSH_SPOOL_DIR` · `RUSH_SPOOL_MAX_BYTES` | `./data/spool` · 2 GiB | durable ingest spool |
 | `RUSH_BUFFER_BACKEND` | `disk` | `disk` or shared `object_store` |
 | `RUSH_BUFFER_REQUIRE_OBJECT_STORE` | `false` | refuse unsafe fallback to disk |
@@ -117,6 +121,9 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_SHUTDOWN_TOKEN` | _(empty)_ | optional token for non-loopback shutdown callers |
 | `RUSH_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `RUST_LOG` | — | e.g. `rush_api=info` |
+
+See [Bounded data exports](docs/exports.md) for streaming JSON, asynchronous
+jobs, tenant-protected downloads, cancellation, and export workload controls.
 
 Startup fails unless the `rush_` ClickHouse custom-setting prefix, strict row
 policies, grants, and the separate read principal all verify. Fresh tenants are
