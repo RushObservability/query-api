@@ -43,6 +43,12 @@ Unix. Mount `RUSH_EXPORT_DIR` on an appropriately encrypted, quota-controlled
 volume if exports must survive pod filesystem pressure. Object access must stay
 behind query-api; do not serve this directory directly from a web server.
 
+Job metadata is process-local in this implementation. The Helm chart's default
+single query-api replica is safe. If query-api is scaled horizontally, keep a
+client on the job-owning pod with service/ingress affinity; a pod restart or
+failover invalidates that pod's outstanding jobs even when the object directory
+is persistent.
+
 ## Cancellation and observability
 
 Dropping a synchronous HTTP response drops its admission permit and ClickHouse
