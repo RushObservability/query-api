@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -459,6 +460,62 @@ impl Drop for QueryAdmissionGuard {
     }
 }
 
+/// Keep an admission permit attached to a streaming response body.
+///
+/// Axum considers a handler complete as soon as it returns a `Response`, while
+/// export cursors continue doing ClickHouse work as the body is polled. Without
+/// this wrapper an export would release its global/per-tenant slots before the
+/// first row was sent. Dropping the client body drops this stream state, which
+/// in turn drops the permit and the underlying ClickHouse cursor immediately.
+pub fn retain_admission_until_body_end(
+    response: axum::response::Response,
+    guard: QueryAdmissionGuard,
+    timeout: Duration,
+) -> axum::response::Response {
+    let (parts, body) = response.into_parts();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let state = (
+        Box::pin(body.into_data_stream()),
+        Some(guard),
+        deadline,
+        false,
+    );
+    let stream =
+        futures_util::stream::unfold(state, |(mut body, mut guard, deadline, done)| async move {
+            if done {
+                return None;
+            }
+            match tokio::time::timeout_at(deadline, body.next()).await {
+                Ok(Some(Ok(bytes))) => Some((
+                    Ok::<bytes::Bytes, std::io::Error>(bytes),
+                    (body, guard, deadline, false),
+                )),
+                Ok(Some(Err(error))) => {
+                    guard.take();
+                    Some((
+                        Err(std::io::Error::other(error)),
+                        (body, guard, deadline, true),
+                    ))
+                }
+                Ok(None) => {
+                    guard.take();
+                    None
+                }
+                Err(_) => {
+                    guard.take();
+                    Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "export response exceeded its workload timeout",
+                        )),
+                        (body, guard, deadline, true),
+                    ))
+                }
+            }
+        });
+    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum AdmissionError {
     TenantBusy { retry_after_secs: u64 },
@@ -639,5 +696,38 @@ mod tests {
                 .is_err()
         );
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn streaming_response_holds_permit_until_body_is_dropped() {
+        let mut config = QueryGovernorConfig::default();
+        config.export.global_concurrency = 1;
+        config.export.per_tenant_concurrency = 1;
+        config.export.queue_timeout_ms = 0;
+        let governor = QueryGovernor::new(config, Arc::new(SelfMetrics::new())).unwrap();
+        let guard = governor
+            .admit(WorkloadClass::Export, "tenant-a")
+            .await
+            .unwrap();
+        let body = axum::body::Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let response = retain_admission_until_body_end(
+            axum::response::Response::new(body),
+            guard,
+            Duration::from_secs(60),
+        );
+
+        assert!(matches!(
+            governor.admit(WorkloadClass::Export, "tenant-a").await,
+            Err(AdmissionError::TenantBusy { .. })
+        ));
+        drop(response);
+        assert!(
+            governor
+                .admit(WorkloadClass::Export, "tenant-a")
+                .await
+                .is_ok()
+        );
     }
 }

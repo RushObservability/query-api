@@ -276,6 +276,7 @@ pub async fn export_query(
 
     let cap = export::read_export_max_rows(&state).await;
     let limit = export::effective_limit(req.limit, cap);
+    let max_bytes = export::max_export_bytes();
 
     // AUDIT: data export. Do NOT log the full search/query text — only a
     // has_search boolean and the row cap.
@@ -296,6 +297,7 @@ pub async fn export_query(
                     "signal": "spans",
                     "format": match req.format { export::ExportFormat::Csv => "csv", export::ExportFormat::Json => "json" },
                     "limit": limit,
+                    "mode": if export::requires_async(req.limit, limit) { "async" } else { "stream" },
                     "has_search": req.search.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
                 }).to_string())
                 .description("spans exported")
@@ -317,6 +319,187 @@ pub async fn export_query(
     );
 
     let unix = chrono::Utc::now().timestamp();
+    if export::requires_async(req.limit, limit) {
+        let filename = format!(
+            "rush-spans-{unix}.{}",
+            match req.format {
+                export::ExportFormat::Csv => "csv",
+                export::ExportFormat::Json => "json",
+            }
+        );
+        let status =
+            state
+                .export_jobs
+                .create(tenant_id, "spans", req.format, filename.clone(), limit);
+        let job_id = status.id.clone();
+        let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
+            Some(token) => crate::request_auth::resolve_session_user(&state, &token)
+                .await
+                .map(|caller| (caller.0, caller.1))
+                .unwrap_or_default(),
+            None => (String::new(), String::new()),
+        };
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new(
+                    "export_job.create",
+                    if actor_id.is_empty() { "anonymous" } else { "user" },
+                )
+                .actor(actor_id, actor_name)
+                .tenant(tenant_id.clone())
+                .resource("export_job", job_id.clone())
+                .changes(
+                    serde_json::json!({
+                        "signal": "spans",
+                        "format": match req.format { export::ExportFormat::Csv => "csv", export::ExportFormat::Json => "json" },
+                        "requested_rows": limit,
+                        "expires_at": status.expires_at,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+
+        let background_state = state.clone();
+        let background_tenant = tenant_id.clone();
+        let background_job_id = job_id.clone();
+        let format = req.format;
+        let mut csv_prelude = export::csv_query_preamble(
+            "spans",
+            &req.time_range.from,
+            &req.time_range.to,
+            req.search.as_deref(),
+            req.query_text.as_deref(),
+        );
+        csv_prelude.push_str("Timestamp,Service,Method,Resource,Status,DurationMs,TraceId\n");
+        let json_prelude = export::json_query_preamble(serde_json::json!({
+            "signal": "spans",
+            "time_range": { "from": req.time_range.from, "to": req.time_range.to },
+            "search": req.search,
+            "query_text": req.query_text,
+        }));
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let guard = match background_state
+                .query_governor
+                .admit(
+                    crate::query_governor::WorkloadClass::Export,
+                    &background_tenant,
+                )
+                .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    background_state
+                        .export_jobs
+                        .mark_failed(&background_job_id, "export capacity unavailable")
+                        .await;
+                    export::audit_job_transition(
+                        &background_state,
+                        &background_tenant,
+                        &background_job_id,
+                        "export_job.fail",
+                        "failed",
+                        "failure",
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let budget = guard.budget().clone();
+            let progress = background_state
+                .export_jobs
+                .progress_callback(&background_job_id);
+            let work = async {
+                let cursor = crate::tenant_query(&background_state.ch, &sql, &background_tenant)
+                    .fetch::<WideEvent>()?;
+                let response = match format {
+                    export::ExportFormat::Csv => export::stream_csv_response(
+                        cursor,
+                        csv_prelude,
+                        |row: &WideEvent| {
+                            let duration_ms =
+                                format!("{:.3}", row.duration_ns as f64 / 1_000_000.0);
+                            let status = if row.http_status_code > 0 {
+                                row.http_status_code.to_string()
+                            } else {
+                                row.status.clone()
+                            };
+                            format!(
+                                "{},{},{},{},{},{},{}\n",
+                                export::csv_field(&export::ts_rfc3339(row.timestamp)),
+                                export::csv_field(&row.service_name),
+                                export::csv_field(&row.http_method),
+                                export::csv_field(&row.http_path),
+                                export::csv_field(&status),
+                                export::csv_field(&duration_ms),
+                                export::csv_field(&row.trace_id),
+                            )
+                        },
+                        &filename,
+                        limit,
+                        max_bytes,
+                        Some(progress),
+                    ),
+                    export::ExportFormat::Json => export::stream_json_response(
+                        cursor,
+                        json_prelude,
+                        &filename,
+                        limit,
+                        max_bytes,
+                        Some(progress),
+                    ),
+                };
+                background_state
+                    .export_jobs
+                    .write_response(&background_job_id, response)
+                    .await
+            };
+            let result = crate::query_governor::with_budget(
+                budget.clone(),
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(budget.request_timeout_secs),
+                    work,
+                ),
+            )
+            .await;
+            drop(guard);
+            match result {
+                Ok(Ok(())) => {
+                    export::audit_job_transition(
+                        &background_state,
+                        &background_tenant,
+                        &background_job_id,
+                        "export_job.complete",
+                        "completed",
+                        "success",
+                    )
+                    .await;
+                }
+                _ if background_state
+                    .export_jobs
+                    .is_cancelled(&background_job_id) => {}
+                _ => {
+                    background_state
+                        .export_jobs
+                        .mark_failed(&background_job_id, "export could not be completed")
+                        .await;
+                    export::audit_job_transition(
+                        &background_state,
+                        &background_tenant,
+                        &background_job_id,
+                        "export_job.fail",
+                        "failed",
+                        "failure",
+                    )
+                    .await;
+                }
+            }
+        });
+        return Ok(export::accepted_job_response(status));
+    }
     match req.format {
         export::ExportFormat::Csv => {
             // Stream span rows from the ClickHouse cursor (see export_logs / export.rs
@@ -361,33 +544,31 @@ pub async fn export_query(
                 prelude,
                 fmt_row,
                 &format!("rush-spans-{unix}.csv"),
+                limit,
+                max_bytes,
+                None,
             ))
         }
         export::ExportFormat::Json => {
-            // JSON export stays buffered (to_string_pretty envelope can't stream
-            // byte-identically). Row count is capped by LIMIT. See report.
-            let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-                .fetch_all::<WideEvent>().await
+            let cursor = crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch::<WideEvent>()
                 .map_err(|e| {
-                    tracing::error!(error = %e, signal = "traces", handler = "export_query", "export query failed");
+                    tracing::error!(error = %e, signal = "traces", handler = "export_query", "export stream init failed");
                     (StatusCode::INTERNAL_SERVER_ERROR, "export query failed".into())
                 })?;
-            let body = serde_json::json!({
-                "query": {
-                    "signal": "spans",
-                    "time_range": { "from": req.time_range.from, "to": req.time_range.to },
-                    "search": req.search,
-                    "query_text": req.query_text,
-                },
-                "exported_at": chrono::Utc::now().to_rfc3339(),
-                "count": rows.len(),
-                "rows": rows,
-            });
-            let s = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
-            Ok(export::file_response(
-                s,
-                "application/json; charset=utf-8",
+            let prelude = export::json_query_preamble(serde_json::json!({
+                "signal": "spans",
+                "time_range": { "from": req.time_range.from, "to": req.time_range.to },
+                "search": req.search,
+                "query_text": req.query_text,
+            }));
+            Ok(export::stream_json_response(
+                cursor,
+                prelude,
                 &format!("rush-spans-{unix}.json"),
+                limit,
+                max_bytes,
+                None,
             ))
         }
     }

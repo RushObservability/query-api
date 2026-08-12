@@ -683,6 +683,9 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
         return None;
     }
 
+    if path.starts_with("/api/v1/exports/") {
+        return path.ends_with("/download").then_some(WorkloadClass::Export);
+    }
     if path.contains("/export") {
         return Some(WorkloadClass::Export);
     }
@@ -872,7 +875,6 @@ async fn query_policy_middleware(
         ),
     )
     .await;
-    drop(guard);
     match result {
         Ok(response) => {
             state.self_metrics.inc_counter(
@@ -880,9 +882,19 @@ async fn query_policy_middleware(
                 &[("workload", label), ("outcome", "completed")],
                 1,
             );
-            response
+            if class == WorkloadClass::Export {
+                rush_api::query_governor::retain_admission_until_body_end(
+                    response,
+                    guard,
+                    Duration::from_secs(budget.request_timeout_secs),
+                )
+            } else {
+                drop(guard);
+                response
+            }
         }
         Err(_) => {
+            drop(guard);
             state.self_metrics.inc_counter(
                 "rush_query_requests_total",
                 &[("workload", label), ("outcome", "timeout")],
@@ -1790,6 +1802,8 @@ async fn main() -> anyhow::Result<()> {
             .context("audit logger initialization failed")?,
     );
     audit.spawn_replayer();
+    let export_jobs = Arc::new(handlers::export::ExportJobs::from_env()?);
+    export_jobs.spawn_janitor(audit.clone());
     let invalidated_sessions = config_db.invalidate_legacy_session_tokens().await?;
     if invalidated_sessions > 0 {
         audit
@@ -2328,6 +2342,7 @@ async fn main() -> anyhow::Result<()> {
         audit,
         self_metrics,
         query_governor,
+        export_jobs,
         ingest_limits: ingest_limits.clone(),
         llm_gateway,
         collectors,
@@ -2362,6 +2377,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/logs/histogram", post(handlers::logs::log_histogram))
         .route("/api/v1/logs/group", post(handlers::logs::group_logs))
         .route("/api/v1/logs/export", post(handlers::logs::export_logs))
+        .route(
+            "/api/v1/exports/{id}",
+            get(handlers::export::get_export_job).delete(handlers::export::cancel_export_job),
+        )
+        .route(
+            "/api/v1/exports/{id}/download",
+            get(handlers::export::download_export_job),
+        )
         // Service catalog
         .route("/api/v1/services", get(handlers::services::list_services))
         .route("/api/v1/services/graph", get(handlers::services::service_graph))

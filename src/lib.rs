@@ -262,6 +262,8 @@ pub struct AppState {
     pub self_metrics: Arc<self_metrics::SelfMetrics>,
     /// Live-reconfigurable workload admission and ClickHouse query budgets.
     pub query_governor: Arc<query_governor::QueryGovernor>,
+    /// Expiring tenant-scoped asynchronous export objects and progress state.
+    pub export_jobs: Arc<handlers::export::ExportJobs>,
     /// Startup-validated byte/entity limits and bounded blocking decode admission.
     pub ingest_limits: ingest_limits::IngestLimits,
     /// Startup-validated, rate-limited outbound LLM client. Handlers never
