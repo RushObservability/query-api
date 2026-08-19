@@ -5190,6 +5190,40 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Register the Helm-managed default-tenant ingest key exactly once.
+    ///
+    /// The fixed row id makes concurrent startup by multiple API replicas
+    /// converge on one ReplacingMergeTree row. Looking up the hash first also
+    /// leaves an already registered, externally managed key untouched.
+    pub async fn ensure_bootstrap_ingest_api_key(
+        &self,
+        key_hash: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if self.resolve_api_key(key_hash).await?.is_some() {
+            return Ok(None);
+        }
+
+        const ID: &str = "bootstrap-ingest-default";
+        let signals = crate::api_key_auth::INGEST_SIGNALS
+            .iter()
+            .map(|signal| (*signal).to_string())
+            .collect::<Vec<_>>();
+        self.create_api_key(
+            ID,
+            "Helm-managed ingest",
+            key_hash,
+            prefix,
+            "default",
+            "ingest",
+            &signals,
+            1_000_000,
+            &[],
+        )
+        .await?;
+        Ok(Some(ID.to_string()))
+    }
+
     pub async fn delete_api_key(&self, id: &str) -> anyhow::Result<bool> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {

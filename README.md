@@ -74,6 +74,7 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_TRUST_PROXY_HEADERS` | `false` | development-only opt-in for deriving a fallback CSRF/SSO origin from forwarded headers; honored only when the direct peer is in `RUSH_TRUSTED_PROXY_CIDRS`, while production always uses `RUSH_BASE_URL` |
 | `RUSH_ALLOW_ANONYMOUS_DEFAULT` | `false` | insecure development-only override for anonymous access to the default tenant |
 | `RUSH_API_KEY_SECRET` | _(empty)_ | HMAC key for API-key hashes — set it in production |
+| `RUSH_BOOTSTRAP_INGEST_API_KEY` | _(unset)_ | Optional 32+ byte ingest key registered idempotently for the default tenant at startup; intended for Helm-managed bootstrap |
 | `RUSH_SESSION_HMAC_SECRET` | falls back to API-key, then audit HMAC secret | stable 32+ byte HMAC key for one-way browser-session token storage; changing it signs every user out |
 | `RUSH_SSO_TRANSACTION_SECRET` | falls back to `RUSH_API_KEY_SECRET` | stable 32+ byte HMAC key for browser-bound OIDC/SAML login transactions |
 | `RUSH_AUDIT_HMAC_SECRET` | _(required in production)_ | current 32+ byte audit-chain signing key |

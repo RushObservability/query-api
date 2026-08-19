@@ -1888,6 +1888,96 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
     }
+    if let Ok(bootstrap_ingest_key) = std::env::var("RUSH_BOOTSTRAP_INGEST_API_KEY") {
+        if bootstrap_ingest_key.len() < 32 || !bootstrap_ingest_key.is_ascii() {
+            audit
+                .log(
+                    rush_api::audit::AuditEvent::new("apikey.create", "system")
+                        .actor_name("query-api bootstrap")
+                        .tenant("default")
+                        .resource("api_key", "bootstrap-ingest-default")
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({
+                                "name": "Helm-managed ingest",
+                                "tenant": "default",
+                                "key_type": "ingest",
+                                "bootstrap": true,
+                                "reason": "invalid_key_format",
+                            })
+                            .to_string(),
+                        )
+                        .description("Helm-managed ingest API key bootstrap rejected"),
+                )
+                .await;
+            anyhow::bail!(
+                "RUSH_BOOTSTRAP_INGEST_API_KEY must contain at least 32 ASCII bytes when configured"
+            );
+        }
+        let key_hash = handlers::settings::hash_api_key(&bootstrap_ingest_key);
+        let prefix = bootstrap_ingest_key.chars().take(12).collect::<String>();
+        let bootstrap_key = config_db
+            .ensure_bootstrap_ingest_api_key(&key_hash, &prefix)
+            .await;
+        match bootstrap_key {
+            Ok(Some(key_id)) => {
+                let signals = rush_api::api_key_auth::INGEST_SIGNALS;
+                audit
+                    .log(
+                        rush_api::audit::AuditEvent::new("apikey.create", "system")
+                            .actor_name("query-api bootstrap")
+                            .tenant("default")
+                            .resource("api_key", &key_id)
+                            .outcome("success")
+                            .changes(
+                                serde_json::json!({
+                                    "name": "Helm-managed ingest",
+                                    "prefix": prefix,
+                                    "tenant": "default",
+                                    "key_type": "ingest",
+                                    "signals": signals,
+                                    "rate_limit_per_minute": 1_000_000,
+                                    "source_restricted": false,
+                                    "bootstrap": true,
+                                })
+                                .to_string(),
+                            )
+                            .description("Helm-managed ingest API key created during bootstrap"),
+                    )
+                    .await;
+                tracing::info!(
+                    key_id = %key_id,
+                    key_prefix = %prefix,
+                    "Helm-managed ingest API key registered"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                audit
+                    .log(
+                        rush_api::audit::AuditEvent::new("apikey.create", "system")
+                            .actor_name("query-api bootstrap")
+                            .tenant("default")
+                            .resource("api_key", "bootstrap-ingest-default")
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({
+                                    "name": "Helm-managed ingest",
+                                    "prefix": prefix,
+                                    "tenant": "default",
+                                    "key_type": "ingest",
+                                    "bootstrap": true,
+                                    "reason": "bootstrap_store_unavailable",
+                                })
+                                .to_string(),
+                            )
+                            .description("Helm-managed ingest API key bootstrap failed"),
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
+    }
     // Reserve the `_audit` tenant (seeded disabled) so it's never an ingest target.
     config_db.ensure_audit_tenant().await?;
     // Seed the UI/tenant global-retention store from rushConfig.retention.defaults
