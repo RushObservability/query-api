@@ -3032,6 +3032,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::kubernetes_access::get_access_event),
         )
         .route(
+            "/api/v1/kubernetes/sessions/{id}/chunks",
+            get(handlers::kubernetes_access::get_session_chunks),
+        )
+        .route(
             "/api/v1/kubernetes/access-events/export",
             post(handlers::kubernetes_access::export_access_events),
         )
@@ -4002,6 +4006,7 @@ mod tenant_auth_tests {
             "/api/v1/kubernetes/session-chunks/ingest",
             "/api/v1/kubernetes/access-events",
             "/api/v1/kubernetes/access-events/{id}",
+            "/api/v1/kubernetes/sessions/{id}/chunks",
             "/api/v1/kubernetes/access-events/export",
         ] {
             assert!(source.contains(route), "missing route {route}");

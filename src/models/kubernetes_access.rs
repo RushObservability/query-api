@@ -55,6 +55,50 @@ pub struct KubernetesSessionChunk {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct KubernetesSessionChunkView {
+    pub id: String,
+    pub session_id: String,
+    pub event_id: String,
+    pub gateway_id: String,
+    pub sequence: u64,
+    pub stream: String,
+    pub encoding: String,
+    pub provenance: serde_json::Value,
+    pub recording_state: String,
+    pub offset_ms: u64,
+    pub data: String,
+    pub byte_count: u64,
+    pub redaction_count: u32,
+    pub created_at: String,
+}
+
+impl From<KubernetesSessionChunk> for KubernetesSessionChunkView {
+    fn from(row: KubernetesSessionChunk) -> Self {
+        let created_at =
+            chrono::NaiveDateTime::parse_from_str(&row.created_at, "%Y-%m-%d %H:%M:%S")
+                .map(|value| value.and_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or(row.created_at);
+        Self {
+            id: row.id,
+            session_id: row.session_id,
+            event_id: row.event_id,
+            gateway_id: row.gateway_id,
+            sequence: row.sequence,
+            stream: row.stream,
+            encoding: row.encoding,
+            provenance: serde_json::from_str(&row.provenance)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            recording_state: row.recording_state,
+            offset_ms: row.offset_ms,
+            data: row.data,
+            byte_count: row.byte_count,
+            redaction_count: row.redaction_count,
+            created_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct KubernetesAccessFilter {
     pub tenant_id: String,

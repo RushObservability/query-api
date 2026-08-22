@@ -15,7 +15,7 @@ use crate::handlers::infrastructure::require_infrastructure_read;
 use crate::handlers::users::{require_admin, require_auth};
 use crate::models::kubernetes_access::{
     KubernetesAccessEvent, KubernetesAccessEventView, KubernetesAccessFilter,
-    KubernetesSessionChunk,
+    KubernetesSessionChunk, KubernetesSessionChunkView,
 };
 use crate::{AppState, RequestIdentity};
 
@@ -30,6 +30,7 @@ const MAX_TEXT_BYTES: usize = 1024;
 const MAX_JSON_METADATA_BYTES: usize = 64 * 1024;
 const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXPORT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SESSION_REPLAY_PAGE: u64 = 512;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -170,6 +171,20 @@ pub struct SessionChunkInput {
     pub recording_state: String,
     #[serde(default)]
     pub created_at: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SessionChunkQuery {
+    pub after_sequence: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionChunkListResponse {
+    pub chunks: Vec<KubernetesSessionChunkView>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_sequence: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -1032,66 +1047,64 @@ fn prepare_session_chunk(
 ) -> Result<(String, String, u64, u32, String), (StatusCode, String)> {
     if !matches!(
         stream,
-        "stdout" | "stderr" | "resize" | "raw_upgrade_output"
+        "stdin"
+            | "stdout"
+            | "stderr"
+            | "error"
+            | "resize"
+            | "session"
+            | "raw_upgrade_input"
+            | "raw_upgrade_output"
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "stream must be stdout, stderr, resize, or raw_upgrade_output; stdin is not recorded"
-                .to_string(),
+            "invalid Kubernetes session stream".to_string(),
         ));
     }
+    let raw_protocol = matches!(stream, "raw_upgrade_input" | "raw_upgrade_output");
     let encoding = if requested_encoding.is_empty() {
-        "utf8".to_string()
+        if raw_protocol { "base64" } else { "utf8" }.to_string()
     } else {
         requested_encoding.to_string()
     };
-    let (data, byte_count, redactions, provenance) = if stream == "raw_upgrade_output" {
-        if encoding != "base64" {
+    let (data, byte_count, redactions) = match encoding.as_str() {
+        "base64" => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(input.as_bytes())
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "session chunk data is not valid base64".to_string(),
+                    )
+                })?;
+            (input, decoded.len() as u64, 0)
+        }
+        "utf8" if !raw_protocol => {
+            let mut data = serde_json::Value::String(input);
+            let redactions = redact_value(&mut data);
+            let data = data.as_str().unwrap_or("[REDACTED]").to_string();
+            let byte_count = data.len() as u64;
+            (data, byte_count, redactions)
+        }
+        _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "raw_upgrade_output requires base64 encoding".to_string(),
+                "session chunk encoding must be base64, or utf8 for decoded streams".to_string(),
             ));
         }
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(input.as_bytes())
-            .map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "raw_upgrade_output data is not valid base64".to_string(),
-                )
-            })?;
-        (
-            input,
-            decoded.len() as u64,
-            0,
-            serde_json::json!({
-                "capture": "gateway_upstream_to_client",
-                "decoded_channels": false,
-                "terminal_text": false,
-            }),
-        )
-    } else {
-        if encoding != "utf8" {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "decoded session streams require utf8 encoding".to_string(),
-            ));
-        }
-        let mut data = serde_json::Value::String(input);
-        let redactions = redact_value(&mut data);
-        let data = data.as_str().unwrap_or("[REDACTED]").to_string();
-        let byte_count = data.len() as u64;
-        (
-            data,
-            byte_count,
-            redactions,
-            serde_json::json!({
-                "capture": "gateway_decoded_stream",
-                "decoded_channels": true,
-                "terminal_text": stream != "resize",
-            }),
-        )
     };
+    let direction = match stream {
+        "stdin" | "resize" | "raw_upgrade_input" => "client_to_cluster",
+        "stdout" | "stderr" | "error" | "raw_upgrade_output" => "cluster_to_client",
+        _ => "gateway",
+    };
+    let provenance = serde_json::json!({
+        "capture": if raw_protocol { "gateway_raw_protocol" } else { "gateway_decoded_stream" },
+        "direction": direction,
+        "decoded_channels": !raw_protocol,
+        "terminal_text": matches!(stream, "stdin" | "stdout" | "stderr" | "error"),
+        "sensitive_input": stream == "stdin",
+    });
     let max_chunk = MAX_SESSION_CHUNK_BODY_BYTES / 2;
     if byte_count > max_chunk as u64 || data.len() > MAX_SESSION_CHUNK_BODY_BYTES {
         return Err((
@@ -1684,7 +1697,7 @@ pub async fn ingest_session_chunk(
     if !input.recording_state.is_empty()
         && !matches!(
             input.recording_state.as_str(),
-            "complete" | "partial" | "partial_protocol_capture" | "failed"
+            "recording" | "complete" | "partial" | "partial_protocol_capture" | "failed"
         )
     {
         return Err((
@@ -1850,6 +1863,79 @@ pub async fn get_access_event(
         "event": KubernetesAccessEventView::from(event),
         "session": session,
     })))
+}
+
+pub async fn get_session_chunks(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<SessionChunkQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = match require_admin(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(error) => {
+            audit_access_denial(
+                &state,
+                &headers,
+                &identity,
+                "kubernetes_access.session_read_denied",
+                &session_id,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    require_text("session_id", &session_id, 128)?;
+    let after_sequence = query.after_sequence.unwrap_or(0);
+    let limit = query.limit.unwrap_or(256).clamp(1, MAX_SESSION_REPLAY_PAGE);
+    let rows = state
+        .config_db
+        .list_kubernetes_session_chunks(
+            &caller.3,
+            &session_id,
+            after_sequence,
+            limit.saturating_add(1),
+        )
+        .await
+        .map_err(internal_error)?;
+
+    let mut has_more = rows.len() as u64 > limit;
+    let mut used = 0_usize;
+    let mut chunks = Vec::new();
+    for row in rows.into_iter().take(limit as usize) {
+        let view = KubernetesSessionChunkView::from(row);
+        let encoded_bytes = serde_json::to_vec(&view)
+            .map(|encoded| encoded.len())
+            .unwrap_or(MAX_LIST_RESPONSE_BYTES);
+        if !chunks.is_empty() && used.saturating_add(encoded_bytes) > MAX_LIST_RESPONSE_BYTES {
+            has_more = true;
+            break;
+        }
+        used = used.saturating_add(encoded_bytes);
+        chunks.push(view);
+    }
+    let next_sequence = has_more
+        .then(|| chunks.last().map(|chunk| chunk.sequence))
+        .flatten();
+    state
+        .audit
+        .log(access_audit_event(
+            "kubernetes_access.session_read",
+            "user",
+            &caller.0,
+            &caller.1,
+            &caller.3,
+            &session_id,
+            &headers,
+        ))
+        .await;
+    Ok(Json(SessionChunkListResponse {
+        chunks,
+        has_more,
+        next_sequence,
+    }))
 }
 
 pub async fn export_access_events(
@@ -2056,8 +2142,17 @@ mod tests {
     }
 
     #[test]
-    fn stdin_chunks_are_rejected_by_the_stream_policy() {
-        assert!(prepare_session_chunk("stdin", "utf8", "secret".to_string()).is_err());
+    fn stdin_chunks_are_preserved_as_bounded_binary_replay_data() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"echo hello\r");
+        let (data, encoding, byte_count, redactions, provenance) =
+            prepare_session_chunk("stdin", "base64", encoded.clone()).unwrap();
+        assert_eq!(data, encoded);
+        assert_eq!(encoding, "base64");
+        assert_eq!(byte_count, 11);
+        assert_eq!(redactions, 0);
+        let provenance: serde_json::Value = serde_json::from_str(&provenance).unwrap();
+        assert_eq!(provenance["decoded_channels"], true);
+        assert_eq!(provenance["sensitive_input"], true);
     }
 
     #[test]
@@ -2072,6 +2167,11 @@ mod tests {
         let provenance: serde_json::Value = serde_json::from_str(&provenance).unwrap();
         assert_eq!(provenance["terminal_text"], false);
         assert_eq!(provenance["decoded_channels"], false);
+    }
+
+    #[test]
+    fn malformed_binary_session_chunks_are_rejected() {
+        assert!(prepare_session_chunk("stdout", "base64", "%%%".to_string()).is_err());
     }
 
     #[test]

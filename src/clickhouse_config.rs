@@ -9383,6 +9383,24 @@ impl ConfigDb {
         Ok(())
     }
 
+    pub async fn list_kubernetes_session_chunks(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        after_sequence: u64,
+        limit: u64,
+    ) -> anyhow::Result<Vec<crate::models::kubernetes_access::KubernetesSessionChunk>> {
+        self.client
+            .query("SELECT id, tenant_id, session_id, event_id, gateway_id, sequence, stream, encoding, provenance, recording_state, offset_ms, data, byte_count, redaction_count, created_at FROM config_kubernetes_session_chunks WHERE tenant_id = ? AND session_id = ? AND sequence > ? ORDER BY sequence ASC, id ASC LIMIT ?")
+            .bind(tenant_id)
+            .bind(session_id)
+            .bind(after_sequence)
+            .bind(limit)
+            .fetch_all::<crate::models::kubernetes_access::KubernetesSessionChunk>()
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn kubernetes_session_summary(
         &self,
         tenant_id: &str,
