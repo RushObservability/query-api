@@ -26,6 +26,7 @@ pub mod ingest_gate;
 pub mod integrations;
 pub mod jaeger;
 pub mod kubernetes;
+pub mod kubernetes_access;
 pub mod license;
 pub mod logs;
 pub mod maintenance;

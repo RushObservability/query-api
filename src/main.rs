@@ -21,6 +21,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use rush_api::AppState;
+use rush_api::RequestIdentity;
 use rush_api::TenantContext;
 use rush_api::alert_engine;
 use rush_api::anomaly_engine;
@@ -255,6 +256,13 @@ fn request_origin_allowed_with_policy(
 }
 
 fn requires_csrf_origin(method: &Method, path: &str, credential: Option<&CredentialKind>) -> bool {
+    if matches!(
+        path,
+        "/api/v1/kubernetes/gateway/authorize" | "/api/v1/kubernetes/gateway/ready"
+    ) {
+        // Token introspection is a read even though the gateway uses POST.
+        return false;
+    }
     if !is_state_changing_method(method) {
         return false;
     }
@@ -509,9 +517,44 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
     .await;
     let session_authenticated = resolution.credential == CredentialKind::Session;
     let resolved_tenant = resolution.tenant_id.clone();
+    let request_identity = match (&resolution.credential, resolution.api_key.as_ref()) {
+        (CredentialKind::Session, _) => RequestIdentity {
+            tenant_id: resolution.tenant_id.clone(),
+            authenticated: true,
+            actor_id: String::new(),
+            actor_name: String::new(),
+            actor_type: "user".to_string(),
+            credential_type: "session".to_string(),
+        },
+        (CredentialKind::QueryKey, Some(grant)) => RequestIdentity {
+            tenant_id: resolution.tenant_id.clone(),
+            authenticated: true,
+            actor_id: grant.id.clone(),
+            actor_name: "API key".to_string(),
+            actor_type: "api_key".to_string(),
+            credential_type: "query_key".to_string(),
+        },
+        (CredentialKind::IngestKey, Some(grant)) => RequestIdentity {
+            tenant_id: resolution.tenant_id.clone(),
+            authenticated: true,
+            actor_id: grant.id.clone(),
+            actor_name: "API key".to_string(),
+            actor_type: "api_key".to_string(),
+            credential_type: "ingest_key".to_string(),
+        },
+        _ => RequestIdentity {
+            tenant_id: resolution.tenant_id.clone(),
+            authenticated: false,
+            actor_id: String::new(),
+            actor_name: String::new(),
+            actor_type: "anonymous".to_string(),
+            credential_type: "anonymous".to_string(),
+        },
+    };
     req.extensions_mut().insert(TenantContext {
         tenant_id: resolution.tenant_id.clone(),
     });
+    req.extensions_mut().insert(request_identity);
     req.extensions_mut().insert(resolution);
     let mut response = next.run(req).await;
 
@@ -614,21 +657,31 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
                     | "/api/v1/sso/providers"
             ));
 
-    matches!(
-        path,
-        "/healthz"
-            | "/readyz"
-            | "/metrics"
-            | "/api/v1/security/csp-report"
-            | "/shutdown"
-            | "/api/v1/auth/login"
-            | "/api/v1/auth/logout"
-            | "/api/v1/sso/status"
-            | "/auth/sso/login"
-            | "/auth/sso/callback"
-            | "/auth/sso/acs"
-            | "/auth/sso/metadata"
-    ) || scoped_setup_session
+    let internal_kubernetes_ingest = method == axum::http::Method::POST
+        && matches!(
+            path,
+            "/api/v1/kubernetes/access-events/ingest"
+                | "/api/v1/kubernetes/session-chunks/ingest"
+                | "/api/v1/kubernetes/gateway/ready"
+        );
+
+    internal_kubernetes_ingest
+        || matches!(
+            path,
+            "/healthz"
+                | "/readyz"
+                | "/metrics"
+                | "/api/v1/security/csp-report"
+                | "/shutdown"
+                | "/api/v1/auth/login"
+                | "/api/v1/auth/logout"
+                | "/api/v1/sso/status"
+                | "/auth/sso/login"
+                | "/auth/sso/callback"
+                | "/auth/sso/acs"
+                | "/auth/sso/metadata"
+        )
+        || scoped_setup_session
         || setup_validation_token.is_some_and(|token| !token.is_empty() && !token.contains('/'))
 }
 
@@ -678,6 +731,12 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
     let path = req.uri().path();
     if ingest_signal_for_route(req.method(), path).is_some()
         || matches!(path, "/healthz" | "/readyz" | "/metrics" | "/shutdown")
+        || matches!(
+            path,
+            "/api/v1/kubernetes/access-events/ingest"
+                | "/api/v1/kubernetes/session-chunks/ingest"
+                | "/api/v1/kubernetes/gateway/ready"
+        )
         || path == "/api/v1/investigate"
     {
         return None;
@@ -2924,6 +2983,58 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/kubernetes/namespaces", get(handlers::kubernetes::list_namespaces))
         .route("/api/v1/kubernetes/resources/{kind}", get(handlers::kubernetes::list_resources))
         .route("/api/v1/kubernetes/resources/{kind}/{namespace}/{name}", get(handlers::kubernetes::get_resource))
+        .route(
+            "/api/v1/kubernetes/access-events/ingest",
+            post(handlers::kubernetes_access::ingest_access_event).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_ACCESS_EVENT_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/gateway/authorize",
+            post(handlers::kubernetes_access::authorize_gateway_request).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_GATEWAY_AUTHORIZE_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/gateway/ready",
+            post(handlers::kubernetes_access::gateway_recording_ready).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_GATEWAY_AUTHORIZE_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/access-events/client",
+            post(handlers::kubernetes_access::ingest_client_event).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_ACCESS_EVENT_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/session-chunks/ingest",
+            post(handlers::kubernetes_access::ingest_session_chunk).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_SESSION_CHUNK_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/access-events",
+            get(handlers::kubernetes_access::list_access_events),
+        )
+        .route(
+            "/api/v1/kubernetes/access-events/{id}",
+            get(handlers::kubernetes_access::get_access_event),
+        )
+        .route(
+            "/api/v1/kubernetes/access-events/export",
+            post(handlers::kubernetes_access::export_access_events),
+        )
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
         .route("/api/v1/stats/partitions", axum::routing::get(handlers::stats::get_storage_partitions))
@@ -3848,5 +3959,55 @@ mod tenant_auth_tests {
                 "{name} lost its explicit admin authorization guard"
             );
         }
+    }
+
+    #[test]
+    fn kubernetes_gateway_routes_keep_their_distinct_auth_boundaries() {
+        assert!(allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/access-events/ingest",
+        ));
+        assert!(allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/session-chunks/ingest",
+        ));
+        assert!(allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/gateway/ready",
+        ));
+        assert!(!allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/access-events/client",
+        ));
+        assert!(!requires_csrf_origin(
+            &Method::POST,
+            "/api/v1/kubernetes/gateway/authorize",
+            Some(&CredentialKind::Session),
+        ));
+        assert!(!requires_csrf_origin(
+            &Method::POST,
+            "/api/v1/kubernetes/gateway/ready",
+            None,
+        ));
+    }
+
+    #[test]
+    fn kubernetes_recording_routes_are_registered_with_body_limits() {
+        let source = include_str!("main.rs");
+        for route in [
+            "/api/v1/kubernetes/gateway/authorize",
+            "/api/v1/kubernetes/gateway/ready",
+            "/api/v1/kubernetes/access-events/ingest",
+            "/api/v1/kubernetes/access-events/client",
+            "/api/v1/kubernetes/session-chunks/ingest",
+            "/api/v1/kubernetes/access-events",
+            "/api/v1/kubernetes/access-events/{id}",
+            "/api/v1/kubernetes/access-events/export",
+        ] {
+            assert!(source.contains(route), "missing route {route}");
+        }
+        assert!(source.contains("MAX_ACCESS_EVENT_BODY_BYTES"));
+        assert!(source.contains("MAX_SESSION_CHUNK_BODY_BYTES"));
+        assert!(source.contains("MAX_GATEWAY_AUTHORIZE_BODY_BYTES"));
     }
 }

@@ -61,6 +61,18 @@ pub struct TenantContext {
     pub tenant_id: String,
 }
 
+/// Authenticated identity resolved by tenant middleware. Handlers use this for
+/// API-key callers because browser-session lookup is not available for keys.
+#[derive(Clone, Debug)]
+pub struct RequestIdentity {
+    pub tenant_id: String,
+    pub authenticated: bool,
+    pub actor_id: String,
+    pub actor_name: String,
+    pub actor_type: String,
+    pub credential_type: String,
+}
+
 /// Process-wide tenant-isolation state.
 ///
 /// 0 = not initialized (fail closed), 1 = verified/enforcing,

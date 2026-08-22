@@ -90,6 +90,42 @@ const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: i64 = 30 * 60;
 const DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_SESSION_RENEWAL_INTERVAL_SECS: i64 = 5 * 60;
 const MAX_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 31 * 24 * 60 * 60;
+const DEFAULT_KUBERNETES_ACCESS_RETENTION_DAYS: u16 = 30;
+const MAX_KUBERNETES_ACCESS_RETENTION_DAYS: u16 = 3650;
+const KUBERNETES_ACCESS_FULL_COLUMNS: &str = "id, tenant_id, cluster_id, gateway_id, session_id, actor_user_id, actor_name, actor_type, kube_username, kube_groups, source_kind, client_reported, observed_network, http_method, verb, api_group, api_version, resource, subresource, namespace, name, request_query, user_agent, status_code, duration_ms, request_bytes, response_bytes, result_summary, result_truncated, redaction_count, recording_state, created_at";
+const KUBERNETES_ACCESS_COMPACT_COLUMNS: &str = "id, tenant_id, cluster_id, gateway_id, session_id, actor_user_id, actor_name, actor_type, kube_username, '[]' AS kube_groups, source_kind, '{}' AS client_reported, '{}' AS observed_network, http_method, verb, api_group, api_version, resource, subresource, namespace, name, '{}' AS request_query, '' AS user_agent, status_code, duration_ms, request_bytes, response_bytes, 'null' AS result_summary, result_truncated, redaction_count, recording_state, created_at";
+
+fn kubernetes_access_columns(include_evidence: bool) -> &'static str {
+    if include_evidence {
+        KUBERNETES_ACCESS_FULL_COLUMNS
+    } else {
+        KUBERNETES_ACCESS_COMPACT_COLUMNS
+    }
+}
+
+fn kubernetes_access_retention_days_from(raw: Option<&str>) -> u16 {
+    raw.and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|days| (1..=MAX_KUBERNETES_ACCESS_RETENTION_DAYS).contains(days))
+        .unwrap_or(DEFAULT_KUBERNETES_ACCESS_RETENTION_DAYS)
+}
+
+fn kubernetes_access_retention_days() -> u16 {
+    let raw = std::env::var("KUBERNETES_ACCESS_RETENTION_DAYS").ok();
+    let days = kubernetes_access_retention_days_from(raw.as_deref());
+    if raw.as_deref().is_some_and(|value| {
+        value
+            .trim()
+            .parse::<u16>()
+            .map_or(true, |configured| configured != days)
+    }) {
+        tracing::warn!(
+            configured = raw.as_deref().unwrap_or_default(),
+            fallback_days = days,
+            "invalid KUBERNETES_ACCESS_RETENTION_DAYS; using the safe default"
+        );
+    }
+    days
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionPolicy {
@@ -354,6 +390,55 @@ fn normalize_slo_incident_events(
 #[cfg(test)]
 mod auth_storage_tests {
     use super::*;
+
+    #[test]
+    fn kubernetes_access_retention_is_always_bounded() {
+        assert_eq!(kubernetes_access_retention_days_from(None), 30);
+        assert_eq!(kubernetes_access_retention_days_from(Some("1")), 1);
+        assert_eq!(kubernetes_access_retention_days_from(Some("3650")), 3650);
+        assert_eq!(kubernetes_access_retention_days_from(Some("0")), 30);
+        assert_eq!(kubernetes_access_retention_days_from(Some("3651")), 30);
+        assert_eq!(kubernetes_access_retention_days_from(Some("invalid")), 30);
+    }
+
+    #[test]
+    fn kubernetes_access_tables_create_and_migrate_retention_and_actor_type() {
+        let source = include_str!("clickhouse_config.rs");
+        assert!(source.contains(
+            "TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
+        ));
+        assert!(source.contains(
+            "ALTER TABLE config_kubernetes_access_events MODIFY TTL parseDateTimeBestEffort(created_at)"
+        ));
+        assert!(source.contains(
+            "ALTER TABLE config_kubernetes_session_chunks MODIFY TTL parseDateTimeBestEffort(created_at)"
+        ));
+        assert!(source.contains(
+            "ADD COLUMN IF NOT EXISTS actor_type LowCardinality(String) DEFAULT 'unknown'"
+        ));
+    }
+
+    #[test]
+    fn kubernetes_access_list_projection_omits_captured_evidence() {
+        let compact = kubernetes_access_columns(false);
+        assert!(compact.contains("'{}' AS client_reported"));
+        assert!(compact.contains("'{}' AS observed_network"));
+        assert!(compact.contains("'{}' AS request_query"));
+        assert!(compact.contains("'null' AS result_summary"));
+
+        let full = kubernetes_access_columns(true);
+        assert!(full.contains("client_reported"));
+        assert!(full.contains("observed_network"));
+        assert!(full.contains("request_query"));
+        assert!(full.contains("result_summary"));
+        assert!(!full.contains(" AS result_summary"));
+    }
+
+    #[test]
+    fn kubernetes_access_free_text_search_includes_event_id() {
+        let source = include_str!("clickhouse_config.rs");
+        assert!(source.contains("positionCaseInsensitive(id, ?) > 0"));
+    }
 
     #[test]
     fn session_policy_enforces_idle_absolute_and_rotation_relationships() {
@@ -1483,6 +1568,72 @@ impl ConfigDb {
     }
 
     async fn run_migrations(&self) -> anyhow::Result<()> {
+        let access_retention_days = kubernetes_access_retention_days();
+        let access_event_ddl = format!(
+            "CREATE TABLE IF NOT EXISTS config_kubernetes_access_events (
+                id                String,
+                tenant_id         String,
+                cluster_id        String,
+                gateway_id        String,
+                session_id        String,
+                actor_user_id     String,
+                actor_name        String,
+                actor_type        LowCardinality(String),
+                kube_username     String,
+                kube_groups       String DEFAULT '[]',
+                source_kind       LowCardinality(String),
+                client_reported   String DEFAULT '{{}}',
+                observed_network  String DEFAULT '{{}}',
+                http_method       LowCardinality(String),
+                verb              LowCardinality(String),
+                api_group         LowCardinality(String),
+                api_version       LowCardinality(String),
+                resource          LowCardinality(String),
+                subresource       LowCardinality(String),
+                namespace         String,
+                name              String,
+                request_query     String DEFAULT '{{}}',
+                user_agent        String,
+                status_code       UInt16,
+                duration_ms       UInt64,
+                request_bytes     UInt64,
+                response_bytes    UInt64,
+                result_summary    String DEFAULT 'null',
+                result_truncated  UInt8 DEFAULT 0,
+                redaction_count   UInt32 DEFAULT 0,
+                recording_state   LowCardinality(String),
+                created_at        String
+            ) ENGINE = MergeTree
+            ORDER BY (tenant_id, created_at, id)
+            TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
+        );
+        let access_chunk_ddl = format!(
+            "CREATE TABLE IF NOT EXISTS config_kubernetes_session_chunks (
+                id                String,
+                tenant_id         String,
+                session_id        String,
+                event_id          String,
+                gateway_id        String,
+                sequence          UInt64,
+                stream            LowCardinality(String),
+                encoding          LowCardinality(String) DEFAULT 'utf8',
+                provenance        String DEFAULT '{{}}',
+                recording_state   LowCardinality(String) DEFAULT 'partial',
+                offset_ms         UInt64,
+                data              String,
+                byte_count        UInt64,
+                redaction_count   UInt32 DEFAULT 0,
+                created_at        String
+            ) ENGINE = MergeTree
+            ORDER BY (tenant_id, session_id, sequence, id)
+            TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
+        );
+        let access_event_ttl_migration = format!(
+            "ALTER TABLE config_kubernetes_access_events MODIFY TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
+        );
+        let access_chunk_ttl_migration = format!(
+            "ALTER TABLE config_kubernetes_session_chunks MODIFY TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
+        );
         let ddls = vec![
             // ── Tenants ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_tenants (
@@ -2197,6 +2348,11 @@ impl ConfigDb {
                 is_deleted UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            access_event_ddl.as_str(),
+            access_chunk_ddl.as_str(),
+            "ALTER TABLE config_kubernetes_access_events ADD COLUMN IF NOT EXISTS actor_type LowCardinality(String) DEFAULT 'unknown' AFTER actor_name",
+            access_event_ttl_migration.as_str(),
+            access_chunk_ttl_migration.as_str(),
         ];
 
         for ddl in ddls {
@@ -9028,5 +9184,228 @@ impl ConfigDb {
             .execute()
             .await?;
         Ok(true)
+    }
+
+    // ── Kubernetes access recording ───────────────────────────────────────────────
+
+    pub async fn kubernetes_access_storage_ready(&self) -> anyhow::Result<()> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct ReadyRow {
+            count: u64,
+        }
+
+        let events = self
+            .client
+            .query("SELECT count() AS count FROM config_kubernetes_access_events WHERE 0")
+            .fetch_one::<ReadyRow>()
+            .await?;
+        let chunks = self
+            .client
+            .query("SELECT count() AS count FROM config_kubernetes_session_chunks WHERE 0")
+            .fetch_one::<ReadyRow>()
+            .await?;
+        let _ = events.count.saturating_add(chunks.count);
+        Ok(())
+    }
+
+    pub async fn insert_kubernetes_access_event(
+        &self,
+        event: &crate::models::kubernetes_access::KubernetesAccessEvent,
+    ) -> anyhow::Result<()> {
+        self.client
+            .query(
+                "INSERT INTO config_kubernetes_access_events (id, tenant_id, cluster_id, gateway_id, session_id, actor_user_id, actor_name, actor_type, kube_username, kube_groups, source_kind, client_reported, observed_network, http_method, verb, api_group, api_version, resource, subresource, namespace, name, request_query, user_agent, status_code, duration_ms, request_bytes, response_bytes, result_summary, result_truncated, redaction_count, recording_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&event.id)
+            .bind(&event.tenant_id)
+            .bind(&event.cluster_id)
+            .bind(&event.gateway_id)
+            .bind(&event.session_id)
+            .bind(&event.actor_user_id)
+            .bind(&event.actor_name)
+            .bind(&event.actor_type)
+            .bind(&event.kube_username)
+            .bind(&event.kube_groups)
+            .bind(&event.source_kind)
+            .bind(&event.client_reported)
+            .bind(&event.observed_network)
+            .bind(&event.http_method)
+            .bind(&event.verb)
+            .bind(&event.api_group)
+            .bind(&event.api_version)
+            .bind(&event.resource)
+            .bind(&event.subresource)
+            .bind(&event.namespace)
+            .bind(&event.name)
+            .bind(&event.request_query)
+            .bind(&event.user_agent)
+            .bind(event.status_code)
+            .bind(event.duration_ms)
+            .bind(event.request_bytes)
+            .bind(event.response_bytes)
+            .bind(&event.result_summary)
+            .bind(event.result_truncated)
+            .bind(event.redaction_count)
+            .bind(&event.recording_state)
+            .bind(&event.created_at)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_kubernetes_access_events(
+        &self,
+        filter: &crate::models::kubernetes_access::KubernetesAccessFilter,
+        include_evidence: bool,
+    ) -> anyhow::Result<(
+        Vec<crate::models::kubernetes_access::KubernetesAccessEvent>,
+        u64,
+    )> {
+        const WHERE_SQL: &str = "tenant_id = ? \
+            AND (? = '' OR created_at >= ?) \
+            AND (? = '' OR created_at <= ?) \
+            AND (? = '' OR actor_user_id = ? OR actor_name = ?) \
+            AND (? = '' OR cluster_id = ?) \
+            AND (? = '' OR namespace = ?) \
+            AND (? = '' OR verb = ?) \
+            AND (? = '' OR resource = ?) \
+            AND (? = 0 OR (status_code >= ? AND status_code <= ?)) \
+            AND (? = '' OR source_kind = ?) \
+            AND (? = '' OR recording_state = ?) \
+            AND (? = '' OR positionCaseInsensitive(id, ?) > 0 OR positionCaseInsensitive(actor_name, ?) > 0 OR positionCaseInsensitive(kube_username, ?) > 0 OR positionCaseInsensitive(name, ?) > 0 OR positionCaseInsensitive(session_id, ?) > 0 OR positionCaseInsensitive(cluster_id, ?) > 0 OR positionCaseInsensitive(namespace, ?) > 0 OR positionCaseInsensitive(resource, ?) > 0 OR positionCaseInsensitive(client_reported, ?) > 0 OR positionCaseInsensitive(result_summary, ?) > 0)";
+        macro_rules! bind_filter {
+            ($query:expr) => {
+                $query
+                    .bind(&filter.tenant_id)
+                    .bind(&filter.from)
+                    .bind(&filter.from)
+                    .bind(&filter.to)
+                    .bind(&filter.to)
+                    .bind(&filter.actor)
+                    .bind(&filter.actor)
+                    .bind(&filter.actor)
+                    .bind(&filter.cluster)
+                    .bind(&filter.cluster)
+                    .bind(&filter.namespace)
+                    .bind(&filter.namespace)
+                    .bind(&filter.verb)
+                    .bind(&filter.verb)
+                    .bind(&filter.resource)
+                    .bind(&filter.resource)
+                    .bind(filter.status_min)
+                    .bind(filter.status_min)
+                    .bind(filter.status_max)
+                    .bind(&filter.source_kind)
+                    .bind(&filter.source_kind)
+                    .bind(&filter.recording_state)
+                    .bind(&filter.recording_state)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+                    .bind(&filter.q)
+            };
+        }
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct CountRow {
+            total: u64,
+        }
+
+        let count_sql = format!(
+            "SELECT count() AS total FROM config_kubernetes_access_events WHERE {WHERE_SQL}"
+        );
+        let total = bind_filter!(self.client.query(&count_sql))
+            .fetch_one::<CountRow>()
+            .await?
+            .total;
+
+        let columns = kubernetes_access_columns(include_evidence);
+        let list_sql = format!(
+            "SELECT {columns} FROM config_kubernetes_access_events WHERE {WHERE_SQL} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let rows = bind_filter!(self.client.query(&list_sql))
+            .bind(filter.limit)
+            .bind(filter.offset)
+            .fetch_all::<crate::models::kubernetes_access::KubernetesAccessEvent>()
+            .await?;
+        Ok((rows, total))
+    }
+
+    pub async fn get_kubernetes_access_event(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::models::kubernetes_access::KubernetesAccessEvent>> {
+        let result = self
+            .client
+            .query("SELECT id, tenant_id, cluster_id, gateway_id, session_id, actor_user_id, actor_name, actor_type, kube_username, kube_groups, source_kind, client_reported, observed_network, http_method, verb, api_group, api_version, resource, subresource, namespace, name, request_query, user_agent, status_code, duration_ms, request_bytes, response_bytes, result_summary, result_truncated, redaction_count, recording_state, created_at FROM config_kubernetes_access_events WHERE tenant_id = ? AND id = ? LIMIT 1")
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_one::<crate::models::kubernetes_access::KubernetesAccessEvent>()
+            .await;
+        match result {
+            Ok(event) => Ok(Some(event)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn insert_kubernetes_session_chunk(
+        &self,
+        chunk: &crate::models::kubernetes_access::KubernetesSessionChunk,
+    ) -> anyhow::Result<()> {
+        self.client
+            .query("INSERT INTO config_kubernetes_session_chunks (id, tenant_id, session_id, event_id, gateway_id, sequence, stream, encoding, provenance, recording_state, offset_ms, data, byte_count, redaction_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&chunk.id)
+            .bind(&chunk.tenant_id)
+            .bind(&chunk.session_id)
+            .bind(&chunk.event_id)
+            .bind(&chunk.gateway_id)
+            .bind(chunk.sequence)
+            .bind(&chunk.stream)
+            .bind(&chunk.encoding)
+            .bind(&chunk.provenance)
+            .bind(&chunk.recording_state)
+            .bind(chunk.offset_ms)
+            .bind(&chunk.data)
+            .bind(chunk.byte_count)
+            .bind(chunk.redaction_count)
+            .bind(&chunk.created_at)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn kubernetes_session_summary(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<crate::models::kubernetes_access::KubernetesSessionSummary> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct SummaryRow {
+            chunk_count: u64,
+            total_bytes: u64,
+            redaction_count: u64,
+        }
+        let row = self
+            .client
+            .query("SELECT count() AS chunk_count, sum(byte_count) AS total_bytes, sum(toUInt64(redaction_count)) AS redaction_count FROM config_kubernetes_session_chunks WHERE tenant_id = ? AND session_id = ?")
+            .bind(tenant_id)
+            .bind(session_id)
+            .fetch_one::<SummaryRow>()
+            .await?;
+        Ok(crate::models::kubernetes_access::KubernetesSessionSummary {
+            session_id: session_id.to_string(),
+            chunk_count: row.chunk_count,
+            total_bytes: row.total_bytes,
+            redaction_count: row.redaction_count,
+        })
     }
 }
