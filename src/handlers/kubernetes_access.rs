@@ -9,7 +9,7 @@ use axum::{
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::handlers::infrastructure::require_infrastructure_read;
 use crate::handlers::users::{require_admin, require_auth};
@@ -22,6 +22,7 @@ use crate::{AppState, RequestIdentity};
 pub const MAX_ACCESS_EVENT_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SESSION_CHUNK_BODY_BYTES: usize = 512 * 1024;
 pub const MAX_GATEWAY_AUTHORIZE_BODY_BYTES: usize = 8 * 1024;
+pub const MAX_KUBERNETES_LOGIN_BODY_BYTES: usize = 4 * 1024;
 const DEFAULT_MAX_RESULT_BYTES: usize = 256 * 1024;
 const HARD_MAX_RESULT_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
@@ -237,6 +238,57 @@ pub struct GatewayReadyInput {
     pub cluster_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesLoginStartInput {
+    pub cluster_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KubernetesLoginStartResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub expires_in: i64,
+    pub interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesLoginApproveInput {
+    pub user_code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KubernetesLoginDetailsResponse {
+    pub status: String,
+    pub cluster_id: String,
+    pub approval_expires_at: String,
+    pub credential_ttl_seconds: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KubernetesLoginApproveResponse {
+    pub status: &'static str,
+    pub cluster_id: String,
+    pub credential_expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesLoginTokenInput {
+    pub device_code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KubernetesLoginTokenResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub interval: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GatewayBinding {
     gateway_id: String,
@@ -290,6 +342,39 @@ fn max_session_bytes() -> u64 {
         DEFAULT_MAX_SESSION_BYTES as usize,
         HARD_MAX_SESSION_BYTES as usize,
     ) as u64
+}
+
+fn kubernetes_credential_ttl_seconds() -> i64 {
+    std::env::var("KUBERNETES_ACCESS_CREDENTIAL_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (300..=43_200).contains(value))
+        .unwrap_or(3_600)
+}
+
+fn temporary_credential_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+fn temporary_device_credential() -> String {
+    format!(
+        "rkt1_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn temporary_user_code() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..16].to_ascii_uppercase()
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn internal_secret() -> Result<String, (StatusCode, String)> {
@@ -448,44 +533,6 @@ fn tenant_cluster_allowed(
     Ok(policy
         .get(tenant_id)
         .is_some_and(|clusters| clusters.iter().any(|allowed| allowed == cluster_id)))
-}
-
-fn api_key_id_allowed(actor_id: &str) -> bool {
-    std::env::var("KUBERNETES_ACCESS_API_KEY_IDS")
-        .ok()
-        .is_some_and(|raw| raw.split(',').map(str::trim).any(|id| id == actor_id))
-}
-
-fn api_key_role_from_policy(
-    raw_policy: Option<&str>,
-    actor_id: &str,
-) -> Result<String, (StatusCode, String)> {
-    let Some(raw_policy) = raw_policy.filter(|value| !value.trim().is_empty()) else {
-        return Ok("read".to_string());
-    };
-    let policy = serde_json::from_str::<std::collections::HashMap<String, String>>(raw_policy)
-        .map_err(|_| {
-            tracing::error!("KUBERNETES_ACCESS_API_KEY_ROLES is invalid JSON");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Kubernetes access API key policy is unavailable".to_string(),
-            )
-        })?;
-    if policy.iter().any(|(key_id, role)| {
-        key_id.trim().is_empty()
-            || key_id.len() > 256
-            || !matches!(role.as_str(), "read" | "write" | "admin")
-    }) {
-        tracing::error!("KUBERNETES_ACCESS_API_KEY_ROLES contains an invalid key ID or role");
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Kubernetes access API key policy is unavailable".to_string(),
-        ));
-    }
-    Ok(policy
-        .get(actor_id)
-        .cloned()
-        .unwrap_or_else(|| "read".to_string()))
 }
 
 fn validate_text(name: &str, value: &str, max_bytes: usize) -> Result<(), (StatusCode, String)> {
@@ -1356,6 +1403,27 @@ async fn audit_access_denial(
         .await;
 }
 
+async fn audit_login_approval_denial(
+    state: &AppState,
+    headers: &HeaderMap,
+    caller: &(String, String, String, String, String),
+    cluster_id: &str,
+    reason: &str,
+) {
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.login_approve", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("kubernetes_cluster", cluster_id)
+                .outcome("failure")
+                .changes(serde_json::json!({ "reason": reason }).to_string())
+                .context(crate::audit::actor_context_from_headers(headers)),
+        )
+        .await;
+}
+
 fn views_within_budget(
     rows: Vec<KubernetesAccessEvent>,
     max_bytes: usize,
@@ -1383,32 +1451,367 @@ fn kubernetes_authorization_groups(tenant_id: &str, role: &str) -> Vec<String> {
     ]
 }
 
-fn api_key_authorization(
-    identity: &RequestIdentity,
-    cluster_id: &str,
-    explicitly_allowed: bool,
-    role: &str,
-) -> Result<GatewayAuthorization, (StatusCode, String)> {
-    if !identity.authenticated
-        || identity.credential_type != "query_key"
-        || !explicitly_allowed
-        || !matches!(role, "read" | "write" | "admin")
+pub async fn start_kubernetes_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<KubernetesLoginStartInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    require_text("cluster_id", &input.cluster_id, 256)?;
+    let binding = gateway_binding()?;
+    if binding.cluster_id != input.cluster_id {
+        return Err((StatusCode::NOT_FOUND, "cluster not found".to_string()));
+    }
+
+    let device_code = temporary_device_credential();
+    let device_code_hash = temporary_credential_hash(&device_code);
+    let user_code = temporary_user_code();
+    let now = chrono::Utc::now();
+    let expires_in = 600_i64;
+    let created_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let expires_at = (now + chrono::Duration::seconds(expires_in))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    state
+        .config_db
+        .create_kubernetes_login_request(
+            &device_code_hash,
+            &user_code,
+            &input.cluster_id,
+            &created_at,
+            &expires_at,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to start Kubernetes browser login");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes login could not be started".to_string(),
+            )
+        })?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.login_start", "anonymous")
+                .tenant("default")
+                .resource("kubernetes_cluster", input.cluster_id.clone())
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "approval_expires_in_seconds": expires_in,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    Ok(Json(KubernetesLoginStartResponse {
+        device_code,
+        user_code,
+        expires_in,
+        interval: 2,
+    }))
+}
+
+pub async fn approve_kubernetes_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<KubernetesLoginApproveInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_infrastructure_read(&state, &headers).await?;
+    let user_code = input.user_code.trim().to_ascii_uppercase();
+    if user_code.len() != 16 || !user_code.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        audit_login_approval_denial(&state, &headers, &caller, "unknown", "invalid_code").await;
+        return Err((StatusCode::BAD_REQUEST, "invalid login code".to_string()));
+    }
+
+    let request = state
+        .config_db
+        .get_kubernetes_login_by_user_code(&user_code)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read Kubernetes browser login");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes login could not be approved".to_string(),
+            )
+        })?;
+    let Some(request) = request else {
+        audit_login_approval_denial(&state, &headers, &caller, "unknown", "not_found").await;
+        return Err((StatusCode::NOT_FOUND, "login request not found".to_string()));
+    };
+    let now = chrono::Utc::now();
+    let now_text = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    if request.state != "pending" || request.expires_at <= now_text {
+        audit_login_approval_denial(
+            &state,
+            &headers,
+            &caller,
+            &request.cluster_id,
+            "expired_or_used",
+        )
+        .await;
+        return Err((StatusCode::GONE, "login request expired".to_string()));
+    }
+
+    let binding = gateway_binding()?;
+    if binding.cluster_id != request.cluster_id
+        || !binding.tenant_ids.iter().any(|tenant| tenant == &caller.3)
     {
+        audit_login_approval_denial(
+            &state,
+            &headers,
+            &caller,
+            &request.cluster_id,
+            "gateway_binding_denied",
+        )
+        .await;
         return Err((
-            StatusCode::UNAUTHORIZED,
-            "valid Rush query credentials required".to_string(),
+            StatusCode::FORBIDDEN,
+            "cluster is not authorized for this tenant".to_string(),
         ));
     }
-    Ok(GatewayAuthorization {
-        actor_user_id: identity.actor_id.clone(),
-        actor_name: identity.actor_name.clone(),
-        actor_type: "api_key".to_string(),
-        tenant_id: identity.tenant_id.clone(),
-        cluster_id: cluster_id.to_string(),
-        role: role.to_string(),
-        kube_username: format!("rush:api-key:{}", identity.actor_id),
-        kube_groups: kubernetes_authorization_groups(&identity.tenant_id, role),
-    })
+    let policy = std::env::var("KUBERNETES_ACCESS_TENANT_CLUSTERS").map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Kubernetes access policy is unavailable".to_string(),
+        )
+    })?;
+    if !tenant_cluster_allowed(&policy, &caller.3, &request.cluster_id)? {
+        audit_login_approval_denial(
+            &state,
+            &headers,
+            &caller,
+            &request.cluster_id,
+            "tenant_policy_denied",
+        )
+        .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "cluster is not authorized for this tenant".to_string(),
+        ));
+    }
+
+    let approval_claim_expires =
+        chrono::NaiveDateTime::parse_from_str(&request.expires_at, "%Y-%m-%d %H:%M:%S")
+            .map_err(|error| {
+                tracing::error!(%error, "Kubernetes login request has an invalid expiry");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Kubernetes login could not be approved".to_string(),
+                )
+            })?
+            .and_utc()
+            .timestamp();
+    let approval_claim = format!("kubernetes-login:{}", request.device_code_hash);
+    if !state
+        .config_db
+        .claim_sso_key_once(&approval_claim, approval_claim_expires)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to claim Kubernetes login approval");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Kubernetes login could not be approved".to_string(),
+            )
+        })?
+    {
+        audit_login_approval_denial(
+            &state,
+            &headers,
+            &caller,
+            &request.cluster_id,
+            "already_approved",
+        )
+        .await;
+        return Err((
+            StatusCode::GONE,
+            "login request was already approved".to_string(),
+        ));
+    }
+
+    let credential_expires_at = (now
+        + chrono::Duration::seconds(kubernetes_credential_ttl_seconds()))
+    .format("%Y-%m-%d %H:%M:%S")
+    .to_string();
+    let approved = state
+        .config_db
+        .approve_kubernetes_login_request(
+            &request,
+            &caller.0,
+            &caller.1,
+            &caller.3,
+            &caller.4,
+            &now_text,
+            &credential_expires_at,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to approve Kubernetes browser login");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes login could not be approved".to_string(),
+            )
+        })?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.login_approve", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("kubernetes_cluster", approved.cluster_id.clone())
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "credential_expires_at": approved.credential_expires_at,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    Ok(Json(KubernetesLoginApproveResponse {
+        status: "approved",
+        cluster_id: approved.cluster_id,
+        credential_expires_at: approved.credential_expires_at,
+    }))
+}
+
+pub async fn get_kubernetes_login_details(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<KubernetesLoginApproveInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_infrastructure_read(&state, &headers).await?;
+    let user_code = input.user_code.trim().to_ascii_uppercase();
+    if user_code.len() != 16 || !user_code.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "invalid login code".to_string()));
+    }
+    let request = state
+        .config_db
+        .get_kubernetes_login_by_user_code(&user_code)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read Kubernetes browser login details");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes login details are unavailable".to_string(),
+            )
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "login request not found".to_string()))?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if (request.state == "pending" && request.expires_at <= now)
+        || (request.state == "approved" && request.credential_expires_at <= now)
+    {
+        return Err((StatusCode::GONE, "login request expired".to_string()));
+    }
+    let binding = gateway_binding()?;
+    let policy = std::env::var("KUBERNETES_ACCESS_TENANT_CLUSTERS").map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Kubernetes access policy is unavailable".to_string(),
+        )
+    })?;
+    if binding.cluster_id != request.cluster_id
+        || !binding.tenant_ids.iter().any(|tenant| tenant == &caller.3)
+        || !tenant_cluster_allowed(&policy, &caller.3, &request.cluster_id)?
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "cluster is not authorized for this tenant".to_string(),
+        ));
+    }
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.login_preview", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("kubernetes_cluster", request.cluster_id.clone())
+                .outcome("success")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(Json(KubernetesLoginDetailsResponse {
+        status: request.state,
+        cluster_id: request.cluster_id,
+        approval_expires_at: request.expires_at,
+        credential_ttl_seconds: kubernetes_credential_ttl_seconds(),
+    }))
+}
+
+pub async fn poll_kubernetes_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<KubernetesLoginTokenInput>,
+) -> Result<(StatusCode, Json<KubernetesLoginTokenResponse>), (StatusCode, String)> {
+    require_enabled()?;
+    if !input.device_code.starts_with("rkt1_") || input.device_code.len() != 69 {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid login credential".to_string(),
+        ));
+    }
+    let request = state
+        .config_db
+        .get_kubernetes_login_by_device_hash(&temporary_credential_hash(&input.device_code))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to poll Kubernetes browser login");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes login is temporarily unavailable".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "invalid login credential".to_string(),
+            )
+        })?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if request.state == "pending" && request.expires_at > now {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(KubernetesLoginTokenResponse {
+                status: "pending",
+                access_token: None,
+                expires_at: None,
+                interval: 2,
+            }),
+        ));
+    }
+    if request.state != "approved" || request.credential_expires_at <= now {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "login credential expired".to_string(),
+        ));
+    }
+
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.credential_issue", "user")
+                .actor(request.user_id.clone(), request.username.clone())
+                .tenant(request.tenant_id.clone())
+                .resource("kubernetes_cluster", request.cluster_id)
+                .outcome("success")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok((
+        StatusCode::OK,
+        Json(KubernetesLoginTokenResponse {
+            status: "approved",
+            access_token: Some(input.device_code),
+            expires_at: Some(request.credential_expires_at),
+            interval: 2,
+        }),
+    ))
 }
 
 pub async fn authorize_gateway_request(
@@ -1442,9 +1845,7 @@ pub async fn authorize_gateway_request(
         return Err((StatusCode::FORBIDDEN, "invalid token audience".to_string()));
     }
     let binding = gateway_binding()?;
-    if let Err(error) =
-        validate_authorizing_gateway(&binding, &headers, &identity.tenant_id, &input.cluster_id)
-    {
+    if let Err(error) = validate_gateway_instance(&binding, &headers, &input.cluster_id) {
         audit_access_denial(
             &state,
             &headers,
@@ -1455,13 +1856,106 @@ pub async fn authorize_gateway_request(
         .await;
         return Err(error);
     }
+    let Some(token) =
+        bearer_token(&headers).filter(|value| value.starts_with("rkt1_") && value.len() == 69)
+    else {
+        audit_access_denial(
+            &state,
+            &headers,
+            &identity,
+            "kubernetes_access.authorize_denied",
+            &input.cluster_id,
+        )
+        .await;
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "temporary Rush login credential required".to_string(),
+        ));
+    };
+    let login = state
+        .config_db
+        .get_kubernetes_login_by_device_hash(&temporary_credential_hash(token))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to validate Kubernetes credential");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Kubernetes credential validation is unavailable".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "invalid Kubernetes credential".to_string(),
+            )
+        })?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if login.state != "approved"
+        || login.cluster_id != input.cluster_id
+        || login.credential_expires_at <= now
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired Kubernetes credential".to_string(),
+        ));
+    }
+    let caller = state
+        .config_db
+        .get_active_kubernetes_user(&login.user_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to resolve Kubernetes credential user");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Kubernetes credential validation is unavailable".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Kubernetes credential user is disabled".to_string(),
+            )
+        })?;
+    if caller.3 != login.tenant_id {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Kubernetes credential is no longer valid".to_string(),
+        ));
+    }
+    let permissions = state
+        .config_db
+        .resolve_user_permissions(&caller.0)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to resolve Kubernetes credential permissions");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Kubernetes credential validation is unavailable".to_string(),
+            )
+        })?
+        .1;
+    if caller.4 != "admin"
+        && !permissions
+            .iter()
+            .any(|permission| matches!(permission.as_str(), "admin" | "infrastructure:read"))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Kubernetes access permission was revoked".to_string(),
+        ));
+    }
+    if let Err(error) =
+        validate_authorizing_gateway(&binding, &headers, &caller.3, &input.cluster_id)
+    {
+        return Err(error);
+    }
     let policy = std::env::var("KUBERNETES_ACCESS_TENANT_CLUSTERS").map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "Kubernetes access policy is unavailable".to_string(),
         )
     })?;
-    if !tenant_cluster_allowed(&policy, &identity.tenant_id, &input.cluster_id)? {
+    if !tenant_cluster_allowed(&policy, &caller.3, &input.cluster_id)? {
         audit_access_denial(
             &state,
             &headers,
@@ -1475,56 +1969,15 @@ pub async fn authorize_gateway_request(
             "tenant is not authorized for this cluster".to_string(),
         ));
     }
-    let authorization = if identity.credential_type == "session" {
-        let caller = require_infrastructure_read(&state, &headers).await?;
-        if caller.3 != identity.tenant_id {
-            return Err((StatusCode::FORBIDDEN, "tenant mismatch".to_string()));
-        }
-        GatewayAuthorization {
-            actor_user_id: caller.0,
-            actor_name: caller.1.clone(),
-            actor_type: "user".to_string(),
-            tenant_id: caller.3.clone(),
-            cluster_id: input.cluster_id.clone(),
-            role: caller.4.clone(),
-            kube_username: format!("rush:user:{}", caller.1),
-            kube_groups: kubernetes_authorization_groups(&caller.3, &caller.4),
-        }
-    } else {
-        let role_policy = std::env::var("KUBERNETES_ACCESS_API_KEY_ROLES").ok();
-        let role = match api_key_role_from_policy(role_policy.as_deref(), &identity.actor_id) {
-            Ok(role) => role,
-            Err(error) => {
-                audit_access_denial(
-                    &state,
-                    &headers,
-                    &identity,
-                    "kubernetes_access.authorize_denied",
-                    &input.cluster_id,
-                )
-                .await;
-                return Err(error);
-            }
-        };
-        match api_key_authorization(
-            &identity,
-            &input.cluster_id,
-            api_key_id_allowed(&identity.actor_id),
-            &role,
-        ) {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                audit_access_denial(
-                    &state,
-                    &headers,
-                    &identity,
-                    "kubernetes_access.authorize_denied",
-                    &input.cluster_id,
-                )
-                .await;
-                return Err(error);
-            }
-        }
+    let authorization = GatewayAuthorization {
+        actor_user_id: caller.0,
+        actor_name: caller.1.clone(),
+        actor_type: "user".to_string(),
+        tenant_id: caller.3.clone(),
+        cluster_id: input.cluster_id.clone(),
+        role: caller.4.clone(),
+        kube_username: format!("rush:user:{}", caller.1),
+        kube_groups: kubernetes_authorization_groups(&caller.3, &caller.4),
     };
     state
         .audit
@@ -2426,39 +2879,17 @@ mod tests {
     }
 
     #[test]
-    fn gateway_authorization_rejects_unresolved_or_ingest_credentials() {
-        let mut anonymous = identity("tenant-a");
-        anonymous.authenticated = false;
-        anonymous.credential_type = "anonymous".to_string();
-        assert!(api_key_authorization(&anonymous, "prod", true, "read").is_err());
-
-        let mut ingest = identity("tenant-a");
-        ingest.credential_type = "ingest_key".to_string();
-        assert!(api_key_authorization(&ingest, "prod", true, "read").is_err());
-
-        assert!(api_key_authorization(&identity("tenant-a"), "prod", false, "read").is_err());
-        assert!(api_key_authorization(&identity("tenant-a"), "prod", true, "operator").is_err());
-    }
-
-    #[test]
-    fn gateway_authorization_derives_actor_and_tenant_from_api_key_identity() {
-        let authorization =
-            api_key_authorization(&identity("tenant-a"), "prod", true, "write").unwrap();
-        assert_eq!(authorization.actor_user_id, "key-1");
-        assert_eq!(authorization.tenant_id, "tenant-a");
-        assert_eq!(authorization.role, "write");
-        assert_eq!(authorization.kube_username, "rush:api-key:key-1");
-        assert_eq!(authorization.cluster_id, "prod");
-        assert!(
-            authorization
-                .kube_groups
-                .contains(&"rush:tenant:tenant-a:role:write".to_string())
-        );
-        assert!(
-            !authorization
-                .kube_groups
-                .contains(&"rush:role:write".to_string())
-        );
+    fn temporary_credentials_are_high_entropy_and_stored_as_hashes() {
+        let credential = temporary_device_credential();
+        assert!(credential.starts_with("rkt1_"));
+        assert_eq!(credential.len(), 69);
+        let digest = temporary_credential_hash(&credential);
+        assert_eq!(digest.len(), 64);
+        assert!(!digest.contains(&credential));
+        assert_eq!(digest, temporary_credential_hash(&credential));
+        let user_code = temporary_user_code();
+        assert_eq!(user_code.len(), 16);
+        assert!(user_code.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -2474,17 +2905,10 @@ mod tests {
     }
 
     #[test]
-    fn api_key_role_policy_is_explicit_and_fail_closed() {
-        let policy = r#"{"key-1":"write","key-2":"admin"}"#;
-        assert_eq!(
-            api_key_role_from_policy(Some(policy), "key-1").unwrap(),
-            "write"
-        );
-        assert_eq!(
-            api_key_role_from_policy(Some(policy), "unmapped").unwrap(),
-            "read"
-        );
-        assert!(api_key_role_from_policy(Some(r#"{"key-1":"operator"}"#), "key-1").is_err());
-        assert!(api_key_role_from_policy(Some("[]"), "key-1").is_err());
+    fn gateway_authorization_has_no_api_key_allowlist_path() {
+        let source = include_str!("kubernetes_access.rs");
+        assert!(!source.contains(&["KUBERNETES_ACCESS_API_KEY_", "IDS"].concat()));
+        assert!(!source.contains(&["KUBERNETES_ACCESS_API_KEY_", "ROLES"].concat()));
+        assert!(source.contains("temporary Rush login credential required"));
     }
 }

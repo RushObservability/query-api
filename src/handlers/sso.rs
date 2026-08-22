@@ -77,6 +77,21 @@ fn random_urlsafe<const N: usize>() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn safe_sso_redirect(raw: Option<&str>) -> String {
+    let value = raw.unwrap_or("/").trim();
+    if !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return "/".to_string();
+    }
+    match value.parse::<axum::http::Uri>() {
+        Ok(uri) if uri.scheme().is_none() && uri.authority().is_none() => value.to_string(),
+        _ => "/".to_string(),
+    }
+}
+
 fn sso_transaction_secret() -> Result<Vec<u8>, String> {
     let secret = std::env::var("RUSH_SSO_TRANSACTION_SECRET")
         .or_else(|_| std::env::var("RUSH_API_KEY_SECRET"))
@@ -558,6 +573,11 @@ pub struct SsoCallbackQuery {
     pub state: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct SsoLoginQuery {
+    pub redirect: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct SsoStatusResponse {
     pub enabled: bool,
@@ -801,7 +821,9 @@ fn extract_oidc_profile(
 pub async fn sso_login(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<SsoLoginQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let redirect_path = safe_sso_redirect(query.redirect.as_deref());
     let provider = state
         .config_db
         .get_enabled_sso_provider()
@@ -865,7 +887,7 @@ pub async fn sso_login(
                 )
             })?;
             let acs_url = format!("{base_url}/auth/sso/acs");
-            let relay_state = "/";
+            let relay_state = redirect_path.as_str();
 
             let login_request = saml::build_login_redirect_url(
                 &saml_sp_entity_id,
@@ -881,7 +903,7 @@ pub async fn sso_login(
                 nonce: String::new(),
                 pkce_verifier: String::new(),
                 saml_request_id: login_request.request_id,
-                redirect_path: relay_state.to_string(),
+                redirect_path: redirect_path.clone(),
                 issued_at: chrono::Utc::now().timestamp(),
             };
             let encoded = encode_sso_transaction(&transaction).map_err(|error| {
@@ -970,7 +992,7 @@ pub async fn sso_login(
                 nonce,
                 pkce_verifier,
                 saml_request_id: String::new(),
-                redirect_path: "/".to_string(),
+                redirect_path: redirect_path.clone(),
                 issued_at: chrono::Utc::now().timestamp(),
             };
             let encoded = encode_sso_transaction(&transaction).map_err(|error| {
@@ -1412,7 +1434,12 @@ async fn sso_callback_inner(
             )
         })?,
     );
-    headers.insert(header::LOCATION, "/".parse().unwrap());
+    headers.insert(
+        header::LOCATION,
+        safe_sso_redirect(Some(&transaction.redirect_path))
+            .parse()
+            .unwrap_or_else(|_| "/".parse().unwrap()),
+    );
 
     Ok((StatusCode::FOUND, headers, ""))
 }
@@ -2620,8 +2647,7 @@ async fn sso_acs_inner(
     );
     resp_headers.insert(
         header::LOCATION,
-        transaction
-            .redirect_path
+        safe_sso_redirect(Some(&transaction.redirect_path))
             .parse()
             .unwrap_or_else(|_| "/".parse().unwrap()),
     );
@@ -3482,6 +3508,18 @@ mod tests {
         assert_eq!(setup_provider_protocol("custom-oidc"), Some("oidc"));
         assert_eq!(setup_provider_protocol("okta"), Some("saml"));
         assert_eq!(setup_provider_protocol("attacker-controlled"), None);
+    }
+
+    #[test]
+    fn sso_redirects_accept_only_same_origin_paths() {
+        assert_eq!(
+            safe_sso_redirect(Some("/kubernetes-access/login/ABC123DE45")),
+            "/kubernetes-access/login/ABC123DE45"
+        );
+        assert_eq!(safe_sso_redirect(Some("//evil.example/path")), "/");
+        assert_eq!(safe_sso_redirect(Some("https://evil.example/path")), "/");
+        assert_eq!(safe_sso_redirect(Some("/\\evil.example/path")), "/");
+        assert_eq!(safe_sso_redirect(Some("/path\nset-cookie:x")), "/");
     }
 }
 

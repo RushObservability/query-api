@@ -657,15 +657,18 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
                     | "/api/v1/sso/providers"
             ));
 
-    let internal_kubernetes_ingest = method == axum::http::Method::POST
+    let unauthenticated_kubernetes_endpoint = method == axum::http::Method::POST
         && matches!(
             path,
             "/api/v1/kubernetes/access-events/ingest"
                 | "/api/v1/kubernetes/session-chunks/ingest"
                 | "/api/v1/kubernetes/gateway/ready"
+                | "/api/v1/kubernetes/gateway/authorize"
+                | "/api/v1/kubernetes/login/start"
+                | "/api/v1/kubernetes/login/token"
         );
 
-    internal_kubernetes_ingest
+    unauthenticated_kubernetes_endpoint
         || matches!(
             path,
             "/healthz"
@@ -2984,6 +2987,38 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/kubernetes/resources/{kind}", get(handlers::kubernetes::list_resources))
         .route("/api/v1/kubernetes/resources/{kind}/{namespace}/{name}", get(handlers::kubernetes::get_resource))
         .route(
+            "/api/v1/kubernetes/login/start",
+            post(handlers::kubernetes_access::start_kubernetes_login).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/login/approve",
+            post(handlers::kubernetes_access::approve_kubernetes_login).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/login/details",
+            post(handlers::kubernetes_access::get_kubernetes_login_details).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/kubernetes/login/token",
+            post(handlers::kubernetes_access::poll_kubernetes_login).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
             "/api/v1/kubernetes/access-events/ingest",
             post(handlers::kubernetes_access::ingest_access_event).layer(
                 DefaultBodyLimit::max(
@@ -3979,6 +4014,22 @@ mod tenant_auth_tests {
             &Method::POST,
             "/api/v1/kubernetes/gateway/ready",
         ));
+        assert!(allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/gateway/authorize",
+        ));
+        assert!(allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/login/start",
+        ));
+        assert!(allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/login/token",
+        ));
+        assert!(!allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/login/approve",
+        ));
         assert!(!allows_unauthenticated_tenant_request(
             &Method::POST,
             "/api/v1/kubernetes/access-events/client",
@@ -3999,6 +4050,10 @@ mod tenant_auth_tests {
     fn kubernetes_recording_routes_are_registered_with_body_limits() {
         let source = include_str!("main.rs");
         for route in [
+            "/api/v1/kubernetes/login/start",
+            "/api/v1/kubernetes/login/approve",
+            "/api/v1/kubernetes/login/details",
+            "/api/v1/kubernetes/login/token",
             "/api/v1/kubernetes/gateway/authorize",
             "/api/v1/kubernetes/gateway/ready",
             "/api/v1/kubernetes/access-events/ingest",

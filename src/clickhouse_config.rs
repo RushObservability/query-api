@@ -416,6 +416,9 @@ mod auth_storage_tests {
         assert!(source.contains(
             "ADD COLUMN IF NOT EXISTS actor_type LowCardinality(String) DEFAULT 'unknown'"
         ));
+        assert!(source.contains("CREATE TABLE IF NOT EXISTS config_kubernetes_login_requests"));
+        assert!(source.contains("device_code_hash     String"));
+        assert!(!source.contains(&["device_code", "          String"].concat()));
     }
 
     #[test]
@@ -1426,6 +1429,24 @@ pub struct ConfigDb {
     session_hmac_secret: Vec<u8>,
 }
 
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct KubernetesLoginRequest {
+    pub device_code_hash: String,
+    pub user_code: String,
+    pub cluster_id: String,
+    pub state: String,
+    pub tenant_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub role: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub approved_at: String,
+    pub credential_expires_at: String,
+    pub version: u64,
+    pub is_deleted: u8,
+}
+
 /// A metric firewall rule (storage + API shape). `enabled`/`*_regex` are 0/1.
 /// `action` is "allow", "block" or "drop_label".
 #[derive(Debug, Clone, clickhouse::Row, serde::Deserialize, serde::Serialize)]
@@ -1726,6 +1747,28 @@ impl ConfigDb {
             ) ENGINE = MergeTree()
             ORDER BY (session_id)
             TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
+            // Browser-approved kubectl credentials. Only a SHA-256 digest of
+            // the bearer is stored; the raw device credential stays with the
+            // CLI that initiated the login. ReplacingMergeTree makes approval
+            // visible to every query-api replica without process-local state.
+            "CREATE TABLE IF NOT EXISTS config_kubernetes_login_requests (
+                device_code_hash     String,
+                user_code            String,
+                cluster_id           String,
+                state                LowCardinality(String) DEFAULT 'pending',
+                tenant_id            String DEFAULT '',
+                user_id              String DEFAULT '',
+                username             String DEFAULT '',
+                role                 String DEFAULT '',
+                created_at           String,
+                expires_at           String,
+                approved_at          String DEFAULT '',
+                credential_expires_at String DEFAULT '',
+                version              UInt64,
+                is_deleted           UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (device_code_hash)
+            TTL parseDateTimeBestEffort(expires_at) + INTERVAL 1 DAY",
             // Shared login-attempt ledger. Identifiers are keyed hashes, never
             // raw usernames or addresses, and expire after one day. IP rows
             // count every request; account rows count failed credentials only.
@@ -4005,6 +4048,26 @@ impl ConfigDb {
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Resolve the current enabled user and role for a short-lived Kubernetes
+    /// credential. Looking the user up on every gateway authorization means a
+    /// disabled or deleted account stops creating new Kubernetes requests even
+    /// when the credential itself has not reached its expiry time yet.
+    pub async fn get_active_kubernetes_user(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<SessionUser>> {
+        let Some((user_id, username, display_name, tenant_id, enabled, _)) =
+            self.get_user(id).await?
+        else {
+            return Ok(None);
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        let role = self.derive_user_role(&user_id).await?;
+        Ok(Some((user_id, username, display_name, tenant_id, role)))
     }
 
     pub async fn change_password(
@@ -9187,6 +9250,113 @@ impl ConfigDb {
     }
 
     // ── Kubernetes access recording ───────────────────────────────────────────────
+
+    async fn insert_kubernetes_login_request(
+        &self,
+        request: &KubernetesLoginRequest,
+    ) -> anyhow::Result<()> {
+        self.client
+            .query("INSERT INTO config_kubernetes_login_requests (device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&request.device_code_hash)
+            .bind(&request.user_code)
+            .bind(&request.cluster_id)
+            .bind(&request.state)
+            .bind(&request.tenant_id)
+            .bind(&request.user_id)
+            .bind(&request.username)
+            .bind(&request.role)
+            .bind(&request.created_at)
+            .bind(&request.expires_at)
+            .bind(&request.approved_at)
+            .bind(&request.credential_expires_at)
+            .bind(request.version)
+            .bind(request.is_deleted)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_kubernetes_login_request(
+        &self,
+        device_code_hash: &str,
+        user_code: &str,
+        cluster_id: &str,
+        created_at: &str,
+        expires_at: &str,
+    ) -> anyhow::Result<()> {
+        self.insert_kubernetes_login_request(&KubernetesLoginRequest {
+            device_code_hash: device_code_hash.to_string(),
+            user_code: user_code.to_string(),
+            cluster_id: cluster_id.to_string(),
+            state: "pending".to_string(),
+            tenant_id: String::new(),
+            user_id: String::new(),
+            username: String::new(),
+            role: String::new(),
+            created_at: created_at.to_string(),
+            expires_at: expires_at.to_string(),
+            approved_at: String::new(),
+            credential_expires_at: String::new(),
+            version: Self::next_version(),
+            is_deleted: 0,
+        })
+        .await
+    }
+
+    pub async fn get_kubernetes_login_by_user_code(
+        &self,
+        user_code: &str,
+    ) -> anyhow::Result<Option<KubernetesLoginRequest>> {
+        let result = self.client
+            .query("SELECT device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted FROM config_kubernetes_login_requests FINAL WHERE user_code = ? AND is_deleted = 0 ORDER BY version DESC LIMIT 1")
+            .bind(user_code)
+            .fetch_one::<KubernetesLoginRequest>()
+            .await;
+        match result {
+            Ok(request) => Ok(Some(request)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn get_kubernetes_login_by_device_hash(
+        &self,
+        device_code_hash: &str,
+    ) -> anyhow::Result<Option<KubernetesLoginRequest>> {
+        let result = self.client
+            .query("SELECT device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted FROM config_kubernetes_login_requests FINAL WHERE device_code_hash = ? AND is_deleted = 0 LIMIT 1")
+            .bind(device_code_hash)
+            .fetch_one::<KubernetesLoginRequest>()
+            .await;
+        match result {
+            Ok(request) => Ok(Some(request)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn approve_kubernetes_login_request(
+        &self,
+        request: &KubernetesLoginRequest,
+        user_id: &str,
+        username: &str,
+        tenant_id: &str,
+        role: &str,
+        approved_at: &str,
+        credential_expires_at: &str,
+    ) -> anyhow::Result<KubernetesLoginRequest> {
+        let mut approved = request.clone();
+        approved.state = "approved".to_string();
+        approved.user_id = user_id.to_string();
+        approved.username = username.to_string();
+        approved.tenant_id = tenant_id.to_string();
+        approved.role = role.to_string();
+        approved.approved_at = approved_at.to_string();
+        approved.credential_expires_at = credential_expires_at.to_string();
+        approved.version = Self::next_version();
+        self.insert_kubernetes_login_request(&approved).await?;
+        Ok(approved)
+    }
 
     pub async fn kubernetes_access_storage_ready(&self) -> anyhow::Result<()> {
         #[derive(clickhouse::Row, serde::Deserialize)]
