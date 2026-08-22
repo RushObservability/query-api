@@ -12,6 +12,7 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-rush-local-clickhouse-password}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/config.d/local-storage.xml:/etc/clickhouse-server/config.d/local-storage.xml:ro
     ulimits:
       nofile:
         soft: 262144
