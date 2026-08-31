@@ -57,6 +57,13 @@ services:
       dockerfile: Dockerfile.agent
     ports:
       - "127.0.0.1:8081:8081"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       - CLICKHOUSE_URL=http://clickhouse:8123
       - CLICKHOUSE_DATABASE=observability

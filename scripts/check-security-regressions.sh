@@ -13,6 +13,9 @@ required_tests=(
   auth_required_ingestion_rejects_anonymous_and_query_credentials
   no_auth_ingestion_accepts_anonymous_across_every_ingest_family
   open_query_tenants_still_require_interactive_auth_for_llm_parsing
+  request_logs_exclude_query_parameters
+  integration_key_rotation_keeps_prior_ciphertexts_readable
+  integration_key_config_rejects_weak_or_ambiguous_keys
 )
 for test_name in "${required_tests[@]}"; do
   if ! rg -q --fixed-strings "$test_name" src; then
@@ -20,6 +23,16 @@ for test_name in "${required_tests[@]}"; do
     failed=1
   fi
 done
+
+if rg -q --fixed-strings 'RUSH_API_KEY_SECRET' src/integrations.rs; then
+  echo 'integration encryption must not fall back to the API-key secret' >&2
+  failed=1
+fi
+
+if rg -q 'uri[[:space:]]*=[[:space:]]*%req\.uri\(\)|TraceLayer::new_for_http\(\)[[:space:]]*\)' src/main.rs; then
+  echo 'request logging must use the query-free request path' >&2
+  failed=1
+fi
 
 # Every literal route must belong to a reviewed external surface. Exact public
 # and ingest behavior is asserted by Rust matrix tests; this inventory catches

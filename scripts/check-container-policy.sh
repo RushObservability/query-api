@@ -21,6 +21,18 @@ if rg -n 'CLICKHOUSE_PASSWORD=$|CLICKHOUSE_PASSWORD:[[:space:]]*$' docker-compos
   failed=1
 fi
 
+if ! rg -q '^USER [1-9][0-9]*:[1-9][0-9]*$' Dockerfile.agent; then
+  echo 'Dockerfile.agent must run as a numeric non-root user' >&2
+  failed=1
+fi
+
+for setting in 'read_only: true' 'no-new-privileges:true'; do
+  if ! rg -q "$setting" docker-compose.yml; then
+    echo "Compose SRE agent is missing $setting" >&2
+    failed=1
+  fi
+done
+
 if (( failed != 0 )); then
   exit 1
 fi

@@ -1,13 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${RUSH_POSTGRES_COLLECTOR_VERSION:?RUSH_POSTGRES_COLLECTOR_VERSION is required}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is required to download the private collector release}"
 : "${DEST_DIR:?DEST_DIR is required}"
 
-repo="${RUSH_POSTGRES_COLLECTOR_REPO:-RushObservability/postgresql-collector}"
-base="https://github.com/${repo}/releases/download/${RUSH_POSTGRES_COLLECTOR_VERSION}"
-asset="postgres-collector-linux-amd64.tar.gz"
+kind="${RUSH_COLLECTOR_KIND:-postgres}"
+case "${kind}" in
+  postgres)
+    : "${RUSH_POSTGRES_COLLECTOR_VERSION:?RUSH_POSTGRES_COLLECTOR_VERSION is required}"
+    version="${RUSH_POSTGRES_COLLECTOR_VERSION}"
+    repo="${RUSH_POSTGRES_COLLECTOR_REPO:-RushObservability/postgresql-collector}"
+    binary="postgres-collector"
+    label="PostgreSQL"
+    ;;
+  mysql)
+    : "${RUSH_MYSQL_COLLECTOR_VERSION:?RUSH_MYSQL_COLLECTOR_VERSION is required}"
+    version="${RUSH_MYSQL_COLLECTOR_VERSION}"
+    repo="${RUSH_MYSQL_COLLECTOR_REPO:-RushObservability/mysql-collector}"
+    binary="mysql-collector"
+    label="MySQL"
+    ;;
+  *)
+    echo "unsupported collector kind: ${kind}" >&2
+    exit 1
+    ;;
+esac
+base="https://github.com/${repo}/releases/download/${version}"
+asset="${binary}-linux-amd64.tar.gz"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -31,5 +50,5 @@ fi
 
 mkdir -p "${DEST_DIR}"
 tar -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}"
-install -m 0755 "${tmp_dir}/postgres-collector" "${DEST_DIR}/postgres-collector"
-echo "installed PostgreSQL collector ${RUSH_POSTGRES_COLLECTOR_VERSION}"
+install -m 0755 "${tmp_dir}/${binary}" "${DEST_DIR}/${binary}"
+echo "installed ${label} collector ${version}"

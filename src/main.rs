@@ -5,7 +5,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Context;
-use axum::http::{HeaderMap, HeaderValue, Method, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Uri, header};
 use axum::response::IntoResponse;
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{
@@ -13,9 +13,10 @@ use axum::{
     response::Response,
 };
 use clickhouse::Client;
+use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -44,6 +45,12 @@ use rush_api::spool::{IngestBuffer, Spool};
 use rush_api::stats_engine;
 use rush_api::usage_accumulator::UsageAccumulator;
 use rush_api::usage_tracker;
+
+/// Return the request target that is safe to include in logs and traces.
+/// Query strings commonly contain OAuth codes, search text, and other secrets.
+fn request_log_path(uri: &Uri) -> &str {
+    uri.path()
+}
 
 /// Result of resolving request credentials to a tenant.
 ///
@@ -569,9 +576,15 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         && response.status().as_u16() < 400
         && !manages_own_session_cookie
         && let Some(token) = session_token
+        && should_check_session_rotation(&state, &token)
     {
+        let checked_key = state.config_db.session_request_key(&token);
         match state.config_db.rotate_session_if_due(&token).await {
             Ok(Some(rotated)) => {
+                state.session_rotation_checks.insert(
+                    state.config_db.session_request_key(&rotated.issued.token),
+                    Instant::now(),
+                );
                 let cookie = handlers::auth::session_cookie(
                     &rotated.issued.token,
                     rotated.issued.max_age_seconds,
@@ -600,6 +613,7 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
             }
             Ok(None) => {}
             Err(error) => {
+                state.session_rotation_checks.remove(&checked_key);
                 tracing::error!(%error, "session renewal failed");
                 state
                     .audit
@@ -621,6 +635,31 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         }
     }
     response
+}
+
+fn should_check_session_rotation(state: &AppState, token: &str) -> bool {
+    let interval =
+        Duration::from_secs(state.config_db.session_activity_interval_seconds().max(1) as u64);
+    let key = state.config_db.session_request_key(token);
+    if state.session_rotation_checks.len() > 10_000 {
+        state
+            .session_rotation_checks
+            .retain(|_, checked_at| checked_at.elapsed() < interval.saturating_mul(2));
+    }
+    match state.session_rotation_checks.entry(key) {
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            if entry.get().elapsed() < interval {
+                false
+            } else {
+                entry.insert(Instant::now());
+                true
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(Instant::now());
+            true
+        }
+    }
 }
 
 fn explicit_ingest_tenant(path: &str) -> Option<String> {
@@ -657,16 +696,19 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
                     | "/api/v1/sso/providers"
             ));
 
-    let unauthenticated_kubernetes_endpoint = method == axum::http::Method::POST
+    let unauthenticated_kubernetes_endpoint = (method == axum::http::Method::POST
         && matches!(
             path,
             "/api/v1/kubernetes/access-events/ingest"
                 | "/api/v1/kubernetes/session-chunks/ingest"
                 | "/api/v1/kubernetes/gateway/ready"
                 | "/api/v1/kubernetes/gateway/authorize"
+                | "/api/v1/kubernetes/gateway/rbac/reconcile"
                 | "/api/v1/kubernetes/login/start"
                 | "/api/v1/kubernetes/login/token"
-        );
+                | "/api/v1/kubernetes/access-events/client"
+        ))
+        || (method == axum::http::Method::GET && path == "/api/v1/kubernetes/gateway/rbac");
 
     unauthenticated_kubernetes_endpoint
         || matches!(
@@ -816,19 +858,30 @@ fn validate_range_pair(from: &str, to: &str, max_seconds: u64) -> Result<(), Res
         .map_err(time_range_error_response)
 }
 
-fn json_time_range(value: &serde_json::Value) -> Result<Option<(String, String)>, TimeRangeError> {
-    let Some(range) = value.get("time_range") else {
+#[derive(serde::Deserialize)]
+struct RequestTimeRangeEnvelope<'a> {
+    #[serde(borrow)]
+    time_range: Option<RequestTimeRange<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RequestTimeRange<'a> {
+    #[serde(borrow)]
+    from: Option<&'a str>,
+    #[serde(borrow)]
+    to: Option<&'a str>,
+}
+
+fn json_time_range(
+    value: RequestTimeRangeEnvelope<'_>,
+) -> Result<Option<(&str, &str)>, TimeRangeError> {
+    let Some(range) = value.time_range else {
         return Ok(None);
     };
-    let from = range
-        .get("from")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(TimeRangeError::Malformed)?;
-    let to = range
-        .get("to")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(TimeRangeError::Malformed)?;
-    Ok(Some((from.to_string(), to.to_string())))
+    Ok(Some((
+        range.from.ok_or(TimeRangeError::Malformed)?,
+        range.to.ok_or(TimeRangeError::Malformed)?,
+    )))
 }
 
 async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Result<(), Response> {
@@ -874,14 +927,24 @@ async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Res
                 .into_response());
             }
         };
-        *req.body_mut() = axum::body::Body::from(bytes.clone());
-        if !bytes.is_empty()
-            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-        {
-            if let Some((from, to)) = json_time_range(&value).map_err(time_range_error_response)? {
-                validate_range_pair(&from, &to, max_seconds)?;
+        let validation = if bytes.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice::<RequestTimeRangeEnvelope<'_>>(&bytes) {
+                Ok(value) => json_time_range(value).map_err(time_range_error_response)?,
+                // Invalid JSON is still left to the downstream extractor, as
+                // before. A valid document with the wrong time_range shape is
+                // a stable workload-policy error here.
+                Err(error) if error.is_data() => {
+                    return Err(time_range_error_response(TimeRangeError::Malformed));
+                }
+                Err(_) => None,
             }
+        };
+        if let Some((from, to)) = validation {
+            validate_range_pair(from, to, max_seconds)?;
         }
+        *req.body_mut() = axum::body::Body::from(bytes);
     }
     Ok(())
 }
@@ -985,6 +1048,9 @@ fn ingest_signal_for_route(method: &axum::http::Method, path: &str) -> Option<&'
     if *method == axum::http::Method::OPTIONS {
         return None;
     }
+    if is_explain_collector_route(method, path) {
+        return Some("collector");
+    }
     if matches!(
         path,
         "/v1/logs" | "/api/v1/ingest/logs" | "/datadog/v1/input" | "/api/v2/logs"
@@ -1029,6 +1095,38 @@ fn ingest_signal_for_route(method: &axum::http::Method, path: &str) -> Option<&'
         return Some("control");
     }
     None
+}
+
+fn is_explain_collector_route(method: &axum::http::Method, path: &str) -> bool {
+    if *method == axum::http::Method::GET {
+        return matches!(
+            path,
+            "/api/v1/integrations/postgres/explain/poll"
+                | "/api/v1/integrations/mysql/explain/poll"
+        );
+    }
+    if *method != axum::http::Method::POST {
+        return false;
+    }
+
+    [
+        "/api/v1/integrations/postgres/explain/",
+        "/api/v1/integrations/mysql/explain/",
+    ]
+    .iter()
+    .any(|prefix| {
+        path.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix("/result"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    })
+}
+
+fn effective_route_ingest_auth_required(
+    signal: Option<&str>,
+    stored_ingest_auth_required: bool,
+    default_compatibility: bool,
+) -> bool {
+    signal == Some("collector") || (stored_ingest_auth_required && !default_compatibility)
 }
 
 fn ingest_source_for_route(path: &str) -> &'static str {
@@ -1274,6 +1372,8 @@ async fn enforce_tenant_auth_middleware(
     let default_compatibility =
         tenant_id == "default" && rush_api::api_key_auth::allow_anonymous_default();
     let auth_required = stored_auth_required && !default_compatibility;
+    // Collector control routes can expose queued SQL and accept execution
+    // results, so they are never covered by open telemetry-ingest policy.
     let ingest_auth_required = if ingest_signal.is_some() {
         let ingest_policy_started = std::time::Instant::now();
         let ingest_policy_result = state
@@ -1291,7 +1391,9 @@ async fn enforce_tenant_auth_middleware(
             },
         );
         match ingest_policy_result {
-            Ok(Some(required)) => required && !default_compatibility,
+            Ok(Some(required)) => {
+                effective_route_ingest_auth_required(ingest_signal, required, default_compatibility)
+            }
             Ok(None) => {
                 tracing::error!(tenant_id = %tenant_id, "resolved tenant has no ingest policy record");
                 return (
@@ -1660,6 +1762,15 @@ async fn build_object_store_buffer(max_bytes: u64) -> anyhow::Result<IngestBuffe
     Ok(IngestBuffer::ObjectStore(s))
 }
 
+fn clickhouse_boolean_option(name: &str, default: &str) -> anyhow::Result<String> {
+    let value = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok("1".to_string()),
+        "0" | "false" | "no" | "off" => Ok("0".to_string()),
+        _ => anyhow::bail!("{name} must be a boolean (0/1, true/false, yes/no, on/off)"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -1731,6 +1842,9 @@ async fn main() -> anyhow::Result<()> {
         wide_config.clone(),
     );
 
+    let async_insert = clickhouse_boolean_option("RUSH_CLICKHOUSE_ASYNC_INSERT", "1")?;
+    let wait_for_async_insert =
+        clickhouse_boolean_option("RUSH_CLICKHOUSE_WAIT_FOR_ASYNC_INSERT", "0")?;
     let admin_ch = Client::default()
         .with_url(&clickhouse_url)
         .with_database(&clickhouse_db)
@@ -1746,10 +1860,10 @@ async fn main() -> anyhow::Result<()> {
         // flush-time error (e.g. disk full) silently drops those rows and the
         // disk spool never sees them, because the insert "succeeded". We accept
         // that window for ingest throughput; the spool covers the common case
-        // (CH down/unreachable → insert errors → rows spooled). Set this to "1"
-        // if at-least-once mattering more than latency.
-        .with_option("async_insert", "1")
-        .with_option("wait_for_async_insert", "0")
+        // (CH down/unreachable → insert errors → rows spooled). Operators can
+        // select the durability/latency point without rebuilding the service.
+        .with_option("async_insert", &async_insert)
+        .with_option("wait_for_async_insert", &wait_for_async_insert)
         .with_compression(clickhouse::Compression::Lz4);
 
     // Tenant reads use a distinct SELECT-only principal. Startup is fail-closed:
@@ -2491,6 +2605,7 @@ async fn main() -> anyhow::Result<()> {
         login_ip_limit_per_minute,
         trusted_proxy_cidrs,
         ingest_key_limiter,
+        session_rotation_checks: Arc::new(DashMap::new()),
         audit,
         self_metrics,
         query_governor,
@@ -2786,6 +2901,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/internal/repository-access-audit",
             post(handlers::repository_access::audit_repository_access),
         )
+        .route(
+            "/api/v1/internal/kubernetes-access-events",
+            get(handlers::kubernetes_access::list_agent_access_events),
+        )
         // Feature flags (public — no auth)
         .route("/api/v1/features", get(handlers::settings::get_features))
         .route("/api/v1/license", get(handlers::license::get_license))
@@ -2805,6 +2924,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/integrations/postgres/explain/poll", get(handlers::pg_explain::poll))
         .route("/api/v1/integrations/postgres/explain/{id}", get(handlers::pg_explain::get_job))
         .route("/api/v1/integrations/postgres/explain/{id}/result", post(handlers::pg_explain::post_result))
+        .route("/api/v1/integrations/mysql/explain", post(handlers::mysql_explain::submit))
+        .route("/api/v1/integrations/mysql/explain/poll", get(handlers::mysql_explain::poll))
+        .route("/api/v1/integrations/mysql/explain/{id}", get(handlers::mysql_explain::get_job))
+        .route("/api/v1/integrations/mysql/explain/{id}/result", post(handlers::mysql_explain::post_result))
         // Export row cap (admin-only setter; value also exposed via /features)
         .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
         .route(
@@ -2837,6 +2960,32 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/settings/cloudwatch",
             get(handlers::settings::get_cloudwatch_setting).put(handlers::settings::set_cloudwatch_setting),
+        )
+        .route(
+            "/api/v1/settings/kubernetes-logging",
+            get(handlers::kubernetes_access::get_kubernetes_logging_settings)
+                .put(handlers::kubernetes_access::set_kubernetes_logging_settings)
+                .delete(handlers::kubernetes_access::revoke_all_kubernetes_clients),
+        )
+        .route(
+            "/api/v1/settings/kubernetes-logging/clients/{id}",
+            delete(handlers::kubernetes_access::revoke_kubernetes_client),
+        )
+        .route(
+            "/api/v1/settings/kubernetes-logging/roles",
+            post(handlers::kubernetes_access::create_kubernetes_rbac_grant).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_KUBERNETES_RBAC_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/settings/kubernetes-logging/roles/{id}",
+            put(handlers::kubernetes_access::update_kubernetes_rbac_grant)
+                .delete(handlers::kubernetes_access::delete_kubernetes_rbac_grant)
+                .layer(DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_KUBERNETES_RBAC_BODY_BYTES,
+                )),
         )
         // API Keys (settings)
         .route(
@@ -3043,10 +3192,22 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         .route(
+            "/api/v1/kubernetes/gateway/rbac",
+            get(handlers::kubernetes_access::list_gateway_kubernetes_rbac_grants),
+        )
+        .route(
+            "/api/v1/kubernetes/gateway/rbac/reconcile",
+            post(handlers::kubernetes_access::record_gateway_kubernetes_rbac_reconcile).layer(
+                DefaultBodyLimit::max(
+                    handlers::kubernetes_access::MAX_GATEWAY_AUTHORIZE_BODY_BYTES,
+                ),
+            ),
+        )
+        .route(
             "/api/v1/kubernetes/access-events/client",
             post(handlers::kubernetes_access::ingest_client_event).layer(
                 DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_ACCESS_EVENT_BODY_BYTES,
+                    handlers::kubernetes_access::MAX_CLIENT_ENRICHMENT_BODY_BYTES,
                 ),
             ),
         )
@@ -3190,7 +3351,7 @@ async fn main() -> anyhow::Result<()> {
         .fallback(|req: axum::http::Request<axum::body::Body>| async move {
             tracing::warn!(
                 method = %req.method(),
-                uri = %req.uri(),
+                path = request_log_path(req.uri()),
                 content_type = req.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none"),
                 "unmatched request"
             );
@@ -3217,7 +3378,16 @@ async fn main() -> anyhow::Result<()> {
         // API RED self-metrics (rush_http_*). Applied as a router layer so the
         // MatchedPath (templated route) is populated by routing before it runs.
         .layer(axum::middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::info_span!(
+                    "http.request",
+                    method = %request.method(),
+                    path = request_log_path(request.uri()),
+                    version = ?request.version(),
+                )
+            },
+        ))
         // Override axum's fixed 2 MiB default with the startup-validated compressed
         // ingest ceiling. Handlers still check the actual body and record the
         // protocol/reason-specific rejection metric before decoding.
@@ -3374,8 +3544,9 @@ async fn graceful_shutdown_drain(
 mod tenant_auth_tests {
     use super::{
         CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
-        credential_route_denial, explicit_ingest_tenant, ingest_signal_for_route,
-        is_state_changing_method, query_workload_for_request, request_origin_allowed_with_policy,
+        credential_route_denial, effective_route_ingest_auth_required, explicit_ingest_tenant,
+        ingest_signal_for_route, is_explain_collector_route, is_state_changing_method,
+        query_workload_for_request, request_log_path, request_origin_allowed_with_policy,
         requires_csrf_origin, should_reject_for_tenant_auth, should_reject_interactive_llm,
         trust_forwarded_origin_headers, validate_request_time_range,
     };
@@ -3413,6 +3584,73 @@ mod tenant_auth_tests {
         ("/datadog/intake/", "control"),
         ("/datadog/intake", "control"),
     ];
+
+    #[test]
+    fn request_logs_exclude_query_parameters() {
+        let uri: axum::http::Uri = "/auth/sso/callback?code=secret&state=private"
+            .parse()
+            .unwrap();
+        assert_eq!(request_log_path(&uri), "/auth/sso/callback");
+        assert!(!request_log_path(&uri).contains("secret"));
+    }
+
+    #[test]
+    fn explain_collector_routes_are_exact_and_method_scoped() {
+        for (method, path) in [
+            (Method::GET, "/api/v1/integrations/postgres/explain/poll"),
+            (Method::GET, "/api/v1/integrations/mysql/explain/poll"),
+            (
+                Method::POST,
+                "/api/v1/integrations/postgres/explain/job-123/result",
+            ),
+            (
+                Method::POST,
+                "/api/v1/integrations/mysql/explain/job-123/result",
+            ),
+        ] {
+            assert!(is_explain_collector_route(&method, path), "{method} {path}");
+            assert_eq!(ingest_signal_for_route(&method, path), Some("collector"));
+        }
+
+        for (method, path) in [
+            (Method::POST, "/api/v1/integrations/postgres/explain"),
+            (Method::GET, "/api/v1/integrations/postgres/explain/job-123"),
+            (Method::POST, "/api/v1/integrations/postgres/explain/poll"),
+            (
+                Method::GET,
+                "/api/v1/integrations/postgres/explain/job-123/result",
+            ),
+            (
+                Method::POST,
+                "/api/v1/integrations/postgres/explain/a/b/result",
+            ),
+        ] {
+            assert!(
+                !is_explain_collector_route(&method, path),
+                "{method} {path}"
+            );
+            assert_eq!(ingest_signal_for_route(&method, path), None);
+        }
+    }
+
+    #[test]
+    fn collector_control_routes_ignore_open_ingest_compatibility() {
+        assert!(effective_route_ingest_auth_required(
+            Some("collector"),
+            false,
+            true,
+        ));
+        assert!(!effective_route_ingest_auth_required(
+            Some("metrics"),
+            false,
+            true,
+        ));
+        assert!(effective_route_ingest_auth_required(
+            Some("metrics"),
+            true,
+            false,
+        ));
+    }
 
     #[test]
     fn workload_policy_classifies_queries_and_preserves_explicit_bypasses() {
@@ -3506,6 +3744,30 @@ mod tenant_auth_tests {
                 .unwrap_err()
                 .status(),
             axum::http::StatusCode::BAD_REQUEST
+        );
+
+        let mut wrong_shape = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query")
+            .body(Body::from(r#"{"time_range":"last hour"}"#))
+            .unwrap();
+        assert_eq!(
+            validate_request_time_range(&mut wrong_shape, 60)
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+
+        let mut invalid_json = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query")
+            .body(Body::from("{"))
+            .unwrap();
+        assert!(
+            validate_request_time_range(&mut invalid_json, 60)
+                .await
+                .is_ok()
         );
     }
 
@@ -4019,6 +4281,14 @@ mod tenant_auth_tests {
             "/api/v1/kubernetes/gateway/authorize",
         ));
         assert!(allows_unauthenticated_tenant_request(
+            &Method::GET,
+            "/api/v1/kubernetes/gateway/rbac",
+        ));
+        assert!(allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/kubernetes/gateway/rbac/reconcile",
+        ));
+        assert!(allows_unauthenticated_tenant_request(
             &Method::POST,
             "/api/v1/kubernetes/login/start",
         ));
@@ -4030,7 +4300,7 @@ mod tenant_auth_tests {
             &Method::POST,
             "/api/v1/kubernetes/login/approve",
         ));
-        assert!(!allows_unauthenticated_tenant_request(
+        assert!(allows_unauthenticated_tenant_request(
             &Method::POST,
             "/api/v1/kubernetes/access-events/client",
         ));
@@ -4050,12 +4320,18 @@ mod tenant_auth_tests {
     fn kubernetes_recording_routes_are_registered_with_body_limits() {
         let source = include_str!("main.rs");
         for route in [
+            "/api/v1/settings/kubernetes-logging",
+            "/api/v1/settings/kubernetes-logging/clients/{id}",
+            "/api/v1/settings/kubernetes-logging/roles",
+            "/api/v1/settings/kubernetes-logging/roles/{id}",
             "/api/v1/kubernetes/login/start",
             "/api/v1/kubernetes/login/approve",
             "/api/v1/kubernetes/login/details",
             "/api/v1/kubernetes/login/token",
             "/api/v1/kubernetes/gateway/authorize",
             "/api/v1/kubernetes/gateway/ready",
+            "/api/v1/kubernetes/gateway/rbac",
+            "/api/v1/kubernetes/gateway/rbac/reconcile",
             "/api/v1/kubernetes/access-events/ingest",
             "/api/v1/kubernetes/access-events/client",
             "/api/v1/kubernetes/session-chunks/ingest",
@@ -4067,7 +4343,31 @@ mod tenant_auth_tests {
             assert!(source.contains(route), "missing route {route}");
         }
         assert!(source.contains("MAX_ACCESS_EVENT_BODY_BYTES"));
+        assert!(source.contains("MAX_CLIENT_ENRICHMENT_BODY_BYTES"));
         assert!(source.contains("MAX_SESSION_CHUNK_BODY_BYTES"));
         assert!(source.contains("MAX_GATEWAY_AUTHORIZE_BODY_BYTES"));
+    }
+
+    #[test]
+    fn kubernetes_logging_settings_keep_the_authenticated_tenant_boundary() {
+        for (method, path) in [
+            (&Method::GET, "/api/v1/settings/kubernetes-logging"),
+            (&Method::PUT, "/api/v1/settings/kubernetes-logging"),
+            (
+                &Method::DELETE,
+                "/api/v1/settings/kubernetes-logging/clients/kcs_0123456789abcdef01234567",
+            ),
+            (&Method::POST, "/api/v1/settings/kubernetes-logging/roles"),
+            (
+                &Method::PUT,
+                "/api/v1/settings/kubernetes-logging/roles/grant-1",
+            ),
+            (
+                &Method::DELETE,
+                "/api/v1/settings/kubernetes-logging/roles/grant-1",
+            ),
+        ] {
+            assert!(!allows_unauthenticated_tenant_request(method, path));
+        }
     }
 }

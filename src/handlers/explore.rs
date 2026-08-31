@@ -1,10 +1,16 @@
-use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Extension, Json,
+    body::Body,
+    extract::State,
+    http::{StatusCode, header},
+    response::Response,
+};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 use crate::models::log::LogListRecord;
 use crate::models::query::{CountBucket, Filter, TimeRange};
-use crate::models::trace::WideEvent;
+use crate::models::trace::SlimEvent;
 use crate::query_builder::{build_where_clause_with_search, clamp_bucket_interval, resolve_field};
 use crate::{AppState, TenantContext};
 
@@ -14,6 +20,7 @@ const MAX_ROWS: u64 = 1_000;
 const MAX_SUMMARY_ROWS_PER_KIND: u64 = 200;
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(3);
 const COORDINATED_QUERY_COUNT: u64 = 2;
+const DEFERRED_QUERY_COUNT: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +59,13 @@ pub struct ExploreSearchRequest {
     pub interval: String,
     #[serde(default)]
     pub group_by: Option<String>,
+    /// Existing clients keep the coordinated two-query response. The UI can
+    /// request rows and summaries separately so rows paint as soon as their
+    /// ClickHouse query finishes.
+    #[serde(default = "default_true")]
+    pub include_rows: bool,
+    #[serde(default = "default_true")]
+    pub include_summary: bool,
 }
 
 fn default_limit() -> u64 {
@@ -60,6 +74,10 @@ fn default_limit() -> u64 {
 
 fn default_interval() -> String {
     "1m".to_string()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -151,7 +169,7 @@ pub async fn search(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<ExploreSearchRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     validate_request(&req)?;
     let _query_guard = state
         .self_metrics
@@ -163,23 +181,11 @@ pub async fn search(
     match req.signal {
         ExploreSignal::Spans => {
             let response = execute_spans(&state, &tenant_id, &req, plan, started).await?;
-            Ok(Json(serde_json::to_value(response).map_err(|error| {
-                tracing::error!(%error, "explore response serialization failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            })?))
+            encode_response(&state, "spans", response)
         }
         ExploreSignal::Logs => {
             let response = execute_logs(&state, &tenant_id, &req, plan, started).await?;
-            Ok(Json(serde_json::to_value(response).map_err(|error| {
-                tracing::error!(%error, "explore response serialization failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            })?))
+            encode_response(&state, "logs", response)
         }
     }
 }
@@ -190,23 +196,53 @@ async fn execute_spans(
     req: &ExploreSearchRequest,
     plan: ExplorePlan,
     started: Instant,
-) -> Result<ExploreSearchResponse<WideEvent>, (StatusCode, String)> {
+) -> Result<ExploreSearchResponse<SlimEvent>, (StatusCode, String)> {
     let query_prefix = uuid::Uuid::new_v4();
-    let rows_started = Instant::now();
-    let rows_query = crate::tenant_query(&state.ch, &plan.rows_sql, tenant_id)
-        .with_option("query_id", format!("rush-explore-{query_prefix}-rows"))
-        .with_option("cancel_http_readonly_queries_on_client_close", "1")
-        .fetch_all::<WideEvent>();
-    let summary_query = tokio::time::timeout(
-        SUMMARY_TIMEOUT,
-        crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
-            .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
-            .with_option("cancel_http_readonly_queries_on_client_close", "1")
-            .fetch_all::<SummaryRow>(),
-    );
+    if !req.include_rows {
+        let summary_result = tokio::time::timeout(
+            SUMMARY_TIMEOUT,
+            crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
+                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .fetch_all::<SummaryRow>(),
+        )
+        .await;
+        return finish_response(
+            state,
+            tenant_id,
+            req,
+            plan.interval_secs,
+            Vec::<SlimEvent>::new(),
+            None,
+            Some(summary_result),
+            0,
+            started,
+            DEFERRED_QUERY_COUNT,
+        );
+    }
 
-    let (rows_result, summary_result) = tokio::join!(rows_query, summary_query);
-    let rows_ready_ms = rows_started.elapsed().as_millis() as u64;
+    let rows_started = Instant::now();
+    let rows_query = async {
+        let result = crate::tenant_query(&state.ch, &plan.rows_sql, tenant_id)
+            .with_option("query_id", format!("rush-explore-{query_prefix}-rows"))
+            .with_option("cancel_http_readonly_queries_on_client_close", "1")
+            .fetch_all::<SlimEvent>()
+            .await;
+        (result, rows_started.elapsed().as_millis() as u64)
+    };
+    let ((rows_result, rows_ready_ms), summary_result, query_count) = if req.include_summary {
+        let summary_query = tokio::time::timeout(
+            SUMMARY_TIMEOUT,
+            crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
+                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .fetch_all::<SummaryRow>(),
+        );
+        let (rows_result, summary_result) = tokio::join!(rows_query, summary_query);
+        (rows_result, Some(summary_result), COORDINATED_QUERY_COUNT)
+    } else {
+        (rows_query.await, None, DEFERRED_QUERY_COUNT)
+    };
     let rows = rows_result.map_err(|error| {
         state
             .self_metrics
@@ -256,6 +292,7 @@ async fn execute_spans(
         summary_result,
         rows_ready_ms,
         started,
+        query_count,
     )
 }
 
@@ -267,21 +304,51 @@ async fn execute_logs(
     started: Instant,
 ) -> Result<ExploreSearchResponse<LogListRecord>, (StatusCode, String)> {
     let query_prefix = uuid::Uuid::new_v4();
-    let rows_started = Instant::now();
-    let rows_query = crate::tenant_query(&state.ch, &plan.rows_sql, tenant_id)
-        .with_option("query_id", format!("rush-explore-{query_prefix}-rows"))
-        .with_option("cancel_http_readonly_queries_on_client_close", "1")
-        .fetch_all::<LogListRecord>();
-    let summary_query = tokio::time::timeout(
-        SUMMARY_TIMEOUT,
-        crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
-            .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
-            .with_option("cancel_http_readonly_queries_on_client_close", "1")
-            .fetch_all::<SummaryRow>(),
-    );
+    if !req.include_rows {
+        let summary_result = tokio::time::timeout(
+            SUMMARY_TIMEOUT,
+            crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
+                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .fetch_all::<SummaryRow>(),
+        )
+        .await;
+        return finish_response(
+            state,
+            tenant_id,
+            req,
+            plan.interval_secs,
+            Vec::<LogListRecord>::new(),
+            None,
+            Some(summary_result),
+            0,
+            started,
+            DEFERRED_QUERY_COUNT,
+        );
+    }
 
-    let (rows_result, summary_result) = tokio::join!(rows_query, summary_query);
-    let rows_ready_ms = rows_started.elapsed().as_millis() as u64;
+    let rows_started = Instant::now();
+    let rows_query = async {
+        let result = crate::tenant_query(&state.ch, &plan.rows_sql, tenant_id)
+            .with_option("query_id", format!("rush-explore-{query_prefix}-rows"))
+            .with_option("cancel_http_readonly_queries_on_client_close", "1")
+            .fetch_all::<LogListRecord>()
+            .await;
+        (result, rows_started.elapsed().as_millis() as u64)
+    };
+    let ((rows_result, rows_ready_ms), summary_result, query_count) = if req.include_summary {
+        let summary_query = tokio::time::timeout(
+            SUMMARY_TIMEOUT,
+            crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
+                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .fetch_all::<SummaryRow>(),
+        );
+        let (rows_result, summary_result) = tokio::join!(rows_query, summary_query);
+        (rows_result, Some(summary_result), COORDINATED_QUERY_COUNT)
+    } else {
+        (rows_query.await, None, DEFERRED_QUERY_COUNT)
+    };
     let rows = rows_result.map_err(|error| {
         state
             .self_metrics
@@ -332,6 +399,7 @@ async fn execute_logs(
         summary_result,
         rows_ready_ms,
         started,
+        query_count,
     )
 }
 
@@ -342,25 +410,25 @@ fn finish_response<T: Serialize>(
     interval_secs: u64,
     rows: Vec<T>,
     next_cursor: Option<String>,
-    summary_result: Result<
-        Result<Vec<SummaryRow>, clickhouse::error::Error>,
-        tokio::time::error::Elapsed,
+    summary_result: Option<
+        Result<Result<Vec<SummaryRow>, clickhouse::error::Error>, tokio::time::error::Elapsed>,
     >,
     rows_ready_ms: u64,
     started: Instant,
+    query_count: u64,
 ) -> Result<ExploreSearchResponse<T>, (StatusCode, String)> {
     let row_count = rows.len() as u64;
     let mut errors = ExploreErrors::default();
     let (summary, count, matched_bytes, summary_ok) = match summary_result {
-        Ok(Ok(summary_rows)) => {
+        Some(Ok(Ok(summary_rows))) => {
             let folded = fold_summary(summary_rows, interval_secs);
             let count = ExploreCount {
                 value: folded.total,
                 kind: CountKind::Exact,
             };
-            (folded.summary, count, folded.matched_bytes, true)
+            (folded.summary, count, folded.matched_bytes, Some(true))
         }
-        Ok(Err(error)) => {
+        Some(Ok(Err(error))) => {
             tracing::warn!(%error, signal = req.signal.label(), "Explore summary failed; returning rows");
             mark_summary_unavailable(&mut errors);
             (
@@ -370,10 +438,10 @@ fn finish_response<T: Serialize>(
                 },
                 fallback_count(row_count, req.limit.min(MAX_ROWS)),
                 0,
-                false,
+                Some(false),
             )
         }
-        Err(_) => {
+        Some(Err(_)) => {
             tracing::warn!(
                 signal = req.signal.label(),
                 "Explore summary timed out; returning rows"
@@ -386,22 +454,33 @@ fn finish_response<T: Serialize>(
                 },
                 fallback_count(row_count, req.limit.min(MAX_ROWS)),
                 0,
-                false,
+                Some(false),
             )
         }
+        None => (
+            ExploreSummary {
+                interval_secs,
+                ..ExploreSummary::default()
+            },
+            fallback_count(row_count, req.limit.min(MAX_ROWS)),
+            0,
+            None,
+        ),
     };
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    state.self_metrics.record_explore_stage(
-        req.signal.label(),
-        "summary",
-        count.value,
-        elapsed_ms,
-        summary_ok,
-    );
+    if let Some(summary_ok) = summary_ok {
+        state.self_metrics.record_explore_stage(
+            req.signal.label(),
+            "summary",
+            count.value,
+            elapsed_ms,
+            summary_ok,
+        );
+    }
     state.self_metrics.record_explore_coordinator(
         req.signal.label(),
-        COORDINATED_QUERY_COUNT,
+        query_count,
         count.value,
         matched_bytes,
         rows_ready_ms,
@@ -415,7 +494,10 @@ fn finish_response<T: Serialize>(
         true,
     );
 
-    if count.value > 0 {
+    // Deferred clients issue one row request and one summary request. Attribute
+    // usage from the authoritative summary only so one user search is not
+    // counted twice.
+    if count.value > 0 && req.include_summary {
         let filter_pairs: Vec<(String, String)> = req
             .filters
             .iter()
@@ -438,7 +520,7 @@ fn finish_response<T: Serialize>(
     }
 
     let matched_rows = count.value;
-    let mut response = ExploreSearchResponse {
+    Ok(ExploreSearchResponse {
         signal: req.signal,
         rows,
         next_cursor,
@@ -446,20 +528,70 @@ fn finish_response<T: Serialize>(
         summary,
         errors,
         query_stats: ExploreQueryStats {
-            clickhouse_queries: COORDINATED_QUERY_COUNT,
+            clickhouse_queries: query_count,
             matched_rows,
             matched_logical_bytes: matched_bytes,
             time_to_first_results_ms: rows_ready_ms,
             response_bytes: 0,
         },
-    };
-    response.query_stats.response_bytes = serde_json::to_vec(&response)
-        .map(|body| body.len() as u64)
-        .unwrap_or(0);
+    })
+}
+
+fn encode_response<T: Serialize>(
+    state: &AppState,
+    signal: &'static str,
+    response: ExploreSearchResponse<T>,
+) -> Result<Response, (StatusCode, String)> {
+    let mut body = serde_json::to_vec(&response).map_err(|error| {
+        tracing::error!(%error, "explore response serialization failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    })?;
+    let response_bytes = patch_response_byte_count(&mut body).ok_or_else(|| {
+        tracing::error!("explore response byte-count field was not serialized");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    })?;
     state
         .self_metrics
-        .record_explore_response_bytes(req.signal.label(), response.query_stats.response_bytes);
-    Ok(response)
+        .record_explore_response_bytes(signal, response_bytes);
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .map_err(|error| {
+            tracing::error!(%error, "explore response construction failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        })
+}
+
+fn patch_response_byte_count(body: &mut Vec<u8>) -> Option<u64> {
+    const PREFIX: &[u8] = b"\"response_bytes\":";
+    let value_start = body
+        .windows(PREFIX.len())
+        .rposition(|window| window == PREFIX)?
+        + PREFIX.len();
+    if body.get(value_start) != Some(&b'0') {
+        return None;
+    }
+
+    let base_len = body.len();
+    let mut final_len = base_len as u64;
+    loop {
+        let adjusted = (base_len - 1 + final_len.to_string().len()) as u64;
+        if adjusted == final_len {
+            break;
+        }
+        final_len = adjusted;
+    }
+    body.splice(value_start..value_start + 1, final_len.to_string().bytes());
+    (body.len() as u64 == final_len).then_some(final_len)
 }
 
 fn mark_summary_unavailable(errors: &mut ExploreErrors) {
@@ -532,6 +664,12 @@ fn fold_summary(rows: Vec<SummaryRow>, interval_secs: u64) -> FoldedSummary {
 }
 
 fn validate_request(req: &ExploreSearchRequest) -> Result<(), (StatusCode, String)> {
+    if !req.include_rows && !req.include_summary {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "include_rows and include_summary cannot both be false".to_string(),
+        ));
+    }
     if req
         .search
         .as_ref()
@@ -589,7 +727,7 @@ fn build_span_plan(
     .with_prewhere_prefix(&format!("tenant_id = '{tenant}'"));
     let predicate = clauses.to_sql();
     let rows_sql = format!(
-        "SELECT * FROM spans {predicate} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}"
+        "SELECT timestamp, service_name, span_name, http_method, http_path, http_status_code, duration_ns, status, trace_id, span_id FROM spans {predicate} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}"
     );
     let group_expr = req
         .group_by
@@ -780,6 +918,8 @@ mod tests {
             limit: 100,
             interval: "1m".to_string(),
             group_by: None,
+            include_rows: true,
+            include_summary: true,
         }
     }
 
@@ -793,6 +933,9 @@ mod tests {
             assert!(sql.contains("%post%"));
         }
         assert!(plan.summary_sql.contains("GROUP BY GROUPING SETS"));
+        assert!(!plan.rows_sql.contains("SELECT *"));
+        assert!(plan.rows_sql.contains("timestamp, service_name, span_name"));
+        assert!(!plan.rows_sql.contains("event_attributes"));
         // Keep the GROUPING() expression under a distinct alias. ClickHouse
         // 26.6 otherwise expands `AS bucket` back into GROUP BY and rejects the
         // query with ILLEGAL_AGGREGATION even though sqlparser accepts it.
@@ -825,6 +968,33 @@ mod tests {
     fn summary_failure_count_is_explicitly_capped_at_the_page_boundary() {
         assert!(matches!(fallback_count(99, 100).kind, CountKind::Exact));
         assert!(matches!(fallback_count(100, 100).kind, CountKind::Capped));
+    }
+
+    #[test]
+    fn deferred_execution_requires_at_least_one_query() {
+        let mut req = request(ExploreSignal::Logs);
+        req.include_rows = false;
+        req.include_summary = false;
+        assert_eq!(
+            validate_request(&req).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        req.include_rows = true;
+        assert!(validate_request(&req).is_ok());
+        req.include_rows = false;
+        req.include_summary = true;
+        assert!(validate_request(&req).is_ok());
+        assert_eq!(DEFERRED_QUERY_COUNT, 1);
+    }
+
+    #[test]
+    fn response_byte_count_is_patched_without_reserializing() {
+        let mut body = br#"{"rows":[1,2,3],"query_stats":{"response_bytes":0}}"#.to_vec();
+        let expected = patch_response_byte_count(&mut body).unwrap();
+        assert_eq!(body.len() as u64, expected);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["query_stats"]["response_bytes"], expected);
     }
 
     #[test]

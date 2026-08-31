@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -270,6 +271,7 @@ impl AdmissionState {
 pub struct QueryGovernor {
     state: RwLock<Arc<AdmissionState>>,
     metrics: Arc<SelfMetrics>,
+    admission_count: AtomicU64,
 }
 
 static GLOBAL_QUERY_GOVERNOR: OnceLock<Arc<QueryGovernor>> = OnceLock::new();
@@ -306,6 +308,7 @@ impl QueryGovernor {
         Ok(Self {
             state: RwLock::new(Arc::new(AdmissionState::new(config))),
             metrics,
+            admission_count: AtomicU64::new(0),
         })
     }
 
@@ -341,6 +344,14 @@ impl QueryGovernor {
             .get(&class)
             .expect("all workload classes configured")
             .clone();
+        // Tenant IDs are dynamic. Periodically discard semaphores that are
+        // held only by the map; active and queued requests own another Arc and
+        // therefore cannot be evicted underneath an admission.
+        if self.admission_count.fetch_add(1, Ordering::Relaxed) % 1_024 == 1_023 {
+            admission
+                .tenants
+                .retain(|_, semaphore| Arc::strong_count(semaphore) > 1);
+        }
         let tenant = admission
             .tenants
             .entry(tenant_id.to_string())
@@ -672,6 +683,27 @@ mod tests {
             Some(AdmissionError::GlobalBusy {
                 retry_after_secs: 1
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_tenant_admission_entries_are_periodically_reclaimed() {
+        let governor =
+            QueryGovernor::new(QueryGovernorConfig::default(), Arc::new(SelfMetrics::new()))
+                .unwrap();
+        for index in 0..1_024 {
+            let guard = governor
+                .admit(WorkloadClass::Interactive, &format!("tenant-{index}"))
+                .await
+                .unwrap();
+            drop(guard);
+        }
+        let state = governor.state.read().unwrap();
+        let tenants = &state.classes[&WorkloadClass::Interactive].tenants;
+        assert!(
+            tenants.len() < 10,
+            "idle tenant map grew to {}",
+            tenants.len()
         );
     }
 

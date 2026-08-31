@@ -1,9 +1,9 @@
 //! API-managed integration metadata, target secrets, and collector lifecycle.
 //!
 //! Integrations are compiled into a distribution, then enabled at runtime only
-//! when the customer license contains the matching entitlement. The first
-//! managed collector is PostgreSQL; the manager intentionally uses a process
-//! boundary so a collector cannot take down the query API.
+//! when the customer license contains the matching entitlement. PostgreSQL and
+//! MySQL collectors run behind a process boundary so a collector cannot take
+//! down the query API.
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -21,6 +21,18 @@ use crate::clickhouse_config::ConfigDb;
 
 pub const POSTGRES_INTEGRATION: &str = "postgresql";
 pub const POSTGRES_ENTITLEMENT: &str = "postgres";
+pub const MYSQL_INTEGRATION: &str = "mysql";
+pub const MYSQL_ENTITLEMENT: &str = "mysql";
+
+const INTEGRATION_CIPHERTEXT_PREFIX: &str = "v2:";
+const INTEGRATION_LEGACY_KEY_ID: &str = "legacy";
+const INTEGRATION_LEGACY_AAD: &[u8] = b"rush-integration-secret-v1";
+
+#[derive(Debug)]
+struct IntegrationEncryptionKeys {
+    current_key_id: String,
+    keys: HashMap<String, [u8; 32]>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntegrationDescriptor {
@@ -31,12 +43,56 @@ pub struct IntegrationDescriptor {
 }
 
 pub fn descriptors() -> Vec<IntegrationDescriptor> {
-    vec![IntegrationDescriptor {
-        id: POSTGRES_INTEGRATION,
-        name: "PostgreSQL",
-        entitlement: POSTGRES_ENTITLEMENT,
-        compiled: cfg!(feature = "postgres-collector"),
-    }]
+    vec![
+        IntegrationDescriptor {
+            id: POSTGRES_INTEGRATION,
+            name: "PostgreSQL",
+            entitlement: POSTGRES_ENTITLEMENT,
+            compiled: cfg!(feature = "postgres-collector"),
+        },
+        IntegrationDescriptor {
+            id: MYSQL_INTEGRATION,
+            name: "MySQL",
+            entitlement: MYSQL_ENTITLEMENT,
+            compiled: cfg!(feature = "mysql-collector"),
+        },
+    ]
+}
+
+struct CollectorRuntime {
+    integration: &'static str,
+    entitlement: &'static str,
+    name: &'static str,
+    compiled: bool,
+    bootstrap_env: &'static str,
+    binary_env: &'static str,
+    binary_default: &'static str,
+    config_env: &'static str,
+}
+
+fn runtimes() -> [CollectorRuntime; 2] {
+    [
+        CollectorRuntime {
+            integration: POSTGRES_INTEGRATION,
+            entitlement: POSTGRES_ENTITLEMENT,
+            name: "PostgreSQL",
+            compiled: cfg!(feature = "postgres-collector"),
+            bootstrap_env: "RUSH_POSTGRES_COLLECTOR_CONFIG",
+            binary_env: "RUSH_POSTGRES_COLLECTOR_BIN",
+            binary_default: "../postgres-collector/target/debug/postgres-collector",
+            config_env: "PG_COLLECTOR_CONFIG",
+        },
+        CollectorRuntime {
+            integration: MYSQL_INTEGRATION,
+            entitlement: MYSQL_ENTITLEMENT,
+            name: "MySQL",
+            compiled: cfg!(feature = "mysql-collector"),
+            bootstrap_env: "RUSH_MYSQL_COLLECTOR_CONFIG",
+            binary_env: "RUSH_MYSQL_COLLECTOR_BIN",
+            binary_default: "../mysql-collector/target/debug/mysql-collector",
+            config_env: "MYSQL_COLLECTOR_CONFIG",
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,19 +144,26 @@ pub fn target_response(target: IntegrationTargetSecret) -> IntegrationTargetResp
 
 /// Encrypt integration credentials before they enter ClickHouse.
 ///
-/// `RUSH_INTEGRATION_ENCRYPTION_KEY` is preferred. `RUSH_API_KEY_SECRET` is a
-/// backwards-compatible local-dev fallback. Production deployments should set
-/// the dedicated key and rotate it through their secret manager.
+/// Ciphertexts carry the non-secret key ID so prior keys can remain available
+/// during a planned rotation without trying every configured secret.
 pub fn encrypt_secret(plaintext: &str) -> Result<String> {
-    let key = encryption_key()?;
+    encrypt_secret_with_keys(plaintext, &load_encryption_keys()?)
+}
+
+fn encrypt_secret_with_keys(plaintext: &str, keys: &IntegrationEncryptionKeys) -> Result<String> {
+    let key = keys
+        .keys
+        .get(&keys.current_key_id)
+        .ok_or_else(|| anyhow!("current integration encryption key is unavailable"))?;
+    let aad = integration_aad(&keys.current_key_id);
     let mut iv = [0u8; 12];
     rand_bytes(&mut iv).context("generate integration secret nonce")?;
     let mut tag = [0u8; 16];
     let ciphertext = encrypt_aead(
         Cipher::aes_256_gcm(),
-        &key,
+        key,
         Some(&iv),
-        b"rush-integration-secret-v1",
+        &aad,
         plaintext.as_bytes(),
         &mut tag,
     )
@@ -110,22 +173,54 @@ pub fn encrypt_secret(plaintext: &str) -> Result<String> {
     packed.extend_from_slice(&iv);
     packed.extend_from_slice(&tag);
     packed.extend_from_slice(&ciphertext);
-    Ok(base64::engine::general_purpose::STANDARD.encode(packed))
+    Ok(format!(
+        "{INTEGRATION_CIPHERTEXT_PREFIX}{}:{}",
+        keys.current_key_id,
+        base64::engine::general_purpose::STANDARD.encode(packed)
+    ))
 }
 
 pub fn decrypt_secret(encoded: &str) -> Result<String> {
-    let key = encryption_key()?;
+    decrypt_secret_with_keys(encoded, &load_encryption_keys()?)
+}
+
+fn decrypt_secret_with_keys(encoded: &str, keys: &IntegrationEncryptionKeys) -> Result<String> {
+    let (payload, key, aad) =
+        if let Some(envelope) = encoded.strip_prefix(INTEGRATION_CIPHERTEXT_PREFIX) {
+            let (key_id, payload) = envelope
+                .split_once(':')
+                .ok_or_else(|| anyhow!("integration secret envelope is malformed"))?;
+            if !valid_integration_key_id(key_id) {
+                bail!("integration secret envelope has an invalid key id");
+            }
+            let key = keys
+                .keys
+                .get(key_id)
+                .ok_or_else(|| anyhow!("integration encryption key '{key_id}' is unavailable"))?;
+            (payload, key, integration_aad(key_id))
+        } else {
+            // Rows written before key IDs were introduced used the v1 AAD and no
+            // envelope. During the first rotation, retain that secret under the
+            // reserved `legacy` ID. Before rotation, the current key also works.
+            let key = keys
+                .keys
+                .get(INTEGRATION_LEGACY_KEY_ID)
+                .or_else(|| keys.keys.get(&keys.current_key_id))
+                .ok_or_else(|| anyhow!("legacy integration encryption key is unavailable"))?;
+            (encoded, key, INTEGRATION_LEGACY_AAD.to_vec())
+        };
+
     let packed = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
+        .decode(payload)
         .context("decode integration secret")?;
     if packed.len() < 28 {
         bail!("integration secret is truncated");
     }
     let plaintext = decrypt_aead(
         Cipher::aes_256_gcm(),
-        &key,
+        key,
         Some(&packed[..12]),
-        b"rush-integration-secret-v1",
+        &aad,
         &packed[28..],
         &packed[12..28],
     )
@@ -133,14 +228,72 @@ pub fn decrypt_secret(encoded: &str) -> Result<String> {
     String::from_utf8(plaintext).context("integration secret is not valid UTF-8")
 }
 
-fn encryption_key() -> Result<[u8; 32]> {
-    let raw = std::env::var("RUSH_INTEGRATION_ENCRYPTION_KEY")
-        .or_else(|_| std::env::var("RUSH_API_KEY_SECRET"))
-        .map_err(|_| anyhow!("RUSH_INTEGRATION_ENCRYPTION_KEY is required"))?;
-    if raw.trim().len() < 16 {
-        bail!("RUSH_INTEGRATION_ENCRYPTION_KEY must be at least 16 characters");
+fn integration_aad(key_id: &str) -> Vec<u8> {
+    format!("rush-integration-secret-v2:{key_id}").into_bytes()
+}
+
+fn valid_integration_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn derive_integration_key(variable: &str, secret: &str) -> Result<[u8; 32]> {
+    if secret.len() < 32 {
+        bail!("{variable} must be at least 32 bytes");
     }
-    Ok(sha256(raw.as_bytes()))
+    Ok(sha256(secret.as_bytes()))
+}
+
+fn build_encryption_keys(
+    current_key_id: &str,
+    current_secret: &str,
+    previous_keys_json: Option<&str>,
+) -> Result<IntegrationEncryptionKeys> {
+    if !valid_integration_key_id(current_key_id) || current_key_id == INTEGRATION_LEGACY_KEY_ID {
+        bail!(
+            "RUSH_INTEGRATION_ENCRYPTION_KEY_ID must be 1-64 ASCII letters, digits, '.', '_' or '-' and may not be 'legacy'"
+        );
+    }
+
+    let mut keys = HashMap::new();
+    if let Some(raw) = previous_keys_json.filter(|value| !value.trim().is_empty()) {
+        let previous: HashMap<String, String> = serde_json::from_str(raw).context(
+            "RUSH_INTEGRATION_ENCRYPTION_PREVIOUS_KEYS must be a JSON object of key-id to secret",
+        )?;
+        for (key_id, secret) in previous {
+            if !valid_integration_key_id(&key_id) {
+                bail!("invalid previous integration encryption key id '{key_id}'");
+            }
+            let key = derive_integration_key(
+                &format!("previous integration encryption key '{key_id}'"),
+                &secret,
+            )?;
+            keys.insert(key_id, key);
+        }
+    }
+    if keys.contains_key(current_key_id) {
+        bail!("current integration encryption key id is duplicated in previous keys");
+    }
+    keys.insert(
+        current_key_id.to_string(),
+        derive_integration_key("RUSH_INTEGRATION_ENCRYPTION_KEY", current_secret)?,
+    );
+    Ok(IntegrationEncryptionKeys {
+        current_key_id: current_key_id.to_string(),
+        keys,
+    })
+}
+
+fn load_encryption_keys() -> Result<IntegrationEncryptionKeys> {
+    let current_key_id = std::env::var("RUSH_INTEGRATION_ENCRYPTION_KEY_ID")
+        .unwrap_or_else(|_| "primary".to_string());
+    let current_secret = std::env::var("RUSH_INTEGRATION_ENCRYPTION_KEY")
+        .map_err(|_| anyhow!("RUSH_INTEGRATION_ENCRYPTION_KEY is required"))?;
+    let previous_keys = std::env::var("RUSH_INTEGRATION_ENCRYPTION_PREVIOUS_KEYS").ok();
+    build_encryption_keys(&current_key_id, &current_secret, previous_keys.as_deref())
 }
 
 #[derive(Debug)]
@@ -175,28 +328,39 @@ impl CollectorManager {
         self.enabled
     }
 
-    /// Reconcile the configured tenant's PostgreSQL process. The manager is
-    /// deliberately opt-in so the community API never launches binaries by
-    /// accident, and the feature check keeps OSS builds collector-free.
+    /// Reconcile every configured, licensed collector for a tenant.
     pub async fn reconcile(&self, tenant_id: &str) -> Result<()> {
-        let key = format!("{POSTGRES_INTEGRATION}:{tenant_id}");
-        if !self.enabled || !cfg!(feature = "postgres-collector") {
+        let mut first_error = None;
+        for runtime in runtimes() {
+            if let Err(error) = self.reconcile_one(tenant_id, &runtime).await {
+                tracing::warn!(tenant = %tenant_id, integration = runtime.integration, %error, "collector reconciliation failed");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn reconcile_one(&self, tenant_id: &str, runtime: &CollectorRuntime) -> Result<()> {
+        let key = format!("{}:{tenant_id}", runtime.integration);
+        if !self.enabled || !runtime.compiled {
             return self.stop(&key).await;
         }
 
         let license = crate::license::evaluate();
-        if !license.has_entitlement(POSTGRES_ENTITLEMENT) {
-            tracing::info!(tenant = %tenant_id, status = %license.status, "PostgreSQL collector not licensed; keeping it stopped");
+        if !license.has_entitlement(runtime.entitlement) {
+            tracing::info!(tenant = %tenant_id, integration = runtime.integration, status = %license.status, "collector not licensed; keeping it stopped");
             return self.stop(&key).await;
         }
 
         let targets = self
             .config_db
-            .list_integration_target_secrets(tenant_id, POSTGRES_INTEGRATION)
+            .list_integration_target_secrets(tenant_id, runtime.integration)
             .await?;
         let targets: Vec<_> = targets.into_iter().filter(|t| t.enabled).collect();
         let bootstrap_config = if targets.is_empty() {
-            std::env::var("RUSH_POSTGRES_COLLECTOR_CONFIG")
+            std::env::var(runtime.bootstrap_env)
                 .ok()
                 .filter(|path| !path.trim().is_empty())
                 .map(PathBuf::from)
@@ -210,8 +374,10 @@ impl CollectorManager {
             if !path.is_file() {
                 self.stop(&key).await?;
                 bail!(
-                    "PostgreSQL collector config not found at {}; set RUSH_POSTGRES_COLLECTOR_CONFIG",
-                    path.display()
+                    "{} collector config not found at {}; set {}",
+                    runtime.name,
+                    path.display(),
+                    runtime.bootstrap_env
                 );
             }
         }
@@ -247,16 +413,21 @@ impl CollectorManager {
                 false,
             )
         } else {
-            (write_collector_config(tenant_id, &targets)?, true)
+            (
+                write_collector_config(runtime.integration, tenant_id, &targets)?,
+                true,
+            )
         };
-        let binary = std::env::var("RUSH_POSTGRES_COLLECTOR_BIN")
-            .unwrap_or_else(|_| "../postgres-collector/target/debug/postgres-collector".into());
+        let binary =
+            std::env::var(runtime.binary_env).unwrap_or_else(|_| runtime.binary_default.into());
         if !Path::new(&binary).exists() {
             if cleanup_config {
                 let _ = std::fs::remove_file(&config_path);
             }
             bail!(
-                "PostgreSQL collector binary not found at {binary}; set RUSH_POSTGRES_COLLECTOR_BIN"
+                "{} collector binary not found at {binary}; set {}",
+                runtime.name,
+                runtime.binary_env
             );
         }
 
@@ -264,7 +435,7 @@ impl CollectorManager {
             .unwrap_or_else(|_| "http://localhost:8080".into());
         let mut command = Command::new(&binary);
         command
-            .env("PG_COLLECTOR_CONFIG", &config_path)
+            .env(runtime.config_env, &config_path)
             .env("RUSH_OTLP_ENDPOINT", endpoint)
             .env("RUSH_COLLECTOR_TENANT", tenant_id)
             .env(
@@ -277,8 +448,8 @@ impl CollectorManager {
         }
         let child = command
             .spawn()
-            .with_context(|| format!("starting PostgreSQL collector binary {binary}"))?;
-        tracing::info!(tenant = %tenant_id, pid = ?child.id(), "started managed PostgreSQL collector");
+            .with_context(|| format!("starting {} collector binary {binary}", runtime.name))?;
+        tracing::info!(tenant = %tenant_id, integration = runtime.integration, pid = ?child.id(), "started managed collector");
         processes.insert(
             key,
             ManagedProcess {
@@ -324,8 +495,8 @@ impl CollectorManager {
 }
 
 fn static_config_fingerprint(path: &Path) -> Result<String> {
-    let contents = std::fs::read(path)
-        .with_context(|| format!("read PostgreSQL collector config {}", path.display()))?;
+    let contents =
+        std::fs::read(path).with_context(|| format!("read collector config {}", path.display()))?;
     Ok(format!(
         "static:{}:{}",
         path.display(),
@@ -333,7 +504,11 @@ fn static_config_fingerprint(path: &Path) -> Result<String> {
     ))
 }
 
-fn write_collector_config(tenant_id: &str, targets: &[IntegrationTargetSecret]) -> Result<PathBuf> {
+fn write_collector_config(
+    integration: &str,
+    tenant_id: &str,
+    targets: &[IntegrationTargetSecret],
+) -> Result<PathBuf> {
     #[derive(Serialize)]
     struct FileTarget<'a> {
         dsn: &'a str,
@@ -358,11 +533,11 @@ fn write_collector_config(tenant_id: &str, targets: &[IntegrationTargetSecret]) 
             },
         );
     }
-    // JSON is a YAML 1.2 subset and is accepted by the PostgreSQL collector's
+    // JSON is a YAML 1.2 subset and is accepted by each collector's
     // YAML parser. Emitting it with serde_json avoids the unmaintained
     // serde_yaml dependency while preserving the existing config contract.
     let contents = serde_json::to_string_pretty(&FileConfig { targets: named })?;
-    let path = dir.join(format!("postgres-{tenant_id}.yaml"));
+    let path = dir.join(format!("{integration}-{tenant_id}.yaml"));
     write_private_file(&path, contents.as_bytes())?;
     Ok(path)
 }
@@ -386,13 +561,98 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    const PRIMARY_SECRET: &str = "primary-integration-secret-32-bytes-minimum";
+    const ROTATED_SECRET: &str = "rotated-integration-secret-32-bytes-minimum";
+
     #[test]
-    fn descriptors_report_postgres_as_feature_gated() {
+    fn descriptors_report_collectors_as_independently_feature_gated() {
         let postgres = descriptors()
             .into_iter()
             .find(|d| d.id == POSTGRES_INTEGRATION)
             .unwrap();
         assert_eq!(postgres.entitlement, POSTGRES_ENTITLEMENT);
         assert_eq!(postgres.compiled, cfg!(feature = "postgres-collector"));
+        let mysql = descriptors()
+            .into_iter()
+            .find(|d| d.id == MYSQL_INTEGRATION)
+            .unwrap();
+        assert_eq!(mysql.entitlement, MYSQL_ENTITLEMENT);
+        assert_eq!(mysql.compiled, cfg!(feature = "mysql-collector"));
+    }
+
+    #[test]
+    fn integration_ciphertext_roundtrips_with_an_authenticated_key_id() {
+        let keys = build_encryption_keys("2026-08", PRIMARY_SECRET, None).unwrap();
+        let encrypted = encrypt_secret_with_keys("mysql://user:pass@db/app", &keys).unwrap();
+        assert!(encrypted.starts_with("v2:2026-08:"));
+        assert_eq!(
+            decrypt_secret_with_keys(&encrypted, &keys).unwrap(),
+            "mysql://user:pass@db/app"
+        );
+    }
+
+    #[test]
+    fn integration_key_rotation_keeps_prior_ciphertexts_readable() {
+        let old_keys = build_encryption_keys("old", PRIMARY_SECRET, None).unwrap();
+        let encrypted = encrypt_secret_with_keys("postgres://old", &old_keys).unwrap();
+        let previous = serde_json::json!({ "old": PRIMARY_SECRET }).to_string();
+        let rotated = build_encryption_keys("current", ROTATED_SECRET, Some(&previous)).unwrap();
+
+        assert_eq!(
+            decrypt_secret_with_keys(&encrypted, &rotated).unwrap(),
+            "postgres://old"
+        );
+        assert!(
+            encrypt_secret_with_keys("postgres://new", &rotated)
+                .unwrap()
+                .starts_with("v2:current:")
+        );
+    }
+
+    #[test]
+    fn integration_key_config_rejects_weak_or_ambiguous_keys() {
+        assert!(build_encryption_keys("primary", "too-short", None).is_err());
+        assert!(build_encryption_keys("legacy", PRIMARY_SECRET, None).is_err());
+        assert!(build_encryption_keys("bad:key", PRIMARY_SECRET, None).is_err());
+        let duplicate = serde_json::json!({ "primary": ROTATED_SECRET }).to_string();
+        assert!(build_encryption_keys("primary", PRIMARY_SECRET, Some(&duplicate)).is_err());
+    }
+
+    #[test]
+    fn integration_decryption_rejects_unknown_key_ids() {
+        let keys = build_encryption_keys("primary", PRIMARY_SECRET, None).unwrap();
+        let encrypted = encrypt_secret_with_keys("secret", &keys).unwrap();
+        let unknown = encrypted.replacen("v2:primary:", "v2:missing:", 1);
+        let error = decrypt_secret_with_keys(&unknown, &keys).unwrap_err();
+        assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn legacy_ciphertexts_use_the_explicit_legacy_rotation_key() {
+        let legacy_key = derive_integration_key("legacy", PRIMARY_SECRET).unwrap();
+        let mut iv = [0u8; 12];
+        rand_bytes(&mut iv).unwrap();
+        let mut tag = [0u8; 16];
+        let ciphertext = encrypt_aead(
+            Cipher::aes_256_gcm(),
+            &legacy_key,
+            Some(&iv),
+            INTEGRATION_LEGACY_AAD,
+            b"legacy-secret",
+            &mut tag,
+        )
+        .unwrap();
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&iv);
+        packed.extend_from_slice(&tag);
+        packed.extend_from_slice(&ciphertext);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(packed);
+
+        let previous = serde_json::json!({ "legacy": PRIMARY_SECRET }).to_string();
+        let keys = build_encryption_keys("current", ROTATED_SECRET, Some(&previous)).unwrap();
+        assert_eq!(
+            decrypt_secret_with_keys(&encoded, &keys).unwrap(),
+            "legacy-secret"
+        );
     }
 }

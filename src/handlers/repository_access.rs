@@ -23,7 +23,7 @@ fn success() -> String {
     "success".to_string()
 }
 
-fn internal_token_matches(headers: &HeaderMap) -> bool {
+pub(crate) fn sre_internal_token_matches(headers: &HeaderMap) -> bool {
     let Some(expected) = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -51,7 +51,7 @@ pub async fn audit_repository_access(
     headers: HeaderMap,
     Json(event): Json<RepositoryAccessAudit>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !internal_token_matches(&headers) {
+    if !sre_internal_token_matches(&headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid internal credential".to_string(),

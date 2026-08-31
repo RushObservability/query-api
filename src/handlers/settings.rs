@@ -289,6 +289,7 @@ pub async fn get_features(State(state): State<AppState>, headers: HeaderMap) -> 
             .flatten()
             .map(|v| v == "true")
             .unwrap_or(false);
+    let kubernetes_logging_enabled = crate::handlers::kubernetes_access::available();
 
     let cloudwatch_enabled = std::env::var("CLOUDWATCH_ENABLED")
         .map(|v| v == "true" || v == "1")
@@ -343,6 +344,7 @@ pub async fn get_features(State(state): State<AppState>, headers: HeaderMap) -> 
         "argocd": argocd_enabled,
         "fluxcd": fluxcd_enabled,
         "kubernetes": kubernetes_enabled,
+        "kubernetes_logging": kubernetes_logging_enabled,
         "cloudwatch": cloudwatch_enabled,
         "sre_agent": sre_agent_enabled,
         "export_max_rows": export_max_rows,
@@ -374,14 +376,19 @@ pub async fn get_runtime_config(
         .await;
     let license = crate::license::evaluate();
     let manager_enabled = state.collectors.enabled();
-    let target_count = state
-        .config_db
-        .list_integration_target_secrets(&caller.3, crate::integrations::POSTGRES_INTEGRATION)
-        .await
-        .map(|targets| targets.into_iter().filter(|target| target.enabled).count())
-        .unwrap_or(0);
+    let descriptors = crate::integrations::descriptors();
+    let mut target_counts = std::collections::HashMap::new();
+    for descriptor in &descriptors {
+        let count = state
+            .config_db
+            .list_integration_target_secrets(&caller.3, descriptor.id)
+            .await
+            .map(|targets| targets.into_iter().filter(|target| target.enabled).count())
+            .unwrap_or(0);
+        target_counts.insert(descriptor.id, count);
+    }
 
-    let integrations = crate::integrations::descriptors()
+    let integrations = descriptors
         .into_iter()
         .map(|descriptor| {
             let licensed = descriptor.compiled && license.has_entitlement(descriptor.entitlement);
@@ -393,7 +400,7 @@ pub async fn get_runtime_config(
                 "licensed": licensed,
                 "loaded": licensed,
                 "manager_enabled": manager_enabled,
-                "configured_targets": if descriptor.id == crate::integrations::POSTGRES_INTEGRATION { target_count } else { 0 },
+                "configured_targets": target_counts.get(descriptor.id).copied().unwrap_or(0),
             })
         })
         .collect::<Vec<_>>();
@@ -419,6 +426,8 @@ pub async fn get_runtime_config(
         ),
         config_entry("RUSH_POSTGRES_COLLECTOR_BIN", None, false, false),
         config_entry("RUSH_POSTGRES_COLLECTOR_CONFIG", None, false, false),
+        config_entry("RUSH_MYSQL_COLLECTOR_BIN", None, false, false),
+        config_entry("RUSH_MYSQL_COLLECTOR_CONFIG", None, false, false),
         config_entry("RUSH_COLLECTOR_TENANT", Some("default"), false, false),
         config_entry("RUSH_SPOOL_DIR", Some("./data/spool"), false, false),
         config_entry("RUSH_BUFFER_BACKEND", Some("disk"), false, false),
@@ -441,7 +450,19 @@ pub async fn get_runtime_config(
         config_entry("RUSH_LICENSE_KEY", None, true, false),
         config_entry("RUSH_API_KEY_SECRET", None, true, false),
         config_entry("RUSH_SSO_TRANSACTION_SECRET", None, true, false),
+        config_entry(
+            "RUSH_INTEGRATION_ENCRYPTION_KEY_ID",
+            Some("primary"),
+            false,
+            false,
+        ),
         config_entry("RUSH_INTEGRATION_ENCRYPTION_KEY", None, true, false),
+        config_entry(
+            "RUSH_INTEGRATION_ENCRYPTION_PREVIOUS_KEYS",
+            None,
+            true,
+            false,
+        ),
         config_entry("RUSH_AUDIT_HMAC_SECRET", None, true, false),
         config_entry("RUSH_COLLECTOR_API_KEY", None, true, false),
         config_entry("RUSH_SRE_AGENT_INTERNAL_TOKEN", None, true, false),

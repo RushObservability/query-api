@@ -10,7 +10,7 @@ use openssl::symm::Cipher;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::sync::{
-    OnceLock,
+    Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 pub type SessionUser = (String, String, String, String, String);
 /// (id, name, enabled, auth_required) for a tenant; None = tenant not found.
 type TenantFlags = Option<(String, String, bool, bool)>;
+type ApiKeyLookupResult = Result<Option<ApiKeyGrant>, String>;
+type ApiKeyLookupCell = Arc<tokio::sync::OnceCell<ApiKeyLookupResult>>;
 
 /// Credential bounds are enforced both at the HTTP boundary and immediately
 /// before database/Argon2 work. They are byte limits, which is what controls
@@ -89,6 +91,7 @@ const SESSION_RENEWAL_INTERVAL_ENV: &str = "RUSH_SESSION_RENEWAL_INTERVAL_SECS";
 const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: i64 = 30 * 60;
 const DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_SESSION_RENEWAL_INTERVAL_SECS: i64 = 5 * 60;
+const SESSION_ROTATION_GRACE_SECS: i64 = 60;
 const MAX_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 31 * 24 * 60 * 60;
 const DEFAULT_KUBERNETES_ACCESS_RETENTION_DAYS: u16 = 30;
 const MAX_KUBERNETES_ACCESS_RETENTION_DAYS: u16 = 3650;
@@ -132,6 +135,79 @@ pub struct SessionPolicy {
     pub idle_timeout_secs: i64,
     pub absolute_timeout_secs: i64,
     pub renewal_interval_secs: i64,
+}
+
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct KubernetesRbacGrantRow {
+    pub id: String,
+    pub tenant_id: String,
+    pub group_id: String,
+    pub cluster_id: String,
+    pub cluster_match: String,
+    pub cluster_pattern: String,
+    pub name: String,
+    pub role_kind: String,
+    pub role_name: String,
+    pub scope: String,
+    pub namespaces: String,
+    pub rules: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct KubernetesGatewayActivityRow {
+    pub gateway_id: String,
+    pub cluster_id: String,
+    pub last_activity: String,
+    pub recorded_requests: u64,
+}
+
+const KUBERNETES_RBAC_GRANT_COLUMNS: &str = "id, tenant_id, group_id, cluster_id, cluster_match, cluster_pattern, name, role_kind, role_name, scope, namespaces, rules, created_at, updated_at";
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut last_star, mut star_value_index) = (None, 0);
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star_index) = last_star {
+            pattern_index = star_index + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+pub fn kubernetes_cluster_selector_matches(
+    cluster_match: &str,
+    cluster_id: &str,
+    cluster_pattern: &str,
+    candidate: &str,
+) -> bool {
+    match cluster_match {
+        "single" | "" => cluster_id == candidate,
+        "all" => true,
+        "pattern" => wildcard_matches(cluster_pattern, candidate),
+        _ => false,
+    }
 }
 
 impl SessionPolicy {
@@ -187,6 +263,11 @@ impl SessionPolicy {
                 DEFAULT_SESSION_RENEWAL_INTERVAL_SECS,
             )?,
         )
+    }
+
+    fn activity_touch_interval_secs(self) -> i64 {
+        self.renewal_interval_secs
+            .min((self.idle_timeout_secs / 2).max(30))
     }
 }
 
@@ -292,6 +373,12 @@ pub struct ApiKeyGrant {
 /// after at most this long. Keep it short — these exist to absorb the
 /// per-request auth fan-out, not to be a long-lived cache.
 const CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Keep attacker-controlled tenant names and user ids from growing the
+/// process-local config caches without bound. Entries are still refreshed on
+/// demand when a cache is full, so this limit changes memory use, not auth
+/// semantics.
+const MAX_CONFIG_CACHE_ENTRIES: usize = 8_192;
+const CONFIG_CACHE_MAINTENANCE_EVERY: u64 = 1_024;
 
 const SSO_CLAIM_STORE_ENV: &str = "RUSH_SSO_REPLAY_STORE";
 const QUERY_API_REPLICAS_ENV: &str = "RUSH_QUERY_API_REPLICAS";
@@ -402,6 +489,49 @@ mod auth_storage_tests {
     }
 
     #[test]
+    fn kubernetes_cluster_selectors_match_exact_all_and_wildcards() {
+        assert!(kubernetes_cluster_selector_matches(
+            "single",
+            "west-production",
+            "",
+            "west-production"
+        ));
+        assert!(!kubernetes_cluster_selector_matches(
+            "single",
+            "east-production",
+            "",
+            "west-production"
+        ));
+        assert!(kubernetes_cluster_selector_matches(
+            "all",
+            "",
+            "",
+            "any-cluster"
+        ));
+        assert!(kubernetes_cluster_selector_matches(
+            "pattern",
+            "",
+            "*-production",
+            "west-production"
+        ));
+        assert!(!kubernetes_cluster_selector_matches(
+            "pattern",
+            "",
+            "*-production",
+            "production-west"
+        ));
+        assert!(kubernetes_cluster_selector_matches(
+            "pattern", "", "prod-?", "prod-a"
+        ));
+        assert!(!kubernetes_cluster_selector_matches(
+            "unknown",
+            "west-production",
+            "*",
+            "west-production"
+        ));
+    }
+
+    #[test]
     fn kubernetes_access_tables_create_and_migrate_retention_and_actor_type() {
         let source = include_str!("clickhouse_config.rs");
         assert!(source.contains(
@@ -417,7 +547,9 @@ mod auth_storage_tests {
             "ADD COLUMN IF NOT EXISTS actor_type LowCardinality(String) DEFAULT 'unknown'"
         ));
         assert!(source.contains("CREATE TABLE IF NOT EXISTS config_kubernetes_login_requests"));
+        assert!(source.contains("CREATE TABLE IF NOT EXISTS config_kubernetes_login_revocations"));
         assert!(source.contains("device_code_hash     String"));
+        assert!(source.contains("ADD COLUMN IF NOT EXISTS client_reported String DEFAULT '{}'"));
         assert!(!source.contains(&["device_code", "          String"].concat()));
     }
 
@@ -444,6 +576,46 @@ mod auth_storage_tests {
     }
 
     #[test]
+    fn kubernetes_gateway_activity_is_tenant_scoped() {
+        let source = include_str!("clickhouse_config.rs");
+        assert!(source.contains(
+            "WHERE tenant_id = ? AND gateway_id != '' AND cluster_id != '' GROUP BY gateway_id, cluster_id"
+        ));
+    }
+
+    #[test]
+    fn api_key_auth_uses_hash_ordered_lookup_with_tombstones() {
+        let source = include_str!("clickhouse_config.rs");
+        assert!(source.contains("CREATE TABLE IF NOT EXISTS config_api_keys_by_hash"));
+        assert!(source.contains("ORDER BY (key_hash)"));
+        assert!(
+            source.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS config_api_keys_by_hash_mv")
+        );
+        assert!(source.contains("FROM config_api_keys_by_hash FINAL WHERE key_hash = ? LIMIT 1"));
+        assert!(source.contains("Ok(row) if row.is_deleted == 0"));
+    }
+
+    #[test]
+    fn session_auth_coalesces_user_role_and_sso_policy_into_one_query() {
+        let source = include_str!("clickhouse_config.rs");
+        assert!(
+            source.contains("FROM config_sessions s\n                   JOIN config_users u FINAL")
+        );
+        assert!(source.contains("LEFT JOIN (\n                       SELECT ug.user_id"));
+        assert!(source.contains("FROM config_sso_active_provider FINAL"));
+        assert!(source.contains("ifNull(roles.role, 'viewer') AS role"));
+    }
+
+    #[test]
+    fn config_plane_caches_have_expiry_maintenance_and_a_hard_insert_cap() {
+        let source = include_str!("clickhouse_config.rs");
+        assert!(source.contains("const MAX_CONFIG_CACHE_ENTRIES: usize = 8_192"));
+        assert!(source.contains("fn maintain_config_caches(&self)"));
+        assert!(source.contains(".retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at))"));
+        assert!(source.contains("self.signal_cache.len() < MAX_CONFIG_CACHE_ENTRIES"));
+    }
+
+    #[test]
     fn session_policy_enforces_idle_absolute_and_rotation_relationships() {
         assert_eq!(
             SessionPolicy::new(1_800, 86_400, 300).unwrap(),
@@ -456,6 +628,18 @@ mod auth_storage_tests {
         assert!(SessionPolicy::new(59, 86_400, 30).is_err());
         assert!(SessionPolicy::new(1_800, 1_799, 300).is_err());
         assert!(SessionPolicy::new(1_800, 86_400, 1_800).is_err());
+        assert_eq!(
+            SessionPolicy::new(1_800, 86_400, 300)
+                .unwrap()
+                .activity_touch_interval_secs(),
+            300
+        );
+        assert_eq!(
+            SessionPolicy::new(60, 3_600, 30)
+                .unwrap()
+                .activity_touch_interval_secs(),
+            30
+        );
     }
 
     #[test]
@@ -562,6 +746,7 @@ mod auth_storage_tests {
         assert!(migration.contains("absolute_expires_at"));
         assert!(migration.contains("DELETE WHERE session_id = ''"));
         assert!(migration.contains("CREATE TABLE IF NOT EXISTS config_session_revocations"));
+        assert!(migration.contains("CREATE TABLE IF NOT EXISTS config_session_rotation_grace"));
 
         let rotation = source
             .rsplit_once("pub async fn rotate_session_if_due")
@@ -570,15 +755,16 @@ mod auth_storage_tests {
             .split("pub async fn delete_session")
             .next()
             .expect("logout deletion must follow rotation");
-        let delete_position = rotation
-            .find("DELETE FROM config_sessions WHERE token = ?")
-            .expect("rotation must revoke the old bearer");
         let insert_position = rotation
             .find("INSERT INTO config_sessions")
             .expect("rotation must write the replacement bearer");
-        assert!(delete_position < insert_position);
+        let grace_position = rotation
+            .find("INSERT INTO config_session_rotation_grace")
+            .expect("rotation must supersede the old bearer after a grace period");
+        assert!(insert_position < grace_position);
         assert!(rotation.contains("session_storage_key(&self.session_hmac_secret, token)"));
-        assert!(rotation.contains("config_session_revocations"));
+        assert!(rotation.contains("SESSION_ROTATION_GRACE_SECS"));
+        assert!(!rotation.contains("DELETE FROM config_sessions WHERE token = ?"));
         assert!(!rotation.contains(".bind(token)"));
 
         let logout = source
@@ -1414,6 +1600,10 @@ pub struct ConfigDb {
     /// request to decide drop-vs-write, so it mirrors the tenant_flags TTL cache.
     /// Defaults (no stored row) are cached too so all-enabled tenants stay cheap.
     signal_cache: DashMap<(String, String), (bool, Instant)>,
+    /// Identical API-key hashes being validated at the same instant share one
+    /// ClickHouse lookup. Completed results are removed immediately, so key
+    /// revocation remains visible on the next request without a cache TTL.
+    api_key_inflight: DashMap<String, ApiKeyLookupCell>,
     /// Serializes canonical username checks and inserts inside one replica.
     /// Authentication also fails closed if separately racing replicas ever
     /// produce a collision.
@@ -1423,6 +1613,7 @@ pub struct ConfigDb {
     sso_claim_store_mode: SsoClaimStoreMode,
     local_sso_claims: DashMap<String, i64>,
     sso_claim_cleanup_counter: AtomicU64,
+    config_cache_maintenance_counter: AtomicU64,
     session_policy: SessionPolicy,
     /// Dedicated key for one-way session bearer storage. The raw bearer exists
     /// only in the issuing response/cookie and is never sent to ClickHouse.
@@ -1439,6 +1630,7 @@ pub struct KubernetesLoginRequest {
     pub user_id: String,
     pub username: String,
     pub role: String,
+    pub client_reported: String,
     pub created_at: String,
     pub expires_at: String,
     pub approved_at: String,
@@ -1512,10 +1704,14 @@ impl ConfigDb {
         &self.session_hmac_secret
     }
 
+    pub fn session_activity_interval_seconds(&self) -> i64 {
+        self.session_policy.activity_touch_interval_secs()
+    }
+
     /// One-way, process-stable identity for a session bearer. Request-scoped
     /// authorization reuse keys by this value so the raw cookie never enters a
     /// cache, metric, log, or trace.
-    pub(crate) fn session_request_key(&self, token: &str) -> String {
+    pub fn session_request_key(&self, token: &str) -> String {
         session_storage_key(&self.session_hmac_secret, token)
     }
 
@@ -1533,10 +1729,12 @@ impl ConfigDb {
             ingest_auth_cache: DashMap::new(),
             perms_cache: DashMap::new(),
             signal_cache: DashMap::new(),
+            api_key_inflight: DashMap::new(),
             username_mutation_lock: tokio::sync::Mutex::new(()),
             sso_claim_store_mode,
             local_sso_claims: DashMap::new(),
             sso_claim_cleanup_counter: AtomicU64::new(0),
+            config_cache_maintenance_counter: AtomicU64::new(0),
             session_policy,
             session_hmac_secret,
         };
@@ -1586,6 +1784,33 @@ impl ConfigDb {
 
     fn cache_fresh(at: Instant) -> bool {
         at.elapsed() < CONFIG_CACHE_TTL
+    }
+
+    /// Opportunistically discard expired entries. The fast path is one relaxed
+    /// atomic increment; a full scan happens infrequently or whenever a cache
+    /// reaches its cap.
+    fn maintain_config_caches(&self) {
+        let maintenance_due = self
+            .config_cache_maintenance_counter
+            .fetch_add(1, Ordering::Relaxed)
+            % CONFIG_CACHE_MAINTENANCE_EVERY
+            == 0;
+        let cache_full = self.tenant_cache.len() >= MAX_CONFIG_CACHE_ENTRIES
+            || self.ingest_auth_cache.len() >= MAX_CONFIG_CACHE_ENTRIES
+            || self.perms_cache.len() >= MAX_CONFIG_CACHE_ENTRIES
+            || self.signal_cache.len() >= MAX_CONFIG_CACHE_ENTRIES;
+        if !maintenance_due && !cache_full {
+            return;
+        }
+
+        self.tenant_cache
+            .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
+        self.ingest_auth_cache
+            .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
+        self.perms_cache
+            .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
+        self.signal_cache
+            .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
     }
 
     async fn run_migrations(&self) -> anyhow::Result<()> {
@@ -1747,6 +1972,17 @@ impl ConfigDb {
             ) ENGINE = MergeTree()
             ORDER BY (session_id)
             TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
+            // Keep a superseded bearer valid briefly so requests already in
+            // flight can finish while the browser applies the replacement
+            // cookie. The raw bearer never enters this table.
+            "CREATE TABLE IF NOT EXISTS config_session_rotation_grace (
+                token            String,
+                grace_expires_at String,
+                expires_at       String,
+                created_at       String
+            ) ENGINE = MergeTree()
+            ORDER BY (token)
+            TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
             // Browser-approved kubectl credentials. Only a SHA-256 digest of
             // the bearer is stored; the raw device credential stays with the
             // CLI that initiated the login. ReplacingMergeTree makes approval
@@ -1760,6 +1996,7 @@ impl ConfigDb {
                 user_id              String DEFAULT '',
                 username             String DEFAULT '',
                 role                 String DEFAULT '',
+                client_reported      String DEFAULT '{}',
                 created_at           String,
                 expires_at           String,
                 approved_at          String DEFAULT '',
@@ -1769,6 +2006,42 @@ impl ConfigDb {
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (device_code_hash)
             TTL parseDateTimeBestEffort(expires_at) + INTERVAL 1 DAY",
+            "ALTER TABLE config_kubernetes_login_requests ADD COLUMN IF NOT EXISTS client_reported String DEFAULT '{}' AFTER role",
+            // Revocations live separately from mutable client enrichment. This
+            // makes de-auth fail closed even if an enrichment write races with
+            // an administrator revoking the same credential.
+            "CREATE TABLE IF NOT EXISTS config_kubernetes_login_revocations (
+                device_code_hash String,
+                tenant_id        String,
+                revoked_at       String,
+                version          UInt64
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (device_code_hash)
+            TTL parseDateTimeBestEffort(revoked_at) + INTERVAL 2 DAY",
+            // Rush group mappings to native Kubernetes RBAC. The gateway reads
+            // these rows through its internal API and reconciles ClusterRoles
+            // and bindings in the target cluster.
+            "CREATE TABLE IF NOT EXISTS config_kubernetes_rbac_grants (
+                id          String,
+                tenant_id   String,
+                group_id    String,
+                cluster_id  String,
+                cluster_match LowCardinality(String) DEFAULT 'single',
+                cluster_pattern String DEFAULT '',
+                name        String,
+                role_kind   LowCardinality(String),
+                role_name   String DEFAULT '',
+                scope       LowCardinality(String),
+                namespaces  String DEFAULT '[]',
+                rules       String DEFAULT '[]',
+                created_at  String,
+                updated_at  String,
+                version     UInt64,
+                is_deleted  UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, id)",
+            "ALTER TABLE config_kubernetes_rbac_grants ADD COLUMN IF NOT EXISTS cluster_match LowCardinality(String) DEFAULT 'single' AFTER cluster_id",
+            "ALTER TABLE config_kubernetes_rbac_grants ADD COLUMN IF NOT EXISTS cluster_pattern String DEFAULT '' AFTER cluster_match",
             // Shared login-attempt ledger. Identifiers are keyed hashes, never
             // raw usernames or addresses, and expire after one day. IP rows
             // count every request; account rows count failed credentials only.
@@ -1889,6 +2162,32 @@ impl ConfigDb {
             "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS signals String DEFAULT '[]' AFTER key_type",
             "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS rate_limit_per_minute UInt64 DEFAULT 0 AFTER signals",
             "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS source_cidrs String DEFAULT '[]' AFTER rate_limit_per_minute",
+            // Authentication reads by key hash, while the source table stays
+            // keyed by id for the admin API. A materialized view keeps this
+            // lookup table current for new and old API replicas during rolling
+            // upgrades, including revocation tombstones.
+            "CREATE TABLE IF NOT EXISTS config_api_keys_by_hash (
+                key_hash              String,
+                id                    String,
+                tenant_id             String,
+                key_type              String,
+                signals               String,
+                rate_limit_per_minute UInt64,
+                source_cidrs          String,
+                version               UInt64,
+                is_deleted            UInt8
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (key_hash)",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS config_api_keys_by_hash_mv
+             TO config_api_keys_by_hash AS
+             SELECT key_hash, id, tenant_id, key_type, signals,
+                    rate_limit_per_minute, source_cidrs, version, is_deleted
+             FROM config_api_keys",
+            "INSERT INTO config_api_keys_by_hash
+             SELECT key_hash, id, tenant_id, key_type, signals,
+                    rate_limit_per_minute, source_cidrs, version, is_deleted
+             FROM config_api_keys FINAL
+             WHERE key_hash NOT IN (SELECT key_hash FROM config_api_keys_by_hash FINAL)",
             // ── Settings ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_settings (
                 key        String,
@@ -2235,6 +2534,22 @@ impl ConfigDb {
             ORDER BY (id)",
             // ── Postgres EXPLAIN jobs (collector-run plan queue) ───────────────────
             "CREATE TABLE IF NOT EXISTS config_pg_explain_jobs (
+                id           String,
+                tenant_id    String DEFAULT 'default',
+                server_name  String,
+                db           String DEFAULT '',
+                query        String,
+                status       String DEFAULT 'pending',
+                plan_json    String DEFAULT '',
+                error        String DEFAULT '',
+                created_at   String DEFAULT '',
+                updated_at   String DEFAULT '',
+                version      UInt64,
+                is_deleted   UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (id)",
+            // ── MySQL EXPLAIN jobs (collector-run plan queue) ─────────────────────
+            "CREATE TABLE IF NOT EXISTS config_mysql_explain_jobs (
                 id           String,
                 tenant_id    String DEFAULT 'default',
                 server_name  String,
@@ -2657,6 +2972,28 @@ impl ConfigDb {
     }
 
     pub async fn resolve_api_key(&self, key_hash: &str) -> anyhow::Result<Option<ApiKeyGrant>> {
+        let cell = self
+            .api_key_inflight
+            .entry(key_hash.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
+        let result = cell
+            .get_or_init(|| async {
+                self.resolve_api_key_uncached(key_hash)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .clone();
+        self.api_key_inflight
+            .remove_if(key_hash, |_, current| Arc::ptr_eq(current, &cell));
+        result.map_err(anyhow::Error::msg)
+    }
+
+    async fn resolve_api_key_uncached(
+        &self,
+        key_hash: &str,
+    ) -> anyhow::Result<Option<ApiKeyGrant>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String,
@@ -2665,14 +3002,15 @@ impl ConfigDb {
             signals: String,
             rate_limit_per_minute: u64,
             source_cidrs: String,
+            is_deleted: u8,
         }
         let result = self.client
-            .query("SELECT id, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs FROM config_api_keys FINAL WHERE key_hash = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, is_deleted FROM config_api_keys_by_hash FINAL WHERE key_hash = ? LIMIT 1")
             .bind(key_hash)
             .fetch_one::<Row>()
             .await;
         match result {
-            Ok(row) => Ok(Some(ApiKeyGrant {
+            Ok(row) if row.is_deleted == 0 => Ok(Some(ApiKeyGrant {
                 id: row.id,
                 tenant_id: row.tenant_id,
                 key_type: row.key_type,
@@ -2680,6 +3018,7 @@ impl ConfigDb {
                 rate_limit_per_minute: row.rate_limit_per_minute,
                 source_cidrs: serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
             })),
+            Ok(_) => Ok(None),
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -2806,8 +3145,13 @@ impl ConfigDb {
             Err(clickhouse::error::Error::RowNotFound) => None,
             Err(error) => return Err(error.into()),
         };
-        self.tenant_cache
-            .insert(name_or_id.to_string(), (flags.clone(), Instant::now()));
+        self.maintain_config_caches();
+        if self.tenant_cache.len() < MAX_CONFIG_CACHE_ENTRIES
+            || self.tenant_cache.contains_key(name_or_id)
+        {
+            self.tenant_cache
+                .insert(name_or_id.to_string(), (flags.clone(), Instant::now()));
+        }
         Ok(flags)
     }
 
@@ -2910,8 +3254,14 @@ impl ConfigDb {
         let required =
             crate::api_key_auth::effective_ingest_auth_required(explicit, legacy_auth_required);
         let now = Instant::now();
-        self.ingest_auth_cache.insert(tenant_id, (required, now));
-        self.ingest_auth_cache.insert(tenant_name, (required, now));
+        self.maintain_config_caches();
+        for cache_key in [tenant_id, tenant_name] {
+            if self.ingest_auth_cache.len() < MAX_CONFIG_CACHE_ENTRIES
+                || self.ingest_auth_cache.contains_key(&cache_key)
+            {
+                self.ingest_auth_cache.insert(cache_key, (required, now));
+            }
+        }
         Ok(Some(required))
     }
 
@@ -3115,7 +3465,12 @@ impl ConfigDb {
             // No row (or any read error) → default enabled (backward compatible).
             Err(_) => true,
         };
-        self.signal_cache.insert(key, (enabled, Instant::now()));
+        self.maintain_config_caches();
+        if self.signal_cache.len() < MAX_CONFIG_CACHE_ENTRIES
+            || self.signal_cache.contains_key(&key)
+        {
+            self.signal_cache.insert(key, (enabled, Instant::now()));
+        }
         enabled
     }
 
@@ -3572,14 +3927,55 @@ impl ConfigDb {
             user_id: String,
             auth_method: String,
             provider_id: String,
+            role: String,
+            active_provider_id: String,
+            active_provider_present: u8,
         }
         let now = Self::now_str();
-        let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id, s.expires_at, s.user_id, s.auth_method, s.provider_id FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1";
+        let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id,
+                          s.expires_at, s.user_id, s.auth_method, s.provider_id,
+                          ifNull(roles.role, 'viewer') AS role,
+                          ifNull(active.provider_id, '') AS active_provider_id,
+                          ifNull(active.present, 0) AS active_provider_present
+                   FROM config_sessions s
+                   JOIN config_users u FINAL ON s.user_id = u.id
+                   LEFT JOIN (
+                       SELECT ug.user_id,
+                              multiIf(
+                                  countIf(has(JSONExtract(g.permissions, 'Array(String)'), 'admin')) > 0, 'admin',
+                                  countIf(has(JSONExtract(g.permissions, 'Array(String)'), 'write')) > 0, 'write',
+                                  'viewer'
+                              ) AS role
+                       FROM config_user_groups ug FINAL
+                       JOIN config_groups g FINAL ON ug.group_id = g.id
+                       WHERE ug.is_deleted = 0 AND g.is_deleted = 0
+                       GROUP BY ug.user_id
+                   ) roles ON roles.user_id = u.id
+                   LEFT JOIN (
+                       SELECT provider_id, toUInt8(1) AS present
+                       FROM config_sso_active_provider FINAL
+                       WHERE slot = 'primary'
+                       LIMIT 1
+                   ) active ON 1
+                   WHERE s.token = ?
+                     AND s.user_version = u.version
+                     AND u.enabled = 1
+                     AND u.is_deleted = 0
+                     AND s.expires_at > ?
+                     AND s.absolute_expires_at > ?
+                     AND s.session_id NOT IN (
+                         SELECT session_id FROM config_session_revocations WHERE expires_at > ?
+                     )
+                     AND s.token NOT IN (
+                         SELECT token FROM config_session_rotation_grace WHERE grace_expires_at <= ?
+                     )
+                   LIMIT 1";
         let user_started = Instant::now();
         let result = self
             .client
             .query(sql)
             .bind(&stored_token)
+            .bind(&now)
             .bind(&now)
             .bind(&now)
             .bind(&now)
@@ -3601,7 +3997,14 @@ impl ConfigDb {
         match row.auth_method.as_str() {
             "local" if row.provider_id.is_empty() => {}
             "oidc" | "saml" => {
-                let active_provider_id = self.effective_active_sso_provider_id().await.ok()?;
+                let active_provider_id = if row.active_provider_present != 0 {
+                    (!row.active_provider_id.is_empty()).then_some(row.active_provider_id.clone())
+                } else {
+                    // Startup reconciliation normally makes the joined row
+                    // authoritative. Keep the legacy path only for an upgrade
+                    // window where the singleton row does not exist yet.
+                    self.effective_active_sso_provider_id().await.ok()?
+                };
                 if active_provider_id.as_deref() != Some(row.provider_id.as_str()) {
                     return None;
                 }
@@ -3609,20 +4012,13 @@ impl ConfigDb {
             // Sessions issued before provenance binding fail closed.
             _ => return None,
         }
-        let role_started = Instant::now();
-        let role_result = self.derive_user_role_with_rows(&row.id).await;
-        if let Some(metrics) = metrics {
-            metrics.record_auth_lookup(
-                "role",
-                role_started.elapsed().as_secs_f64() * 1_000.0,
-                role_result.as_ref().map(|(_, rows)| *rows).unwrap_or(0),
-                if role_result.is_ok() { "ok" } else { "error" },
-            );
-        }
-        let role = role_result
-            .map(|(role, _)| role)
-            .unwrap_or_else(|_| "viewer".to_string());
-        let user: SessionUser = (row.id, row.username, row.display_name, row.tenant_id, role);
+        let user: SessionUser = (
+            row.id,
+            row.username,
+            row.display_name,
+            row.tenant_id,
+            row.role,
+        );
         Some(user)
     }
 
@@ -3632,12 +4028,13 @@ impl ConfigDb {
         current_token: &str,
     ) -> anyhow::Result<Vec<AuthSessionInfo>> {
         let now = Self::now_str();
-        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?)";
+        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) AND s.token NOT IN (SELECT token FROM config_session_rotation_grace WHERE grace_expires_at <= ?)";
         let rows = if let Some(user_id) = user_id {
             self.client
                 .query(&format!(
                     "{base} AND s.user_id = ? ORDER BY s.last_seen_at DESC LIMIT 100"
                 ))
+                .bind(&now)
                 .bind(&now)
                 .bind(&now)
                 .bind(&now)
@@ -3650,11 +4047,14 @@ impl ConfigDb {
                 .bind(&now)
                 .bind(&now)
                 .bind(&now)
+                .bind(&now)
                 .fetch_all::<AuthSessionRow>()
                 .await?
         };
+        let mut seen = std::collections::HashSet::new();
         Ok(rows
             .into_iter()
+            .filter(|row| seen.insert(row.session_id.clone()))
             .map(|row| row.into_info(&self.session_hmac_secret, current_token))
             .collect())
     }
@@ -3734,6 +4134,7 @@ impl ConfigDb {
             auth_method: String,
             provider_id: String,
             created_at: String,
+            last_seen_at: String,
             last_seen_unix: i64,
             expires_unix: i64,
             absolute_expires_unix: i64,
@@ -3746,7 +4147,7 @@ impl ConfigDb {
         let stored_token = session_storage_key(&self.session_hmac_secret, token);
         let row = self
             .client
-            .query("SELECT s.session_id, s.user_id, s.user_version, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.last_seen_at))) AS last_seen_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.expires_at))) AS expires_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.absolute_expires_at))) AS absolute_expires_unix, s.absolute_expires_at FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1")
+            .query("SELECT s.session_id, s.user_id, s.user_version, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.last_seen_at))) AS last_seen_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.expires_at))) AS expires_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.absolute_expires_at))) AS absolute_expires_unix, s.absolute_expires_at FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1")
             .bind(&stored_token)
             .bind(&now_string)
             .bind(&now_string)
@@ -3789,6 +4190,19 @@ impl ConfigDb {
         let expires_at = (now + chrono::Duration::seconds(max_age_seconds))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
+        let grace_expires_unix = now_unix
+            .saturating_add(SESSION_ROTATION_GRACE_SECS)
+            .min(row.absolute_expires_unix);
+        let grace_expires_at = chrono::DateTime::from_timestamp(grace_expires_unix, 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid session rotation grace deadline"))?
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let grace_record_expires_unix = row.expires_unix.max(grace_expires_unix);
+        let grace_record_expires_at =
+            chrono::DateTime::from_timestamp(grace_record_expires_unix, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid session rotation cleanup deadline"))?
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
         let new_token: String = {
             use rand::Rng;
             let bytes: [u8; 32] = rand::rng().random();
@@ -3796,15 +4210,9 @@ impl ConfigDb {
         };
         let new_stored_token = session_storage_key(&self.session_hmac_secret, &new_token);
 
-        // Delete first and wait: if the replacement insert fails, the request
-        // that just succeeded remains successful but the caller must sign in
-        // again. That is safer than leaving both old and new bearers valid.
-        self.client
-            .query("DELETE FROM config_sessions WHERE token = ?")
-            .with_option("lightweight_deletes_sync", "1")
-            .bind(&stored_token)
-            .execute()
-            .await?;
+        // Write the replacement before superseding the old bearer. Requests
+        // that were already in flight may keep using the old cookie during a
+        // short shared grace period, which avoids a logout race across API pods.
         self.client
             .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&new_stored_token)
@@ -3819,6 +4227,35 @@ impl ConfigDb {
             .bind(&row.absolute_expires_at)
             .execute()
             .await?;
+
+        self.client
+            .query("INSERT INTO config_session_rotation_grace (token, grace_expires_at, expires_at, created_at) VALUES (?, ?, ?, ?)")
+            .bind(&stored_token)
+            .bind(&grace_expires_at)
+            .bind(&grace_record_expires_at)
+            .bind(&now_string)
+            .execute()
+            .await?;
+
+        // Extend a bearer that rotated very close to its idle deadline through
+        // the full grace period. The grace table rejects every copy afterward.
+        if let Err(error) = self.client
+            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&stored_token)
+            .bind(&row.session_id)
+            .bind(&row.user_id)
+            .bind(row.user_version)
+            .bind(&row.auth_method)
+            .bind(&row.provider_id)
+            .bind(&row.created_at)
+            .bind(&row.last_seen_at)
+            .bind(&grace_expires_at)
+            .bind(&row.absolute_expires_at)
+            .execute()
+            .await
+        {
+            tracing::warn!(%error, session_id = %row.session_id, "failed to extend rotated session through grace period");
+        }
 
         Ok(Some(RotatedSession {
             issued: IssuedSession {
@@ -4665,8 +5102,13 @@ impl ConfigDb {
             all_permissions.into_iter().collect::<Vec<_>>(),
             all_tenant_ids.into_iter().collect::<Vec<_>>(),
         );
-        self.perms_cache
-            .insert(user_id.to_string(), (result.clone(), Instant::now()));
+        self.maintain_config_caches();
+        if self.perms_cache.len() < MAX_CONFIG_CACHE_ENTRIES
+            || self.perms_cache.contains_key(user_id)
+        {
+            self.perms_cache
+                .insert(user_id.to_string(), (result.clone(), Instant::now()));
+        }
         Ok(result)
     }
 
@@ -5711,6 +6153,90 @@ impl ConfigDb {
             .fetch_all::<ExplainStatusRow>().await?
             .into_iter().next()
             .map(|r| (r.status, r.db, r.plan_json, r.error)))
+    }
+
+    // ── MySQL EXPLAIN job queue ───────────────────────────────────────────────
+    pub async fn create_mysql_explain_job(
+        &self,
+        tenant_id: &str,
+        server: &str,
+        db: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Self::now_str();
+        self.client
+            .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, server_name, db, query, status, plan_json, error, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'pending', '', '', ?, ?, ?, 0)")
+            .bind(&id).bind(tenant_id).bind(server).bind(db).bind(query).bind(&now).bind(&now).bind(Self::next_version())
+            .execute().await?;
+        Ok(id)
+    }
+
+    pub async fn claim_pending_mysql_explain_job(
+        &self,
+        tenant_id: &str,
+        server: &str,
+    ) -> anyhow::Result<Option<(String, String, String)>> {
+        let row = self.client
+            .query("SELECT id, db, query FROM config_mysql_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
+            .bind(tenant_id).bind(server)
+            .fetch_all::<ExplainClaimRow>().await?
+            .into_iter().next();
+        if let Some(row) = &row {
+            self.client
+                .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, server_name, db, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0)")
+                .bind(&row.id).bind(tenant_id).bind(server).bind(&row.db).bind(&row.query).bind(Self::now_str()).bind(Self::next_version())
+                .execute().await?;
+        }
+        Ok(row.map(|row| (row.id, row.db, row.query)))
+    }
+
+    pub async fn requeue_stale_mysql_explain_jobs(
+        &self,
+        tenant_id: &str,
+        server: &str,
+    ) -> anyhow::Result<u64> {
+        let rows = self.client
+            .query("SELECT id, db, query FROM config_mysql_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'running' AND is_deleted = 0 AND updated_at < toString(now() - INTERVAL 2 MINUTE) LIMIT 20")
+            .bind(tenant_id).bind(server)
+            .fetch_all::<ExplainClaimRow>().await?;
+        let mut count = 0;
+        for row in rows {
+            self.client
+                .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, server_name, db, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 0)")
+                .bind(&row.id).bind(tenant_id).bind(server).bind(&row.db).bind(&row.query).bind(Self::now_str()).bind(Self::next_version())
+                .execute().await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub async fn complete_mysql_explain_job(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        plan_json: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let status = if error.is_empty() { "done" } else { "error" };
+        self.client
+            .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, status, plan_json, error, updated_at, version, is_deleted) SELECT id, tenant_id, ?, ?, ?, ?, ?, 0 FROM config_mysql_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version()).bind(id).bind(tenant_id)
+            .execute().await?;
+        Ok(())
+    }
+
+    pub async fn get_mysql_explain_job(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<(String, String, String, String)>> {
+        Ok(self.client
+            .query("SELECT status, db, plan_json, error FROM config_mysql_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(id).bind(tenant_id)
+            .fetch_all::<ExplainStatusRow>().await?
+            .into_iter().next()
+            .map(|row| (row.status, row.db, row.plan_json, row.error)))
     }
 
     // ── Setup token operations ─────────────────────────────────────────────────
@@ -9256,7 +9782,7 @@ impl ConfigDb {
         request: &KubernetesLoginRequest,
     ) -> anyhow::Result<()> {
         self.client
-            .query("INSERT INTO config_kubernetes_login_requests (device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .query("INSERT INTO config_kubernetes_login_requests (device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, client_reported, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&request.device_code_hash)
             .bind(&request.user_code)
             .bind(&request.cluster_id)
@@ -9265,6 +9791,7 @@ impl ConfigDb {
             .bind(&request.user_id)
             .bind(&request.username)
             .bind(&request.role)
+            .bind(&request.client_reported)
             .bind(&request.created_at)
             .bind(&request.expires_at)
             .bind(&request.approved_at)
@@ -9274,6 +9801,237 @@ impl ConfigDb {
             .execute()
             .await?;
         Ok(())
+    }
+
+    pub async fn list_kubernetes_rbac_grants(
+        &self,
+        tenant_id: &str,
+        cluster_id: Option<&str>,
+    ) -> anyhow::Result<Vec<KubernetesRbacGrantRow>> {
+        let rows = self
+            .client
+            .query(&format!(
+                "SELECT {KUBERNETES_RBAC_GRANT_COLUMNS} FROM config_kubernetes_rbac_grants FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY cluster_match, cluster_id, cluster_pattern, name, id"
+            ))
+            .bind(tenant_id)
+            .fetch_all::<KubernetesRbacGrantRow>()
+            .await?;
+        Ok(match cluster_id {
+            Some(cluster_id) => rows
+                .into_iter()
+                .filter(|row| {
+                    kubernetes_cluster_selector_matches(
+                        &row.cluster_match,
+                        &row.cluster_id,
+                        &row.cluster_pattern,
+                        cluster_id,
+                    )
+                })
+                .collect(),
+            None => rows,
+        })
+    }
+
+    pub async fn list_gateway_kubernetes_rbac_grants(
+        &self,
+        cluster_id: &str,
+        tenant_ids: &[String],
+    ) -> anyhow::Result<Vec<KubernetesRbacGrantRow>> {
+        let allowed = tenant_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let rows = self
+            .client
+            .query(&format!(
+                "SELECT {KUBERNETES_RBAC_GRANT_COLUMNS} FROM config_kubernetes_rbac_grants FINAL WHERE is_deleted = 0 ORDER BY tenant_id, name, id"
+            ))
+            .fetch_all::<KubernetesRbacGrantRow>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                allowed.contains(row.tenant_id.as_str())
+                    && kubernetes_cluster_selector_matches(
+                        &row.cluster_match,
+                        &row.cluster_id,
+                        &row.cluster_pattern,
+                        cluster_id,
+                    )
+            })
+            .collect())
+    }
+
+    pub async fn get_kubernetes_rbac_grant(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<KubernetesRbacGrantRow>> {
+        let result = self
+            .client
+            .query(&format!(
+                "SELECT {KUBERNETES_RBAC_GRANT_COLUMNS} FROM config_kubernetes_rbac_grants FINAL WHERE tenant_id = ? AND id = ? AND is_deleted = 0 LIMIT 1"
+            ))
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_one::<KubernetesRbacGrantRow>()
+            .await;
+        match result {
+            Ok(row) => Ok(Some(row)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_kubernetes_rbac_grant(
+        &self,
+        tenant_id: &str,
+        group_id: &str,
+        cluster_id: &str,
+        cluster_match: &str,
+        cluster_pattern: &str,
+        name: &str,
+        role_kind: &str,
+        role_name: &str,
+        scope: &str,
+        namespaces: &str,
+        rules: &str,
+    ) -> anyhow::Result<KubernetesRbacGrantRow> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Self::now_str();
+        self.client
+            .query("INSERT INTO config_kubernetes_rbac_grants (id, tenant_id, group_id, cluster_id, cluster_match, cluster_pattern, name, role_kind, role_name, scope, namespaces, rules, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&id)
+            .bind(tenant_id)
+            .bind(group_id)
+            .bind(cluster_id)
+            .bind(cluster_match)
+            .bind(cluster_pattern)
+            .bind(name)
+            .bind(role_kind)
+            .bind(role_name)
+            .bind(scope)
+            .bind(namespaces)
+            .bind(rules)
+            .bind(&now)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        self.get_kubernetes_rbac_grant(tenant_id, &id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Kubernetes RBAC grant was not visible after creation"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_kubernetes_rbac_grant(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        group_id: &str,
+        cluster_id: &str,
+        cluster_match: &str,
+        cluster_pattern: &str,
+        name: &str,
+        role_kind: &str,
+        role_name: &str,
+        scope: &str,
+        namespaces: &str,
+        rules: &str,
+    ) -> anyhow::Result<Option<KubernetesRbacGrantRow>> {
+        let Some(existing) = self.get_kubernetes_rbac_grant(tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let now = Self::now_str();
+        self.client
+            .query("INSERT INTO config_kubernetes_rbac_grants (id, tenant_id, group_id, cluster_id, cluster_match, cluster_pattern, name, role_kind, role_name, scope, namespaces, rules, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(id)
+            .bind(tenant_id)
+            .bind(group_id)
+            .bind(cluster_id)
+            .bind(cluster_match)
+            .bind(cluster_pattern)
+            .bind(name)
+            .bind(role_kind)
+            .bind(role_name)
+            .bind(scope)
+            .bind(namespaces)
+            .bind(rules)
+            .bind(&existing.created_at)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        self.get_kubernetes_rbac_grant(tenant_id, id).await
+    }
+
+    pub async fn delete_kubernetes_rbac_grant(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<KubernetesRbacGrantRow>> {
+        let Some(existing) = self.get_kubernetes_rbac_grant(tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let now = Self::now_str();
+        self.client
+            .query("INSERT INTO config_kubernetes_rbac_grants (id, tenant_id, group_id, cluster_id, cluster_match, cluster_pattern, name, role_kind, role_name, scope, namespaces, rules, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(&existing.id)
+            .bind(&existing.tenant_id)
+            .bind(&existing.group_id)
+            .bind(&existing.cluster_id)
+            .bind(&existing.cluster_match)
+            .bind(&existing.cluster_pattern)
+            .bind(&existing.name)
+            .bind(&existing.role_kind)
+            .bind(&existing.role_name)
+            .bind(&existing.scope)
+            .bind(&existing.namespaces)
+            .bind(&existing.rules)
+            .bind(&existing.created_at)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(Some(existing))
+    }
+
+    pub async fn kubernetes_rbac_group_ids_for_user(
+        &self,
+        tenant_id: &str,
+        cluster_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            group_id: String,
+            cluster_id: String,
+            cluster_match: String,
+            cluster_pattern: String,
+        }
+        let mut group_ids = self
+            .client
+            .query("SELECT DISTINCT gr.group_id AS group_id, gr.cluster_id AS cluster_id, gr.cluster_match AS cluster_match, gr.cluster_pattern AS cluster_pattern FROM config_kubernetes_rbac_grants gr FINAL JOIN config_user_groups ug FINAL ON gr.group_id = ug.group_id JOIN config_group_tenants gt FINAL ON gr.group_id = gt.group_id JOIN config_groups cg FINAL ON gr.group_id = cg.id WHERE gr.tenant_id = ? AND gr.is_deleted = 0 AND ug.user_id = ? AND ug.is_deleted = 0 AND gt.tenant_id = ? AND gt.is_deleted = 0 AND cg.is_deleted = 0")
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(tenant_id)
+            .fetch_all::<Row>()
+            .await?
+            .into_iter()
+            .filter(|row| {
+                kubernetes_cluster_selector_matches(
+                    &row.cluster_match,
+                    &row.cluster_id,
+                    &row.cluster_pattern,
+                    cluster_id,
+                )
+            })
+            .map(|row| row.group_id)
+            .collect::<Vec<_>>();
+        group_ids.sort();
+        group_ids.dedup();
+        Ok(group_ids)
     }
 
     pub async fn create_kubernetes_login_request(
@@ -9293,6 +10051,7 @@ impl ConfigDb {
             user_id: String::new(),
             username: String::new(),
             role: String::new(),
+            client_reported: "{}".to_string(),
             created_at: created_at.to_string(),
             expires_at: expires_at.to_string(),
             approved_at: String::new(),
@@ -9308,7 +10067,7 @@ impl ConfigDb {
         user_code: &str,
     ) -> anyhow::Result<Option<KubernetesLoginRequest>> {
         let result = self.client
-            .query("SELECT device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted FROM config_kubernetes_login_requests FINAL WHERE user_code = ? AND is_deleted = 0 ORDER BY version DESC LIMIT 1")
+            .query("SELECT device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, client_reported, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted FROM config_kubernetes_login_requests FINAL WHERE user_code = ? AND is_deleted = 0 ORDER BY version DESC LIMIT 1")
             .bind(user_code)
             .fetch_one::<KubernetesLoginRequest>()
             .await;
@@ -9324,7 +10083,7 @@ impl ConfigDb {
         device_code_hash: &str,
     ) -> anyhow::Result<Option<KubernetesLoginRequest>> {
         let result = self.client
-            .query("SELECT device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted FROM config_kubernetes_login_requests FINAL WHERE device_code_hash = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, client_reported, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted FROM config_kubernetes_login_requests FINAL WHERE device_code_hash = ? AND is_deleted = 0 LIMIT 1")
             .bind(device_code_hash)
             .fetch_one::<KubernetesLoginRequest>()
             .await;
@@ -9358,6 +10117,65 @@ impl ConfigDb {
         Ok(approved)
     }
 
+    pub async fn attach_kubernetes_login_enrichment(
+        &self,
+        request: &KubernetesLoginRequest,
+        client_reported: &str,
+    ) -> anyhow::Result<KubernetesLoginRequest> {
+        let mut enriched = request.clone();
+        enriched.client_reported = client_reported.to_string();
+        enriched.version = Self::next_version();
+        self.insert_kubernetes_login_request(&enriched).await?;
+        Ok(enriched)
+    }
+
+    pub async fn list_active_kubernetes_login_requests(
+        &self,
+        tenant_id: &str,
+        now: &str,
+    ) -> anyhow::Result<Vec<KubernetesLoginRequest>> {
+        self.client
+            .query("SELECT device_code_hash, user_code, cluster_id, state, tenant_id, user_id, username, role, client_reported, created_at, expires_at, approved_at, credential_expires_at, version, is_deleted FROM config_kubernetes_login_requests FINAL WHERE tenant_id = ? AND state = 'approved' AND credential_expires_at > ? AND is_deleted = 0 AND device_code_hash NOT IN (SELECT device_code_hash FROM config_kubernetes_login_revocations FINAL) ORDER BY credential_expires_at ASC")
+            .bind(tenant_id)
+            .bind(now)
+            .fetch_all::<KubernetesLoginRequest>()
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn is_kubernetes_login_revoked(
+        &self,
+        device_code_hash: &str,
+    ) -> anyhow::Result<bool> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            count: u64,
+        }
+        let row = self
+            .client
+            .query("SELECT count() AS count FROM config_kubernetes_login_revocations FINAL WHERE device_code_hash = ?")
+            .bind(device_code_hash)
+            .fetch_one::<Row>()
+            .await?;
+        Ok(row.count > 0)
+    }
+
+    pub async fn revoke_kubernetes_login_request(
+        &self,
+        request: &KubernetesLoginRequest,
+        revoked_at: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .query("INSERT INTO config_kubernetes_login_revocations (device_code_hash, tenant_id, revoked_at, version) VALUES (?, ?, ?, ?)")
+            .bind(&request.device_code_hash)
+            .bind(&request.tenant_id)
+            .bind(revoked_at)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
     pub async fn kubernetes_access_storage_ready(&self) -> anyhow::Result<()> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct ReadyRow {
@@ -9376,6 +10194,18 @@ impl ConfigDb {
             .await?;
         let _ = events.count.saturating_add(chunks.count);
         Ok(())
+    }
+
+    pub async fn list_kubernetes_gateway_activity(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<KubernetesGatewayActivityRow>> {
+        self.client
+            .query("SELECT gateway_id, cluster_id, max(created_at) AS last_activity, count() AS recorded_requests FROM config_kubernetes_access_events WHERE tenant_id = ? AND gateway_id != '' AND cluster_id != '' GROUP BY gateway_id, cluster_id ORDER BY last_activity DESC, gateway_id ASC")
+            .bind(tenant_id)
+            .fetch_all::<KubernetesGatewayActivityRow>()
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn insert_kubernetes_access_event(

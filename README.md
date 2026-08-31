@@ -37,13 +37,12 @@ make dev      # ClickHouse in Docker + query-api on :8080
 make watch    # same, but reloads on change
 ```
 
-If `../postgres-collector` is checked out locally, `make dev` and `make watch`
-automatically compile it, enable the PostgreSQL collector feature, and point
-the API's collector supervisor at the debug binary. When that checkout also
-contains `config.yaml` and no API-managed PostgreSQL target exists yet, the
-supervisor uses the local file as a bootstrap configuration. API-managed
-targets take precedence. Use `LOCAL_COLLECTOR_DIR=/path/to/postgresql-collector
-make watch` for a different checkout location.
+If `../postgres-collector` or `../mysql-collector` is checked out locally,
+`make dev` and `make watch` compile the available collectors, enable their
+features, and point the API supervisor at the debug binaries. A checkout's
+ignored `config.yaml` acts as bootstrap configuration until an API-managed
+target exists. Set `LOCAL_COLLECTOR_DIR` or `LOCAL_MYSQL_COLLECTOR_DIR` when a
+checkout lives elsewhere.
 
 Or run everything in Docker, or just the database:
 
@@ -91,16 +90,21 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_SESSION_IDLE_TIMEOUT_SECS` | `1800` | inactivity window for browser sessions; accepted range is 60 seconds through 31 days |
 | `RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS` | `86400` | hard browser-session lifetime; must be at least the idle timeout and no more than 31 days |
 | `RUSH_SESSION_RENEWAL_INTERVAL_SECS` | `300` | minimum activity interval before the HttpOnly bearer is rotated; must be 30 seconds or more and less than the idle timeout |
-| `KUBERNETES_ACCESS_CREDENTIAL_TTL_SECONDS` | `3600` | browser-approved kubectl credential lifetime; accepted range is 300 through 43200 seconds, and API keys are never accepted for Kubernetes access |
+| `KUBERNETES_ACCESS_CREDENTIAL_TTL_SECONDS` | `3600` | initial browser-approved kubectl credential lifetime; accepted range is 300 through 43200 seconds. The saved Kubernetes logging setting overrides it for new approvals; API keys are never accepted |
+| `KUBERNETES_ACCESS_COLLECT_PRIVATE_IP` | `false` | keep private addresses from authenticated Rush CLI device enrichment; other reported device fields are informational and never used for authorization |
 | `RUSH_TRUSTED_PROXY_CIDRS` | _(empty)_ | comma-separated proxy networks allowed to supply `X-Forwarded-For`/`X-Real-IP`; other peers' forwarding headers are ignored |
 | `RUSH_SSO_ONLY` | `false` | when `true` and an SSO provider is active, reject local sign-in except for the configured admin break-glass account |
 | `RUSH_BREAK_GLASS_USERNAME` | `admin` | canonical username of the local admin retained for emergency access in SSO-only mode; other admins cannot reset its password |
 | `INITIAL_ADMIN_PASSWORD` | _(required for a new database)_ | initial administrator seed supplied through a secret; it is never generated or written to application logs |
-| `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | stable key used to encrypt integration DSNs |
+| `RUSH_INTEGRATION_ENCRYPTION_KEY_ID` | `primary` | non-secret identifier stored with new encrypted integration DSNs |
+| `RUSH_INTEGRATION_ENCRYPTION_KEY` | _(required for managed targets)_ | dedicated 32+ byte secret used to encrypt integration DSNs; it never falls back to the API-key secret |
+| `RUSH_INTEGRATION_ENCRYPTION_PREVIOUS_KEYS` | _(empty)_ | JSON object of prior key IDs to 32+ byte secrets; retain the pre-key-ID secret as `legacy` during migration |
 | `RUSH_COLLECTOR_MANAGER_ENABLED` | `false` | enable API-managed local collector supervision |
 | `RUSH_POSTGRES_COLLECTOR_BIN` | `../postgres-collector/target/debug/postgres-collector` | managed PostgreSQL collector executable |
 | `RUSH_POSTGRES_COLLECTOR_CONFIG` | _(empty)_ | optional bootstrap YAML when no API-managed target exists |
-| `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant-scoped API key for managed collector ingest |
+| `RUSH_MYSQL_COLLECTOR_BIN` | `../mysql-collector/target/debug/mysql-collector` | managed MySQL collector executable |
+| `RUSH_MYSQL_COLLECTOR_CONFIG` | _(empty)_ | optional bootstrap YAML when no API-managed MySQL target exists |
+| `RUSH_COLLECTOR_API_KEY` | _(empty)_ | tenant ingest key with `logs`, `metrics`, and `collector` signals for managed collectors |
 | `RUSH_ALLOWED_ORIGINS` | _(empty; cross-origin disabled)_ | Comma-separated exact HTTP(S) browser origins. Invalid, `null`, wildcard, credential-bearing, or path-bearing entries stop startup; production browser mutations must still match `RUSH_BASE_URL` |
 | `RUSH_INGEST_MAX_COMPRESSED_BYTES` | `8388608` | maximum wire body accepted by an ingest endpoint before decoding |
 | `RUSH_INGEST_MAX_DECOMPRESSED_BYTES` | `33554432` | maximum inflated bytes per ingest request, including cumulative nested CloudWatch records |
@@ -109,6 +113,9 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_INGEST_MAX_METADATA` | `10000` | Prometheus remote-write metadata-record limit |
 | `RUSH_INGEST_MAX_LABELS_PER_SERIES` | `128` | maximum labels on one Prometheus series |
 | `RUSH_INGEST_MAX_LABEL_NAME_BYTES` / `RUSH_INGEST_MAX_LABEL_VALUE_BYTES` | `256` / `4096` | UTF-8 byte limits for Prometheus label names and values |
+| `RUSH_INGEST_BATCH_ROWS` / `RUSH_INGEST_BATCH_MS` | `5000` / `500` | flush an in-memory table batch when either limit is reached; set rows to `1` or milliseconds to `0` for synchronous writes |
+| `RUSH_CLICKHOUSE_ASYNC_INSERT` | `true` | let ClickHouse buffer inserts server-side |
+| `RUSH_CLICKHOUSE_WAIT_FOR_ASYNC_INSERT` | `false` | wait for the ClickHouse async-insert flush; enable for stronger delivery confirmation at higher latency |
 | `RUSH_INGEST_DECODE_CONCURRENCY` | `4` | process-wide CPU-heavy ingest decode slots; excess requests receive retryable 429 responses |
 | `RUSH_EXPORT_SYNC_MAX_ROWS` | `50000` | synchronous streaming ceiling; larger allowed exports become expiring jobs |
 | `RUSH_EXPORT_MAX_BYTES` | `268435456` | hard byte cap for synchronous downloads and asynchronous export objects |
@@ -313,20 +320,29 @@ still gate each collector with the signed `RUSH_LICENSE_KEY` at runtime.
 # Open-source API
 make build
 
-# PostgreSQL-enabled build containing the collector supervisor
+# Collector-enabled builds containing the process supervisor
 FEATURES=postgres-collector make build
+FEATURES=mysql-collector make build
+FEATURES=postgres-collector,mysql-collector make build
 
 # PostgreSQL-enabled container build; GITHUB_TOKEN is consumed as a BuildKit secret
 GITHUB_TOKEN="$GITHUB_TOKEN" \
 RUSH_POSTGRES_COLLECTOR_VERSION=v0.1.0 \
 FEATURES=postgres-collector make docker
+
+GITHUB_TOKEN="$GITHUB_TOKEN" \
+RUSH_MYSQL_COLLECTOR_VERSION=v0.1.0 \
+FEATURES=mysql-collector make docker
 ```
 
 When enabled, set `RUSH_COLLECTOR_MANAGER_ENABLED=true`. The API stores
-integration targets in its config plane, encrypts DSNs with
+integration targets in its config plane, encrypts DSNs with the dedicated
 `RUSH_INTEGRATION_ENCRYPTION_KEY`, and supervises the collector process. For
-local development the Makefile supplies a development encryption key; use a
-stable secret-manager value in production.
+local development the Makefile supplies a development key. In production, use
+a stable 32+ byte secret-manager value and set a distinct key ID. To rotate it,
+move the former ID and secret into `RUSH_INTEGRATION_ENCRYPTION_PREVIOUS_KEYS`,
+then install a new current ID and key. Keep a pre-key-ID secret under `legacy`
+until all older targets have been saved again.
 
 Targets are managed through the admin API:
 
@@ -336,14 +352,22 @@ GET    /api/v1/integrations/postgresql/targets
 POST   /api/v1/integrations/postgresql/targets
 PUT    /api/v1/integrations/postgresql/targets/{id}
 DELETE /api/v1/integrations/postgresql/targets/{id}
+
+GET    /api/v1/integrations/mysql/targets
+POST   /api/v1/integrations/mysql/targets
+PUT    /api/v1/integrations/mysql/targets/{id}
+DELETE /api/v1/integrations/mysql/targets/{id}
 ```
 
 The target response never returns the DSN. Target changes are audit logged and
 the collector is reconciled immediately, then periodically. Set
 `RUSH_POSTGRES_COLLECTOR_BIN` when the collector binary is not at the local
 development default, and set `RUSH_COLLECTOR_API_KEY` for locked tenants.
+That key must be an ingest key with the `logs`, `metrics`, and `collector`
+signals. Existing collector keys without `collector` cannot poll or complete
+EXPLAIN jobs and should be replaced.
 The private collector release repository is
-`RushObservability/postgresql-collector`.
+`RushObservability/postgresql-collector` or `RushObservability/mysql-collector`.
 
 Static config (retention defaults, storage tiering) lives in `rush.toml`, found via `RUSH_CONFIG`.
 

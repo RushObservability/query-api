@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use axum::{
     Extension, Json,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::handlers::infrastructure::require_infrastructure_read;
-use crate::handlers::users::{require_admin, require_auth};
+use crate::handlers::users::require_admin;
 use crate::models::kubernetes_access::{
     KubernetesAccessEvent, KubernetesAccessEventView, KubernetesAccessFilter,
     KubernetesSessionChunk, KubernetesSessionChunkView,
@@ -23,6 +23,12 @@ pub const MAX_ACCESS_EVENT_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SESSION_CHUNK_BODY_BYTES: usize = 512 * 1024;
 pub const MAX_GATEWAY_AUTHORIZE_BODY_BYTES: usize = 8 * 1024;
 pub const MAX_KUBERNETES_LOGIN_BODY_BYTES: usize = 4 * 1024;
+pub const MAX_CLIENT_ENRICHMENT_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_KUBERNETES_RBAC_BODY_BYTES: usize = 64 * 1024;
+pub const MIN_KUBERNETES_SESSION_SECONDS: i64 = 300;
+pub const MAX_KUBERNETES_SESSION_SECONDS: i64 = 43_200;
+pub const DEFAULT_KUBERNETES_SESSION_SECONDS: i64 = 3_600;
+const KUBERNETES_SESSION_SECONDS_SETTING: &str = "kubernetes_access_max_session_seconds";
 const DEFAULT_MAX_RESULT_BYTES: usize = 256 * 1024;
 const HARD_MAX_RESULT_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
@@ -32,6 +38,9 @@ const MAX_JSON_METADATA_BYTES: usize = 64 * 1024;
 const MAX_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXPORT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SESSION_REPLAY_PAGE: u64 = 512;
+const MAX_KUBERNETES_RBAC_GRANTS: usize = 100;
+const MAX_KUBERNETES_RBAC_RULES: usize = 32;
+const MAX_KUBERNETES_AUTHORIZATION_GROUPS: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -114,39 +123,11 @@ pub struct ClientReportedInput {
     pub private_ips: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientExecutionInput {
-    #[serde(default)]
-    pub started_at: String,
-    #[serde(default)]
-    pub duration_ms: u64,
-    #[serde(default)]
-    pub exit_code: i32,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientCaptureInput {
-    #[serde(default)]
-    pub stdout_preview: String,
-    #[serde(default)]
-    pub stderr_preview: String,
-    #[serde(default)]
-    pub truncated: bool,
-    #[serde(default)]
-    pub redaction_count: u32,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAccessEventInput {
     pub cluster_id: String,
     pub client_reported: ClientReportedInput,
-    #[serde(default)]
-    pub execution: Option<ClientExecutionInput>,
-    #[serde(default)]
-    pub capture: Option<ClientCaptureInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +194,48 @@ struct AccessEventListResponse {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct AgentAccessEventQuery {
+    pub tenant_id: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub actor: Option<String>,
+    pub cluster: Option<String>,
+    pub namespace: Option<String>,
+    pub verb: Option<String>,
+    pub resource: Option<String>,
+    pub status: Option<String>,
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct AgentAccessEventView {
+    id: String,
+    created_at: String,
+    actor_name: String,
+    actor_type: String,
+    kube_username: String,
+    cluster_id: String,
+    namespace: String,
+    verb: String,
+    resource: String,
+    subresource: String,
+    name: String,
+    status_code: u16,
+    duration_ms: u64,
+    likely_kubectl_command: String,
+    source_kind: String,
+    session_id: String,
+    recording_state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentAccessEventListResponse {
+    events: Vec<AgentAccessEventView>,
+    total: u64,
+    evidence_note: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GatewayAuthorization {
     pub actor_user_id: String,
@@ -223,6 +246,7 @@ pub struct GatewayAuthorization {
     pub role: String,
     pub kube_username: String,
     pub kube_groups: Vec<String>,
+    pub client_reported: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +313,117 @@ pub struct KubernetesLoginTokenResponse {
     pub interval: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesLoggingSettingsInput {
+    pub max_session_seconds: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KubernetesClientSessionView {
+    pub session_id: String,
+    pub username: String,
+    pub cluster_id: String,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub cli_version: String,
+    pub approved_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KubernetesLoggingSettingsResponse {
+    pub max_session_seconds: i64,
+    pub min_session_seconds: i64,
+    pub max_allowed_session_seconds: i64,
+    pub active_clients: Vec<KubernetesClientSessionView>,
+    pub rbac_grants: Vec<KubernetesRbacGrantView>,
+    pub gateways: Vec<KubernetesGatewayClusterView>,
+    pub available_clusters: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KubernetesGatewayClusterView {
+    pub gateway_id: String,
+    pub cluster_id: String,
+    pub configured: bool,
+    pub last_activity: String,
+    pub recorded_requests: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesRbacRule {
+    #[serde(default)]
+    pub api_groups: Vec<String>,
+    pub resources: Vec<String>,
+    pub verbs: Vec<String>,
+}
+
+fn default_kubernetes_cluster_match() -> String {
+    "single".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesRbacGrantInput {
+    pub group_id: String,
+    #[serde(default)]
+    pub cluster_id: String,
+    #[serde(default = "default_kubernetes_cluster_match")]
+    pub cluster_match: String,
+    #[serde(default)]
+    pub cluster_pattern: String,
+    pub name: String,
+    pub role_kind: String,
+    #[serde(default)]
+    pub role_name: String,
+    pub scope: String,
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    #[serde(default)]
+    pub rules: Vec<KubernetesRbacRule>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KubernetesRbacGrantView {
+    pub id: String,
+    pub tenant_id: String,
+    pub group_id: String,
+    pub kubernetes_group: String,
+    pub cluster_id: String,
+    pub cluster_match: String,
+    pub cluster_pattern: String,
+    pub name: String,
+    pub role_kind: String,
+    pub role_name: String,
+    pub scope: String,
+    pub namespaces: Vec<String>,
+    pub rules: Vec<KubernetesRbacRule>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GatewayRbacResponse {
+    pub cluster_id: String,
+    pub grants: Vec<KubernetesRbacGrantView>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GatewayRbacQuery {
+    pub cluster_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRbacReconcileInput {
+    pub cluster_id: String,
+    pub revision: String,
+    pub grant_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GatewayBinding {
     gateway_id: String,
@@ -305,6 +440,10 @@ fn enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+pub fn available() -> bool {
+    enabled() && crate::license::evaluate().has_entitlement("kubernetes_access")
 }
 
 fn require_enabled() -> Result<(), (StatusCode, String)> {
@@ -344,12 +483,34 @@ fn max_session_bytes() -> u64 {
     ) as u64
 }
 
-fn kubernetes_credential_ttl_seconds() -> i64 {
+fn kubernetes_session_seconds_from_env() -> i64 {
     std::env::var("KUBERNETES_ACCESS_CREDENTIAL_TTL_SECONDS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| (300..=43_200).contains(value))
-        .unwrap_or(3_600)
+        .filter(|value| {
+            (MIN_KUBERNETES_SESSION_SECONDS..=MAX_KUBERNETES_SESSION_SECONDS).contains(value)
+        })
+        .unwrap_or(DEFAULT_KUBERNETES_SESSION_SECONDS)
+}
+
+async fn kubernetes_session_seconds(state: &AppState) -> Result<i64, (StatusCode, String)> {
+    let stored = state
+        .config_db
+        .get_setting(KUBERNETES_SESSION_SECONDS_SETTING)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read Kubernetes session limit");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes logging settings are unavailable".to_string(),
+            )
+        })?;
+    Ok(stored
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| {
+            (MIN_KUBERNETES_SESSION_SECONDS..=MAX_KUBERNETES_SESSION_SECONDS).contains(value)
+        })
+        .unwrap_or_else(kubernetes_session_seconds_from_env))
 }
 
 fn temporary_credential_hash(token: &str) -> String {
@@ -366,6 +527,38 @@ fn temporary_device_credential() -> String {
 
 fn temporary_user_code() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_ascii_uppercase()
+}
+
+fn client_session_id(device_code_hash: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kubernetes-client-session\0");
+    digest.update(device_code_hash.as_bytes());
+    format!("kcs_{}", &hex::encode(digest.finalize())[..24])
+}
+
+fn client_session_view(
+    request: &crate::clickhouse_config::KubernetesLoginRequest,
+) -> KubernetesClientSessionView {
+    let reported = serde_json::from_str::<serde_json::Value>(&request.client_reported)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let field = |name: &str| {
+        reported
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    KubernetesClientSessionView {
+        session_id: client_session_id(&request.device_code_hash),
+        username: request.username.clone(),
+        cluster_id: request.cluster_id.clone(),
+        hostname: field("hostname"),
+        os: field("os"),
+        arch: field("arch"),
+        cli_version: field("cli_version"),
+        approved_at: request.approved_at.clone(),
+        expires_at: request.credential_expires_at.clone(),
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -522,17 +715,22 @@ fn tenant_cluster_allowed(
     tenant_id: &str,
     cluster_id: &str,
 ) -> Result<bool, (StatusCode, String)> {
-    let policy = serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(raw_policy)
-        .map_err(|_| {
-            tracing::error!("KUBERNETES_ACCESS_TENANT_CLUSTERS is invalid JSON");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Kubernetes access policy is unavailable".to_string(),
-            )
-        })?;
+    let policy = parse_tenant_cluster_policy(raw_policy)?;
     Ok(policy
         .get(tenant_id)
         .is_some_and(|clusters| clusters.iter().any(|allowed| allowed == cluster_id)))
+}
+
+fn parse_tenant_cluster_policy(
+    raw_policy: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>, (StatusCode, String)> {
+    serde_json::from_str(raw_policy).map_err(|_| {
+        tracing::error!("KUBERNETES_ACCESS_TENANT_CLUSTERS is invalid JSON");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Kubernetes access policy is unavailable".to_string(),
+        )
+    })
 }
 
 fn validate_text(name: &str, value: &str, max_bytes: usize) -> Result<(), (StatusCode, String)> {
@@ -960,41 +1158,6 @@ fn internal_event(
     })
 }
 
-fn resolved_client_ip(peer: IpAddr, headers: &HeaderMap, trusted_proxy_cidrs: &[String]) -> IpAddr {
-    let trusted = |address| {
-        !trusted_proxy_cidrs.is_empty()
-            && crate::api_key_auth::source_allowed(address, trusted_proxy_cidrs)
-    };
-    if !trusted(peer) {
-        return peer;
-    }
-    if let Some(raw) = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-    {
-        let Ok(chain) = raw
-            .split(',')
-            .map(|value| value.trim().parse::<IpAddr>())
-            .collect::<Result<Vec<_>, _>>()
-        else {
-            return peer;
-        };
-        let mut client = peer;
-        for address in chain.into_iter().rev() {
-            if !trusted(client) {
-                break;
-            }
-            client = address;
-        }
-        return client;
-    }
-    headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        .unwrap_or(peer)
-}
-
 fn network_evidence(ip: IpAddr, secret: &str) -> serde_json::Value {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
     mac.update(b"kubernetes-access-source-ip\0");
@@ -1018,49 +1181,6 @@ fn network_evidence(ip: IpAddr, secret: &str) -> serde_json::Value {
         "ip_hash": ip_hash,
         "ip_prefix": prefix,
     })
-}
-
-fn kubectl_parts(argv: &[String]) -> (String, String, String) {
-    const VERBS: &[&str] = &[
-        "get",
-        "list",
-        "describe",
-        "logs",
-        "apply",
-        "create",
-        "delete",
-        "patch",
-        "edit",
-        "exec",
-        "attach",
-        "debug",
-        "run",
-        "port-forward",
-        "scale",
-        "rollout",
-        "cordon",
-        "uncordon",
-        "drain",
-    ];
-    let verb_index = argv.iter().position(|arg| VERBS.contains(&arg.as_str()));
-    let verb = verb_index
-        .and_then(|index| argv.get(index))
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
-    let resource = verb_index
-        .and_then(|index| argv.get(index + 1))
-        .filter(|value| !value.starts_with('-'))
-        .cloned()
-        .unwrap_or_default();
-    let namespace = argv
-        .iter()
-        .enumerate()
-        .find_map(|(index, arg)| match arg.as_str() {
-            "-n" | "--namespace" => argv.get(index + 1).cloned(),
-            _ => arg.strip_prefix("--namespace=").map(str::to_string),
-        })
-        .unwrap_or_default();
-    (verb, resource, namespace)
 }
 
 fn collect_private_ips(input: &[String]) -> Vec<String> {
@@ -1168,114 +1288,44 @@ fn prepare_session_chunk(
     ))
 }
 
-fn client_event(
-    input: ClientAccessEventInput,
-    identity: &RequestIdentity,
-    actor_id: String,
-    actor_name: String,
-    actor_type: String,
-    user_agent: String,
-    peer_ip: IpAddr,
-    secret: &str,
-) -> Result<KubernetesAccessEvent, (StatusCode, String)> {
-    require_text("cluster_id", &input.cluster_id, 256)?;
-    if input.client_reported.argv.len() > 128
-        || input
-            .client_reported
-            .argv
-            .iter()
-            .any(|argument| argument.len() > 4096)
-    {
+fn prepare_client_reported(mut input: ClientReportedInput) -> Result<String, (StatusCode, String)> {
+    if input.argv.len() > 128 || input.argv.iter().any(|argument| argument.len() > 4096) {
         return Err((
             StatusCode::BAD_REQUEST,
             "client_reported.argv exceeds its limit".to_string(),
         ));
     }
     for (name, value, max) in [
-        (
-            "cli_version",
-            input.client_reported.cli_version.as_str(),
-            128,
-        ),
-        ("os", input.client_reported.os.as_str(), 128),
-        ("arch", input.client_reported.arch.as_str(), 128),
-        ("hostname", input.client_reported.hostname.as_str(), 256),
+        ("cli_version", input.cli_version.as_str(), 128),
+        ("os", input.os.as_str(), 128),
+        ("arch", input.arch.as_str(), 128),
+        ("hostname", input.hostname.as_str(), 256),
     ] {
         validate_text(name, value, max)?;
     }
 
-    let execution = input.execution.unwrap_or(ClientExecutionInput {
-        started_at: String::new(),
-        duration_ms: 0,
-        exit_code: 0,
-    });
-    let capture = input.capture.unwrap_or(ClientCaptureInput {
-        stdout_preview: String::new(),
-        stderr_preview: String::new(),
-        truncated: false,
-        redaction_count: 0,
-    });
-    let private_ips = collect_private_ips(&input.client_reported.private_ips);
-    let (verb, resource, namespace) = kubectl_parts(&input.client_reported.argv);
-    let client_reported_value = serde_json::json!({
+    let private_ips = collect_private_ips(&input.private_ips);
+    input.private_ips = private_ips;
+    let private_ips_collected = !input.private_ips.is_empty();
+    let mut client_reported_value = serde_json::json!({
         "provenance": "client_reported",
-        "argv": input.client_reported.argv,
-        "cli_version": input.client_reported.cli_version,
-        "os": input.client_reported.os,
-        "arch": input.client_reported.arch,
-        "hostname": input.client_reported.hostname,
-        "private_ips": private_ips,
-        "private_ips_collected": !private_ips.is_empty(),
-        "execution": execution,
+        "argv": input.argv,
+        "cli_version": input.cli_version,
+        "os": input.os,
+        "arch": input.arch,
+        "hostname": input.hostname,
+        "private_ips": input.private_ips,
+        "private_ips_collected": private_ips_collected,
     });
-    let result_value = serde_json::json!({
-        "stdout": capture.stdout_preview,
-        "stderr": capture.stderr_preview,
-        "client_reported_truncated": capture.truncated,
-    });
-    let (client_reported, _, client_redactions) =
-        bounded_json(client_reported_value, MAX_JSON_METADATA_BYTES)?;
-    let (result_summary, bounded, result_redactions) =
-        bounded_json(result_value, max_result_bytes())?;
-    let truncated = bounded || capture.truncated;
-
-    Ok(KubernetesAccessEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        tenant_id: identity.tenant_id.clone(),
-        cluster_id: input.cluster_id,
-        gateway_id: String::new(),
-        session_id: String::new(),
-        actor_user_id: actor_id,
-        actor_name,
-        actor_type,
-        kube_username: String::new(),
-        kube_groups: "[]".to_string(),
-        source_kind: "rush_cli".to_string(),
-        client_reported,
-        observed_network: serde_json::to_string(&network_evidence(peer_ip, secret))
-            .unwrap_or_else(|_| "{}".to_string()),
-        http_method: "KUBECTL".to_string(),
-        verb,
-        api_group: String::new(),
-        api_version: String::new(),
-        resource,
-        subresource: String::new(),
-        namespace,
-        name: String::new(),
-        request_query: "{}".to_string(),
-        user_agent,
-        status_code: if execution.exit_code == 0 { 200 } else { 500 },
-        duration_ms: execution.duration_ms,
-        request_bytes: 0,
-        response_bytes: result_summary.len() as u64,
-        result_summary,
-        result_truncated: u8::from(truncated),
-        redaction_count: client_redactions
-            .saturating_add(result_redactions)
-            .saturating_add(capture.redaction_count),
-        recording_state: if truncated { "partial" } else { "complete" }.to_string(),
-        created_at: normalize_timestamp(&execution.started_at),
-    })
+    let argv_redactions = redact_client_argv(&mut client_reported_value);
+    if let Some(fields) = client_reported_value.as_object_mut() {
+        fields.insert(
+            "redaction_count".to_string(),
+            serde_json::Value::from(argv_redactions),
+        );
+    }
+    let (client_reported, _, _) = bounded_json(client_reported_value, MAX_JSON_METADATA_BYTES)?;
+    Ok(client_reported)
 }
 
 fn map_query(
@@ -1444,11 +1494,924 @@ fn views_within_budget(
     views
 }
 
-fn kubernetes_authorization_groups(tenant_id: &str, role: &str) -> Vec<String> {
-    vec![
+fn shell_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn shell_command(parts: impl IntoIterator<Item = String>) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| shell_argument(&part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn reconstructed_kubectl_command(event: &KubernetesAccessEventView) -> String {
+    let verb = event.verb.to_ascii_lowercase();
+    let subresource = event.subresource.to_ascii_lowercase();
+    let mut namespace = Vec::new();
+    if !event.namespace.is_empty() {
+        namespace.extend(["-n".to_string(), event.namespace.clone()]);
+    }
+
+    if matches!(subresource.as_str(), "exec" | "attach") {
+        let mut parts = vec!["kubectl".to_string(), subresource];
+        parts.extend(namespace);
+        if !event.name.is_empty() {
+            parts.push(event.name.clone());
+        }
+        return shell_command(parts);
+    }
+    if matches!(subresource.as_str(), "log" | "logs") {
+        let mut parts = vec!["kubectl".to_string(), "logs".to_string()];
+        parts.extend(namespace);
+        if !event.name.is_empty() {
+            parts.push(event.name.clone());
+        }
+        return shell_command(parts);
+    }
+    if subresource == "portforward" {
+        let mut parts = vec!["kubectl".to_string(), "port-forward".to_string()];
+        parts.extend(namespace);
+        if !event.name.is_empty() {
+            parts.push(format!("{}/{}", event.resource, event.name));
+        }
+        return shell_command(parts);
+    }
+    if event.resource.is_empty() {
+        return "kubectl api-resources".to_string();
+    }
+
+    let action = match verb.as_str() {
+        "get" | "list" | "watch" => "get".to_string(),
+        "deletecollection" => "delete".to_string(),
+        "update" => "replace".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => event.http_method.to_ascii_lowercase(),
+    };
+    let mut parts = vec!["kubectl".to_string(), action, event.resource.clone()];
+    if !event.name.is_empty() && verb != "deletecollection" {
+        parts.push(event.name.clone());
+    }
+    parts.extend(namespace);
+    if verb == "watch" {
+        parts.push("--watch".to_string());
+    } else if verb == "deletecollection" {
+        parts.push("--all".to_string());
+    }
+    shell_command(parts)
+}
+
+impl From<KubernetesAccessEventView> for AgentAccessEventView {
+    fn from(event: KubernetesAccessEventView) -> Self {
+        let likely_kubectl_command = reconstructed_kubectl_command(&event);
+        Self {
+            id: event.id,
+            created_at: event.created_at,
+            actor_name: event.actor_name,
+            actor_type: event.actor_type,
+            kube_username: event.kube_username,
+            cluster_id: event.cluster_id,
+            namespace: event.namespace,
+            verb: event.verb,
+            resource: event.resource,
+            subresource: event.subresource,
+            name: event.name,
+            status_code: event.status_code,
+            duration_ms: event.duration_ms,
+            likely_kubectl_command,
+            source_kind: event.source_kind,
+            session_id: event.session_id,
+            recording_state: event.recording_state,
+        }
+    }
+}
+
+fn kubernetes_group_for_rush_group(group_id: &str) -> String {
+    format!("rush:group:{group_id}")
+}
+
+fn kubernetes_authorization_groups(
+    tenant_id: &str,
+    role: &str,
+    rbac_group_ids: &[String],
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let mut groups = vec![
         "rush:authenticated".to_string(),
         format!("rush:tenant:{tenant_id}:role:{role}"),
-    ]
+    ];
+    groups.extend(
+        rbac_group_ids
+            .iter()
+            .map(|group_id| kubernetes_group_for_rush_group(group_id)),
+    );
+    groups.sort();
+    groups.dedup();
+    if groups.len() > MAX_KUBERNETES_AUTHORIZATION_GROUPS {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Kubernetes access matches too many Rush groups".to_string(),
+        ));
+    }
+    Ok(groups)
+}
+
+fn valid_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn valid_dns_subdomain(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 253 && value.split('.').all(valid_dns_label)
+}
+
+fn normalize_rbac_values(values: Vec<String>) -> Vec<String> {
+    let mut normalized = values
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn valid_rbac_resource(value: &str) -> bool {
+    value == "*"
+        || value.len() <= 128
+            && value
+                .split('/')
+                .all(|part| part == "*" || valid_dns_label(part))
+}
+
+fn validate_kubernetes_rbac_grant(
+    mut input: KubernetesRbacGrantInput,
+) -> Result<KubernetesRbacGrantInput, (StatusCode, String)> {
+    input.group_id = input.group_id.trim().to_string();
+    input.cluster_id = input.cluster_id.trim().to_string();
+    input.cluster_match = input.cluster_match.trim().to_ascii_lowercase();
+    input.cluster_pattern = input.cluster_pattern.trim().to_string();
+    input.name = input.name.trim().to_string();
+    input.role_kind = input.role_kind.trim().to_ascii_lowercase();
+    input.role_name = input.role_name.trim().to_ascii_lowercase();
+    input.scope = input.scope.trim().to_ascii_lowercase();
+
+    require_text("group_id", &input.group_id, 128)?;
+    if !input
+        .group_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid Rush group id".to_string()));
+    }
+    if !matches!(input.cluster_match.as_str(), "single" | "all" | "pattern") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cluster_match must be single, all, or pattern".to_string(),
+        ));
+    }
+    match input.cluster_match.as_str() {
+        "single" => {
+            require_text("cluster_id", &input.cluster_id, 256)?;
+            if input.cluster_id.contains('/')
+                || input
+                    .cluster_id
+                    .chars()
+                    .any(|character| character.is_control())
+            {
+                return Err((StatusCode::BAD_REQUEST, "invalid cluster id".to_string()));
+            }
+            input.cluster_pattern.clear();
+        }
+        "all" => {
+            input.cluster_id.clear();
+            input.cluster_pattern.clear();
+        }
+        "pattern" => {
+            require_text("cluster_pattern", &input.cluster_pattern, 256)?;
+            if !input.cluster_pattern.contains(['*', '?']) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "cluster pattern must contain * or ?".to_string(),
+                ));
+            }
+            if input.cluster_pattern.contains('/')
+                || input
+                    .cluster_pattern
+                    .chars()
+                    .any(|character| character.is_control())
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid cluster pattern".to_string(),
+                ));
+            }
+            input.cluster_id.clear();
+        }
+        _ => unreachable!(),
+    }
+    require_text("name", &input.name, 100)?;
+    if !matches!(
+        input.role_kind.as_str(),
+        "view" | "edit" | "admin" | "existing" | "custom"
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "role_kind must be view, edit, admin, existing, or custom".to_string(),
+        ));
+    }
+    if !matches!(input.scope.as_str(), "cluster" | "namespaces") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scope must be cluster or namespaces".to_string(),
+        ));
+    }
+
+    if matches!(input.role_kind.as_str(), "view" | "edit" | "admin") {
+        input.role_name.clone_from(&input.role_kind);
+        input.rules.clear();
+    } else if input.role_kind == "existing" {
+        if !valid_dns_subdomain(&input.role_name) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "existing ClusterRole name is invalid".to_string(),
+            ));
+        }
+        input.rules.clear();
+    } else {
+        input.role_name.clear();
+        if input.rules.is_empty() || input.rules.len() > MAX_KUBERNETES_RBAC_RULES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("custom roles require 1 to {MAX_KUBERNETES_RBAC_RULES} rules"),
+            ));
+        }
+        for rule in &mut input.rules {
+            rule.api_groups = normalize_rbac_values(std::mem::take(&mut rule.api_groups));
+            if rule.api_groups.is_empty() {
+                rule.api_groups.push(String::new());
+            }
+            rule.resources = normalize_rbac_values(std::mem::take(&mut rule.resources));
+            rule.verbs = normalize_rbac_values(std::mem::take(&mut rule.verbs));
+            if rule.api_groups.len() > 16
+                || rule.resources.is_empty()
+                || rule.resources.len() > 32
+                || rule.verbs.is_empty()
+                || rule.verbs.len() > 16
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "RBAC rule exceeds its limit".to_string(),
+                ));
+            }
+            if rule.api_groups.iter().any(|group| {
+                group == "*"
+                    || (!group.is_empty() && !valid_dns_subdomain(group))
+                    || group == "rbac.authorization.k8s.io"
+            }) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "custom rules cannot grant Kubernetes RBAC administration".to_string(),
+                ));
+            }
+            if rule
+                .resources
+                .iter()
+                .any(|resource| !valid_rbac_resource(resource))
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid Kubernetes resource".to_string(),
+                ));
+            }
+            if rule.verbs.iter().any(|verb| {
+                !matches!(
+                    verb.as_str(),
+                    "get"
+                        | "list"
+                        | "watch"
+                        | "create"
+                        | "update"
+                        | "patch"
+                        | "delete"
+                        | "deletecollection"
+                        | "*"
+                )
+            }) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid Kubernetes verb".to_string(),
+                ));
+            }
+        }
+    }
+
+    input.namespaces = normalize_rbac_values(input.namespaces);
+    if input.scope == "cluster" {
+        input.namespaces.clear();
+    } else if input.namespaces.is_empty()
+        || input.namespaces.len() > 64
+        || input
+            .namespaces
+            .iter()
+            .any(|namespace| !valid_dns_label(namespace))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "namespace roles require 1 to 64 valid namespaces".to_string(),
+        ));
+    }
+    Ok(input)
+}
+
+fn kubernetes_rbac_grant_view(
+    row: crate::clickhouse_config::KubernetesRbacGrantRow,
+) -> KubernetesRbacGrantView {
+    KubernetesRbacGrantView {
+        kubernetes_group: kubernetes_group_for_rush_group(&row.group_id),
+        id: row.id,
+        tenant_id: row.tenant_id,
+        group_id: row.group_id,
+        cluster_id: row.cluster_id,
+        cluster_match: row.cluster_match,
+        cluster_pattern: row.cluster_pattern,
+        name: row.name,
+        role_kind: row.role_kind,
+        role_name: row.role_name,
+        scope: row.scope,
+        namespaces: serde_json::from_str(&row.namespaces).unwrap_or_default(),
+        rules: serde_json::from_str(&row.rules).unwrap_or_default(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+async fn kubernetes_logging_settings_response(
+    state: &AppState,
+    tenant_id: &str,
+) -> Result<KubernetesLoggingSettingsResponse, (StatusCode, String)> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let active_clients = state
+        .config_db
+        .list_active_kubernetes_login_requests(tenant_id, &now)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to list active Kubernetes clients");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes clients are unavailable".to_string(),
+            )
+        })?
+        .iter()
+        .map(client_session_view)
+        .collect();
+    let rbac_grants = state
+        .config_db
+        .list_kubernetes_rbac_grants(tenant_id, None)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to list Kubernetes RBAC grants");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes roles are unavailable".to_string(),
+            )
+        })?
+        .into_iter()
+        .map(kubernetes_rbac_grant_view)
+        .collect();
+    let configured_binding = gateway_binding()
+        .ok()
+        .filter(|binding| binding.tenant_ids.iter().any(|tenant| tenant == tenant_id));
+    let mut gateways = state
+        .config_db
+        .list_kubernetes_gateway_activity(tenant_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to list Kubernetes gateway activity");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Kubernetes gateways are unavailable".to_string(),
+            )
+        })?
+        .into_iter()
+        .map(|row| KubernetesGatewayClusterView {
+            configured: configured_binding.as_ref().is_some_and(|binding| {
+                binding.gateway_id == row.gateway_id && binding.cluster_id == row.cluster_id
+            }),
+            gateway_id: row.gateway_id,
+            cluster_id: row.cluster_id,
+            last_activity: row.last_activity,
+            recorded_requests: row.recorded_requests,
+        })
+        .collect::<Vec<_>>();
+    if let Some(binding) = configured_binding {
+        if !gateways.iter().any(|gateway| {
+            gateway.gateway_id == binding.gateway_id && gateway.cluster_id == binding.cluster_id
+        }) {
+            gateways.push(KubernetesGatewayClusterView {
+                gateway_id: binding.gateway_id,
+                cluster_id: binding.cluster_id,
+                configured: true,
+                last_activity: String::new(),
+                recorded_requests: 0,
+            });
+        }
+    }
+    gateways.sort_by(|left, right| {
+        right
+            .configured
+            .cmp(&left.configured)
+            .then_with(|| right.last_activity.cmp(&left.last_activity))
+            .then_with(|| left.gateway_id.cmp(&right.gateway_id))
+    });
+    let mut available_clusters = gateways
+        .iter()
+        .map(|gateway| gateway.cluster_id.clone())
+        .collect::<Vec<_>>();
+    available_clusters.sort();
+    available_clusters.dedup();
+    Ok(KubernetesLoggingSettingsResponse {
+        max_session_seconds: kubernetes_session_seconds(state).await?,
+        min_session_seconds: MIN_KUBERNETES_SESSION_SECONDS,
+        max_allowed_session_seconds: MAX_KUBERNETES_SESSION_SECONDS,
+        active_clients,
+        rbac_grants,
+        gateways,
+        available_clusters,
+    })
+}
+
+pub async fn get_kubernetes_logging_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_admin(&state, &headers).await?;
+    let response = kubernetes_logging_settings_response(&state, &caller.3).await?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.client_session_list", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3.clone())
+                .resource("kubernetes_client_sessions", caller.3)
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "active_client_count": response.active_clients.len(),
+                        "gateway_count": response.gateways.len(),
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(Json(response))
+}
+
+pub async fn set_kubernetes_logging_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<KubernetesLoggingSettingsInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_admin(&state, &headers).await?;
+    if !(MIN_KUBERNETES_SESSION_SECONDS..=MAX_KUBERNETES_SESSION_SECONDS)
+        .contains(&input.max_session_seconds)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "max_session_seconds must be between {MIN_KUBERNETES_SESSION_SECONDS} and {MAX_KUBERNETES_SESSION_SECONDS}"
+            ),
+        ));
+    }
+    let before = kubernetes_session_seconds(&state).await?;
+    state
+        .config_db
+        .set_setting(
+            KUBERNETES_SESSION_SECONDS_SETTING,
+            &input.max_session_seconds.to_string(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to save Kubernetes session limit");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save Kubernetes logging settings".to_string(),
+            )
+        })?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("settings.update", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(caller.3.clone())
+                .resource("setting", KUBERNETES_SESSION_SECONDS_SETTING)
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "key": KUBERNETES_SESSION_SECONDS_SETTING,
+                        "before": before,
+                        "after": input.max_session_seconds,
+                    })
+                    .to_string(),
+                )
+                .description("Kubernetes client session limit updated")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(Json(
+        kubernetes_logging_settings_response(&state, &caller.3).await?,
+    ))
+}
+
+async fn validate_rbac_grant_context(
+    state: &AppState,
+    tenant_id: &str,
+    input: KubernetesRbacGrantInput,
+) -> Result<KubernetesRbacGrantInput, (StatusCode, String)> {
+    let input = validate_kubernetes_rbac_grant(input)?;
+    let group = state
+        .config_db
+        .get_group(&input.group_id)
+        .await
+        .map_err(internal_error)?;
+    let Some(group) = group else {
+        return Err((StatusCode::BAD_REQUEST, "Rush group not found".to_string()));
+    };
+    if !group.7.iter().any(|group_tenant| group_tenant == tenant_id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Rush group is not assigned to this tenant".to_string(),
+        ));
+    }
+    let policy = std::env::var("KUBERNETES_ACCESS_TENANT_CLUSTERS").map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Kubernetes access policy is unavailable".to_string(),
+        )
+    })?;
+    let authorized = if input.cluster_match == "single" {
+        tenant_cluster_allowed(&policy, tenant_id, &input.cluster_id)?
+    } else {
+        parse_tenant_cluster_policy(&policy)?
+            .get(tenant_id)
+            .is_some_and(|clusters| !clusters.is_empty())
+    };
+    if !authorized {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "tenant has no authorized Kubernetes clusters".to_string(),
+        ));
+    }
+    Ok(input)
+}
+
+pub async fn create_kubernetes_rbac_grant(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<KubernetesRbacGrantInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_admin(&state, &headers).await?;
+    let input = validate_rbac_grant_context(&state, &caller.3, input).await?;
+    if state
+        .config_db
+        .list_kubernetes_rbac_grants(&caller.3, None)
+        .await
+        .map_err(internal_error)?
+        .len()
+        >= MAX_KUBERNETES_RBAC_GRANTS
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("a tenant may define at most {MAX_KUBERNETES_RBAC_GRANTS} Kubernetes roles"),
+        ));
+    }
+    let namespaces =
+        serde_json::to_string(&input.namespaces).map_err(|error| internal_error(error.into()))?;
+    let rules =
+        serde_json::to_string(&input.rules).map_err(|error| internal_error(error.into()))?;
+    let view = kubernetes_rbac_grant_view(
+        state
+            .config_db
+            .create_kubernetes_rbac_grant(
+                &caller.3,
+                &input.group_id,
+                &input.cluster_id,
+                &input.cluster_match,
+                &input.cluster_pattern,
+                &input.name,
+                &input.role_kind,
+                &input.role_name,
+                &input.scope,
+                &namespaces,
+                &rules,
+            )
+            .await
+            .map_err(internal_error)?,
+    );
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_rbac.grant_create", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("kubernetes_rbac_grant", view.id.clone())
+                .outcome("success")
+                .changes(serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_string()))
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+pub async fn update_kubernetes_rbac_grant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<KubernetesRbacGrantInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_admin(&state, &headers).await?;
+    let before = state
+        .config_db
+        .get_kubernetes_rbac_grant(&caller.3, &id)
+        .await
+        .map_err(internal_error)?
+        .map(kubernetes_rbac_grant_view)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Kubernetes role not found".to_string(),
+            )
+        })?;
+    let input = validate_rbac_grant_context(&state, &caller.3, input).await?;
+    let namespaces =
+        serde_json::to_string(&input.namespaces).map_err(|error| internal_error(error.into()))?;
+    let rules =
+        serde_json::to_string(&input.rules).map_err(|error| internal_error(error.into()))?;
+    let view = state
+        .config_db
+        .update_kubernetes_rbac_grant(
+            &caller.3,
+            &id,
+            &input.group_id,
+            &input.cluster_id,
+            &input.cluster_match,
+            &input.cluster_pattern,
+            &input.name,
+            &input.role_kind,
+            &input.role_name,
+            &input.scope,
+            &namespaces,
+            &rules,
+        )
+        .await
+        .map_err(internal_error)?
+        .map(kubernetes_rbac_grant_view)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Kubernetes role not found".to_string(),
+            )
+        })?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_rbac.grant_update", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("kubernetes_rbac_grant", id)
+                .outcome("success")
+                .changes(serde_json::json!({ "before": before, "after": view }).to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(Json(view))
+}
+
+pub async fn delete_kubernetes_rbac_grant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_admin(&state, &headers).await?;
+    let deleted = state
+        .config_db
+        .delete_kubernetes_rbac_grant(&caller.3, &id)
+        .await
+        .map_err(internal_error)?
+        .map(kubernetes_rbac_grant_view)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Kubernetes role not found".to_string(),
+            )
+        })?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_rbac.grant_delete", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("kubernetes_rbac_grant", id)
+                .outcome("success")
+                .changes(serde_json::to_string(&deleted).unwrap_or_else(|_| "{}".to_string()))
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_gateway_kubernetes_rbac_grants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GatewayRbacQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    require_internal(&headers)?;
+    require_text("cluster_id", &query.cluster_id, 256)?;
+    let binding = gateway_binding()?;
+    validate_gateway_instance(&binding, &headers, &query.cluster_id)?;
+    let grants = state
+        .config_db
+        .list_gateway_kubernetes_rbac_grants(&query.cluster_id, &binding.tenant_ids)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to list gateway Kubernetes RBAC grants");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Kubernetes roles are unavailable".to_string(),
+            )
+        })?
+        .into_iter()
+        .map(kubernetes_rbac_grant_view)
+        .collect();
+    Ok(Json(GatewayRbacResponse {
+        cluster_id: query.cluster_id,
+        grants,
+    }))
+}
+
+pub async fn record_gateway_kubernetes_rbac_reconcile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<GatewayRbacReconcileInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    require_internal(&headers)?;
+    require_text("cluster_id", &input.cluster_id, 256)?;
+    if input.revision.len() != 32
+        || !input.revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || input.grant_count > MAX_KUBERNETES_RBAC_GRANTS
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid Kubernetes RBAC reconciliation result".to_string(),
+        ));
+    }
+    let binding = gateway_binding()?;
+    validate_gateway_instance(&binding, &headers, &input.cluster_id)?;
+    for tenant_id in &binding.tenant_ids {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("kubernetes_rbac.reconcile", "system")
+                    .actor(binding.gateway_id.clone(), "Kubernetes access gateway")
+                    .tenant(tenant_id.clone())
+                    .resource("kubernetes_cluster", input.cluster_id.clone())
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "revision": input.revision,
+                            "grant_count": input.grant_count,
+                        })
+                        .to_string(),
+                    )
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn revoke_kubernetes_client(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_admin(&state, &headers).await?;
+    if !session_id.starts_with("kcs_")
+        || session_id.len() != 28
+        || !session_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid client session id".to_string(),
+        ));
+    }
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let active = state
+        .config_db
+        .list_active_kubernetes_login_requests(&caller.3, &now)
+        .await
+        .map_err(internal_error)?;
+    let request = active
+        .iter()
+        .find(|request| client_session_id(&request.device_code_hash) == session_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "active client not found".to_string()))?;
+    state
+        .config_db
+        .revoke_kubernetes_login_request(request, &now)
+        .await
+        .map_err(internal_error)?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.credential_revoke", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("kubernetes_client_session", session_id.clone())
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "username": request.username,
+                        "cluster_id": request.cluster_id,
+                        "bulk": false,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn revoke_all_kubernetes_clients(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_enabled()?;
+    let caller = require_admin(&state, &headers).await?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let active = state
+        .config_db
+        .list_active_kubernetes_login_requests(&caller.3, &now)
+        .await
+        .map_err(internal_error)?;
+    for request in &active {
+        state
+            .config_db
+            .revoke_kubernetes_login_request(request, &now)
+            .await
+            .map_err(internal_error)?;
+        let session_id = client_session_id(&request.device_code_hash);
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("kubernetes_access.credential_revoke", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("kubernetes_client_session", session_id.clone())
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "username": request.username,
+                            "cluster_id": request.cluster_id,
+                            "bulk": true,
+                        })
+                        .to_string(),
+                    )
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+    }
+    Ok(Json(serde_json::json!({ "revoked": active.len() })))
 }
 
 pub async fn start_kubernetes_login(
@@ -1633,7 +2596,7 @@ pub async fn approve_kubernetes_login(
     }
 
     let credential_expires_at = (now
-        + chrono::Duration::seconds(kubernetes_credential_ttl_seconds()))
+        + chrono::Duration::seconds(kubernetes_session_seconds(&state).await?))
     .format("%Y-%m-%d %H:%M:%S")
     .to_string();
     let approved = state
@@ -1736,11 +2699,19 @@ pub async fn get_kubernetes_login_details(
                 .context(crate::audit::actor_context_from_headers(&headers)),
         )
         .await;
+    if state
+        .config_db
+        .is_kubernetes_login_revoked(&request.device_code_hash)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((StatusCode::GONE, "login credential was revoked".to_string()));
+    }
     Ok(Json(KubernetesLoginDetailsResponse {
         status: request.state,
         cluster_id: request.cluster_id,
         approval_expires_at: request.expires_at,
-        credential_ttl_seconds: kubernetes_credential_ttl_seconds(),
+        credential_ttl_seconds: kubernetes_session_seconds(&state).await?,
     }))
 }
 
@@ -1773,6 +2744,17 @@ pub async fn poll_kubernetes_login(
                 "invalid login credential".to_string(),
             )
         })?;
+    if state
+        .config_db
+        .is_kubernetes_login_revoked(&request.device_code_hash)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "login credential was revoked".to_string(),
+        ));
+    }
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if request.state == "pending" && request.expires_at > now {
         return Ok((
@@ -1889,6 +2871,23 @@ pub async fn authorize_gateway_request(
                 "invalid Kubernetes credential".to_string(),
             )
         })?;
+    if state
+        .config_db
+        .is_kubernetes_login_revoked(&login.device_code_hash)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to check Kubernetes credential revocation");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Kubernetes credential validation is unavailable".to_string(),
+            )
+        })?
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Kubernetes credential was revoked".to_string(),
+        ));
+    }
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if login.state != "approved"
         || login.cluster_id != input.cluster_id
@@ -1969,6 +2968,18 @@ pub async fn authorize_gateway_request(
             "tenant is not authorized for this cluster".to_string(),
         ));
     }
+    let rbac_group_ids = state
+        .config_db
+        .kubernetes_rbac_group_ids_for_user(&caller.3, &input.cluster_id, &caller.0)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to resolve Kubernetes RBAC groups");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Kubernetes credential validation is unavailable".to_string(),
+            )
+        })?;
+    let kube_groups = kubernetes_authorization_groups(&caller.3, &caller.4, &rbac_group_ids)?;
     let authorization = GatewayAuthorization {
         actor_user_id: caller.0,
         actor_name: caller.1.clone(),
@@ -1977,7 +2988,9 @@ pub async fn authorize_gateway_request(
         cluster_id: input.cluster_id.clone(),
         role: caller.4.clone(),
         kube_username: format!("rush:user:{}", caller.1),
-        kube_groups: kubernetes_authorization_groups(&caller.3, &caller.4),
+        kube_groups,
+        client_reported: serde_json::from_str(&login.client_reported)
+            .unwrap_or_else(|_| serde_json::json!({})),
     };
     state
         .audit
@@ -2063,74 +3076,112 @@ pub async fn ingest_access_event(
 
 pub async fn ingest_client_event(
     State(state): State<AppState>,
-    Extension(identity): Extension<RequestIdentity>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(input): Json<ClientAccessEventInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_enabled()?;
-    if !crate::api_key_auth::env_flag("KUBERNETES_ACCESS_CLIENT_ENRICHMENT_ENABLED") {
-        return Err((StatusCode::NOT_FOUND, "not found".to_string()));
-    }
-    if !identity.authenticated || identity.credential_type == "ingest_key" {
+    require_text("cluster_id", &input.cluster_id, 256)?;
+    let Some(token) =
+        bearer_token(&headers).filter(|value| value.starts_with("rkt1_") && value.len() == 69)
+    else {
         return Err((
             StatusCode::UNAUTHORIZED,
-            "authentication required".to_string(),
+            "temporary Rush login credential required".to_string(),
+        ));
+    };
+    let login = state
+        .config_db
+        .get_kubernetes_login_by_device_hash(&temporary_credential_hash(token))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "invalid Kubernetes credential".to_string(),
+            )
+        })?;
+    if state
+        .config_db
+        .is_kubernetes_login_revoked(&login.device_code_hash)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Kubernetes credential was revoked".to_string(),
         ));
     }
-    let secret = internal_secret()?;
-    let (actor_id, actor_name, actor_type) = if identity.credential_type == "session" {
-        let caller = require_auth(&state, &headers).await?;
-        if caller.3 != identity.tenant_id {
-            return Err((StatusCode::FORBIDDEN, "tenant mismatch".to_string()));
-        }
-        (caller.0, caller.1, "user")
-    } else {
-        (
-            identity.actor_id.clone(),
-            identity.actor_name.clone(),
-            "api_key",
-        )
-    };
-    let client_ip = resolved_client_ip(peer.ip(), &headers, &state.trusted_proxy_cidrs);
-    let user_agent = headers
-        .get("user-agent")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .chars()
-        .take(MAX_TEXT_BYTES)
-        .collect();
-    let event = client_event(
-        input,
-        &identity,
-        actor_id.clone(),
-        actor_name.clone(),
-        actor_type.to_string(),
-        user_agent,
-        client_ip,
-        &secret,
-    )?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if login.state != "approved"
+        || login.cluster_id != input.cluster_id
+        || login.credential_expires_at <= now
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired Kubernetes credential".to_string(),
+        ));
+    }
+    let caller = state
+        .config_db
+        .get_active_kubernetes_user(&login.user_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Kubernetes credential user is disabled".to_string(),
+            )
+        })?;
+    if caller.3 != login.tenant_id {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Kubernetes credential is no longer valid".to_string(),
+        ));
+    }
+    let permissions = state
+        .config_db
+        .resolve_user_permissions(&caller.0)
+        .await
+        .map_err(internal_error)?
+        .1;
+    if caller.4 != "admin"
+        && !permissions
+            .iter()
+            .any(|permission| matches!(permission.as_str(), "admin" | "infrastructure:read"))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Kubernetes access permission was revoked".to_string(),
+        ));
+    }
+
+    let reported_fields = serde_json::json!({
+        "argv": !input.client_reported.argv.is_empty(),
+        "cli_version": !input.client_reported.cli_version.is_empty(),
+        "os": !input.client_reported.os.is_empty(),
+        "arch": !input.client_reported.arch.is_empty(),
+        "hostname": !input.client_reported.hostname.is_empty(),
+        "private_ips": !input.client_reported.private_ips.is_empty(),
+    });
+    let client_reported = prepare_client_reported(input.client_reported)?;
     state
         .config_db
-        .insert_kubernetes_access_event(&event)
+        .attach_kubernetes_login_enrichment(&login, &client_reported)
         .await
         .map_err(internal_error)?;
     state
         .audit
-        .log(access_audit_event(
-            "kubernetes_access.client_enrichment_create",
-            actor_type,
-            &actor_id,
-            &actor_name,
-            &event.tenant_id,
-            &event.id,
-            &headers,
-        ))
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.client_enrichment_update", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("kubernetes_cluster", input.cluster_id)
+                .outcome("success")
+                .changes(reported_fields.to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
         .await;
-    Ok((
-        StatusCode::CREATED,
-        Json(KubernetesAccessEventView::from(event)),
-    ))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn ingest_session_chunk(
@@ -2210,6 +3261,81 @@ pub async fn ingest_session_chunk(
         ))
         .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_agent_access_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentAccessEventQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !crate::handlers::repository_access::sre_internal_token_matches(&headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid internal credential".to_string(),
+        ));
+    }
+    require_text("tenant_id", &query.tenant_id, 128)?;
+    require_enabled()?;
+
+    let filters = AccessEventQuery {
+        from: query.from,
+        to: query.to,
+        actor: query.actor,
+        cluster: query.cluster,
+        namespace: query.namespace,
+        verb: query.verb,
+        resource: query.resource,
+        status: query.status,
+        source_kind: None,
+        recording_state: None,
+        q: None,
+        limit: Some(query.limit.unwrap_or(25).clamp(1, 50)),
+        offset: Some(0),
+    };
+    let filter = map_query(&query.tenant_id, &filters, false)?;
+    let (rows, total) = state
+        .config_db
+        .list_kubernetes_access_events(&filter, false)
+        .await
+        .map_err(internal_error)?;
+    let events = views_within_budget(rows, MAX_LIST_RESPONSE_BYTES)
+        .into_iter()
+        .map(AgentAccessEventView::from)
+        .collect::<Vec<_>>();
+
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("kubernetes_access.agent_search", "system")
+                .actor_name("sre-agent")
+                .tenant(query.tenant_id)
+                .resource("kubernetes_access", "agent-search")
+                .changes(
+                    serde_json::json!({
+                        "from": filter.from,
+                        "to": filter.to,
+                        "cluster": filter.cluster,
+                        "namespace": filter.namespace,
+                        "verb": filter.verb,
+                        "resource": filter.resource,
+                        "actor_filter_applied": !filter.actor.is_empty(),
+                        "returned": events.len(),
+                        "total": total,
+                    })
+                    .to_string(),
+                )
+                .description(
+                    "SRE agent searched Kubernetes access metadata during an investigation",
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    Ok(Json(AgentAccessEventListResponse {
+        events,
+        total,
+        evidence_note: "Commands are reconstructed from Kubernetes API request metadata. Recorded command arguments, terminal output, device details, and network evidence are not included.",
+    }))
 }
 
 pub async fn list_access_events(
@@ -2451,17 +3577,6 @@ fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
 mod tests {
     use super::*;
 
-    fn identity(tenant: &str) -> RequestIdentity {
-        RequestIdentity {
-            tenant_id: tenant.to_string(),
-            authenticated: true,
-            actor_id: "key-1".to_string(),
-            actor_name: "API key".to_string(),
-            actor_type: "api_key".to_string(),
-            credential_type: "query_key".to_string(),
-        }
-    }
-
     #[test]
     fn internal_auth_uses_exact_constant_time_comparison() {
         assert!(constant_time_eq(b"same-value", b"same-value"));
@@ -2515,47 +3630,28 @@ mod tests {
     }
 
     #[test]
-    fn tenant_comes_only_from_authenticated_identity() {
-        let event = client_event(
-            ClientAccessEventInput {
-                cluster_id: "prod".to_string(),
-                client_reported: ClientReportedInput {
-                    argv: vec!["get".to_string(), "pods".to_string()],
-                    cli_version: String::new(),
-                    os: String::new(),
-                    arch: String::new(),
-                    hostname: String::new(),
-                    private_ips: vec![],
-                },
-                execution: None,
-                capture: None,
-            },
-            &identity("tenant-a"),
-            "key-1".to_string(),
-            "API key".to_string(),
-            "api_key".to_string(),
-            String::new(),
-            "198.51.100.25".parse().unwrap(),
-            "01234567890123456789012345678901",
-        )
+    fn temporary_credential_enrichment_is_bounded_and_redacted() {
+        let encoded = prepare_client_reported(ClientReportedInput {
+            argv: vec![
+                "kubectl".to_string(),
+                "get".to_string(),
+                "pods".to_string(),
+                "--token".to_string(),
+                "secret-value".to_string(),
+            ],
+            cli_version: "1.2.3".to_string(),
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+            hostname: "workstation".to_string(),
+            private_ips: vec![],
+        })
         .unwrap();
-        assert_eq!(event.tenant_id, "tenant-a");
-        assert_eq!(event.actor_user_id, "key-1");
-        assert_eq!(event.source_kind, "rush_cli");
-    }
-
-    #[test]
-    fn untrusted_forwarded_header_cannot_spoof_observed_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
-        let peer: IpAddr = "198.51.100.25".parse().unwrap();
-        assert_eq!(resolved_client_ip(peer, &headers, &[]), peer);
-
-        let trusted = vec!["198.51.100.0/24".to_string()];
-        assert_eq!(
-            resolved_client_ip(peer, &headers, &trusted),
-            "203.0.113.9".parse::<IpAddr>().unwrap()
-        );
+        let reported: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(reported["os"], "macos");
+        assert_eq!(reported["arch"], "aarch64");
+        assert_eq!(reported["cli_version"], "1.2.3");
+        assert_eq!(reported["argv"][4], "[REDACTED]");
+        assert_eq!(reported["redaction_count"], 1);
     }
 
     #[test]
@@ -2666,6 +3762,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!((exact.status_min, exact.status_max), (404, 404));
+    }
+
+    #[test]
+    fn agent_access_view_returns_causal_metadata_without_captured_evidence() {
+        let input: InternalAccessEventInput = serde_json::from_value(serde_json::json!({
+            "id": "event-1",
+            "tenant_id": "tenant-a",
+            "cluster_id": "prod",
+            "gateway_id": "gateway-1",
+            "session_id": "session-1",
+            "actor_user_id": "user-1",
+            "actor_name": "operator",
+            "actor_type": "user",
+            "kube_username": "rush:user:operator",
+            "source_kind": "gateway",
+            "client_reported": {
+                "argv": ["kubectl", "exec", "api-7f8c", "--", "sh", "-lc", "sensitive command"],
+                "hostname": "workstation"
+            },
+            "observed_network": {"country": "JP", "source_ip": "203.0.113.10"},
+            "http_method": "POST",
+            "verb": "create",
+            "api_version": "v1",
+            "resource": "pods",
+            "subresource": "exec",
+            "namespace": "payments",
+            "name": "api-7f8c",
+            "request_query": {"command": ["sh", "-lc", "sensitive command"]},
+            "status_code": 201,
+            "duration_ms": 42,
+            "result_summary": {"stdout": "sensitive output"},
+            "recording_state": "complete",
+            "created_at": "2026-08-23T10:00:00Z"
+        }))
+        .unwrap();
+        let event = internal_event(input, "01234567890123456789012345678901").unwrap();
+        let view = AgentAccessEventView::from(KubernetesAccessEventView::from(event));
+        let encoded = serde_json::to_value(view).unwrap();
+
+        assert_eq!(
+            encoded["likely_kubectl_command"],
+            "kubectl exec -n payments api-7f8c"
+        );
+        assert_eq!(encoded["actor_name"], "operator");
+        assert_eq!(encoded["session_id"], "session-1");
+        for forbidden in [
+            "client_reported",
+            "observed_network",
+            "request_query",
+            "result_summary",
+            "user_agent",
+            "kube_groups",
+        ] {
+            assert!(encoded.get(forbidden).is_none(), "unexpected {forbidden}");
+        }
+        assert!(!encoded.to_string().contains("sensitive"));
+        assert!(!encoded.to_string().contains("workstation"));
+        assert!(!encoded.to_string().contains("203.0.113.10"));
     }
 
     #[test]
@@ -2876,6 +4030,7 @@ mod tests {
             assert_eq!(event.tenant_id, "tenant-a");
             assert_eq!(event.actor_id, "user-1");
         }
+        assert!(include_str!("kubernetes_access.rs").contains("kubernetes_access.agent_search"));
     }
 
     #[test]
@@ -2893,15 +4048,129 @@ mod tests {
     }
 
     #[test]
+    fn client_session_ids_are_stable_opaque_handles() {
+        let first = client_session_id(&"a".repeat(64));
+        let second = client_session_id(&"b".repeat(64));
+
+        assert_eq!(first, client_session_id(&"a".repeat(64)));
+        assert_ne!(first, second);
+        assert!(first.starts_with("kcs_"));
+        assert_eq!(first.len(), 28);
+        assert!(!first.contains(&"a".repeat(16)));
+    }
+
+    #[test]
+    fn kubernetes_client_settings_are_bounded_audited_and_revocation_checked() {
+        assert_eq!(MIN_KUBERNETES_SESSION_SECONDS, 300);
+        assert_eq!(MAX_KUBERNETES_SESSION_SECONDS, 43_200);
+        let source = include_str!("kubernetes_access.rs");
+        assert!(source.contains(KUBERNETES_SESSION_SECONDS_SETTING));
+        assert!(source.contains("kubernetes_access.client_session_list"));
+        assert!(source.contains("kubernetes_access.credential_revoke"));
+        assert!(source.matches("is_kubernetes_login_revoked").count() >= 4);
+    }
+
+    #[test]
     fn kubernetes_role_groups_are_tenant_qualified() {
-        let tenant_a = kubernetes_authorization_groups("tenant-a", "write");
-        let tenant_b = kubernetes_authorization_groups("tenant-b", "write");
+        let tenant_a =
+            kubernetes_authorization_groups("tenant-a", "write", &["platform".to_string()])
+                .unwrap();
+        let tenant_b =
+            kubernetes_authorization_groups("tenant-b", "write", &["developers".to_string()])
+                .unwrap();
 
         assert_ne!(tenant_a, tenant_b);
-        assert_eq!(tenant_a[1], "rush:tenant:tenant-a:role:write");
-        assert_eq!(tenant_b[1], "rush:tenant:tenant-b:role:write");
+        assert!(tenant_a.contains(&"rush:tenant:tenant-a:role:write".to_string()));
+        assert!(tenant_b.contains(&"rush:tenant:tenant-b:role:write".to_string()));
+        assert!(tenant_a.contains(&"rush:group:platform".to_string()));
+        assert!(tenant_b.contains(&"rush:group:developers".to_string()));
         assert!(tenant_a.iter().all(|group| group != "rush:role:write"));
         assert!(tenant_b.iter().all(|group| group != "rush:role:write"));
+    }
+
+    #[test]
+    fn custom_kubernetes_roles_support_crds_but_not_rbac_administration() {
+        let crd = KubernetesRbacGrantInput {
+            group_id: "platform".to_string(),
+            cluster_id: "prod".to_string(),
+            cluster_match: "single".to_string(),
+            cluster_pattern: String::new(),
+            name: "Read Argo CD applications".to_string(),
+            role_kind: "custom".to_string(),
+            role_name: String::new(),
+            scope: "namespaces".to_string(),
+            namespaces: vec!["argocd".to_string()],
+            rules: vec![KubernetesRbacRule {
+                api_groups: vec!["argoproj.io".to_string()],
+                resources: vec![
+                    "applications".to_string(),
+                    "applications/status".to_string(),
+                ],
+                verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
+            }],
+        };
+        assert!(validate_kubernetes_rbac_grant(crd).is_ok());
+
+        let rbac_admin = KubernetesRbacGrantInput {
+            group_id: "platform".to_string(),
+            cluster_id: "prod".to_string(),
+            cluster_match: "single".to_string(),
+            cluster_pattern: String::new(),
+            name: "RBAC admin".to_string(),
+            role_kind: "custom".to_string(),
+            role_name: String::new(),
+            scope: "cluster".to_string(),
+            namespaces: vec![],
+            rules: vec![KubernetesRbacRule {
+                api_groups: vec!["rbac.authorization.k8s.io".to_string()],
+                resources: vec!["clusterroles".to_string()],
+                verbs: vec!["*".to_string()],
+            }],
+        };
+        assert!(validate_kubernetes_rbac_grant(rbac_admin).is_err());
+    }
+
+    #[test]
+    fn kubernetes_roles_accept_single_all_and_wildcard_cluster_targets() {
+        let base = KubernetesRbacGrantInput {
+            group_id: "platform".to_string(),
+            cluster_id: "west-production".to_string(),
+            cluster_match: "single".to_string(),
+            cluster_pattern: String::new(),
+            name: "Production readers".to_string(),
+            role_kind: "view".to_string(),
+            role_name: String::new(),
+            scope: "cluster".to_string(),
+            namespaces: vec![],
+            rules: vec![],
+        };
+
+        let single = validate_kubernetes_rbac_grant(base.clone()).unwrap();
+        assert_eq!(single.cluster_id, "west-production");
+
+        let all = validate_kubernetes_rbac_grant(KubernetesRbacGrantInput {
+            cluster_match: "all".to_string(),
+            ..base.clone()
+        })
+        .unwrap();
+        assert!(all.cluster_id.is_empty());
+
+        let pattern = validate_kubernetes_rbac_grant(KubernetesRbacGrantInput {
+            cluster_match: "pattern".to_string(),
+            cluster_pattern: "*-production".to_string(),
+            ..base.clone()
+        })
+        .unwrap();
+        assert!(pattern.cluster_id.is_empty());
+
+        assert!(
+            validate_kubernetes_rbac_grant(KubernetesRbacGrantInput {
+                cluster_match: "pattern".to_string(),
+                cluster_pattern: "production".to_string(),
+                ..base
+            })
+            .is_err()
+        );
     }
 
     #[test]

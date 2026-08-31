@@ -20,7 +20,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -347,7 +347,15 @@ fn key_for_id<'a>(
 }
 
 fn create_private_directory(path: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!("audit spool path must be a regular directory");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Err(error) => return Err(error.into()),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -362,6 +370,15 @@ fn pending_files(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
         let entry = entry?;
         let candidate = entry.path();
         if candidate.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                anyhow::bail!("audit spool entry must be a regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600))?;
+            }
             files.push(candidate);
         }
     }
@@ -370,7 +387,19 @@ fn pending_files(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 fn read_spool_row(path: &Path) -> anyhow::Result<(AuditRow, u64)> {
-    let payload = fs::read(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("audit spool entry must be a regular file");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut payload = Vec::with_capacity(metadata.len() as usize);
+    options.open(path)?.read_to_end(&mut payload)?;
     let row = serde_json::from_slice::<AuditRow>(&payload).map_err(|error| {
         anyhow::anyhow!("invalid audit outbox file {}: {error}", path.display())
     })?;
@@ -650,7 +679,7 @@ impl AuditLogger {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut file = options.open(&temp_path)?;
         file.write_all(&payload)?;
@@ -957,6 +986,26 @@ mod tests {
         assert!(!logger.health().ready);
 
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_spool_rejects_symlink_directories_and_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("rush-audit-symlink-test-{}", uuid::Uuid::new_v4()));
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let linked = root.join("linked");
+        symlink(&real, &linked).unwrap();
+        assert!(create_private_directory(&linked).is_err());
+
+        let target = root.join("target");
+        fs::write(&target, b"{}").unwrap();
+        symlink(&target, real.join("00000000000000000001-test.json")).unwrap();
+        assert!(pending_files(&real).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

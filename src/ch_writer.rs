@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clickhouse::Client;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -483,19 +484,25 @@ impl ChWriter {
         // (allow→block precedence + label stripping all happen pre-buffer). The
         // spooled/inserted data is therefore already filtered, exactly as before.
         self.apply_firewall(&mut batch);
-        if batch.len() == 0 {
+        if batch.is_empty() {
             return Ok(());
         }
 
         if self.batcher.cfg.disabled() {
             // Batching off: preserve today's synchronous insert→spool→429 path.
-            return self.write_now(batch).await;
+            return self.write_now(batch).await.map_err(|(error, _batch)| error);
         }
 
         // Buffer the rows; flush inline only if this enqueue crossed the row
         // threshold. Otherwise the background flusher / age trigger drains it.
         if let Some(due) = self.batcher.enqueue(batch).await {
-            self.write_now(due).await
+            match self.write_now(due).await {
+                Ok(()) => Ok(()),
+                Err((error, batch)) => {
+                    self.batcher.restore(batch).await;
+                    Err(error)
+                }
+            }
         } else {
             Ok(())
         }
@@ -505,8 +512,8 @@ impl ChWriter {
     /// on CH failure. This is the single durable write path shared by the inline
     /// `write` (batching-disabled), the row-threshold inline flush, the
     /// background flusher, and graceful shutdown.
-    async fn write_now(&self, batch: SpoolBatch) -> Result<(), WriteError> {
-        if batch.len() == 0 {
+    async fn write_now(&self, batch: SpoolBatch) -> Result<(), (WriteError, SpoolBatch)> {
+        if batch.is_empty() {
             return Ok(());
         }
         let row_count = batch.len();
@@ -523,11 +530,14 @@ impl ChWriter {
                 );
 
                 // Serialise for the spool (zstd-compressed MessagePack).
-                let payload = encode_spool(&batch)?;
+                let payload = match encode_spool(&batch) {
+                    Ok(payload) => payload,
+                    Err(error) => return Err((error, batch)),
+                };
 
                 match self.buffer.append(table, payload).await {
                     Ok(()) => Ok(()),
-                    Err(SpoolFull) => Err(WriteError::Backpressure),
+                    Err(SpoolFull) => Err((WriteError::Backpressure, batch)),
                 }
             }
         }
@@ -536,14 +546,16 @@ impl ChWriter {
     /// Flush every buffered table batch to ClickHouse (spooling on failure).
     /// Called on graceful shutdown so no buffered rows are silently dropped.
     pub async fn flush_all(&self) {
-        for batch in self.batcher.drain_all().await {
-            let table = batch.table();
-            let rows = batch.len();
-            if let Err(e) = self.write_now(batch.clone()).await {
-                self.batcher.restore(batch).await;
-                tracing::warn!(error = %e, table = table, rows = rows, "flush_all: write failed (spool full?)");
-            }
-        }
+        stream::iter(self.batcher.drain_all().await)
+            .for_each_concurrent(4, |batch| async move {
+                let table = batch.table();
+                let rows = batch.len();
+                if let Err((e, batch)) = self.write_now(batch).await {
+                    self.batcher.restore(batch).await;
+                    tracing::warn!(error = %e, table = table, rows = rows, "flush_all: write failed (spool full?)");
+                }
+            })
+            .await;
     }
 
     /// Whether the cross-request batcher still contains rows that have not
@@ -574,16 +586,25 @@ impl ChWriter {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
+                let mut aged = Vec::new();
                 for slot in 0..SpoolBatch::SLOTS {
                     if let Some(batch) = me.batcher.take_aged(slot, now).await {
-                        let table = batch.table();
-                        let rows = batch.len();
-                        if let Err(e) = me.write_now(batch.clone()).await {
-                            me.batcher.restore(batch).await;
-                            tracing::warn!(error = %e, table = table, rows = rows, "batch flush failed (spool full?)");
-                        }
+                        aged.push(batch);
                     }
                 }
+                stream::iter(aged)
+                    .for_each_concurrent(4, |batch| {
+                        let me = &me;
+                        async move {
+                            let table = batch.table();
+                            let rows = batch.len();
+                            if let Err((e, batch)) = me.write_now(batch).await {
+                                me.batcher.restore(batch).await;
+                                tracing::warn!(error = %e, table = table, rows = rows, "batch flush failed (spool full?)");
+                            }
+                        }
+                    })
+                    .await;
             }
         });
     }
@@ -909,6 +930,21 @@ mod batch_tests {
         assert_eq!(total, 5, "all buffered rows drained exactly once");
         // Second drain is empty.
         assert!(acc.drain_all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_flush_restore_preserves_the_exact_batch_without_cloning() {
+        let acc = BatchAccumulator::new(BatchConfig {
+            max_rows: 5,
+            max_age: Duration::from_secs(60),
+        });
+        let due = acc.enqueue(gauge(5)).await.expect("threshold batch");
+        assert!(acc.is_empty().await);
+        acc.restore(due).await;
+        let restored = acc.drain_all().await;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].len(), 5);
+        assert!(acc.is_empty().await);
     }
 
     // ── Spool payload codec ──

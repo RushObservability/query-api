@@ -602,12 +602,18 @@ pub async fn cancel_export_job(
     Json(status).into_response()
 }
 
-/// Escape a single CSV field (RFC 4180): quote if it contains comma/quote/newline.
+/// Escape a single CSV field (RFC 4180) and neutralize spreadsheet formulas.
 pub fn csv_field(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    let dangerous = matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'));
+    let safe = if dangerous {
+        format!("'{s}")
     } else {
         s.to_string()
+    };
+    if safe.contains(',') || safe.contains('"') || safe.contains('\n') || safe.contains('\r') {
+        format!("\"{}\"", safe.replace('"', "\"\""))
+    } else {
+        safe
     }
 }
 
@@ -935,6 +941,23 @@ mod tests {
         // The state owns one RowCursor and boxed encoder, never a Vec<TestRow>.
         // This guards against accidentally reintroducing fetch_all-style storage.
         assert!(std::mem::size_of::<ExportStreamState<TestRow>>() < 512);
+    }
+
+    #[test]
+    fn csv_fields_neutralize_spreadsheet_formulas() {
+        assert_eq!(csv_field("=1+1"), "'=1+1");
+        assert_eq!(csv_field("+cmd|' /C calc'!A0"), "'+cmd|' /C calc'!A0");
+        assert_eq!(csv_field("-42"), "'-42");
+        assert_eq!(csv_field("@SUM(A1:A2)"), "'@SUM(A1:A2)");
+        assert_eq!(csv_field("\t=1+1"), "'\t=1+1");
+        assert_eq!(csv_field("\r=1+1"), "\"'\r=1+1\"");
+    }
+
+    #[test]
+    fn csv_fields_still_follow_rfc_4180_escaping() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("two,fields"), "\"two,fields\"");
+        assert_eq!(csv_field("a \"quote\""), "\"a \"\"quote\"\"\"");
     }
 
     #[tokio::test]

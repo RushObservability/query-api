@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 
-pub const INGEST_SIGNALS: [&str; 4] = ["logs", "traces", "metrics", "rum"];
+pub const INGEST_SIGNALS: [&str; 5] = ["logs", "traces", "metrics", "rum", "collector"];
 
 pub fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -142,6 +142,10 @@ mod tests {
         );
         assert!(normalize_signals(&[]).is_err());
         assert!(normalize_signals(&["query".into()]).is_err());
+        assert_eq!(
+            normalize_signals(&["collector".into()]).unwrap(),
+            vec!["collector"]
+        );
     }
 
     #[test]

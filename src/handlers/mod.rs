@@ -33,6 +33,7 @@ pub mod maintenance;
 pub mod metric_firewall;
 pub mod metrics;
 pub mod monitors;
+pub mod mysql_explain;
 pub mod otlp;
 pub mod parse_promql;
 pub mod parse_query;

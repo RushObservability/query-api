@@ -51,7 +51,16 @@ impl Spool {
     /// restore `total_bytes` so the cap is honoured across restarts.
     pub fn open(dir: impl AsRef<Path>, max_bytes: u64) -> std::io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) => ensure_real_directory(&dir, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir)?;
+            }
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(&dir)?;
+        ensure_real_directory(&dir, &metadata)?;
+        set_private_directory_permissions(&dir)?;
 
         let mut total_bytes: u64 = 0;
         let mut max_seq: u64 = 0;
@@ -64,6 +73,17 @@ impl Spool {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".spool") {
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() || !file_type.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "spool segment is not a regular file: {}",
+                            entry.path().display()
+                        ),
+                    ));
+                }
+                set_private_file_permissions(&entry.path())?;
                 let size = entry.metadata()?.len();
                 total_bytes += size;
                 segments.insert(entry.path());
@@ -137,11 +157,10 @@ impl Spool {
             }
             g.seq += 1;
             let path = g.dir.join(seg_name(g.seq));
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|_| SpoolFull)?;
+            let mut options = OpenOptions::new();
+            options.create_new(true).append(true);
+            secure_open_options(&mut options);
+            let file = options.open(&path).map_err(|_| SpoolFull)?;
             g.segments.insert(path.clone());
             g.current = Some((file, 0, path));
         }
@@ -182,7 +201,17 @@ impl Spool {
     /// encountered partway through a frame ends parsing and returns the records
     /// read so far, rather than discarding the whole (otherwise-valid) segment.
     pub fn read_segment(path: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
-        let mut file = File::open(path)?;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "spool segment is not a regular file",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        secure_open_options(&mut options);
+        let mut file = options.open(path)?;
         let mut records = Vec::new();
 
         loop {
@@ -254,6 +283,42 @@ impl Spool {
     pub fn segment_count(&self) -> usize {
         self.inner.lock().unwrap().segments.len()
     }
+}
+
+fn ensure_real_directory(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("spool path is not a regular directory: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn secure_open_options(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+}
+
+fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Like `read_exact`, but returns `Ok(None)` on EOF (clean or partial) instead
@@ -456,4 +521,67 @@ fn parse_seq(name: &str) -> Option<u64> {
 /// durable for replay.
 fn sync_file(f: &mut File) -> std::io::Result<()> {
     f.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Spool;
+    use std::fs;
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rush-spool-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spool_migrates_directory_and_segment_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("permissions");
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let old = path.join("seg-00000000000000000001-0000000000000001.spool");
+        fs::write(&old, []).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let spool = Spool::open(&path, 1024 * 1024).unwrap();
+        spool.append("logs", b"payload").unwrap();
+        spool.seal_current();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for entry in fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spool_rejects_symlink_directory_and_segment() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("symlink");
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let linked = root.join("linked");
+        symlink(&real, &linked).unwrap();
+        assert!(Spool::open(&linked, 1024).is_err());
+
+        let target = root.join("target");
+        fs::write(&target, b"payload").unwrap();
+        symlink(
+            &target,
+            real.join("seg-00000000000000000001-0000000000000001.spool"),
+        )
+        .unwrap();
+        assert!(Spool::open(&real, 1024).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::handlers::users::require_admin;
 use crate::{
     AppState,
-    integrations::{self, IntegrationTargetSecret, POSTGRES_ENTITLEMENT, POSTGRES_INTEGRATION},
+    integrations::{self, IntegrationTargetSecret},
 };
 
 #[derive(Debug, Deserialize)]
@@ -37,27 +37,30 @@ fn default_enabled() -> bool {
 }
 
 fn check_integration(integration: &str) -> Result<(), (StatusCode, String)> {
-    if integration != POSTGRES_INTEGRATION {
-        return Err((StatusCode::NOT_FOUND, "integration not found".into()));
-    }
     let descriptor = integrations::descriptors()
         .into_iter()
         .find(|d| d.id == integration)
-        .expect("postgres descriptor is registered");
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "integration not found".into()))?;
     if !descriptor.compiled {
         return Err((
             StatusCode::NOT_FOUND,
             "integration is not included in this build".into(),
         ));
     }
-    if !crate::license::evaluate().has_entitlement(POSTGRES_ENTITLEMENT) {
-        return Err((StatusCode::FORBIDDEN, "postgres add-on not licensed".into()));
+    if !crate::license::evaluate().has_entitlement(descriptor.entitlement) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("{} add-on not licensed", descriptor.name),
+        ));
     }
     Ok(())
 }
 
-fn validate_body(body: &TargetBody) -> Result<(), (StatusCode, String)> {
-    if body.name.trim().is_empty() || body.name.len() > 255 {
+fn validate_body(integration: &str, body: &TargetBody) -> Result<(), (StatusCode, String)> {
+    if body.name.trim().is_empty()
+        || body.name.len() > 255
+        || body.name.chars().any(char::is_control)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             "name must be between 1 and 255 characters".into(),
@@ -67,6 +70,21 @@ fn validate_body(body: &TargetBody) -> Result<(), (StatusCode, String)> {
         return Err((
             StatusCode::BAD_REQUEST,
             "dsn must be between 1 and 16384 characters".into(),
+        ));
+    }
+    let parsed = url::Url::parse(body.dsn.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "dsn must be a valid URL".into()))?;
+    let scheme_ok = match integration {
+        integrations::MYSQL_INTEGRATION => parsed.scheme() == "mysql",
+        integrations::POSTGRES_INTEGRATION => {
+            matches!(parsed.scheme(), "postgres" | "postgresql")
+        }
+        _ => false,
+    };
+    if !scheme_ok || parsed.host_str().is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("dsn must be a valid {integration} connection URL with a host"),
         ));
     }
     if body.environment.len() > 128 || body.environment.chars().any(char::is_control) {
@@ -125,7 +143,7 @@ pub async fn create_target(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
     check_integration(&integration)?;
-    validate_body(&body)?;
+    validate_body(&integration, &body)?;
     let id = body
         .id
         .clone()
@@ -166,7 +184,7 @@ pub async fn update_target(
     let caller = require_admin(&state, &headers).await?;
     check_integration(&integration)?;
     body.id = Some(id.clone());
-    validate_body(&body)?;
+    validate_body(&integration, &body)?;
     let target = target_from_body(body, id.clone());
     let encrypted = integrations::encrypt_secret(&target.dsn).map_err(internal_error)?;
     state
@@ -283,4 +301,27 @@ fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "integration operation failed".into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(dsn: &str) -> TargetBody {
+        TargetBody {
+            id: None,
+            name: "orders-db".into(),
+            dsn: dsn.into(),
+            environment: "test".into(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn target_dsn_must_match_the_integration() {
+        assert!(validate_body("mysql", &body("mysql://monitor:secret@db/app")).is_ok());
+        assert!(validate_body("postgresql", &body("postgresql://monitor:secret@db/app")).is_ok());
+        assert!(validate_body("mysql", &body("postgresql://monitor:secret@db/app")).is_err());
+        assert!(validate_body("mysql", &body("mysql:///app")).is_err());
+    }
 }

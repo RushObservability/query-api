@@ -266,6 +266,9 @@ pub struct AppState {
     pub trusted_proxy_cidrs: Arc<Vec<String>>,
     /// Per ingest-key fixed-window request limiter: key id -> (count, window start).
     pub ingest_key_limiter: Arc<DashMap<String, (u64, Instant)>>,
+    /// HMAC session key → last rotation eligibility check. This gates only the
+    /// extra renewal query; authorization itself is still checked every request.
+    pub session_rotation_checks: Arc<DashMap<String, Instant>>,
     /// Tamper-evident audit log writer (hash-chained, serialized). Shared.
     pub audit: Arc<audit::AuditLogger>,
     /// In-process system-health self-metrics registry. Updated on the HTTP hot path,

@@ -571,6 +571,9 @@ pub async fn login(
                 tenant_id,
                 role,
             },
+            "session": {
+                "activity_interval_seconds": state.config_db.session_activity_interval_seconds(),
+            },
         })),
     ))
 }
@@ -670,7 +673,10 @@ pub async fn me(
             display_name,
             tenant_id,
             role,
-        }
+        },
+        "session": {
+            "activity_interval_seconds": state.config_db.session_activity_interval_seconds(),
+        },
     })))
 }
 

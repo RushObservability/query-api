@@ -1,9 +1,4 @@
-//! PostgreSQL EXPLAIN job queue.
-//!
-//! The collector is push-only, so query-plan requests flow through a poll-based
-//! queue: the UI submits a job, the collector polls (`/poll`), runs a plain
-//! `EXPLAIN (FORMAT JSON)`, and posts the result (`/result`); the UI polls `/{id}`.
-//! Tenant is resolved by the global middleware (UI session OR collector Bearer key).
+//! MySQL EXPLAIN job queue. Plans are produced by the licensed collector.
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -14,14 +9,6 @@ use serde::Deserialize;
 
 use crate::handlers::users::{require_auth, require_write};
 use crate::{AppState, RequestIdentity, TenantContext};
-
-fn licensed() -> Result<(), (StatusCode, String)> {
-    if crate::license::evaluate().has_entitlement("postgres") {
-        Ok(())
-    } else {
-        Err((StatusCode::FORBIDDEN, "postgres add-on not licensed".into()))
-    }
-}
 
 fn require_collector_identity(
     tenant: &TenantContext,
@@ -48,26 +35,45 @@ pub struct SubmitBody {
     pub query: String,
 }
 
-/// Reject anything that isn't a single, non-EXPLAIN statement.
-fn validate_query(q: &str) -> Result<(), String> {
-    let t = q.trim();
-    if t.is_empty() {
-        return Err("query is empty".into());
+fn validate_query(query: &str) -> Result<String, String> {
+    let query = query.trim().trim_end_matches(';').trim();
+    if query.is_empty() || query.len() > 100_000 {
+        return Err("query must contain 1 to 100000 characters".into());
     }
-    if t.len() > 100_000 {
-        return Err("query too long".into());
+    if query.contains(';') {
+        return Err("only one statement is allowed".into());
     }
-    // Disallow embedded statements (allow a single trailing semicolon).
-    if t.trim_end_matches(';').contains(';') {
-        return Err("only a single statement is allowed".into());
+    let first = query.split_whitespace().next().unwrap_or_default();
+    if !first.eq_ignore_ascii_case("select") && !first.eq_ignore_ascii_case("with") {
+        return Err("only SELECT or WITH queries can be explained".into());
     }
-    if t.to_lowercase().starts_with("explain") {
-        return Err("omit EXPLAIN — it is added automatically".into());
+    let upper = format!(" {} ", query.to_ascii_uppercase());
+    if [
+        " INSERT ",
+        " UPDATE ",
+        " DELETE ",
+        " REPLACE ",
+        " INTO OUTFILE ",
+        " INTO DUMPFILE ",
+        " FOR UPDATE ",
+        " LOCK IN SHARE MODE ",
+    ]
+    .iter()
+    .any(|clause| upper.contains(clause))
+    {
+        return Err("only non-locking read queries can be explained".into());
     }
-    Ok(())
+    Ok(query.to_string())
 }
 
-/// POST /api/v1/integrations/postgres/explain — UI submits a job.
+fn licensed() -> Result<(), (StatusCode, String)> {
+    if crate::license::evaluate().has_entitlement("mysql") {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "MySQL add-on not licensed".into()))
+    }
+}
+
 pub async fn submit(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -77,26 +83,29 @@ pub async fn submit(
     let caller = require_write(&state, &headers).await?;
     licensed()?;
     if body.server.trim().is_empty() || body.server.len() > 255 {
-        return Err((StatusCode::BAD_REQUEST, "server is required".into()));
+        return Err((StatusCode::BAD_REQUEST, "invalid server name".into()));
     }
-    if body.db.len() > 255 || body.db.chars().any(char::is_control) {
+    if body.db.len() > 64 || body.db.chars().any(char::is_control) {
         return Err((StatusCode::BAD_REQUEST, "invalid database name".into()));
     }
-    validate_query(&body.query).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let query = body.query.trim().trim_end_matches(';').trim();
-
+    let query = validate_query(&body.query).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let id = state
         .config_db
-        .create_explain_job(&tenant.tenant_id, body.server.trim(), body.db.trim(), query)
+        .create_mysql_explain_job(
+            &tenant.tenant_id,
+            body.server.trim(),
+            body.db.trim(),
+            &query,
+        )
         .await
-        .map_err(|e| crate::api_error::internal_legacy("postgres_explain.create", e))?;
+        .map_err(|error| crate::api_error::internal_legacy("mysql_explain.create", error))?;
     state
         .audit
         .log(
-            crate::audit::AuditEvent::new("postgres_explain.submit", "user")
+            crate::audit::AuditEvent::new("mysql_explain.submit", "user")
                 .actor(caller.0.clone(), caller.1.clone())
                 .tenant(tenant.tenant_id.clone())
-                .resource("postgres_explain_job", &id)
+                .resource("mysql_explain_job", &id)
                 .outcome("success")
                 .changes(serde_json::json!({ "server": body.server, "db": body.db }).to_string())
                 .context(crate::audit::actor_context_from_headers(&headers)),
@@ -105,7 +114,6 @@ pub async fn submit(
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
-/// GET /api/v1/integrations/postgres/explain/{id} — UI polls for the result.
 pub async fn get_job(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -116,17 +124,17 @@ pub async fn get_job(
     licensed()?;
     match state
         .config_db
-        .get_explain_job(&tenant.tenant_id, &id)
+        .get_mysql_explain_job(&tenant.tenant_id, &id)
         .await
     {
         Ok(Some((status, db, plan_json, error))) => {
             state
                 .audit
                 .log(
-                    crate::audit::AuditEvent::new("postgres_explain.read", "user")
+                    crate::audit::AuditEvent::new("mysql_explain.read", "user")
                         .actor(caller.0.clone(), caller.1.clone())
                         .tenant(tenant.tenant_id.clone())
-                        .resource("postgres_explain_job", &id)
+                        .resource("mysql_explain_job", &id)
                         .outcome("success")
                         .context(crate::audit::actor_context_from_headers(&headers)),
                 )
@@ -136,7 +144,10 @@ pub async fn get_job(
             })))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "job not found".into())),
-        Err(e) => Err(crate::api_error::internal_legacy("postgres_explain.get", e)),
+        Err(error) => Err(crate::api_error::internal_legacy(
+            "mysql_explain.get",
+            error,
+        )),
     }
 }
 
@@ -145,36 +156,35 @@ pub struct PollParams {
     pub server: String,
 }
 
-/// GET /api/v1/integrations/postgres/explain/poll?server= — collector claims a job.
 pub async fn poll(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
     Extension(identity): Extension<RequestIdentity>,
     headers: HeaderMap,
-    Query(p): Query<PollParams>,
+    Query(params): Query<PollParams>,
 ) -> Response {
     if let Err(error) = require_collector_identity(&tenant, &identity) {
         return error.into_response();
     }
-    if let Err(error) = licensed() {
-        return error.into_response();
+    if licensed().is_err() {
+        return (StatusCode::FORBIDDEN, "MySQL add-on not licensed").into_response();
     }
-    if p.server.trim().is_empty() {
+    if params.server.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "server is required").into_response();
     }
     if let Ok(requeued) = state
         .config_db
-        .requeue_stale_explain_jobs(&tenant.tenant_id, &p.server)
+        .requeue_stale_mysql_explain_jobs(&tenant.tenant_id, &params.server)
         .await
     {
         if requeued > 0 {
             state
                 .audit
                 .log(
-                    crate::audit::AuditEvent::new("postgres_explain.requeue", &identity.actor_type)
+                    crate::audit::AuditEvent::new("mysql_explain.requeue", &identity.actor_type)
                         .actor(identity.actor_id.clone(), identity.actor_name.clone())
                         .tenant(tenant.tenant_id.clone())
-                        .resource("postgres_explain_queue", &p.server)
+                        .resource("mysql_explain_queue", &params.server)
                         .outcome("success")
                         .changes(serde_json::json!({ "requeued": requeued }).to_string())
                         .context(crate::audit::actor_context_from_headers(&headers)),
@@ -184,26 +194,30 @@ pub async fn poll(
     }
     match state
         .config_db
-        .claim_pending_explain_job(&tenant.tenant_id, &p.server)
+        .claim_pending_mysql_explain_job(&tenant.tenant_id, &params.server)
         .await
     {
         Ok(Some((id, db, query))) => {
             state
                 .audit
                 .log(
-                    crate::audit::AuditEvent::new("postgres_explain.claim", &identity.actor_type)
+                    crate::audit::AuditEvent::new("mysql_explain.claim", &identity.actor_type)
                         .actor(identity.actor_id.clone(), identity.actor_name.clone())
                         .tenant(tenant.tenant_id.clone())
-                        .resource("postgres_explain_job", &id)
+                        .resource("mysql_explain_job", &id)
                         .outcome("success")
-                        .changes(serde_json::json!({ "server": p.server, "db": db }).to_string())
+                        .changes(
+                            serde_json::json!({ "server": params.server, "db": db }).to_string(),
+                        )
                         .context(crate::audit::actor_context_from_headers(&headers)),
                 )
                 .await;
             Json(serde_json::json!({ "id": id, "db": db, "query": query })).into_response()
         }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => crate::api_error::internal_legacy("postgres_explain.poll", e).into_response(),
+        Err(error) => {
+            crate::api_error::internal_legacy("mysql_explain.poll", error).into_response()
+        }
     }
 }
 
@@ -215,7 +229,6 @@ pub struct ResultBody {
     pub error: String,
 }
 
-/// POST /api/v1/integrations/postgres/explain/{id}/result — collector posts the plan.
 pub async fn post_result(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -234,21 +247,18 @@ pub async fn post_result(
     }
     state
         .config_db
-        .complete_explain_job(&tenant.tenant_id, &id, &body.plan_json, &body.error)
+        .complete_mysql_explain_job(&tenant.tenant_id, &id, &body.plan_json, &body.error)
         .await
-        .map_err(|e| crate::api_error::internal_legacy("postgres_explain.complete", e))?;
-    state
-        .audit
-        .log(
-            crate::audit::AuditEvent::new("postgres_explain.complete", &identity.actor_type)
-                .actor(identity.actor_id.clone(), identity.actor_name.clone())
-                .tenant(tenant.tenant_id.clone())
-                .resource("postgres_explain_job", &id)
-                .outcome(if body.error.is_empty() { "success" } else { "failure" })
-                .changes(serde_json::json!({ "has_plan": !body.plan_json.is_empty(), "has_error": !body.error.is_empty() }).to_string())
-                .context(crate::audit::actor_context_from_headers(&headers)),
-        )
-        .await;
+        .map_err(|error| crate::api_error::internal_legacy("mysql_explain.complete", error))?;
+    state.audit.log(
+        crate::audit::AuditEvent::new("mysql_explain.complete", &identity.actor_type)
+            .actor(identity.actor_id.clone(), identity.actor_name.clone())
+            .tenant(tenant.tenant_id.clone())
+            .resource("mysql_explain_job", &id)
+            .outcome(if body.error.is_empty() { "success" } else { "failure" })
+            .changes(serde_json::json!({ "has_plan": !body.plan_json.is_empty(), "has_error": !body.error.is_empty() }).to_string())
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
     Ok(StatusCode::OK)
 }
 
@@ -269,6 +279,16 @@ mod tests {
     }
 
     #[test]
+    fn only_single_read_statements_enter_the_queue() {
+        assert!(validate_query("select * from orders").is_ok());
+        assert!(validate_query("WITH recent AS (SELECT 1) SELECT * FROM recent").is_ok());
+        assert!(validate_query("delete from orders").is_err());
+        assert!(validate_query("select 1; drop table users").is_err());
+        assert!(validate_query("WITH recent AS (SELECT 1) DELETE FROM orders").is_err());
+        assert!(validate_query("SELECT * FROM orders INTO OUTFILE '/tmp/orders'").is_err());
+    }
+
+    #[test]
     fn collector_identity_requires_an_authenticated_ingest_key_for_the_same_tenant() {
         let tenant = TenantContext {
             tenant_id: "tenant-a".into(),
@@ -286,12 +306,5 @@ mod tests {
             require_collector_identity(&tenant, &identity("tenant-a", "ingest_key", false))
                 .is_err()
         );
-    }
-
-    #[test]
-    fn explain_jobs_reject_multiple_or_nested_explain_statements() {
-        assert!(validate_query("select * from orders").is_ok());
-        assert!(validate_query("select 1; drop table users").is_err());
-        assert!(validate_query("EXPLAIN SELECT 1").is_err());
     }
 }
