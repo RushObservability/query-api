@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "20260810T233944Z59793",
+  "captured_at": "2026-08-10T23:39:44Z",
+  "environment": {
+    "clickhouse_version": "26.6.1.1193",
+    "database": "observability",
+    "table": "spans",
+    "cache_state": "warm",
+    "warmups_per_plan": 3,
+    "samples_per_plan": 20
+  },
+  "request": {
+    "tenant": "default",
+    "anchor_utc": "2026-08-10 23:39:29",
+    "window_minutes": 60,
+    "limit": 100,
+    "interval_seconds": 60,
+    "matched_spans": 333250,
+    "matched_services": 6
+  },
+  "plans": {
+    "legacy": {
+      "queries_per_interaction": 6,
+      "p50_first_results_ms": 25,
+      "p95_first_results_ms": 93,
+      "p99_first_results_ms": 93,
+      "p95_full_interaction_ms": 93,
+      "avg_read_rows": 1391388,
+      "avg_read_bytes": 15980421
+    },
+    "coordinated": {
+      "queries_per_interaction": 2,
+      "p50_first_results_ms": 12,
+      "p95_first_results_ms": 66,
+      "p99_first_results_ms": 66,
+      "p95_full_interaction_ms": 81,
+      "avg_read_rows": 362767,
+      "avg_read_bytes": 11817751
+    }
+  },
+  "improvement_percent": {
+    "queries_per_interaction": 66.7,
+    "p95_first_results_ms": 29.0,
+    "p95_full_interaction_ms": 12.9,
+    "avg_read_rows": 73.9,
+    "avg_read_bytes": 26.0
+  },
+  "acceptance": {
+    "query_reduction_at_least_40_percent": true,
+    "p95_first_results_improved": true,
+    "physical_bytes_read_improved": true
+  }
+}

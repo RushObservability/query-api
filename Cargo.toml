@@ -1,0 +1,100 @@
+[package]
+name = "rush-api"
+version = "0.1.25"
+edition = "2024"
+license = "BUSL-1.1"
+
+[features]
+# The community build contains the core API only. Licensed collector support is
+# compiled into explicitly selected distributions and is still entitlement-gated
+# at runtime by RUSH_LICENSE_KEY.
+default = ["oss"]
+oss = []
+postgres-collector = []
+mysql-collector = []
+
+[lib]
+name = "rush_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rush-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "rush-anomaly-engine"
+path = "src/bin/anomaly_engine.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+clickhouse = { version = "0.13", features = ["time", "uuid", "lz4"] }
+# "rc" enables Serialize/Deserialize for Arc<T> (and Rc<T>). The ingest row
+# structs in models::ingest share per-resource/per-scope data behind Arc to
+# avoid re-allocating identical strings/Vecs for every datapoint (see the
+# "Arc refactor" comment there). Arc<T>'s serde impls delegate straight to T
+# ((**self).serialize / Box::deserialize), so the RowBinary wire format sent to
+# ClickHouse and the JSON written to the spool are byte-identical to the
+# pre-Arc owned types — verified against the clickhouse 0.13 rowbinary codec.
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-logfmt = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1.0.103"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.9"
+argon2 = { version = "0.5", features = ["password-hash", "std"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+lettre = { version = "0.11.22", features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
+promql-parser = "0.7"
+regex = "1"
+dotenvy = "0.15"
+urlencoding = "2"
+toml = "0.8"
+prost = "0.13"
+snap = "1"
+flate2 = "1"
+rmp-serde = "1"
+zstd = "0.13"
+tokio-stream = "0.1"
+futures-util = "0.3"
+object_store = { version = "0.14.1", features = ["aws"] }
+bytes = "1"
+kube = { version = "0.98", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+base64 = "0.22"
+quick-xml = "0.41"
+url = "2"
+openssl = "0.10"
+# Pure-Rust SAML signature verification (XML-DSig + exclusive C14N via bergshamra).
+# No native/xmlsec deps; works on macOS dev and Linux prod. Verifies the signed
+# SAML Response (signature + reference digest) and guards against XSW / dup-ID.
+opensaml = "0.3.0"
+dashmap = "6"
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
+hex = "0.4"
+# Drop-in global allocator. glibc malloc fragments badly under tokio's
+# multi-thread churn (many short-lived per-request Vec/String allocations in the
+# ingest + query paths) and rarely returns freed pages to the OS, so steady-state
+# RSS drifts up. jemalloc keeps RSS lower and flatter; pair with a deploy-time
+# MALLOC_CONF=...,dirty_decay_ms/muzzy_decay_ms to release pages promptly.
+tikv-jemallocator = "0.6"
+sqlparser = { version = "0.62.0", features = ["visitor"] }
+
+[dev-dependencies]
+proptest = "1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

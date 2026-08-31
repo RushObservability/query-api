@@ -1,0 +1,22 @@
+# wide / query-api runtime config.
+#
+# NOTE: ClickHouse connects to object storage via clickhouse/config.d/storage.xml
+# (the `s3_disk` + `tiered` policy). This `[storage.s3]` block is what tells the
+# query-api migration layer that tiering is enabled, so it attaches the `tiered`
+# policy and the TTL-MOVE rules to the data tables. The credentials here mirror
+# the MinIO dev setup; ClickHouse itself uses the ones in storage.xml.
+
+[storage.s3]
+endpoint = "http://minio:9000"
+bucket = "wide-clickhouse"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+region = "us-east-1"
+
+# Move parts to the S3 (cold) volume once they're older than N days.
+# Table-level DELETE TTL stays at the retention defaults (30d), so nothing is
+# deleted early — data just relocates from local disk to object storage.
+[storage.tiering]
+metrics_move_after_days = 2
+traces_move_after_days = 2
+logs_move_after_days = 2

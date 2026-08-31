@@ -1,0 +1,117 @@
+name: Rust security and quality
+
+on:
+  pull_request:
+    paths:
+      - "**/*.rs"
+      - "**/*.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - "Dockerfile"
+      - "Dockerfile.agent"
+      - "docker-compose.yml"
+      - "scripts/check-container-policy.sh"
+      - "scripts/check-public-errors.sh"
+      - "scripts/check-llm-gateway.sh"
+      - "scripts/check-security-regressions.sh"
+      - "security/**"
+      - ".github/workflows/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.rs"
+      - "**/*.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - "Dockerfile"
+      - "Dockerfile.agent"
+      - "docker-compose.yml"
+      - "scripts/check-container-policy.sh"
+      - "scripts/check-public-errors.sh"
+      - "scripts/check-llm-gateway.sh"
+      - "scripts/check-security-regressions.sh"
+      - "security/**"
+      - ".github/workflows/**"
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security-and-quality:
+    name: Format, lint, test, build, and dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, reviewed 2026-08-02
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-deny@0.20.2
+
+      # The policy scripts intentionally use ripgrep's multiline/PCRE-compatible
+      # matching. ubuntu-latest does not guarantee that `rg` is preinstalled, so
+      # install an explicit version instead of letting a missing binary turn into
+      # a misleading policy failure.
+      - name: Install policy search tool
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: ripgrep@14.1.1
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Enforce container deployment policy
+        run: bash scripts/check-container-policy.sh
+
+      - name: Prevent raw internal API errors
+        run: bash scripts/check-public-errors.sh
+
+      - name: Enforce bounded LLM gateway usage
+        run: bash scripts/check-llm-gateway.sh
+
+      - name: Enforce adversarial parser and authorization coverage
+        run: bash scripts/check-security-regressions.sh
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features
+        env:
+          # PRs stay bounded; the weekly schedule exercises a much larger corpus.
+          PROPTEST_CASES: ${{ github.event_name == 'schedule' && '4096' || '256' }}
+
+      - name: Build release targets
+        run: cargo build --release --all-features
+
+      - name: Scan RustSec advisories
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+      - name: Enforce dependency policy
+        run: cargo deny check --hide-inclusion-graph advisories bans licenses sources
