@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.88-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+
+RUN cargo build --release --bin wide-sre-agent
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 65532 appgroup \
+    && useradd --system --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin appuser
+
+COPY --from=builder --chown=65532:65532 /app/target/release/wide-sre-agent /usr/local/bin/wide-sre-agent
+
+USER 65532:65532
+EXPOSE 8081
+
+CMD ["wide-sre-agent"]

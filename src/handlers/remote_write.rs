@@ -1,0 +1,413 @@
+use axum::{
+    Extension,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
+use prost::Message;
+
+use crate::AppState;
+use crate::TenantContext;
+use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::models::ingest::GaugeRow;
+
+// ═══ Prometheus remote write protobuf types ═══
+// Defined manually to avoid requiring protoc at build time.
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WriteRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub timeseries: Vec<TimeSeries>,
+    #[prost(message, repeated, tag = "3")]
+    pub metadata: Vec<MetricMetadata>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TimeSeries {
+    #[prost(message, repeated, tag = "1")]
+    pub labels: Vec<Label>,
+    #[prost(message, repeated, tag = "2")]
+    pub samples: Vec<Sample>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Label {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Sample {
+    #[prost(double, tag = "1")]
+    pub value: f64,
+    #[prost(int64, tag = "2")]
+    pub timestamp: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MetricMetadata {
+    #[prost(enumeration = "MetricType", tag = "1")]
+    pub r#type: i32,
+    #[prost(string, tag = "2")]
+    pub metric_family_name: String,
+    #[prost(string, tag = "4")]
+    pub help: String,
+    #[prost(string, tag = "5")]
+    pub unit: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum MetricType {
+    Unknown = 0,
+    Counter = 1,
+    Gauge = 2,
+    Summary = 3,
+    Histogram = 4,
+    GaugeHistogram = 5,
+    Info = 6,
+    StateSet = 7,
+}
+
+// ═══ Handler ═══
+
+/// POST /prom/api/v1/write — Prometheus remote write receiver.
+///
+/// Accepts snappy-compressed protobuf `prometheus.WriteRequest` and inserts
+/// samples into `metrics_gauge` in ClickHouse.
+pub async fn prom_remote_write(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    state.ingest_limits.check_body("prometheus", &body)?;
+    // Verify content type (optional — some clients don't set it)
+    if let Some(ct) = headers.get("content-type") {
+        let ct_str = ct.to_str().unwrap_or("");
+        if !ct_str.is_empty()
+            && !ct_str.contains("x-protobuf")
+            && !ct_str.contains("protobuf")
+            && !ct_str.contains("snappy")
+            && !ct_str.contains("octet-stream")
+        {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("unsupported content-type: {ct_str}"),
+            ));
+        }
+    }
+
+    // Check content-encoding for snappy (some clients use this header)
+    let is_snappy = headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("snappy"));
+
+    // Decompress snappy — Prometheus remote write always uses snappy framing.
+    // Decompression + protobuf decode are synchronous CPU work; run them on the
+    // blocking pool so large remote_write batches don't stall a tokio worker.
+    // If decompression fails and content-encoding isn't snappy, treat as raw
+    // protobuf (for flexibility with custom senders).
+    let decode_permit = state.ingest_limits.acquire_decode("prometheus").await?;
+    let limits = state.ingest_limits.clone();
+    let (write_req, decompressed_len) = tokio::task::spawn_blocking(move || {
+        let _decode_permit = decode_permit;
+        decode_write_request(&limits, is_snappy, &body)
+    })
+    .await
+    .map_err(|e| crate::api_error::internal_legacy("remote_write.decode_task", e))??;
+
+    validate_write_request(&state.ingest_limits, &write_req)?;
+
+    if write_req.timeseries.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Build metadata lookup (metric_name → description/unit)
+    let mut meta_map = std::collections::HashMap::new();
+    for m in &write_req.metadata {
+        meta_map.insert(
+            m.metric_family_name.clone(),
+            (m.help.clone(), m.unit.clone()),
+        );
+    }
+
+    // Count samples for logging
+    let sample_count: usize = write_req.timeseries.iter().map(|ts| ts.samples.len()).sum();
+    tracing::debug!(
+        signal = "metrics",
+        source = "prometheus",
+        timeseries = write_req.timeseries.len(),
+        samples = sample_count,
+        "remote write payload decoded"
+    );
+
+    // Build all gauge rows for metrics_gauge.
+    // Arc refactor: tenant_id and the constant scope fields are shared across
+    // every sample in the request; allocate each once and Arc-clone per row.
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let empty_str: std::sync::Arc<str> = "".into();
+    let scope_prom: std::sync::Arc<str> = "prometheus".into();
+    let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
+    let mut rows: Vec<GaugeRow> = Vec::new();
+
+    for ts in &write_req.timeseries {
+        // Extract __name__ (metric name) and job (service name) from labels
+        let mut metric_name = String::new();
+        let mut service_name = String::new();
+        let mut attrs = Vec::new();
+
+        for label in &ts.labels {
+            match label.name.as_str() {
+                "__name__" => metric_name = label.value.clone(),
+                "job" => service_name = label.value.clone(),
+                _ => {
+                    attrs.push((label.name.clone(), label.value.clone()));
+                }
+            }
+        }
+
+        if metric_name.is_empty() {
+            continue; // Skip timeseries without a metric name
+        }
+
+        let (description, unit) = meta_map.get(&metric_name).cloned().unwrap_or_default();
+
+        // P1: Build template row once per timeseries, only update time+value per sample
+        let template = GaugeRow {
+            tenant_id: tenant_arc.clone(),
+            resource_attributes: empty_attrs.clone(),
+            resource_schema_url: empty_str.clone(),
+            scope_name: scope_prom.clone(),
+            scope_version: empty_str.clone(),
+            scope_attributes: empty_attrs.clone(),
+            scope_dropped_attr_count: 0,
+            scope_schema_url: empty_str.clone(),
+            service_name: service_name.as_str().into(),
+            metric_name: metric_name.as_str().into(),
+            metric_description: description.as_str().into(),
+            metric_unit: unit.as_str().into(),
+            attributes: attrs,
+            start_time_unix: 0,
+            time_unix: 0,
+            value: 0.0,
+            flags: 0,
+            exemplars_filtered_attributes: Vec::new(),
+            exemplars_time_unix: Vec::new(),
+            exemplars_value: Vec::new(),
+            exemplars_span_id: Vec::new(),
+            exemplars_trace_id: Vec::new(),
+        };
+
+        for sample in &ts.samples {
+            let mut row = template.clone();
+            row.time_unix = sample.timestamp * 1_000_000;
+            row.value = sample.value;
+            rows.push(row);
+        }
+    }
+
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("remote_write.write", s),
+        })?;
+
+    // Record usage for per-tenant ingest metering (use decompressed size for bytes)
+    state.usage_accumulator.record(
+        tenant_id,
+        "metrics",
+        sample_count as u64,
+        decompressed_len as u64,
+    );
+
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        series_count = write_req.timeseries.len(),
+        samples = sample_count,
+        source = "prometheus",
+        "ingested remote write"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn decode_write_request(
+    limits: &crate::ingest_limits::IngestLimits,
+    is_snappy: bool,
+    body: &[u8],
+) -> Result<(WriteRequest, usize), (StatusCode, String)> {
+    let decompressed = match snap::raw::decompress_len(body) {
+        Ok(claimed_len) => {
+            // Snappy embeds the uncompressed length. Check it before
+            // `decompress_vec` allocates the claimed output buffer.
+            limits.check_decompressed("prometheus", claimed_len)?;
+            snap::raw::Decoder::new()
+                .decompress_vec(body)
+                .map_err(|_| limits.malformed("prometheus", "invalid Snappy ingest payload"))?
+        }
+        Err(_) if !is_snappy => {
+            limits.check_decompressed("prometheus", body.len())?;
+            body.to_vec()
+        }
+        Err(_) => {
+            return Err(limits.malformed("prometheus", "invalid Snappy ingest payload"));
+        }
+    };
+    let len = decompressed.len();
+    limits.check_decompressed("prometheus", len)?;
+    WriteRequest::decode(decompressed.as_slice())
+        .map(|request| (request, len))
+        .map_err(|_| limits.malformed("prometheus", "invalid Prometheus remote-write payload"))
+}
+
+fn validate_write_request(
+    limits: &crate::ingest_limits::IngestLimits,
+    request: &WriteRequest,
+) -> Result<(), (StatusCode, String)> {
+    limits.check_count("prometheus", request.timeseries.len(), limits.max_series)?;
+    limits.check_count("prometheus", request.metadata.len(), limits.max_metadata)?;
+
+    let mut samples = 0usize;
+    let mut labels = 0usize;
+    for series in &request.timeseries {
+        limits.check_count(
+            "prometheus",
+            series.labels.len(),
+            limits.max_labels_per_series,
+        )?;
+        samples = samples
+            .checked_add(series.samples.len())
+            .ok_or_else(|| limits.check_entities("prometheus", usize::MAX).unwrap_err())?;
+        labels = labels
+            .checked_add(series.labels.len())
+            .ok_or_else(|| limits.check_entities("prometheus", usize::MAX).unwrap_err())?;
+        for label in &series.labels {
+            limits.check_label("prometheus", &label.name, &label.value)?;
+        }
+    }
+    limits.check_count("prometheus", samples, limits.max_samples)?;
+    let total = request
+        .timeseries
+        .len()
+        .checked_add(request.metadata.len())
+        .and_then(|count| count.checked_add(samples))
+        .and_then(|count| count.checked_add(labels))
+        .ok_or_else(|| limits.check_entities("prometheus", usize::MAX).unwrap_err())?;
+    limits.check_entities("prometheus", total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+
+    fn limits() -> crate::ingest_limits::IngestLimits {
+        crate::ingest_limits::IngestLimits::for_test(Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ))
+    }
+
+    #[test]
+    fn remote_write_rejects_oversized_series_labels_and_samples() {
+        let limits = limits();
+        let too_many_series = WriteRequest {
+            timeseries: (0..11).map(|_| TimeSeries::default()).collect(),
+            metadata: Vec::new(),
+        };
+        assert_eq!(
+            validate_write_request(&limits, &too_many_series)
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let long_label = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![Label {
+                    name: "x".repeat(33),
+                    value: "ok".into(),
+                }],
+                samples: vec![],
+            }],
+            metadata: Vec::new(),
+        };
+        assert_eq!(
+            validate_write_request(&limits, &long_label).unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn malformed_snappy_and_protobuf_have_stable_public_errors() {
+        let limits = limits();
+        let err = snap::raw::decompress_len(&[0xff, 0xff, 0xff])
+            .map_err(|_| limits.malformed("prometheus", "invalid Snappy ingest payload"))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid Snappy ingest payload".into()
+            )
+        );
+
+        let err = WriteRequest::decode([0xff, 0xff, 0xff].as_slice())
+            .map_err(|_| limits.malformed("prometheus", "invalid Prometheus remote-write payload"))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid Prometheus remote-write payload".into()
+            )
+        );
+    }
+
+    #[test]
+    fn snappy_claimed_output_is_rejected_before_decompression() {
+        let limits = limits();
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&vec![0_u8; 4097])
+            .unwrap();
+        assert!(compressed.len() < limits.max_compressed_bytes);
+        let error = decode_write_request(&limits, true, &compressed).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error.1,
+            "decompressed ingest payload exceeds configured limit"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_snappy_and_protobuf_never_panic_or_leak_decoder_details(
+            body in proptest::collection::vec(any::<u8>(), 0..2048),
+            declared_snappy in any::<bool>(),
+        ) {
+            let limits = limits();
+            let result = limits
+                .check_compressed("prometheus", body.len())
+                .and_then(|_| decode_write_request(&limits, declared_snappy, &body))
+                .and_then(|(request, len)| {
+                    validate_write_request(&limits, &request).map(|_| (request, len))
+                });
+            if let Err((status, message)) = result {
+                prop_assert!(matches!(status, StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE));
+                prop_assert!(!message.contains("prost"));
+                prop_assert!(!message.contains("snappy::"));
+                prop_assert!(!message.contains("failed to"));
+            }
+        }
+    }
+}

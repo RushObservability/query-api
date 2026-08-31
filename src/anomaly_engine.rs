@@ -1,0 +1,670 @@
+use crate::alert_engine::SmtpConfig;
+use crate::clickhouse_config::ConfigDb;
+use crate::models::anomaly::AnomalyRule;
+use clickhouse::Client;
+use lettre::message::header::ContentType;
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use std::sync::Arc;
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+#[allow(dead_code)]
+struct ApmBucket {
+    bucket: u32,
+    count: u64,
+    error_count: u64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PromResponse {
+    data: Option<PromData>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PromData {
+    result: Vec<PromSeries>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PromSeries {
+    metric: std::collections::BTreeMap<String, String>,
+    values: Vec<(f64, String)>,
+}
+
+struct EwmaResult {
+    mean: f64,
+    anomalous: bool,
+    deviation: f64,
+}
+
+fn ewma_eval(data: &[f64], alpha: f64, sensitivity: f64) -> EwmaResult {
+    let warmup = 12.min(data.len());
+    if warmup == 0 {
+        return EwmaResult {
+            mean: 0.0,
+            anomalous: false,
+            deviation: 0.0,
+        };
+    }
+
+    let mut sum = 0.0;
+    for v in &data[..warmup] {
+        sum += v;
+    }
+    let mut mean = sum / warmup as f64;
+    let mut var_sum = 0.0;
+    for v in &data[..warmup] {
+        var_sum += (v - mean).powi(2);
+    }
+    let mut variance = var_sum / warmup as f64;
+    let min_var = variance * 0.3;
+
+    for (i, &val) in data.iter().enumerate() {
+        let std = variance.sqrt();
+        let upper = mean + sensitivity * std;
+        let lower = (mean - sensitivity * std).max(0.0);
+
+        let is_anomaly = i >= warmup && (val > upper || val < lower);
+
+        if i > 0 && !is_anomaly {
+            let diff = val - mean;
+            mean = alpha * val + (1.0 - alpha) * mean;
+            let va = alpha * 0.25;
+            variance = (va * diff * diff + (1.0 - va) * variance).max(min_var);
+        }
+
+        // Return result for the last data point
+        if i == data.len() - 1 {
+            let dev = if std > 0.0 {
+                (val - mean).abs() / std
+            } else {
+                0.0
+            };
+            return EwmaResult {
+                mean,
+                anomalous: is_anomaly,
+                deviation: dev,
+            };
+        }
+    }
+
+    EwmaResult {
+        mean: 0.0,
+        anomalous: false,
+        deviation: 0.0,
+    }
+}
+
+fn build_smtp_transport(cfg: &SmtpConfig) -> Option<AsyncSmtpTransport<Tokio1Executor>> {
+    let host = cfg.host.as_deref()?;
+    let mut builder = AsyncSmtpTransport::<Tokio1Executor>::relay(host).ok()?;
+    builder = builder.port(cfg.port);
+    if let (Some(user), Some(pass)) = (&cfg.user, &cfg.pass) {
+        builder = builder.credentials(Credentials::new(user.clone(), pass.clone()));
+    }
+    Some(builder.build())
+}
+
+/// Spawn the anomaly engine as a background task on the API server (mirrors
+/// `spawn_alert_engine` / `spawn_slo_engine`). Without this, anomaly rules are
+/// never evaluated unless the standalone `anomaly_engine` binary is run, so no
+/// anomaly events are ever persisted.
+pub fn spawn_anomaly_engine(
+    config_db: Arc<ConfigDb>,
+    read_ch: Client,
+    write_ch: Client,
+    smtp_config: SmtpConfig,
+    prom_base_url: String,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+) {
+    tokio::spawn(run_anomaly_engine(
+        config_db,
+        read_ch,
+        write_ch,
+        smtp_config,
+        prom_base_url,
+        self_metrics,
+    ));
+}
+
+/// Run the anomaly engine loop forever. Call this directly from the standalone binary.
+pub async fn run_anomaly_engine(
+    config_db: Arc<ConfigDb>,
+    read_ch: Client,
+    write_ch: Client,
+    smtp_config: SmtpConfig,
+    prom_base_url: String,
+    self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+) {
+    let http_client = reqwest::Client::new();
+    let smtp_transport = build_smtp_transport(&smtp_config);
+    if smtp_transport.is_some() {
+        tracing::info!(
+            engine = "anomaly",
+            "SMTP configured for email notifications"
+        );
+    }
+    tracing::info!(engine = "anomaly", interval_secs = 30, prom_base_url = %prom_base_url, "anomaly engine started");
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+        let start = std::time::Instant::now();
+        let ok = match eval_anomaly_rules(
+            &config_db,
+            &read_ch,
+            &write_ch,
+            &http_client,
+            &smtp_config,
+            &smtp_transport,
+            &prom_base_url,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, engine = "anomaly", "anomaly engine error");
+                false
+            }
+        };
+        self_metrics.record_engine("anomaly_engine", start.elapsed().as_millis() as u64, ok);
+    }
+}
+
+async fn eval_anomaly_rules(
+    config_db: &ConfigDb,
+    read_ch: &Client,
+    write_ch: &Client,
+    http_client: &reqwest::Client,
+    smtp_config: &SmtpConfig,
+    smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+    prom_base_url: &str,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let due_rules = config_db.get_due_anomaly_rules(&now_str).await?;
+
+    if due_rules.is_empty() {
+        tracing::debug!(engine = "anomaly", "tick -- no rules due");
+    } else {
+        tracing::debug!(
+            engine = "anomaly",
+            rules_due = due_rules.len(),
+            "tick -- evaluating rules"
+        );
+    }
+
+    // Prefetch every due rule's data concurrently — the fetches are independent
+    // reads, so the tick pays for the slowest fetch instead of the sum of all.
+    let fetched = futures_util::future::join_all(due_rules.iter().map(|rule| async move {
+        let fetched = crate::query_governor::run_background(&rule.tenant_id, async {
+            match rule.source.as_str() {
+                "apm" => Some(fetch_apm_data(read_ch, rule, &now).await),
+                "prometheus" => Some(fetch_prom_data(http_client, prom_base_url, rule, &now).await),
+                _ => None,
+            }
+        })
+        .await;
+        match fetched {
+            Ok(result) => result,
+            Err(error) => Some(Err(anyhow::anyhow!(
+                "background admission rejected: {error:?}"
+            ))),
+        }
+    }))
+    .await;
+
+    // Per-series eval logs are accumulated here and written as ONE batch insert
+    // at the end of the tick (previously one INSERT per series per rule).
+    let mut eval_log_values: Vec<String> = Vec::new();
+
+    for (rule, prefetched) in due_rules.into_iter().zip(fetched) {
+        tracing::debug!(
+            engine = "anomaly",
+            rule_name = %rule.name,
+            source = %rule.source,
+            state = %rule.state,
+            "evaluating rule"
+        );
+
+        let all_series = match prefetched {
+            Some(r) => r,
+            None => {
+                tracing::warn!(engine = "anomaly", rule_id = %rule.id, source = %rule.source, "unknown data source");
+                continue;
+            }
+        };
+
+        let series_list = match all_series {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                tracing::debug!(engine = "anomaly", rule_name = %rule.name, "no data points returned");
+                config_db
+                    .update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None)
+                    .await?;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "data fetch failed");
+                config_db
+                    .update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None)
+                    .await?;
+                continue;
+            }
+        };
+
+        tracing::debug!(
+            engine = "anomaly",
+            rule_name = %rule.name,
+            series_count = series_list.len(),
+            "series to evaluate"
+        );
+
+        // Evaluate each series independently; if ANY is anomalous the rule triggers
+        let mut any_anomalous = false;
+        let mut worst_deviation = 0.0_f64;
+        let mut worst_metric = String::new();
+        let mut worst_val = 0.0_f64;
+        let mut worst_expected = 0.0_f64;
+
+        for (values, metric_label) in &series_list {
+            if values.is_empty() {
+                continue;
+            }
+            let latest_val = *values.last().unwrap_or(&0.0);
+            let result = ewma_eval(values, rule.alpha, rule.sensitivity);
+
+            let series_state = if result.anomalous {
+                "anomalous"
+            } else {
+                "normal"
+            };
+
+            tracing::debug!(
+                engine = "anomaly",
+                rule_name = %rule.name,
+                metric = %metric_label,
+                data_points = values.len(),
+                latest_value = format_args!("{:.2}", latest_val),
+                ewma_mean = format_args!("{:.2}", result.mean),
+                deviation_sigma = format_args!("{:.1}", result.deviation),
+                anomalous = result.anomalous,
+                "series evaluated"
+            );
+
+            // Collect the eval log row; flushed in one batch insert per tick.
+            eval_log_values.push(anomaly_log_tuple(
+                &now,
+                &rule,
+                series_state,
+                metric_label,
+                latest_val,
+                result.mean,
+                result.deviation,
+            ));
+
+            if result.anomalous {
+                any_anomalous = true;
+            }
+            if result.deviation > worst_deviation {
+                worst_deviation = result.deviation;
+                worst_metric = metric_label.clone();
+                worst_val = latest_val;
+                worst_expected = result.mean;
+            }
+        }
+
+        let new_state = if any_anomalous { "anomalous" } else { "normal" };
+        let old_state = rule.state.as_str();
+
+        if new_state != old_state {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let message = format!(
+                "Anomaly '{}': {} (metric={}, value={:.2}, expected={:.2}, deviation={:.1}σ)",
+                rule.name,
+                if any_anomalous {
+                    "ANOMALOUS"
+                } else {
+                    "RESOLVED"
+                },
+                worst_metric,
+                worst_val,
+                worst_expected,
+                worst_deviation,
+            );
+
+            config_db
+                .create_anomaly_event(
+                    &event_id,
+                    &rule.id,
+                    &rule.tenant_id,
+                    new_state,
+                    &worst_metric,
+                    worst_val,
+                    worst_expected,
+                    worst_deviation,
+                    &message,
+                )
+                .await?;
+
+            let triggered_at = if any_anomalous {
+                Some(now_str.as_str())
+            } else {
+                None
+            };
+            config_db
+                .update_anomaly_state(&rule.id, &rule.tenant_id, new_state, &now_str, triggered_at)
+                .await?;
+
+            // Send notifications
+            send_notifications(
+                config_db,
+                http_client,
+                smtp_config,
+                smtp_transport,
+                &rule,
+                &message,
+                any_anomalous,
+            )
+            .await;
+
+            tracing::info!(
+                engine = "anomaly",
+                rule_name = %rule.name,
+                old_state = %old_state,
+                new_state = %new_state,
+                metric = %worst_metric,
+                deviation_sigma = format_args!("{:.1}", worst_deviation),
+                "anomaly state changed"
+            );
+        } else {
+            config_db
+                .update_anomaly_state(&rule.id, &rule.tenant_id, new_state, &now_str, None)
+                .await?;
+        }
+    }
+
+    // Flush all per-series eval logs in one INSERT (previously one per series).
+    if !eval_log_values.is_empty() {
+        let sql = format!(
+            "INSERT INTO logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES {}",
+            eval_log_values.join(", ")
+        );
+        if let Err(e) = write_ch.query(&sql).execute().await {
+            tracing::warn!(error = %e, engine = "anomaly", rows = eval_log_values.len(), "failed to write eval log batch");
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_apm_data(
+    ch: &Client,
+    rule: &AnomalyRule,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Vec<(Vec<f64>, String)>> {
+    let from = (*now - chrono::Duration::seconds(rule.window_secs))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let escaped_tenant = crate::query_builder::escape_string_literal(&rule.tenant_id);
+    let sql = format!(
+        "SELECT toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL '1' MINUTE)) as bucket, \
+         count() as count, \
+         countIf(status = 'error') as error_count, \
+         quantile(0.50)(duration_ns) as p50, \
+         quantile(0.95)(duration_ns) as p95, \
+         quantile(0.99)(duration_ns) as p99 \
+         FROM spans \
+         WHERE tenant_id = '{}' AND service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp <= parseDateTimeBestEffort('{}') \
+         GROUP BY bucket ORDER BY bucket",
+        escaped_tenant,
+        rule.service_name.replace('\'', "''"),
+        from,
+        now_str,
+    );
+
+    let rows = crate::tenant_query(ch, &sql, &rule.tenant_id)
+        .fetch_all::<ApmBucket>()
+        .await?;
+    if rows.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let metric_label = format!("{}:{}", rule.service_name, rule.apm_metric);
+    let values: Vec<f64> = rows
+        .iter()
+        .map(|r| {
+            match rule.apm_metric.as_str() {
+                "error_rate" => r.error_count as f64,
+                "p50" => r.p50,
+                "p95" => r.p95,
+                "p99" => r.p99,
+                _ => r.count as f64, // request_rate
+            }
+        })
+        .collect();
+
+    Ok(vec![(values, metric_label)])
+}
+
+async fn fetch_prom_data(
+    http_client: &reqwest::Client,
+    prom_base_url: &str,
+    rule: &AnomalyRule,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Vec<(Vec<f64>, String)>> {
+    let end = now.timestamp();
+    let start = end - rule.window_secs;
+    let step = if rule.window_secs <= 3600 {
+        15
+    } else if rule.window_secs <= 21600 {
+        60
+    } else {
+        300
+    };
+
+    let split_labels: Vec<String> = serde_json::from_str(&rule.split_labels).unwrap_or_default();
+
+    let query = if !rule.query.is_empty() {
+        rule.query.clone()
+    } else {
+        // Auto-build from pattern
+        let suffix_is_counter = ["_total", "_count", "_sum", "_bucket", "_created"]
+            .iter()
+            .any(|s| rule.pattern.ends_with(s));
+        let by_clause = if split_labels.is_empty() {
+            String::new()
+        } else {
+            format!(" by ({})", split_labels.join(", "))
+        };
+        if suffix_is_counter {
+            format!("sum{by_clause}(rate({}[5m]))", rule.pattern)
+        } else {
+            format!("sum{by_clause}({})", rule.pattern)
+        }
+    };
+
+    let url = format!(
+        "{}/prom/api/v1/query_range?query={}&start={}&end={}&step={}",
+        prom_base_url,
+        urlencoding::encode(&query),
+        start,
+        end,
+        step,
+    );
+
+    // Scope the upstream PromQL evaluation to this rule's tenant. The /prom
+    // endpoint resolves the tenant from the X-Rush-Tenant header and pushes it
+    // into the PromQL→ClickHouse query, so without this an anomaly rule would
+    // evaluate against the default tenant's metrics.
+    let resp: PromResponse = http_client
+        .get(&url)
+        .header("X-Rush-Tenant", &rule.tenant_id)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let all_series = resp.data.map(|d| d.result).unwrap_or_default();
+
+    if all_series.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let results: Vec<(Vec<f64>, String)> = all_series
+        .into_iter()
+        .map(|s| {
+            let values: Vec<f64> = s
+                .values
+                .iter()
+                .map(|(_, v)| v.parse::<f64>().unwrap_or(0.0))
+                .collect();
+            // Build a human-readable label from the metric map
+            let label = if s.metric.is_empty() {
+                rule.pattern.clone()
+            } else {
+                let parts: Vec<String> = s
+                    .metric
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "__name__")
+                    .map(|(k, v)| format!("{}=\"{}\"", k, v))
+                    .collect();
+                if parts.is_empty() {
+                    rule.pattern.clone()
+                } else {
+                    format!("{}{{{}}}", rule.pattern, parts.join(", "))
+                }
+            };
+            (values, label)
+        })
+        .collect();
+
+    Ok(results)
+}
+
+/// Build one VALUES tuple for a per-series eval log row. Rows are accumulated
+/// across the whole tick and flushed in a single batch INSERT.
+fn anomaly_log_tuple(
+    now: &chrono::DateTime<chrono::Utc>,
+    rule: &AnomalyRule,
+    state: &str,
+    metric: &str,
+    value: f64,
+    expected: f64,
+    deviation: f64,
+) -> String {
+    let ts_nanos = now
+        .timestamp_nanos_opt()
+        .unwrap_or(now.timestamp() * 1_000_000_000);
+    let severity_text = if state == "anomalous" { "WARN" } else { "INFO" };
+    let severity_number: u8 = if state == "anomalous" { 13 } else { 9 }; // WARN=13, INFO=9
+
+    let body = format!(
+        "[wide-anomaly] rule={} state={} metric={} value={:.2} expected={:.2} deviation={:.1}σ",
+        rule.name, state, metric, value, expected, deviation,
+    );
+
+    format!(
+        "({ts_nanos}, '{severity_text}', {severity_number}, 'wide-anomaly-engine', '{body}', \
+         {{'anomaly.rule_id': '{rule_id}', 'anomaly.rule_name': '{rule_name}', 'anomaly.state': '{state}', \
+         'anomaly.metric': '{metric}', 'anomaly.value': '{value:.2}', 'anomaly.expected': '{expected:.2}', \
+         'anomaly.deviation': '{deviation:.1}'}})",
+        ts_nanos = ts_nanos,
+        severity_text = severity_text,
+        severity_number = severity_number,
+        body = crate::query_builder::escape_string_literal(&body),
+        rule_id = rule.id,
+        rule_name = crate::query_builder::escape_string_literal(&rule.name),
+        state = state,
+        metric = crate::query_builder::escape_string_literal(metric),
+        value = value,
+        expected = expected,
+        deviation = deviation,
+    )
+}
+
+async fn send_notifications(
+    config_db: &ConfigDb,
+    _http_client: &reqwest::Client,
+    smtp_config: &SmtpConfig,
+    smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+    rule: &AnomalyRule,
+    message: &str,
+    is_anomalous: bool,
+) {
+    let channel_ids: Vec<String> =
+        serde_json::from_str(&rule.notification_channel_ids).unwrap_or_default();
+    for channel_id in &channel_ids {
+        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
+            let config: serde_json::Value =
+                serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
+
+            match channel.channel_type.as_str() {
+                "email" => {
+                    if let Some(to_addr) = config.get("to").and_then(|t| t.as_str()) {
+                        if let Some(transport) = smtp_transport {
+                            let subject = format!(
+                                "[Wide Anomaly] {} - {}",
+                                rule.name,
+                                if is_anomalous {
+                                    "ANOMALOUS"
+                                } else {
+                                    "RESOLVED"
+                                }
+                            );
+                            match Message::builder()
+                                .from(
+                                    smtp_config
+                                        .from
+                                        .parse()
+                                        .unwrap_or_else(|_| "wide@localhost".parse().unwrap()),
+                                )
+                                .to(to_addr
+                                    .parse()
+                                    .unwrap_or_else(|_| "noreply@localhost".parse().unwrap()))
+                                .subject(subject)
+                                .header(ContentType::TEXT_PLAIN)
+                                .body(message.to_string())
+                            {
+                                Ok(email) => {
+                                    if let Err(e) = transport.send(email).await {
+                                        tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "email", "notification failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "failed to build email");
+                                }
+                            }
+                        }
+                    }
+                }
+                "slack" => {
+                    if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
+                        let payload = serde_json::json!({ "text": message });
+                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
+                            tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "slack", "notification failed");
+                        }
+                    }
+                }
+                _ => {
+                    // webhook
+                    if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
+                        let payload = serde_json::json!({
+                            "anomaly": rule.name,
+                            "state": if is_anomalous { "anomalous" } else { "normal" },
+                            "message": message,
+                        });
+                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
+                            tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "webhook", "notification failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
