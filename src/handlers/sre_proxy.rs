@@ -256,10 +256,12 @@ pub async fn delete_session(
 ) -> Result<Response, (StatusCode, String)> {
     let caller = require_write(&state, &headers).await?;
     enforce_agent_access(&state, &headers, &caller, false).await?;
+    let query = query_with_tenant(None, &caller.3);
     let url = format!(
-        "{}/api/v1/sessions/{}",
+        "{}/api/v1/sessions/{}?{}",
         sre_base(),
-        urlencoding::encode(&id)
+        urlencoding::encode(&id),
+        query,
     );
     let internal_token = sre_internal_token()?;
     let resp = with_internal_token(client().delete(&url), internal_token)
