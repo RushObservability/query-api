@@ -1418,6 +1418,31 @@ mod auth_storage_tests {
     }
 
     #[test]
+    fn llm_provider_ciphertext_is_bound_to_tenant_and_provider() {
+        let key = config_encryption_key_from_secret(
+            "0123456789abcdef0123456789abcdef-extra-key-material",
+        )
+        .unwrap();
+        let aad = llm_provider_secret_aad("tenant-a", "provider-a");
+        let encrypted = encrypt_config_secret_with_key("provider-key", &key, &aad).unwrap();
+
+        assert_eq!(
+            decrypt_config_secret_with_key(&encrypted, &key, &aad, "LLM provider").unwrap(),
+            "provider-key"
+        );
+        let other_tenant = llm_provider_secret_aad("tenant-b", "provider-a");
+        let other_provider = llm_provider_secret_aad("tenant-a", "provider-b");
+        assert!(
+            decrypt_config_secret_with_key(&encrypted, &key, &other_tenant, "LLM provider")
+                .is_err()
+        );
+        assert!(
+            decrypt_config_secret_with_key(&encrypted, &key, &other_provider, "LLM provider")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn legacy_plaintext_secret_is_read_only_for_startup_migration() {
         let key = config_encryption_key_from_secret(
             "0123456789abcdef0123456789abcdef-extra-key-material",
@@ -1533,6 +1558,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 const ENCRYPTED_SECRET_PREFIX: &str = "enc:v1:";
 const CONFIG_ENCRYPTION_CONTEXT: &[u8] = b"rush-config-encryption-v1\0";
 const SSO_SECRET_AAD: &[u8] = b"rush-sso-client-secret-v1";
+const LLM_PROVIDER_SECRET_AAD: &[u8] = b"rush-llm-provider-secret-v1\0";
 
 const SESSION_HMAC_PREFIX: &str = "hmac-sha256:v1:";
 
@@ -1573,13 +1599,17 @@ fn config_encryption_key_from_secret(secret: &str) -> anyhow::Result<[u8; 32]> {
 fn config_encryption_key() -> anyhow::Result<[u8; 32]> {
     let secret = std::env::var("RUSH_CONFIG_ENCRYPTION_KEY").map_err(|_| {
         anyhow::anyhow!(
-            "RUSH_CONFIG_ENCRYPTION_KEY is required to store or read SSO client secrets"
+            "RUSH_CONFIG_ENCRYPTION_KEY is required to store or read sensitive configuration"
         )
     })?;
     config_encryption_key_from_secret(&secret)
 }
 
-fn encrypt_sso_secret_with_key(plaintext: &str, key: &[u8; 32]) -> anyhow::Result<String> {
+fn encrypt_config_secret_with_key(
+    plaintext: &str,
+    key: &[u8; 32],
+    aad: &[u8],
+) -> anyhow::Result<String> {
     if plaintext.is_empty() {
         return Ok(String::new());
     }
@@ -1589,7 +1619,7 @@ fn encrypt_sso_secret_with_key(plaintext: &str, key: &[u8; 32]) -> anyhow::Resul
         Cipher::aes_256_gcm(),
         key,
         Some(&nonce),
-        SSO_SECRET_AAD,
+        aad,
         plaintext.as_bytes(),
         &mut tag,
     )?;
@@ -1601,6 +1631,10 @@ fn encrypt_sso_secret_with_key(plaintext: &str, key: &[u8; 32]) -> anyhow::Resul
     ))
 }
 
+fn encrypt_sso_secret_with_key(plaintext: &str, key: &[u8; 32]) -> anyhow::Result<String> {
+    encrypt_config_secret_with_key(plaintext, key, SSO_SECRET_AAD)
+}
+
 fn encrypt_sso_secret(plaintext: &str) -> anyhow::Result<String> {
     if plaintext.is_empty() {
         return Ok(String::new());
@@ -1608,39 +1642,48 @@ fn encrypt_sso_secret(plaintext: &str) -> anyhow::Result<String> {
     encrypt_sso_secret_with_key(plaintext, &config_encryption_key()?)
 }
 
-fn decrypt_sso_secret_with_key(stored: &str, key: &[u8; 32]) -> anyhow::Result<String> {
+fn decrypt_config_secret_with_key(
+    stored: &str,
+    key: &[u8; 32],
+    aad: &[u8],
+    kind: &str,
+) -> anyhow::Result<String> {
     if stored.is_empty() || !stored.starts_with(ENCRYPTED_SECRET_PREFIX) {
         return Ok(stored.to_string());
     }
     let encoded = stored
         .strip_prefix(ENCRYPTED_SECRET_PREFIX)
-        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted {kind} secret"))?;
     let mut parts = encoded.split('.');
     let nonce = parts
         .next()
         .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
-        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted {kind} secret"))?;
     let ciphertext = parts
         .next()
         .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
-        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted {kind} secret"))?;
     let tag = parts
         .next()
         .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
-        .ok_or_else(|| anyhow::anyhow!("invalid encrypted SSO secret"))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid encrypted {kind} secret"))?;
     if parts.next().is_some() || nonce.len() != 12 || tag.len() != 16 {
-        anyhow::bail!("invalid encrypted SSO secret");
+        anyhow::bail!("invalid encrypted {kind} secret");
     }
     let plaintext = openssl::symm::decrypt_aead(
         Cipher::aes_256_gcm(),
         key,
         Some(&nonce),
-        SSO_SECRET_AAD,
+        aad,
         &ciphertext,
         &tag,
     )
-    .map_err(|_| anyhow::anyhow!("SSO client secret could not be decrypted"))?;
-    String::from_utf8(plaintext).map_err(|_| anyhow::anyhow!("SSO client secret is invalid UTF-8"))
+    .map_err(|_| anyhow::anyhow!("{kind} secret could not be decrypted"))?;
+    String::from_utf8(plaintext).map_err(|_| anyhow::anyhow!("{kind} secret is invalid UTF-8"))
+}
+
+fn decrypt_sso_secret_with_key(stored: &str, key: &[u8; 32]) -> anyhow::Result<String> {
+    decrypt_config_secret_with_key(stored, key, SSO_SECRET_AAD, "SSO client")
 }
 
 fn decrypt_sso_secret(stored: &str) -> anyhow::Result<String> {
@@ -1648,6 +1691,37 @@ fn decrypt_sso_secret(stored: &str) -> anyhow::Result<String> {
         return Ok(stored.to_string());
     }
     decrypt_sso_secret_with_key(stored, &config_encryption_key()?)
+}
+
+fn llm_provider_secret_aad(tenant_id: &str, provider_id: &str) -> Vec<u8> {
+    let mut aad =
+        Vec::with_capacity(LLM_PROVIDER_SECRET_AAD.len() + tenant_id.len() + provider_id.len() + 1);
+    aad.extend_from_slice(LLM_PROVIDER_SECRET_AAD);
+    aad.extend_from_slice(tenant_id.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(provider_id.as_bytes());
+    aad
+}
+
+fn encrypt_llm_provider_secret(
+    plaintext: &str,
+    tenant_id: &str,
+    provider_id: &str,
+) -> anyhow::Result<String> {
+    let aad = llm_provider_secret_aad(tenant_id, provider_id);
+    encrypt_config_secret_with_key(plaintext, &config_encryption_key()?, &aad)
+}
+
+fn decrypt_llm_provider_secret(
+    stored: &str,
+    tenant_id: &str,
+    provider_id: &str,
+) -> anyhow::Result<String> {
+    if stored.is_empty() {
+        return Ok(String::new());
+    }
+    let aad = llm_provider_secret_aad(tenant_id, provider_id);
+    decrypt_config_secret_with_key(stored, &config_encryption_key()?, &aad, "LLM provider")
 }
 
 // ── Module-level row types used by helper methods ─────────────────────────────
@@ -2455,6 +2529,38 @@ impl ConfigDb {
                 is_deleted     UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (tenant_id, integration, id)",
+            // ── LLM providers and selectable models ──────────────────────────
+            // Provider credentials are AES-256-GCM encrypted by query-api.
+            "CREATE TABLE IF NOT EXISTS config_llm_providers (
+                id                String,
+                tenant_id         String,
+                name              String,
+                kind              String,
+                base_url          String,
+                api_key_encrypted String,
+                key_hint          String DEFAULT '',
+                routing_json      String DEFAULT '{}',
+                enabled           UInt8 DEFAULT 1,
+                created_at        String DEFAULT toString(now()),
+                updated_at        String DEFAULT toString(now()),
+                version           UInt64,
+                is_deleted        UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, id)",
+            "CREATE TABLE IF NOT EXISTS config_llm_models (
+                id          String,
+                tenant_id   String,
+                provider_id String,
+                name        String,
+                model_id    String,
+                reasoning   String DEFAULT '[]',
+                enabled     UInt8 DEFAULT 1,
+                created_at  String DEFAULT toString(now()),
+                updated_at  String DEFAULT toString(now()),
+                version     UInt64,
+                is_deleted  UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, id)",
             // ── Custom skills ─────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_custom_skills (
                 id            String,
@@ -6289,6 +6395,273 @@ impl ConfigDb {
             .bind(target_id)
             .bind(tenant_id)
             .bind(integration)
+            .bind(&now)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    // ── LLM providers and selectable models ─────────────────────────────────
+
+    pub async fn list_llm_providers(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<crate::llm_providers::LlmProviderResponse>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            name: String,
+            kind: String,
+            base_url: String,
+            api_key_encrypted: String,
+            key_hint: String,
+            routing_json: String,
+            enabled: u8,
+            created_at: String,
+            updated_at: String,
+        }
+        let rows = self
+            .client
+            .query(
+                "SELECT id, name, kind, base_url, api_key_encrypted, key_hint, routing_json,
+                        enabled, created_at, updated_at
+                 FROM config_llm_providers FINAL
+                 WHERE tenant_id = ? AND is_deleted = 0
+                 ORDER BY name, id",
+            )
+            .bind(tenant_id)
+            .fetch_all::<Row>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::llm_providers::LlmProviderResponse {
+                id: row.id,
+                name: row.name,
+                kind: row.kind,
+                base_url: row.base_url,
+                key_configured: !row.api_key_encrypted.is_empty(),
+                key_hint: row.key_hint,
+                routing: serde_json::from_str(&row.routing_json).unwrap_or_default(),
+                enabled: row.enabled != 0,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            })
+            .collect())
+    }
+
+    pub async fn get_llm_provider_secret(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::llm_providers::LlmProviderSecret>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            tenant_id: String,
+            name: String,
+            kind: String,
+            base_url: String,
+            api_key_encrypted: String,
+            key_hint: String,
+            routing_json: String,
+            enabled: u8,
+            created_at: String,
+            updated_at: String,
+        }
+        let result = self
+            .client
+            .query(
+                "SELECT id, tenant_id, name, kind, base_url, api_key_encrypted, key_hint,
+                        routing_json, enabled, created_at, updated_at
+                 FROM config_llm_providers FINAL
+                 WHERE tenant_id = ? AND id = ? AND is_deleted = 0 LIMIT 1",
+            )
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_one::<Row>()
+            .await;
+        let row = match result {
+            Ok(row) => row,
+            Err(clickhouse::error::Error::RowNotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let api_key = decrypt_llm_provider_secret(&row.api_key_encrypted, &row.tenant_id, &row.id)?;
+        Ok(Some(crate::llm_providers::LlmProviderSecret {
+            id: row.id,
+            tenant_id: row.tenant_id,
+            name: row.name,
+            kind: row.kind,
+            base_url: row.base_url,
+            api_key,
+            key_hint: row.key_hint,
+            routing: serde_json::from_str(&row.routing_json).unwrap_or_default(),
+            enabled: row.enabled != 0,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }))
+    }
+
+    pub async fn upsert_llm_provider(
+        &self,
+        provider: &crate::llm_providers::LlmProviderSecret,
+    ) -> anyhow::Result<()> {
+        let encrypted =
+            encrypt_llm_provider_secret(&provider.api_key, &provider.tenant_id, &provider.id)?;
+        let routing = serde_json::to_string(&provider.routing)?;
+        let now = Self::now_str();
+        let created_at = if provider.created_at.is_empty() {
+            &now
+        } else {
+            &provider.created_at
+        };
+        self.client
+            .query(
+                "INSERT INTO config_llm_providers
+                 (id, tenant_id, name, kind, base_url, api_key_encrypted, key_hint, routing_json,
+                  enabled, created_at, updated_at, version, is_deleted)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            )
+            .bind(&provider.id)
+            .bind(&provider.tenant_id)
+            .bind(&provider.name)
+            .bind(&provider.kind)
+            .bind(&provider.base_url)
+            .bind(encrypted)
+            .bind(&provider.key_hint)
+            .bind(routing)
+            .bind(provider.enabled)
+            .bind(created_at)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_llm_provider(&self, tenant_id: &str, id: &str) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        self.client
+            .query(
+                "INSERT INTO config_llm_providers
+                 (id, tenant_id, name, kind, base_url, api_key_encrypted, key_hint, routing_json,
+                  enabled, created_at, updated_at, version, is_deleted)
+                 VALUES (?, ?, '', '', '', '', '', '{}', 0, ?, ?, ?, 1)",
+            )
+            .bind(id)
+            .bind(tenant_id)
+            .bind(&now)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_llm_models(
+        &self,
+        tenant_id: &str,
+        enabled_only: bool,
+    ) -> anyhow::Result<Vec<crate::llm_providers::LlmModel>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            tenant_id: String,
+            provider_id: String,
+            name: String,
+            model_id: String,
+            reasoning: String,
+            enabled: u8,
+            created_at: String,
+            updated_at: String,
+        }
+        let enabled = if enabled_only { " AND enabled = 1" } else { "" };
+        let sql = format!(
+            "SELECT id, tenant_id, provider_id, name, model_id, reasoning, enabled,
+                    created_at, updated_at
+             FROM config_llm_models FINAL
+             WHERE tenant_id = ? AND is_deleted = 0{enabled}
+             ORDER BY name, id"
+        );
+        let rows = self
+            .client
+            .query(&sql)
+            .bind(tenant_id)
+            .fetch_all::<Row>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::llm_providers::LlmModel {
+                id: row.id,
+                tenant_id: row.tenant_id,
+                provider_id: row.provider_id,
+                name: row.name,
+                model_id: row.model_id,
+                reasoning: serde_json::from_str(&row.reasoning).unwrap_or_default(),
+                enabled: row.enabled != 0,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            })
+            .collect())
+    }
+
+    pub async fn get_llm_model(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::llm_providers::LlmModel>> {
+        Ok(self
+            .list_llm_models(tenant_id, false)
+            .await?
+            .into_iter()
+            .find(|model| model.id == id))
+    }
+
+    pub async fn upsert_llm_model(
+        &self,
+        model: &crate::llm_providers::LlmModel,
+    ) -> anyhow::Result<()> {
+        let reasoning = serde_json::to_string(&model.reasoning)?;
+        let now = Self::now_str();
+        let created_at = if model.created_at.is_empty() {
+            &now
+        } else {
+            &model.created_at
+        };
+        self.client
+            .query(
+                "INSERT INTO config_llm_models
+                 (id, tenant_id, provider_id, name, model_id, reasoning, enabled,
+                  created_at, updated_at, version, is_deleted)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            )
+            .bind(&model.id)
+            .bind(&model.tenant_id)
+            .bind(&model.provider_id)
+            .bind(&model.name)
+            .bind(&model.model_id)
+            .bind(reasoning)
+            .bind(model.enabled)
+            .bind(created_at)
+            .bind(&now)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_llm_model(&self, tenant_id: &str, id: &str) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        self.client
+            .query(
+                "INSERT INTO config_llm_models
+                 (id, tenant_id, provider_id, name, model_id, reasoning, enabled,
+                  created_at, updated_at, version, is_deleted)
+                 VALUES (?, ?, '', '', '', '[]', 0, ?, ?, ?, 1)",
+            )
+            .bind(id)
+            .bind(tenant_id)
             .bind(&now)
             .bind(&now)
             .bind(Self::next_version())
