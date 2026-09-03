@@ -45,7 +45,7 @@ DEV_ALLOW_PRIVATE_NOTIFICATION_URLS := true
 DEV_ALLOWED_ORIGINS           := http://localhost:5173,http://localhost:8080
 DEV_ALLOW_ANONYMOUS_DEFAULT  := true
 
-.PHONY: build release fetch-collector fetch-mysql-collector prepare-local-collector run run-anomaly dev check test fmt lint security security-audit security-policy clean docker package \
+.PHONY: build build-release release fetch-collector fetch-mysql-collector prepare-local-collector run run-anomaly dev check test fmt lint security security-audit security-policy clean docker package \
         up up-full down deps logs run-local watch watch-anomaly
 
 ## Development — local binary + ClickHouse in Docker
@@ -87,7 +87,7 @@ run-local: dev        ## Backwards-compatible alias for dev
 build:                ## Build debug binary
 	cargo build $(CARGO_FEATURES)
 
-release:              ## Build optimised release binary
+build-release:        ## Build optimised release binary
 	cargo build --release $(CARGO_FEATURES)
 
 fetch-collector:       ## Download and verify a private PostgreSQL collector release
@@ -165,6 +165,11 @@ security-audit:       ## Scan Cargo.lock against RustSec (one documented unreach
 security-policy:      ## Enforce deny.toml advisory, license, source, and dependency policy
 	cargo deny check advisories bans licenses sources
 
+## Release
+
+release:              ## Open a version-bump PR: make release VERSION=0.1.26
+	@VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" ./scripts/release.sh
+
 ## Docker Compose
 
 up:                   ## Start ClickHouse only (for local dev)
@@ -198,7 +203,7 @@ docker-run:           ## Run via Docker (connects to host ClickHouse)
 
 ## Package
 
-package: release      ## Package release binary into tarball
+package: build-release ## Package release binary into tarball
 	@mkdir -p dist
 	cp target/release/$(BINARY) dist/
 	cd dist && tar czf $(BINARY)-$(VERSION)-$(COMMIT).tar.gz $(BINARY)
