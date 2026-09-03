@@ -1250,6 +1250,7 @@ fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
                     | "/api/v1/logs/histogram"
                     | "/api/v1/logs/group"
                     | "/api/v1/internal/sre/context"
+                    | "/api/v1/internal/sre/llm/chat"
                     | "/api/v1/internal/sre/sessions"
                     | "/api/v1/internal/repository-access-audit"
             ) || path.starts_with("/api/v1/internal/sre/sessions/") && path.ends_with("/turns")
@@ -1262,6 +1263,7 @@ fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
                 || path.starts_with("/prom/api/v1/labels")
                 || path.starts_with("/prom/api/v1/label/")
                 || path.starts_with("/api/v1/internal/sre/sessions")
+                || path == "/api/v1/internal/sre/llm/ready"
                 || path == "/api/v1/internal/kubernetes-access-events"
         }
         Method::PATCH | Method::DELETE => path.starts_with("/api/v1/internal/sre/sessions/"),
@@ -2754,6 +2756,14 @@ async fn main() -> anyhow::Result<()> {
         // internal credential only for this route set and the normal query APIs.
         .route("/api/v1/internal/sre/context", post(handlers::sre_internal::context))
         .route(
+            "/api/v1/internal/sre/llm/chat",
+            post(handlers::llm_providers::internal_chat),
+        )
+        .route(
+            "/api/v1/internal/sre/llm/ready",
+            get(handlers::llm_providers::internal_ready),
+        )
+        .route(
             "/api/v1/internal/sre/sessions",
             get(handlers::sre_internal::list_sessions).post(handlers::sre_internal::create_session),
         )
@@ -3040,6 +3050,30 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/settings/sre-agent/models",
             get(handlers::settings::list_sre_agent_models),
+        )
+        .route(
+            "/api/v1/settings/llm/providers",
+            get(handlers::llm_providers::list_providers)
+                .post(handlers::llm_providers::create_provider),
+        )
+        .route(
+            "/api/v1/settings/llm/providers/{id}",
+            axum::routing::put(handlers::llm_providers::update_provider)
+                .delete(handlers::llm_providers::delete_provider),
+        )
+        .route(
+            "/api/v1/settings/llm/providers/{id}/models",
+            get(handlers::llm_providers::discover_models),
+        )
+        .route(
+            "/api/v1/settings/llm/models",
+            get(handlers::llm_providers::list_models)
+                .post(handlers::llm_providers::create_model),
+        )
+        .route(
+            "/api/v1/settings/llm/models/{id}",
+            axum::routing::put(handlers::llm_providers::update_model)
+                .delete(handlers::llm_providers::delete_model),
         )
         // User-facing model/thinking menu (the admin-defined policy). Any
         // authenticated user can read it to populate the investigation pickers.

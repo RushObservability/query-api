@@ -7,7 +7,12 @@
 use crate::api_error;
 use crate::outbound::blocked_address;
 use crate::self_metrics::SelfMetrics;
-use axum::http::StatusCode;
+use axum::{
+    body::Body,
+    http::StatusCode,
+    response::{IntoResponse, Response as AxumResponse},
+};
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use reqwest::{Client, Response, Url};
@@ -43,6 +48,7 @@ pub enum LlmOperation {
     ParsePromql,
     AnalyzeAnomaly,
     ListModels,
+    SreInvestigation,
 }
 
 impl LlmOperation {
@@ -52,6 +58,7 @@ impl LlmOperation {
             Self::ParsePromql => "parse_promql",
             Self::AnalyzeAnomaly => "analyze_anomaly",
             Self::ListModels => "list_models",
+            Self::SreInvestigation => "sre_investigation",
         }
     }
 }
@@ -405,6 +412,299 @@ impl LlmGateway {
         result
     }
 
+    /// Send an SRE-agent Chat Completions request through a provider configured
+    /// in Rush. The provider key stays inside query-api. The response remains
+    /// OpenAI-compatible SSE so the agent loop has one streaming protocol.
+    pub async fn stream_agent_chat(
+        &self,
+        caller: &LlmCaller,
+        provider: &crate::llm_providers::LlmProviderSecret,
+        upstream_model: &str,
+        mut body: Value,
+    ) -> Result<AxumResponse, (StatusCode, String)> {
+        let operation = LlmOperation::SreInvestigation;
+        if !provider.enabled || provider.api_key.trim().is_empty() {
+            return Err(public_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "llm_provider_unavailable",
+                "The selected LLM provider is disabled or has no credential",
+            ));
+        }
+        validate_model(upstream_model)?;
+        let object = body.as_object_mut().ok_or_else(|| {
+            public_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_llm_request",
+                "LLM request must be a JSON object",
+            )
+        })?;
+        let messages_valid = object
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| !messages.is_empty() && messages.len() <= 256);
+        if !messages_valid {
+            return Err(public_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_llm_messages",
+                "LLM request must contain between 1 and 256 messages",
+            ));
+        }
+        object.insert("model".into(), Value::String(upstream_model.to_string()));
+        object.insert("stream".into(), Value::Bool(true));
+        object.insert(
+            "stream_options".into(),
+            serde_json::json!({ "include_usage": true }),
+        );
+        // Routing policy is trusted configuration. Never let the agent inject
+        // an arbitrary OpenRouter provider override.
+        object.remove("provider");
+        if provider.kind == crate::llm_providers::PROVIDER_OPENROUTER {
+            let routing = &provider.routing;
+            let mut preferences = serde_json::Map::new();
+            if !routing.allowed_providers.is_empty() {
+                preferences.insert("only".into(), serde_json::json!(routing.allowed_providers));
+            }
+            if !routing.provider_order.is_empty() {
+                preferences.insert("order".into(), serde_json::json!(routing.provider_order));
+            }
+            preferences.insert(
+                "allow_fallbacks".into(),
+                Value::Bool(routing.allow_fallbacks),
+            );
+            preferences.insert("zdr".into(), Value::Bool(routing.zero_data_retention));
+            preferences.insert(
+                "data_collection".into(),
+                Value::String(routing.data_collection.clone()),
+            );
+            object.insert("provider".into(), Value::Object(preferences));
+        }
+        if provider.kind == crate::llm_providers::PROVIDER_ANTHROPIC {
+            if let Some(effort) = object
+                .remove("reasoning_effort")
+                .and_then(|value| value.as_str().map(str::to_string))
+            {
+                let budget_tokens = match effort.as_str() {
+                    "minimal" => 1_024,
+                    "low" => 2_048,
+                    "medium" => 4_096,
+                    "high" => 8_192,
+                    _ => 0,
+                };
+                if budget_tokens > 0 {
+                    object.insert(
+                        "thinking".into(),
+                        serde_json::json!({ "type": "enabled", "budget_tokens": budget_tokens }),
+                    );
+                }
+            }
+        }
+        let use_responses_api = provider.kind == crate::llm_providers::PROVIDER_OPENAI
+            && openai_model_uses_responses_api(upstream_model);
+        if use_responses_api {
+            body = chat_request_to_responses_request(body)?;
+        }
+
+        let request_size = serde_json::to_vec(&body).map_err(|error| {
+            api_error::internal_legacy_with_status(
+                StatusCode::BAD_REQUEST,
+                "llm_gateway.serialize",
+                error,
+            )
+        })?;
+        // Agent transcripts are larger than the small parsing prompts handled
+        // by chat(), but still need a hard process boundary.
+        let max_agent_input = self.inner.limits.max_input_bytes.max(1_048_576);
+        if request_size.len() > max_agent_input {
+            return Err(public_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "llm_input_too_large",
+                "LLM input exceeds the configured limit",
+            ));
+        }
+
+        let guard = self.admit(operation, caller)?;
+        let (base_url, client) = dynamic_client(&provider.base_url).await.map_err(|error| {
+            api_error::internal_legacy_with_status(
+                StatusCode::BAD_REQUEST,
+                "llm_gateway.provider_url",
+                error,
+            )
+        })?;
+        let endpoint = if use_responses_api {
+            "responses"
+        } else {
+            "chat/completions"
+        };
+        let url = join_openai_endpoint(&base_url, endpoint).map_err(|error| {
+            api_error::internal_legacy_with_status(
+                StatusCode::BAD_REQUEST,
+                "llm_gateway.provider_url",
+                error,
+            )
+        })?;
+        let started = Instant::now();
+        let upstream = client
+            .post(url)
+            .bearer_auth(&provider.api_key)
+            .header("content-type", "application/json")
+            .body(request_size)
+            .send()
+            .await
+            .map_err(|error| {
+                self.record(
+                    operation,
+                    if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "failed"
+                    },
+                );
+                api_error::internal_legacy_with_status(
+                    if error.is_timeout() {
+                        StatusCode::GATEWAY_TIMEOUT
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
+                    "llm_gateway.agent_request",
+                    error,
+                )
+            })?;
+        self.inner.metrics.observe_histogram(
+            "rush_llm_request_duration_ms",
+            &[("operation", operation.as_str())],
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        if !upstream.status().is_success() {
+            let status = upstream.status();
+            self.record(operation, "failed");
+            return Err(api_error::internal_legacy_with_status(
+                StatusCode::BAD_GATEWAY,
+                "llm_gateway.upstream_status",
+                format!("provider returned HTTP {status}"),
+            ));
+        }
+
+        let max_bytes = self.inner.limits.max_response_bytes.max(1_048_576);
+        if use_responses_api {
+            let value = read_bounded_json(upstream, max_bytes)
+                .await
+                .map_err(|error| {
+                    self.record(operation, "failed");
+                    api_error::internal_legacy_with_status(
+                        StatusCode::BAD_GATEWAY,
+                        "llm_gateway.responses_read",
+                        error,
+                    )
+                })?;
+            let sse = responses_response_to_chat_sse(&value, upstream_model).map_err(|error| {
+                self.record(operation, "failed");
+                api_error::internal_legacy_with_status(
+                    StatusCode::BAD_GATEWAY,
+                    "llm_gateway.responses_translate",
+                    error,
+                )
+            })?;
+            self.record(operation, "streaming");
+            return Ok(AxumResponse::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .header(axum::http::header::CACHE_CONTROL, "no-cache")
+                .header("X-Accel-Buffering", "no")
+                .body(Body::from(sse))
+                .map_err(|error| api_error::internal_legacy("llm_gateway.response", error))?
+                .into_response());
+        }
+
+        let content_type = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("text/event-stream")
+            .to_string();
+        let byte_stream = upstream.bytes_stream().scan(
+            (0usize, false, guard),
+            move |(seen, stopped, _guard), chunk| {
+                let next = if *stopped {
+                    None
+                } else {
+                    match chunk {
+                        Ok(bytes) => {
+                            *seen = seen.saturating_add(bytes.len());
+                            if *seen > max_bytes {
+                                *stopped = true;
+                                Some(Err(std::io::Error::other(
+                                    "LLM stream exceeded the response limit",
+                                )))
+                            } else {
+                                Some(Ok::<Bytes, std::io::Error>(bytes))
+                            }
+                        }
+                        Err(error) => {
+                            *stopped = true;
+                            Some(Err(std::io::Error::other(error)))
+                        }
+                    }
+                };
+                std::future::ready(next)
+            },
+        );
+        self.record(operation, "streaming");
+        Ok(AxumResponse::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, content_type)
+            .header(axum::http::header::CACHE_CONTROL, "no-cache")
+            .header("X-Accel-Buffering", "no")
+            .body(Body::from_stream(byte_stream))
+            .map_err(|error| api_error::internal_legacy("llm_gateway.response", error))?
+            .into_response())
+    }
+
+    pub async fn list_configured_provider_models(
+        &self,
+        caller: &LlmCaller,
+        provider: &crate::llm_providers::LlmProviderSecret,
+    ) -> Result<Vec<String>, (StatusCode, String)> {
+        let operation = LlmOperation::ListModels;
+        let guard = self.admit(operation, caller)?;
+        let (base_url, client) = dynamic_client(&provider.base_url).await.map_err(|error| {
+            api_error::internal_legacy_with_status(
+                StatusCode::BAD_REQUEST,
+                "llm_gateway.provider_url",
+                error,
+            )
+        })?;
+        let url = join_openai_endpoint(&base_url, "models").map_err(|error| {
+            api_error::internal_legacy_with_status(
+                StatusCode::BAD_REQUEST,
+                "llm_gateway.provider_url",
+                error,
+            )
+        })?;
+        let response = client
+            .get(url)
+            .bearer_auth(&provider.api_key)
+            .send()
+            .await
+            .map_err(|error| {
+                api_error::internal_legacy_with_status(
+                    StatusCode::BAD_GATEWAY,
+                    "llm_gateway.models_request",
+                    error,
+                )
+            })?;
+        let result = self.read_json_response(operation, response).await?;
+        drop(guard);
+        Ok(result["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["id"].as_str())
+            .filter(|id| validate_model(id).is_ok())
+            .filter(|id| crate::llm_providers::sre_agent_model_compatible(&provider.kind, id))
+            .map(str::to_string)
+            .collect())
+    }
+
     fn provider(&self) -> Result<&Provider, (StatusCode, String)> {
         self.inner.provider.as_ref().ok_or_else(|| {
             public_error(
@@ -647,6 +947,324 @@ fn private_development_address(ip: IpAddr) -> bool {
     }
 }
 
+async fn dynamic_client(raw_base: &str) -> anyhow::Result<(Url, Client)> {
+    let mut url = Url::parse(raw_base).map_err(|_| anyhow::anyhow!("LLM base URL is invalid"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("LLM base URL must not contain credentials");
+    }
+    if url.host_str().is_none()
+        || !matches!(url.scheme(), "http" | "https")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("LLM base URL must be an HTTP(S) URL without query or fragment");
+    }
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    let host = url.host_str().expect("host checked above").to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|_| anyhow::anyhow!("LLM provider host could not be resolved"))?
+            .collect::<Vec<_>>()
+    };
+    if addresses.is_empty() {
+        anyhow::bail!("LLM provider host could not be resolved");
+    }
+    let all_public = addresses
+        .iter()
+        .all(|address| !blocked_address(address.ip()));
+    let all_development_private = addresses
+        .iter()
+        .all(|address| private_development_address(address.ip()));
+    let allow_private = crate::api_key_auth::env_flag("RUSH_LLM_ALLOW_INSECURE_PRIVATE")
+        && !crate::api_key_auth::production_mode();
+    if !all_public && !(allow_private && all_development_private) {
+        anyhow::bail!("LLM provider must resolve only to public addresses");
+    }
+    if url.scheme() == "http" && !(allow_private && all_development_private) {
+        anyhow::bail!("HTTP LLM providers are allowed only for private development targets");
+    }
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS))
+        .timeout(Duration::from_millis(DEFAULT_TOTAL_TIMEOUT_MS.max(300_000)))
+        .resolve_to_addrs(&host, &addresses)
+        .user_agent("rush-query-api/llm-provider")
+        .build()?;
+    Ok((url, client))
+}
+
+fn join_openai_endpoint(base_url: &Url, endpoint: &str) -> Result<Url, url::ParseError> {
+    let path = base_url.path().trim_end_matches('/');
+    if path.ends_with("/v1") {
+        base_url.join(endpoint)
+    } else {
+        base_url.join(&format!("v1/{endpoint}"))
+    }
+}
+
+fn openai_model_uses_responses_api(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt-5") || model.starts_with("o1-pro")
+}
+
+fn chat_request_to_responses_request(mut body: Value) -> Result<Value, (StatusCode, String)> {
+    let object = body.as_object_mut().ok_or_else(|| {
+        public_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_llm_request",
+            "LLM request must be a JSON object",
+        )
+    })?;
+    let messages = object
+        .remove("messages")
+        .and_then(|value| value.as_array().cloned())
+        .ok_or_else(|| {
+            public_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_llm_messages",
+                "LLM request must contain messages",
+            )
+        })?;
+    let mut input = Vec::new();
+    for message in messages {
+        let Some(message) = message.as_object() else {
+            continue;
+        };
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "tool" {
+            let Some(call_id) = message.get("tool_call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let output = message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    message
+                        .get("content")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_string()
+                });
+            input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }));
+            continue;
+        }
+
+        if role == "assistant" {
+            if let Some(reasoning) = message
+                .get("_rush_responses_reasoning")
+                .and_then(Value::as_array)
+            {
+                input.extend(
+                    reasoning
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                        })
+                        .cloned(),
+                );
+            }
+            if let Some(content) = message.get("content").and_then(Value::as_str)
+                && !content.is_empty()
+            {
+                input.push(serde_json::json!({ "role": "assistant", "content": content }));
+            }
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for tool_call in tool_calls {
+                    let function = &tool_call["function"];
+                    let Some(name) = function.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(call_id) = tool_call.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    input.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": function
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}"),
+                    }));
+                }
+            }
+            continue;
+        }
+
+        if matches!(role, "system" | "developer" | "user") {
+            input.push(serde_json::json!({
+                "role": role,
+                "content": message.get("content").cloned().unwrap_or(Value::String(String::new())),
+            }));
+        }
+    }
+    object.insert("input".into(), Value::Array(input));
+    object.insert("stream".into(), Value::Bool(false));
+    object.insert("store".into(), Value::Bool(false));
+    object.insert(
+        "include".into(),
+        serde_json::json!(["reasoning.encrypted_content"]),
+    );
+    object.remove("stream_options");
+
+    if let Some(effort) = object.remove("reasoning_effort")
+        && effort.as_str().is_some_and(|value| !value.is_empty())
+    {
+        object.insert("reasoning".into(), serde_json::json!({ "effort": effort }));
+    }
+    if let Some(tools) = object
+        .remove("tools")
+        .and_then(|value| value.as_array().cloned())
+    {
+        let tools = tools
+            .into_iter()
+            .filter_map(|tool| {
+                let function = tool.get("function")?.as_object()?;
+                let name = function.get("name")?.clone();
+                let parameters = function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+                let mut converted = serde_json::json!({
+                    "type": "function",
+                    "name": name,
+                    "parameters": parameters,
+                });
+                if let Some(description) = function.get("description") {
+                    converted["description"] = description.clone();
+                }
+                if let Some(strict) = function.get("strict") {
+                    converted["strict"] = strict.clone();
+                }
+                Some(converted)
+            })
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            object.insert("tools".into(), Value::Array(tools));
+        }
+    }
+    Ok(body)
+}
+
+async fn read_bounded_json(response: Response, max_bytes: usize) -> anyhow::Result<Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        anyhow::bail!("provider response exceeded the configured byte limit");
+    }
+    let mut bytes = Vec::with_capacity(max_bytes.min(16_384));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("provider response exceeded the configured byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn responses_response_to_chat_sse(response: &Value, model: &str) -> anyhow::Result<String> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Responses API response omitted output"))?;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    let mut reasoning = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        if part.get("type").and_then(Value::as_str) == Some("output_text")
+                            && let Some(text) = part.get("text").and_then(Value::as_str)
+                        {
+                            content.push_str(text);
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if call_id.is_empty() {
+                    continue;
+                }
+                tool_calls.push(serde_json::json!({
+                    "index": tool_calls.len(),
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or("{}"),
+                    },
+                }));
+            }
+            Some("reasoning") => reasoning.push(item.clone()),
+            _ => {}
+        }
+    }
+    if content.is_empty() && tool_calls.is_empty() {
+        anyhow::bail!("Responses API response contained no text or function calls");
+    }
+
+    let mut delta = serde_json::json!({ "role": "assistant" });
+    if !content.is_empty() {
+        delta["content"] = Value::String(content);
+    }
+    if !tool_calls.is_empty() {
+        delta["tool_calls"] = Value::Array(tool_calls);
+    }
+    if !reasoning.is_empty() {
+        delta["_rush_responses_reasoning"] = Value::Array(reasoning);
+    }
+    let prompt_tokens = response
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = response
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let chunk = serde_json::json!({
+        "id": response.get("id").and_then(Value::as_str).unwrap_or("rush-responses-adapter"),
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" },
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens.saturating_add(completion_tokens),
+        },
+    });
+    Ok(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+}
+
 fn allowed_origins_from_env() -> anyhow::Result<Vec<String>> {
     let raw = std::env::var("RUSH_LLM_ALLOWED_ORIGINS")
         .unwrap_or_else(|_| DEFAULT_ALLOWED_ORIGIN.to_string());
@@ -826,6 +1444,115 @@ mod tests {
         assert!(parse_origin("https://example.com?next=http://127.0.0.1").is_err());
         assert!(parse_origin("https://example.com#fragment").is_err());
         assert!(parse_origin("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn configured_base_url_accepts_root_or_existing_v1_prefix() {
+        let root = Url::parse("https://api.example.com/").unwrap();
+        assert_eq!(
+            join_openai_endpoint(&root, "chat/completions")
+                .unwrap()
+                .as_str(),
+            "https://api.example.com/v1/chat/completions"
+        );
+        let versioned = Url::parse("https://api.example.com/openai/v1/").unwrap();
+        assert_eq!(
+            join_openai_endpoint(&versioned, "models").unwrap().as_str(),
+            "https://api.example.com/openai/v1/models"
+        );
+    }
+
+    #[test]
+    fn openai_gpt5_models_use_responses_api() {
+        assert!(openai_model_uses_responses_api("gpt-5.5-pro"));
+        assert!(openai_model_uses_responses_api("gpt-5.5-pro-2026-04-23"));
+        assert!(openai_model_uses_responses_api("o1-pro"));
+        assert!(openai_model_uses_responses_api("gpt-5.4"));
+        assert!(openai_model_uses_responses_api("gpt-5.5"));
+        assert!(openai_model_uses_responses_api("gpt-5.6-sol"));
+        assert!(!openai_model_uses_responses_api("gpt-4.1"));
+    }
+
+    #[test]
+    fn converts_chat_tools_and_history_to_responses_input() {
+        let request = chat_request_to_responses_request(json!({
+            "model": "gpt-5.5-pro",
+            "messages": [
+                { "role": "system", "content": "Investigate carefully." },
+                { "role": "user", "content": "What failed?" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "search_logs", "arguments": "{\"service\":\"api\"}" }
+                    }],
+                    "_rush_responses_reasoning": [{
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "opaque"
+                    }]
+                },
+                { "role": "tool", "tool_call_id": "call_1", "content": "found an error" }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search_logs",
+                    "description": "Search logs",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "reasoning_effort": "high",
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        }))
+        .unwrap();
+
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["store"], false);
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["tools"][0]["name"], "search_logs");
+        assert!(request.get("messages").is_none());
+        assert!(request.get("stream_options").is_none());
+        assert_eq!(request["input"][2]["type"], "reasoning");
+        assert_eq!(request["input"][3]["type"], "function_call");
+        assert_eq!(request["input"][4]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn converts_responses_output_to_chat_sse() {
+        let sse = responses_response_to_chat_sse(
+            &json!({
+                "id": "resp_1",
+                "output": [
+                    { "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque" },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "search_logs",
+                        "arguments": "{\"service\":\"api\"}"
+                    }
+                ],
+                "usage": { "input_tokens": 12, "output_tokens": 8 }
+            }),
+            "gpt-5.5-pro",
+        )
+        .unwrap();
+
+        let data = sse.lines().next().unwrap().strip_prefix("data: ").unwrap();
+        let chunk: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "search_logs"
+        );
+        assert_eq!(
+            chunk["choices"][0]["delta"]["_rush_responses_reasoning"][0]["id"],
+            "rs_1"
+        );
+        assert_eq!(chunk["usage"]["prompt_tokens"], 12);
+        assert!(sse.ends_with("data: [DONE]\n\n"));
     }
 
     #[tokio::test]
