@@ -1,6 +1,6 @@
 [package]
 name = "rush-api"
-version = "0.1.25"
+version = "0.1.0"
 edition = "2024"
 license = "BUSL-1.1"
 
