@@ -28,6 +28,7 @@ pub mod jaeger;
 pub mod kubernetes;
 pub mod kubernetes_access;
 pub mod license;
+pub mod llm_providers;
 pub mod logs;
 pub mod maintenance;
 pub mod metric_firewall;

@@ -1108,7 +1108,7 @@ pub async fn get_sre_agent_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let read = |key: &'static str, default: u64| {
         let db = state.config_db.clone();
         async move {
@@ -1134,7 +1134,7 @@ pub async fn get_sre_agent_settings(
     // Operator-chosen model (empty = use the agent's built-in default).
     let model = state
         .config_db
-        .get_setting("sre_agent_model")
+        .get_setting(&crate::llm_providers::default_model_setting_key(&caller.3))
         .await
         .ok()
         .flatten()
@@ -1222,9 +1222,35 @@ pub async fn set_sre_agent_settings(
         if model.len() > 100 {
             return Err((StatusCode::BAD_REQUEST, "model name too long".to_string()));
         }
+        if !model.is_empty() {
+            let configured_models = state
+                .config_db
+                .list_llm_models(&caller.3, false)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "failed to validate SRE agent default model");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to validate model".to_string(),
+                    )
+                })?;
+            if !configured_models.is_empty()
+                && !configured_models
+                    .iter()
+                    .any(|configured| configured.id == model && configured.enabled)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "default model must be an enabled model for this tenant".to_string(),
+                ));
+            }
+        }
         state
             .config_db
-            .set_setting("sre_agent_model", model)
+            .set_setting(
+                &crate::llm_providers::default_model_setting_key(&caller.3),
+                model,
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to save sre_agent_model");
@@ -1585,6 +1611,76 @@ pub async fn get_sre_agent_options(
             ));
         }
     }
+    let configured_models = state
+        .config_db
+        .list_llm_models(&caller.3, true)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read configured LLM models");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read LLM models".to_string(),
+            )
+        })?;
+    if !configured_models.is_empty() {
+        let providers = state
+            .config_db
+            .list_llm_providers(&caller.3)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to read configured LLM providers");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to read LLM providers".to_string(),
+                )
+            })?;
+        let models = configured_models
+            .into_iter()
+            .filter_map(|model| {
+                let provider = providers
+                    .iter()
+                    .find(|provider| provider.id == model.provider_id && provider.enabled)?;
+                if !crate::llm_providers::sre_agent_model_compatible(
+                    &provider.kind,
+                    &model.model_id,
+                ) {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "id": model.id,
+                    "name": model.name,
+                    "model_id": model.model_id,
+                    "provider": provider.name,
+                    "provider_kind": provider.kind,
+                    "reasoning": model.reasoning,
+                }))
+            })
+            .collect::<Vec<_>>();
+        let configured_default = state
+            .config_db
+            .get_setting(&crate::llm_providers::default_model_setting_key(&caller.3))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let default_model = if models.iter().any(|model| {
+            model.get("id").and_then(serde_json::Value::as_str) == Some(configured_default.as_str())
+        }) {
+            configured_default
+        } else {
+            models
+                .first()
+                .and_then(|model| model.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        return Ok(Json(serde_json::json!({
+            "models": models,
+            "default_model": default_model,
+        })));
+    }
+
     let allowed_raw = state
         .config_db
         .get_setting("sre_agent_allowed_models")
@@ -1593,16 +1689,29 @@ pub async fn get_sre_agent_options(
         .flatten()
         .unwrap_or_default();
     let allowed_models = parse_allowed_models(&allowed_raw);
+    let legacy_models = allowed_models
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "id": model.id,
+                "name": model.id,
+                "model_id": model.id,
+                "provider": "Legacy configuration",
+                "provider_kind": "openai_compatible",
+                "reasoning": model.reasoning,
+            })
+        })
+        .collect::<Vec<_>>();
     let default = state
         .config_db
-        .get_setting("sre_agent_model")
+        .get_setting(&crate::llm_providers::default_model_setting_key(&caller.3))
         .await
         .ok()
         .flatten()
         .unwrap_or_default();
     let default_model = resolve_default_model(&default, &allowed_models);
     Ok(Json(serde_json::json!({
-        "models": allowed_models,
+        "models": legacy_models,
         "default_model": default_model,
     })))
 }

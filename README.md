@@ -83,7 +83,7 @@ Migrations run on startup, so the schema and materialized views are created if t
 | `RUSH_AUDIT_SPOOL_MAX_BYTES` | `268435456` | maximum audit outbox bytes before readiness remains degraded and new audit events follow the documented fail-open policy |
 | `RUSH_QUERY_API_REPLICAS` | `1` | positive replica count; values above one require a shared SSO replay store |
 | `RUSH_SSO_REPLAY_STORE` | `auto` | `auto`, `local`, or `keeper`; `auto` selects KeeperMap for multiple replicas and refuses an unsafe local override |
-| `RUSH_CONFIG_ENCRYPTION_KEY` | _(required when SSO secrets exist)_ | stable 32+ byte key for AES-256-GCM encryption of SSO client secrets; rotating it requires re-encrypting stored values |
+| `RUSH_CONFIG_ENCRYPTION_KEY` | _(required when SSO or LLM provider secrets exist)_ | stable 32+ byte key for AES-256-GCM encryption of SSO and LLM provider secrets; rotating it requires re-encrypting stored values |
 | `RUSH_LOGIN_RATE_LIMIT_SECRET` | falls back to SSO/API-key secret | stable 32+ byte HMAC key for privacy-preserving distributed login-limit identifiers |
 | `RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE` | `10` | maximum login attempts against one normalized account per minute across replicas |
 | `RUSH_LOGIN_IP_LIMIT_PER_MINUTE` | `50` | maximum login attempts from one resolved client address per minute across replicas |
