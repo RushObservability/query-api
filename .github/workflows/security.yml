@@ -2,7 +2,24 @@ name: Rust security and quality
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    paths:
+      - "**/*.rs"
+      - "**/*.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - "Dockerfile"
+      - "Dockerfile.agent"
+      - "docker-compose.yml"
+      - "scripts/check-container-policy.sh"
+      - "scripts/check-public-errors.sh"
+      - "scripts/check-llm-gateway.sh"
+      - "scripts/check-security-regressions.sh"
+      - "security/**"
+      - ".github/workflows/**"
+  push:
+    branches:
+      - main
     paths:
       - "**/*.rs"
       - "**/*.toml"
