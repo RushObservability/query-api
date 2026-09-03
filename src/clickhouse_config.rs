@@ -43,6 +43,249 @@ pub enum PasswordPolicyError {
     Common,
 }
 
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize, serde::Serialize)]
+pub struct InvestigationSession {
+    pub id: String,
+    pub tenant_id: String,
+    pub title: String,
+    pub status: String,
+    pub template_id: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub working_memory: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub llm_model: String,
+}
+
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize, serde::Serialize)]
+pub struct InvestigationTurn {
+    pub id: String,
+    pub session_id: String,
+    pub turn_index: i64,
+    pub role: String,
+    pub content: String,
+    pub tool_calls: String,
+    pub report_kind: String,
+    pub created_at: String,
+}
+
+impl ConfigDb {
+    pub async fn create_investigation_session(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        title: &str,
+        created_by: &str,
+        template_id: &str,
+    ) -> anyhow::Result<()> {
+        let now = Self::now_str();
+        let version = Self::next_version();
+        self.client
+            .query("INSERT INTO config_investigation_sessions (id, tenant_id, title, status, template_id, created_by, created_at, updated_at, working_memory, prompt_tokens, completion_tokens, llm_model, version, is_deleted) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, '{}', 0, 0, '', ?, 0)")
+            .bind(id)
+            .bind(tenant_id)
+            .bind(title)
+            .bind(template_id)
+            .bind(created_by)
+            .bind(&now)
+            .bind(&now)
+            .bind(version)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_investigation_session(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<Option<InvestigationSession>> {
+        let result = self.client
+            .query("SELECT id, tenant_id, title, status, template_id, created_by, created_at, updated_at, working_memory, prompt_tokens, completion_tokens, llm_model FROM config_investigation_sessions FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
+            .bind(id)
+            .bind(tenant_id)
+            .fetch_one::<InvestigationSession>()
+            .await;
+        match result {
+            Ok(session) => Ok(Some(session)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn list_investigation_sessions(
+        &self,
+        tenant_id: &str,
+        limit: u64,
+    ) -> anyhow::Result<Vec<InvestigationSession>> {
+        Ok(self.client
+            .query("SELECT id, tenant_id, title, status, template_id, created_by, created_at, updated_at, working_memory, prompt_tokens, completion_tokens, llm_model FROM config_investigation_sessions FINAL WHERE tenant_id = ? AND is_deleted = 0 AND status != 'archived' ORDER BY updated_at DESC LIMIT ?")
+            .bind(tenant_id)
+            .bind(limit.min(200))
+            .fetch_all::<InvestigationSession>()
+            .await?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_investigation_session(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        title: Option<&str>,
+        status: Option<&str>,
+        working_memory: Option<&str>,
+        prompt_tokens_delta: u64,
+        completion_tokens_delta: u64,
+        llm_model: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let Some(existing) = self.get_investigation_session(id, tenant_id).await? else {
+            return Ok(false);
+        };
+        let now = Self::now_str();
+        let version = Self::next_version();
+        self.client
+            .query("INSERT INTO config_investigation_sessions (id, tenant_id, title, status, template_id, created_by, created_at, updated_at, working_memory, prompt_tokens, completion_tokens, llm_model, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&existing.id)
+            .bind(&existing.tenant_id)
+            .bind(title.unwrap_or(&existing.title))
+            .bind(status.unwrap_or(&existing.status))
+            .bind(&existing.template_id)
+            .bind(&existing.created_by)
+            .bind(&existing.created_at)
+            .bind(&now)
+            .bind(working_memory.unwrap_or(&existing.working_memory))
+            .bind(existing.prompt_tokens.saturating_add(prompt_tokens_delta.min(i64::MAX as u64) as i64))
+            .bind(existing.completion_tokens.saturating_add(completion_tokens_delta.min(i64::MAX as u64) as i64))
+            .bind(llm_model.unwrap_or(&existing.llm_model))
+            .bind(version)
+            .execute()
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn delete_investigation_session(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(existing) = self.get_investigation_session(id, tenant_id).await? else {
+            return Ok(false);
+        };
+        let now = Self::now_str();
+        let version = Self::next_version();
+        self.client
+            .query("INSERT INTO config_investigation_sessions (id, tenant_id, title, status, template_id, created_by, created_at, updated_at, working_memory, prompt_tokens, completion_tokens, llm_model, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(&existing.id)
+            .bind(&existing.tenant_id)
+            .bind(&existing.title)
+            .bind(&existing.status)
+            .bind(&existing.template_id)
+            .bind(&existing.created_by)
+            .bind(&existing.created_at)
+            .bind(&now)
+            .bind(&existing.working_memory)
+            .bind(existing.prompt_tokens)
+            .bind(existing.completion_tokens)
+            .bind(&existing.llm_model)
+            .bind(version)
+            .execute()
+            .await?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_investigation_turn(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        session_id: &str,
+        turn_index: i64,
+        role: &str,
+        content: &str,
+        tool_calls: &str,
+        report_kind: &str,
+    ) -> anyhow::Result<bool> {
+        if self
+            .get_investigation_session(session_id, tenant_id)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let now = Self::now_str();
+        self.client
+            .query("INSERT INTO config_investigation_turns (id, session_id, turn_index, role, content, tool_calls, report_kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(id)
+            .bind(session_id)
+            .bind(turn_index)
+            .bind(role)
+            .bind(content)
+            .bind(tool_calls)
+            .bind(report_kind)
+            .bind(&now)
+            .execute()
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn get_investigation_turns(
+        &self,
+        session_id: &str,
+        tenant_id: &str,
+        limit: Option<u64>,
+    ) -> anyhow::Result<Vec<InvestigationTurn>> {
+        if self
+            .get_investigation_session(session_id, tenant_id)
+            .await?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+        let rows = if let Some(limit) = limit {
+            self.client
+                .query("SELECT id, session_id, turn_index, role, content, tool_calls, report_kind, created_at FROM (SELECT id, session_id, turn_index, role, content, tool_calls, report_kind, created_at FROM config_investigation_turns WHERE session_id = ? ORDER BY turn_index DESC LIMIT ?) ORDER BY turn_index ASC")
+                .bind(session_id)
+                .bind(limit.min(200))
+                .fetch_all::<InvestigationTurn>()
+                .await?
+        } else {
+            self.client
+                .query("SELECT id, session_id, turn_index, role, content, tool_calls, report_kind, created_at FROM config_investigation_turns WHERE session_id = ? ORDER BY turn_index ASC LIMIT 1000")
+                .bind(session_id)
+                .fetch_all::<InvestigationTurn>()
+                .await?
+        };
+        Ok(rows)
+    }
+
+    pub async fn count_investigation_turns(
+        &self,
+        session_id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<i64> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct CountRow {
+            n: u64,
+        }
+        if self
+            .get_investigation_session(session_id, tenant_id)
+            .await?
+            .is_none()
+        {
+            return Ok(0);
+        }
+        let row = self
+            .client
+            .query("SELECT count() AS n FROM config_investigation_turns WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_one::<CountRow>()
+            .await?;
+        Ok(row.n.min(i64::MAX as u64) as i64)
+    }
+}
+
 impl PasswordPolicyError {
     pub fn code(self) -> &'static str {
         match self {

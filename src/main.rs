@@ -5,7 +5,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Context;
-use axum::http::{HeaderMap, HeaderValue, Method, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::IntoResponse;
 use axum::{Router, routing::any, routing::delete, routing::get, routing::post, routing::put};
 use axum::{
@@ -71,6 +71,7 @@ enum CredentialKind {
     Session,
     QueryKey,
     IngestKey,
+    InternalSre,
 }
 
 impl TenantResolution {
@@ -511,17 +512,40 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         .map(|s| s.to_owned())
         .or(url_tenant);
     let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
+    let internal_sre = rush_api::internal_auth::sre_agent_token_matches(req.headers());
     let session_audit_context = rush_api::audit::actor_context_from_headers(req.headers());
     let request_path = req.uri().path().to_string();
 
-    let resolution = resolve_tenant_from_headers(
-        &state,
-        auth_header,
-        agent_key,
-        rush_tenant,
-        session_token.clone(),
-    )
-    .await;
+    let resolution = if internal_sre {
+        let Some(tenant) = rush_tenant.as_deref().map(str::trim) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "x-rush-tenant is required for SRE agent requests",
+            )
+                .into_response();
+        };
+        if tenant.is_empty() || tenant.eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT) {
+            return (StatusCode::FORBIDDEN, "invalid SRE agent tenant scope").into_response();
+        }
+        if !state.config_db.is_tenant_enabled(tenant).await {
+            return (StatusCode::FORBIDDEN, "SRE agent tenant is not enabled").into_response();
+        }
+        TenantResolution {
+            tenant_id: tenant.to_string(),
+            authenticated: true,
+            credential: CredentialKind::InternalSre,
+            api_key: None,
+        }
+    } else {
+        resolve_tenant_from_headers(
+            &state,
+            auth_header,
+            agent_key,
+            rush_tenant,
+            session_token.clone(),
+        )
+        .await
+    };
     let session_authenticated = resolution.credential == CredentialKind::Session;
     let resolved_tenant = resolution.tenant_id.clone();
     let request_identity = match (&resolution.credential, resolution.api_key.as_ref()) {
@@ -1212,6 +1236,39 @@ fn credential_route_denial(
     }
 }
 
+fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
+    match *method {
+        Method::POST => {
+            matches!(
+                path,
+                "/api/v1/query"
+                    | "/api/v1/query/count"
+                    | "/api/v1/query/group"
+                    | "/api/v1/query/timeseries"
+                    | "/api/v1/logs"
+                    | "/api/v1/logs/count"
+                    | "/api/v1/logs/histogram"
+                    | "/api/v1/logs/group"
+                    | "/api/v1/internal/sre/context"
+                    | "/api/v1/internal/sre/sessions"
+                    | "/api/v1/internal/repository-access-audit"
+            ) || path.starts_with("/api/v1/internal/sre/sessions/") && path.ends_with("/turns")
+        }
+        Method::GET => {
+            path == "/api/v1/services"
+                || path == "/api/v1/services/graph"
+                || path.starts_with("/api/v1/traces/")
+                || path.starts_with("/prom/api/v1/query")
+                || path.starts_with("/prom/api/v1/labels")
+                || path.starts_with("/prom/api/v1/label/")
+                || path.starts_with("/api/v1/internal/sre/sessions")
+                || path == "/api/v1/internal/kubernetes-access-events"
+        }
+        Method::PATCH | Method::DELETE => path.starts_with("/api/v1/internal/sre/sessions/"),
+        _ => false,
+    }
+}
+
 async fn audit_api_key_denial(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1223,6 +1280,7 @@ async fn audit_api_key_denial(
         CredentialKind::QueryKey | CredentialKind::IngestKey => ("apikey.scope_denied", "api_key"),
         CredentialKind::Session => ("ingest.auth_denied", "user"),
         CredentialKind::Anonymous => ("ingest.auth_denied", "anonymous"),
+        CredentialKind::InternalSre => ("sre_agent.scope_denied", "system"),
     };
     let mut event = rush_api::audit::AuditEvent::new(action, actor_type)
         .tenant(resolution.tenant_id.clone())
@@ -1290,6 +1348,29 @@ async fn enforce_tenant_auth_middleware(
         .unwrap_or_else(|| TenantResolution::anonymous(&tenant_id));
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    if resolution.credential == CredentialKind::InternalSre
+        && !internal_sre_route_allowed(&method, &path)
+    {
+        tracing::warn!(tenant_id = %tenant_id, path = %path, "SRE agent credential denied for route");
+        state
+            .audit
+            .log(
+                rush_api::audit::AuditEvent::new("sre_agent.scope_denied", "system")
+                    .actor_name("sre-agent")
+                    .tenant(tenant_id.clone())
+                    .resource("http_route", path.clone())
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "route_not_allowed" }).to_string())
+                    .context(rush_api::audit::actor_context_from_headers(req.headers())),
+            )
+            .await;
+        return (
+            StatusCode::FORBIDDEN,
+            "SRE agent credential is not allowed for this route",
+        )
+            .into_response();
+    }
 
     // Login/SSO/bootstrap and operational probes must remain reachable even if
     // the config store is temporarily unavailable.
@@ -2669,6 +2750,23 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::sre_proxy::get_session).delete(handlers::sre_proxy::delete_session),
         )
         .route("/api/v1/investigation-templates", get(handlers::sre_proxy::list_investigation_templates))
+        // Private SRE-agent data plane. The outer middleware accepts the shared
+        // internal credential only for this route set and the normal query APIs.
+        .route("/api/v1/internal/sre/context", post(handlers::sre_internal::context))
+        .route(
+            "/api/v1/internal/sre/sessions",
+            get(handlers::sre_internal::list_sessions).post(handlers::sre_internal::create_session),
+        )
+        .route(
+            "/api/v1/internal/sre/sessions/{id}",
+            get(handlers::sre_internal::get_session)
+                .patch(handlers::sre_internal::update_session)
+                .delete(handlers::sre_internal::delete_session),
+        )
+        .route(
+            "/api/v1/internal/sre/sessions/{id}/turns",
+            get(handlers::sre_internal::get_turns).post(handlers::sre_internal::add_turn),
+        )
         // Natural language query parsing (LLM-powered)
         .route("/api/v1/parse-query", post(handlers::parse_query::parse_query))
         .route("/api/v1/parse-promql", post(handlers::parse_promql::parse_promql))
@@ -3545,10 +3643,10 @@ mod tenant_auth_tests {
     use super::{
         CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
         credential_route_denial, effective_route_ingest_auth_required, explicit_ingest_tenant,
-        ingest_signal_for_route, is_explain_collector_route, is_state_changing_method,
-        query_workload_for_request, request_log_path, request_origin_allowed_with_policy,
-        requires_csrf_origin, should_reject_for_tenant_auth, should_reject_interactive_llm,
-        trust_forwarded_origin_headers, validate_request_time_range,
+        ingest_signal_for_route, internal_sre_route_allowed, is_explain_collector_route,
+        is_state_changing_method, query_workload_for_request, request_log_path,
+        request_origin_allowed_with_policy, requires_csrf_origin, should_reject_for_tenant_auth,
+        should_reject_interactive_llm, trust_forwarded_origin_headers, validate_request_time_range,
     };
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, Method, Request, header};
@@ -3630,6 +3728,40 @@ mod tenant_auth_tests {
                 "{method} {path}"
             );
             assert_eq!(ingest_signal_for_route(&method, path), None);
+        }
+    }
+
+    #[test]
+    fn internal_sre_credential_is_confined_to_read_and_investigation_routes() {
+        for (method, path) in [
+            (Method::POST, "/api/v1/query"),
+            (Method::POST, "/api/v1/query/timeseries"),
+            (Method::POST, "/api/v1/logs"),
+            (
+                Method::GET,
+                "/api/v1/traces/0123456789abcdef0123456789abcdef",
+            ),
+            (Method::GET, "/prom/api/v1/query_range"),
+            (Method::POST, "/api/v1/internal/sre/context"),
+            (Method::POST, "/api/v1/internal/sre/sessions"),
+            (Method::PATCH, "/api/v1/internal/sre/sessions/session-1"),
+            (Method::DELETE, "/api/v1/internal/sre/sessions/session-1"),
+        ] {
+            assert!(internal_sre_route_allowed(&method, path), "{method} {path}");
+        }
+
+        for (method, path) in [
+            (Method::POST, "/v1/logs"),
+            (Method::POST, "/api/v1/investigate"),
+            (Method::POST, "/api/v1/logs/export"),
+            (Method::GET, "/api/v1/audit"),
+            (Method::PUT, "/api/v1/settings"),
+            (Method::DELETE, "/api/v1/users/admin"),
+        ] {
+            assert!(
+                !internal_sre_route_allowed(&method, path),
+                "{method} {path}"
+            );
         }
     }
 

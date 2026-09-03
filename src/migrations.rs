@@ -649,17 +649,29 @@ fn validate_clickhouse_identifier(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn row_policy_sql(table: &str, read_user: &str, alter: bool) -> String {
+fn quote_table_identifier(value: &str) -> anyhow::Result<String> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        anyhow::bail!("invalid ClickHouse table identifier: {value:?}");
+    }
+    Ok(format!("`{value}`"))
+}
+
+fn row_policy_sql(table: &str, read_user: &str, alter: bool) -> anyhow::Result<String> {
     let verb = if alter {
         "ALTER ROW POLICY"
     } else {
         "CREATE ROW POLICY IF NOT EXISTS"
     };
-    format!(
+    let table = quote_table_identifier(table)?;
+    Ok(format!(
         "{verb} tenant_isolation ON observability.{table} \
          FOR SELECT USING notEmpty(getSetting('rush_tenant_id')) \
          AND tenant_id = getSetting('rush_tenant_id') TO {read_user}"
-    )
+    ))
 }
 
 #[derive(clickhouse::Row, serde::Deserialize)]
@@ -667,11 +679,15 @@ struct TenantTableRow {
     table: String,
 }
 
-/// Fail startup when a new tenant-bearing telemetry table is added without
-/// being enrolled in the policy and least-privilege grant set. Config and
-/// audit tables deliberately stay on the privileged client; `*_mv` objects
-/// write into already-protected target tables and are not granted to readers.
-async fn verify_policy_table_coverage(client: &Client) -> anyhow::Result<()> {
+fn is_managed_policy_table(table: &str) -> bool {
+    ROW_POLICY_TABLES.contains(&table) || table.starts_with(".inner_id.")
+}
+
+/// Return every table that needs tenant isolation. Named telemetry tables stay
+/// explicit so a new public table fails closed until reviewed. ClickHouse owns
+/// `.inner_id.*` backing tables for materialized views, so their generated names
+/// must be discovered after migrations and protected before startup continues.
+async fn tenant_policy_tables(client: &Client) -> anyhow::Result<Vec<String>> {
     let rows = client
         .query(
             "SELECT DISTINCT table FROM system.columns \
@@ -683,9 +699,9 @@ async fn verify_policy_table_coverage(client: &Client) -> anyhow::Result<()> {
         .fetch_all::<TenantTableRow>()
         .await?;
     let missing: Vec<String> = rows
-        .into_iter()
-        .filter(|row| !ROW_POLICY_TABLES.contains(&row.table.as_str()))
-        .map(|row| row.table)
+        .iter()
+        .filter(|row| !is_managed_policy_table(&row.table))
+        .map(|row| row.table.clone())
         .collect();
     if !missing.is_empty() {
         anyhow::bail!(
@@ -693,24 +709,36 @@ async fn verify_policy_table_coverage(client: &Client) -> anyhow::Result<()> {
             missing.join(", ")
         );
     }
-    Ok(())
+
+    let mut tables: Vec<String> = ROW_POLICY_TABLES
+        .iter()
+        .map(|table| (*table).to_string())
+        .collect();
+    tables.extend(
+        rows.into_iter()
+            .filter(|row| row.table.starts_with(".inner_id."))
+            .map(|row| row.table),
+    );
+    tables.sort_unstable();
+    tables.dedup();
+    Ok(tables)
 }
 
 /// Create or replace strict row policies on every tenant-scoped telemetry
 /// table. Existing permissive policies are altered in place during upgrades.
 pub async fn apply_row_policies(client: &Client, read_user: &str) -> anyhow::Result<()> {
     validate_clickhouse_identifier(read_user)?;
-    verify_policy_table_coverage(client).await?;
+    let tables = tenant_policy_tables(client).await?;
     tracing::info!(
         read_user,
         "applying row-level security policies ({} tables)",
-        ROW_POLICY_TABLES.len()
+        tables.len()
     );
-    for table in ROW_POLICY_TABLES {
-        let create = row_policy_sql(table, read_user, false);
+    for table in &tables {
+        let create = row_policy_sql(table, read_user, false)?;
         client.query(&create).execute().await?;
 
-        let alter = row_policy_sql(table, read_user, true);
+        let alter = row_policy_sql(table, read_user, true)?;
         client.query(&alter).execute().await?;
     }
     Ok(())
@@ -736,8 +764,11 @@ pub async fn verify_row_policies(
     read_user: &str,
 ) -> anyhow::Result<()> {
     validate_clickhouse_identifier(read_user)?;
-    for table in ROW_POLICY_TABLES {
-        let show = format!("SHOW CREATE ROW POLICY tenant_isolation ON observability.{table}");
+    let tables = tenant_policy_tables(admin).await?;
+    for table in &tables {
+        let table_identifier = quote_table_identifier(table)?;
+        let show =
+            format!("SHOW CREATE ROW POLICY tenant_isolation ON observability.{table_identifier}");
         let ddl = admin.query(&show).fetch_one::<ShowPolicyRow>().await?;
         if !ddl
             .statement
@@ -754,7 +785,7 @@ pub async fn verify_row_policies(
         }
 
         let probe = format!(
-            "SELECT count() AS leaked FROM observability.{table} \
+            "SELECT count() AS leaked FROM observability.{table_identifier} \
              WHERE tenant_id != getSetting('rush_tenant_id')"
         );
         let row = read
@@ -1471,12 +1502,28 @@ mod row_policy_tests {
 
     #[test]
     fn policy_sql_is_strict_and_targets_only_the_read_principal() {
-        let sql = row_policy_sql("logs", "rushquery", true);
+        let sql = row_policy_sql("logs", "rushquery", true).unwrap();
         assert!(sql.starts_with("ALTER ROW POLICY tenant_isolation"));
         assert!(sql.contains("notEmpty(getSetting('rush_tenant_id'))"));
         assert!(sql.contains("tenant_id = getSetting('rush_tenant_id')"));
         assert!(sql.ends_with("TO rushquery"));
         assert!(!sql.contains(" OR "));
         assert!(!sql.contains("TO ALL"));
+    }
+
+    #[test]
+    fn materialized_view_backing_tables_are_managed_and_safely_quoted() {
+        let table = ".inner_id.12f631ec-c195-4164-becb-584e3bf96aca";
+        assert!(is_managed_policy_table(table));
+
+        let sql = row_policy_sql(table, "rushquery", false).unwrap();
+        assert!(sql.contains("ON observability.`.inner_id.12f631ec-c195-4164-becb-584e3bf96aca`"));
+    }
+
+    #[test]
+    fn generated_table_identifier_rejects_sql_syntax() {
+        assert!(quote_table_identifier(".inner_id.valid-uuid").is_ok());
+        assert!(quote_table_identifier("logs` TO ALL").is_err());
+        assert!(quote_table_identifier("logs; DROP TABLE logs").is_err());
     }
 }
