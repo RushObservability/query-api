@@ -14,6 +14,7 @@ pub mod github_repository_policy;
 pub mod handlers;
 pub mod ingest_limits;
 pub mod integrations;
+pub mod internal_auth;
 pub mod license;
 pub mod llm_gateway;
 pub mod metric_firewall;

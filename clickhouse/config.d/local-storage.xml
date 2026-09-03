@@ -1,10 +1,12 @@
 <clickhouse>
+    <!-- Keep local Compose compatible with migrations that use the tiered policy. -->
     <storage_configuration>
         <policies>
             <tiered>
                 <volumes>
                     <default>
                         <disk>default</disk>
+                        <max_data_part_size_bytes>1073741824</max_data_part_size_bytes>
                     </default>
                 </volumes>
             </tiered>

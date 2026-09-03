@@ -3268,7 +3268,7 @@ pub async fn list_agent_access_events(
     headers: HeaderMap,
     Query(query): Query<AgentAccessEventQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !crate::handlers::repository_access::sre_internal_token_matches(&headers) {
+    if !crate::internal_auth::sre_agent_token_matches(&headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid internal credential".to_string(),

@@ -23,35 +23,12 @@ fn success() -> String {
     "success".to_string()
 }
 
-pub(crate) fn sre_internal_token_matches(headers: &HeaderMap) -> bool {
-    let Some(expected) = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return false;
-    };
-    let Some(actual) = headers
-        .get("x-rush-internal-token")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    if actual.len() != expected.len() {
-        return false;
-    }
-    actual
-        .bytes()
-        .zip(expected.bytes())
-        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
-}
-
 pub async fn audit_repository_access(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(event): Json<RepositoryAccessAudit>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !sre_internal_token_matches(&headers) {
+    if !crate::internal_auth::sre_agent_token_matches(&headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid internal credential".to_string(),

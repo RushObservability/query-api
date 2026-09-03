@@ -149,6 +149,8 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
                 span_id: e.span_id.clone(),
                 parent_span_id: e.parent_span_id.clone(),
                 service_name: e.service_name.clone(),
+                span_name: e.span_name.clone(),
+                kind: e.kind.clone(),
                 service_version: String::new(),
                 http_method: e.http_method.clone(),
                 http_path: e.http_path.clone(),
