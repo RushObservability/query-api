@@ -17,6 +17,7 @@ pub mod integrations;
 pub mod internal_auth;
 pub mod license;
 pub mod llm_gateway;
+pub mod llm_providers;
 pub mod metric_firewall;
 pub mod migrations;
 pub mod models;
