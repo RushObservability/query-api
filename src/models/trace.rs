@@ -154,6 +154,8 @@ pub struct SpanNode {
     pub span_id: String,
     pub parent_span_id: String,
     pub service_name: String,
+    pub span_name: String,
+    pub kind: String,
     pub service_version: String,
     pub http_method: String,
     pub http_path: String,
