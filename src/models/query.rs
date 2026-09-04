@@ -122,6 +122,9 @@ pub struct TimeseriesRequest {
     pub group_by: Option<String>,
     #[serde(default)]
     pub search: Option<String>,
+    /// Include a bounded time-by-latency density grid for heatmap clients.
+    #[serde(default)]
+    pub include_heatmap: bool,
 }
 
 /// A single timeseries bucket with RED metrics.
@@ -134,6 +137,18 @@ pub struct TimeseriesBucket {
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
+}
+
+/// A bounded time-by-latency density cell for trace heatmaps.
+///
+/// `latency_bin` stores quarter-decades in milliseconds. For example, bin 0
+/// covers 1ms up to 10^0.25ms, and bin 4 starts at 10ms.
+#[derive(Debug, Serialize, Deserialize, Row)]
+pub struct LatencyHeatmapCell {
+    pub bucket: String,
+    pub latency_bin: i32,
+    pub count: u64,
+    pub error_count: u64,
 }
 
 /// A grouped timeseries bucket (with a group key).

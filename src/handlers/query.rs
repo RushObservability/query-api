@@ -8,8 +8,8 @@ use axum::{
 use crate::AppState;
 use crate::TenantContext;
 use crate::models::query::{
-    CountBucket, CountQueryRequest, CountRow, GroupedTimeseriesBucket, QueryRequest,
-    TimeseriesBucket, TimeseriesRequest,
+    CountBucket, CountQueryRequest, CountRow, GroupedTimeseriesBucket, LatencyHeatmapCell,
+    QueryRequest, TimeseriesBucket, TimeseriesRequest,
 };
 use crate::models::trace::WideEvent;
 use crate::pagination::{CursorPosition, query_scope};
@@ -40,6 +40,32 @@ fn span_before_predicate(position: &CursorPosition) -> Result<String, (StatusCod
          (timestamp = fromUnixTimestamp64Nano({timestamp}) AND span_id < '{span_id}'))",
         timestamp = position.timestamp_ns,
     ))
+}
+
+fn timeseries_interval_fn(interval: &str) -> &'static str {
+    match interval {
+        "1s" => "toStartOfSecond(timestamp)",
+        "10s" => "toStartOfTenSeconds(timestamp)",
+        "1m" => "toStartOfMinute(timestamp)",
+        "5m" => "toStartOfFiveMinutes(timestamp)",
+        "15m" => "toStartOfFifteenMinutes(timestamp)",
+        "1h" => "toStartOfHour(timestamp)",
+        "1d" => "toStartOfDay(timestamp)",
+        _ => "toStartOfMinute(timestamp)",
+    }
+}
+
+fn latency_heatmap_sql(interval_fn: &str, clauses_sql: &str) -> String {
+    format!(
+        "SELECT \
+            toString({interval_fn}) as bucket, \
+            toInt32(greatest(-24, least(36, floor(log10(greatest(duration_ns / 1000000.0, 0.000001)) * 4)))) as latency_bin, \
+            count() as count, \
+            countIf(http_status_code >= 500 OR status = 'ERROR') as error_count \
+         FROM spans {clauses_sql} \
+         GROUP BY bucket, latency_bin \
+         ORDER BY bucket ASC, latency_bin ASC"
+    )
 }
 
 /// Execute a structured query against spans.
@@ -626,16 +652,7 @@ pub async fn count_query(
         2000,
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let interval_fn = match interval {
-        "1s" => "toStartOfSecond(timestamp)",
-        "10s" => "toStartOfTenSeconds(timestamp)",
-        "1m" => "toStartOfMinute(timestamp)",
-        "5m" => "toStartOfFiveMinutes(timestamp)",
-        "15m" => "toStartOfFifteenMinutes(timestamp)",
-        "1h" => "toStartOfHour(timestamp)",
-        "1d" => "toStartOfDay(timestamp)",
-        _ => "toStartOfMinute(timestamp)",
-    };
+    let interval_fn = timeseries_interval_fn(interval);
 
     let sql = format!(
         "SELECT toString({interval_fn}) as bucket, count() as count, \
@@ -765,16 +782,7 @@ pub async fn timeseries_query(
         2000,
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let interval_fn = match interval {
-        "1s" => "toStartOfSecond(timestamp)",
-        "10s" => "toStartOfTenSeconds(timestamp)",
-        "1m" => "toStartOfMinute(timestamp)",
-        "5m" => "toStartOfFiveMinutes(timestamp)",
-        "15m" => "toStartOfFifteenMinutes(timestamp)",
-        "1h" => "toStartOfHour(timestamp)",
-        "1d" => "toStartOfDay(timestamp)",
-        _ => "toStartOfMinute(timestamp)",
-    };
+    let interval_fn = timeseries_interval_fn(interval);
 
     if let Some(ref group_field) = req.group_by {
         let col = resolve_field(group_field);
@@ -783,7 +791,7 @@ pub async fn timeseries_query(
                 toString({interval_fn}) as bucket, \
                 toString({col}) as group_key, \
                 count() as count, \
-                countIf(http_status_code >= 500) as error_count, \
+                countIf(http_status_code >= 500 OR status = 'ERROR') as error_count, \
                 avg(duration_ns) / 1000000.0 as avg_duration_ms, \
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
@@ -838,11 +846,22 @@ pub async fn timeseries_query(
             serde_json::json!({ "buckets": buckets, "grouped": true }),
         ))
     } else {
+        // Keep heatmaps bounded independently from the percentile series. A maximum
+        // of 240 time buckets and 61 latency bins caps the response at 14,640 cells.
+        let heatmap_interval = crate::query_builder::clamp_bucket_interval(
+            &req.interval,
+            &req.time_range.from,
+            &req.time_range.to,
+            240,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let heatmap_interval_fn = timeseries_interval_fn(heatmap_interval);
+        let clauses_sql = clauses.to_sql();
         let sql = format!(
             "SELECT \
                 toString({interval_fn}) as bucket, \
                 count() as count, \
-                countIf(http_status_code >= 500) as error_count, \
+                countIf(http_status_code >= 500 OR status = 'ERROR') as error_count, \
                 avg(duration_ns) / 1000000.0 as avg_duration_ms, \
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
@@ -850,14 +869,18 @@ pub async fn timeseries_query(
              FROM spans {} \
              GROUP BY bucket \
              ORDER BY bucket ASC",
-            clauses.to_sql(),
+            clauses_sql,
         );
+        let heatmap_sql = latency_heatmap_sql(heatmap_interval_fn, &clauses_sql);
 
-        let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
-            .fetch_all::<TimeseriesBucket>()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", "query failed");
+        let (buckets, heatmap) = if req.include_heatmap {
+            let buckets_query =
+                crate::tenant_query(&state.ch, &sql, tenant_id).fetch_all::<TimeseriesBucket>();
+            let heatmap_query = crate::tenant_query(&state.ch, &heatmap_sql, tenant_id)
+                .fetch_all::<LatencyHeatmapCell>();
+            let (buckets_result, heatmap_result) = tokio::join!(buckets_query, heatmap_query);
+            let buckets = buckets_result.map_err(|e| {
+                tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", query = "percentiles", "query failed");
                 state.self_metrics.record_query(
                     "explore_spans",
                     "spans",
@@ -867,6 +890,35 @@ pub async fn timeseries_query(
                 );
                 (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
             })?;
+            let heatmap = heatmap_result.map_err(|e| {
+                tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", query = "latency_heatmap", "query failed");
+                state.self_metrics.record_query(
+                    "explore_spans",
+                    "spans",
+                    0,
+                    start.elapsed().as_millis() as u64,
+                    false,
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+            })?;
+            (buckets, heatmap)
+        } else {
+            let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
+                .fetch_all::<TimeseriesBucket>()
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, signal = "traces", handler = "timeseries_query", query = "percentiles", "query failed");
+                    state.self_metrics.record_query(
+                        "explore_spans",
+                        "spans",
+                        0,
+                        start.elapsed().as_millis() as u64,
+                        false,
+                    );
+                    (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+                })?;
+            (buckets, Vec::new())
+        };
 
         // Only track usage if results returned
         if !buckets.is_empty() {
@@ -888,13 +940,13 @@ pub async fn timeseries_query(
         state.self_metrics.record_query(
             "explore_spans",
             "spans",
-            buckets.len() as u64,
+            (buckets.len() + heatmap.len()) as u64,
             start.elapsed().as_millis() as u64,
             true,
         );
 
         Ok(Json(
-            serde_json::json!({ "buckets": buckets, "grouped": false }),
+            serde_json::json!({ "buckets": buckets, "heatmap": heatmap, "grouped": false }),
         ))
     }
 }
@@ -924,5 +976,44 @@ mod pagination_tests {
         let predicate = span_before_predicate(&cursor).unwrap();
         assert!(predicate.starts_with("(timestamp <"));
         assert!(!predicate.contains("timestamp >"));
+    }
+
+    #[test]
+    fn heatmap_query_uses_log_latency_bins_and_the_supplied_predicate() {
+        let sql = latency_heatmap_sql(
+            "toStartOfFiveMinutes(timestamp)",
+            "PREWHERE tenant_id = 'acme' WHERE timestamp >= now() - INTERVAL 3 HOUR",
+        );
+
+        assert!(sql.contains("toStartOfFiveMinutes(timestamp)"));
+        assert!(sql.contains("floor(log10(greatest(duration_ns / 1000000.0, 0.000001)) * 4)"));
+        assert!(sql.contains("PREWHERE tenant_id = 'acme'"));
+        assert!(sql.contains("GROUP BY bucket, latency_bin"));
+    }
+
+    #[test]
+    fn timeseries_interval_function_has_a_safe_default() {
+        assert_eq!(
+            timeseries_interval_fn("5m"),
+            "toStartOfFiveMinutes(timestamp)"
+        );
+        assert_eq!(
+            timeseries_interval_fn("unexpected"),
+            "toStartOfMinute(timestamp)"
+        );
+    }
+
+    #[test]
+    fn timeseries_heatmap_is_opt_in() {
+        let request: TimeseriesRequest = serde_json::from_value(serde_json::json!({
+            "time_range": {
+                "from": "2026-09-03T17:00:00Z",
+                "to": "2026-09-03T20:00:00Z"
+            },
+            "filters": []
+        }))
+        .unwrap();
+
+        assert!(!request.include_heatmap);
     }
 }
