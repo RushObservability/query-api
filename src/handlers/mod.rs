@@ -51,6 +51,7 @@ pub mod shutdown;
 pub mod slos;
 pub mod sre_internal;
 pub mod sre_proxy;
+pub mod sre_sessions;
 pub mod sso;
 pub mod stats;
 pub mod suggest;
