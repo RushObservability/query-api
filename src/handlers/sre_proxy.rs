@@ -1,4 +1,4 @@
-//! Reverse proxy that fronts the SRE-agent service behind query-api.
+//! Reverse proxy for operations that the SRE-agent service must execute.
 //!
 //! The browser talks only to query-api; query-api authenticates the session,
 //! derives the caller's real tenant, and forwards the SRE-agent routes to the
@@ -8,17 +8,18 @@
 //! verbatim) — closing a tenant-spoofing gap.
 //!
 //! `POST /investigate` is a long-lived SSE stream and is passed through
-//! unbuffered; `/sessions*` and `/investigation-templates` are plain JSON.
+//! unbuffered. Investigation session history is read directly from query-api's
+//! ClickHouse-backed config store in `sre_sessions`.
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::sync::OnceLock;
 
 use crate::AppState;
 use crate::handlers::settings::{SreAgentAccessDecision, sre_agent_access_decision};
-use crate::handlers::users::{require_auth, require_write};
+use crate::handlers::users::require_auth;
 
 /// Shared HTTP client. No total timeout — `/investigate` streams for minutes;
 /// a short connect timeout still fails fast when the agent is down.
@@ -113,23 +114,6 @@ async fn enforce_agent_access(
     Err((StatusCode::FORBIDDEN, message.to_string()))
 }
 
-/// Rebuild a query string, forcing `tenant_id` to the authenticated tenant and
-/// dropping any client-supplied value.
-fn query_with_tenant(raw: Option<&str>, tenant: &str) -> String {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    if let Some(q) = raw {
-        for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
-            if k != "tenant_id" {
-                pairs.push((k.into_owned(), v.into_owned()));
-            }
-        }
-    }
-    pairs.push(("tenant_id".to_string(), tenant.to_string()));
-    url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs)
-        .finish()
-}
-
 /// `POST /api/v1/investigate` — SSE passthrough with tenant/scope injection.
 pub async fn investigate(
     State(state): State<AppState>,
@@ -217,76 +201,6 @@ async fn forward_get(url: String) -> Result<Response, (StatusCode, String)> {
         .into_response())
 }
 
-/// `GET /api/v1/sessions` — list the caller's investigation sessions.
-pub async fn list_sessions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(q): RawQuery,
-) -> Result<Response, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers).await?;
-    enforce_agent_access(&state, &headers, &caller, false).await?;
-    let query = query_with_tenant(q.as_deref(), &caller.3);
-    forward_get(format!("{}/api/v1/sessions?{}", sre_base(), query)).await
-}
-
-/// `GET /api/v1/sessions/{id}` — fetch one session.
-pub async fn get_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    RawQuery(q): RawQuery,
-) -> Result<Response, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers).await?;
-    enforce_agent_access(&state, &headers, &caller, false).await?;
-    let query = query_with_tenant(q.as_deref(), &caller.3);
-    forward_get(format!(
-        "{}/api/v1/sessions/{}?{}",
-        sre_base(),
-        urlencoding::encode(&id),
-        query
-    ))
-    .await
-}
-
-/// `DELETE /api/v1/sessions/{id}` — delete a session (write access).
-pub async fn delete_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Response, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
-    enforce_agent_access(&state, &headers, &caller, false).await?;
-    let query = query_with_tenant(None, &caller.3);
-    let url = format!(
-        "{}/api/v1/sessions/{}?{}",
-        sre_base(),
-        urlencoding::encode(&id),
-        query,
-    );
-    let internal_token = sre_internal_token()?;
-    let resp = with_internal_token(client().delete(&url), internal_token)
-        .send()
-        .await
-        .map_err(unavailable)?;
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let bytes = resp.bytes().await.map_err(unavailable)?;
-    if status.is_success() {
-        state
-            .audit
-            .log(
-                crate::audit::AuditEvent::new("sre_agent.session_delete", "user")
-                    .actor(caller.0.clone(), caller.1.clone())
-                    .tenant(caller.3.clone())
-                    .resource("sre_agent_session", id)
-                    .outcome("success")
-                    .description("SRE agent investigation session deleted")
-                    .context(crate::audit::actor_context_from_headers(&headers)),
-            )
-            .await;
-    }
-    Ok((status, bytes).into_response())
-}
-
 /// `GET /api/v1/investigation-templates` — built-in templates (no tenant scope).
 pub async fn list_investigation_templates(
     State(state): State<AppState>,
@@ -304,7 +218,7 @@ mod tests {
     #[test]
     fn proxy_attaches_the_internal_agent_credential() {
         let request = with_internal_token(
-            reqwest::Client::new().get("http://agent.internal/api/v1/sessions"),
+            reqwest::Client::new().post("http://agent.internal/api/v1/investigate"),
             "test-token".to_string(),
         )
         .build()

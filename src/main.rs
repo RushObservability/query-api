@@ -2743,13 +2743,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/services/latency-histogram", get(handlers::services::service_latency_histogram))
         .route("/api/v1/services/endpoints", get(handlers::services::service_endpoints))
         .route("/api/v1/services/errors", get(handlers::services::service_errors))
-        // SRE-agent gateway: query-api fronts the agent (auth + tenant injection),
-        // so the browser only talks to query-api. Forwards to SRE_AGENT_URL.
+        // SRE-agent gateway: live runs and agent-owned templates are proxied,
+        // while stored session history is served directly from query-api.
         .route("/api/v1/investigate", post(handlers::sre_proxy::investigate))
-        .route("/api/v1/sessions", get(handlers::sre_proxy::list_sessions))
+        .route("/api/v1/sessions", get(handlers::sre_sessions::list_sessions))
         .route(
             "/api/v1/sessions/{id}",
-            get(handlers::sre_proxy::get_session).delete(handlers::sre_proxy::delete_session),
+            get(handlers::sre_sessions::get_session)
+                .delete(handlers::sre_sessions::delete_session),
         )
         .route("/api/v1/investigation-templates", get(handlers::sre_proxy::list_investigation_templates))
         // Private SRE-agent data plane. The outer middleware accepts the shared
