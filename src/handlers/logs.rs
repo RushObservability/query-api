@@ -30,7 +30,11 @@ pub(crate) fn resolve_log_field(field: &str) -> String {
                     "k8s.pod.name" => "mat_k8s_pod".to_string(),
                     "k8s.container.name" => "mat_k8s_container".to_string(),
                     "k8s.deployment.name" => "mat_k8s_deployment".to_string(),
-                    "deployment.environment" => "mat_environment".to_string(),
+                    "deployment.environment" | "deployment.environment.name" => {
+                        // Existing parts may predate the canonical OTel semantic-convention
+                        // key. Keep those rows queryable without forcing a full-table rewrite.
+                        "if(notEmpty(mat_environment), mat_environment, ResourceAttributes['deployment.environment.name'])".to_string()
+                    }
                     _ => format!("ResourceAttributes['{attr}']"),
                 }
             } else if let Some(attr) = field.strip_prefix("log.") {
@@ -285,10 +289,10 @@ pub async fn query_logs(
         LOG_DETAIL_SELECT_COLS
     };
 
-    // Fast path: when browsing logs (no search), try a narrow recent window first.
-    // The table's primary key is (ServiceName, TimestampTime, Timestamp), so a
-    // wide time range without ServiceName filter requires a full scan.  Querying
-    // just the last hour first is nearly instant and usually returns enough rows.
+    // Fast path: try a narrow recent window first. The base table's time-first
+    // primary key makes ordinary browsing cheap, while Body search predicates
+    // can still require work across the requested range. One hour usually fills
+    // the first page without paying for the full range.
     let clauses = build_log_where(
         &req.filters,
         &req.time_range.from,
@@ -1300,6 +1304,16 @@ pub async fn group_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_filters_accept_current_and_legacy_otel_names() {
+        let current = resolve_log_field("resource.deployment.environment.name");
+        let legacy = resolve_log_field("resource.deployment.environment");
+
+        assert_eq!(current, legacy);
+        assert!(current.contains("mat_environment"));
+        assert!(current.contains("deployment.environment.name"));
+    }
 
     #[test]
     fn slim_projection_excludes_attribute_maps() {

@@ -194,7 +194,11 @@ fn resolve_log_filter_field(field: &str) -> String {
                     "k8s.pod.name" => "mat_k8s_pod".to_string(),
                     "k8s.container.name" => "mat_k8s_container".to_string(),
                     "k8s.deployment.name" => "mat_k8s_deployment".to_string(),
-                    "deployment.environment" => "mat_environment".to_string(),
+                    "deployment.environment" | "deployment.environment.name" => {
+                        // Existing parts may have been materialized before Rush recognized
+                        // deployment.environment.name.
+                        "if(notEmpty(mat_environment), mat_environment, ResourceAttributes['deployment.environment.name'])".to_string()
+                    }
                     _ => format!("ResourceAttributes['{attr}']"),
                 }
             } else if let Some(attr) = field.strip_prefix("log.") {
@@ -479,6 +483,16 @@ pub async fn bubbleup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_environment_dimension_accepts_current_and_legacy_otel_names() {
+        let current = resolve_log_filter_field("resource.deployment.environment.name");
+        let legacy = resolve_log_filter_field("resource.deployment.environment");
+
+        assert_eq!(current, legacy);
+        assert!(current.contains("mat_environment"));
+        assert!(current.contains("deployment.environment.name"));
+    }
 
     fn request(signal: &str) -> BubbleUpRequest {
         BubbleUpRequest {
