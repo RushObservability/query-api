@@ -465,7 +465,7 @@ pub fn build_span_search_sql(search: &str) -> Option<String> {
 /// Build a SQL condition for free-text search on log columns (logs table).
 /// Whole words search `lower(Body)` through the native word text index using
 /// `hasToken` predicates. Multi-word expressions deliberately expand to AND/OR
-/// combinations of `hasToken` because ClickHouse 26.1 requires the
+/// combinations of `hasToken` because ClickHouse 26.6 requires the
 /// `enable_full_text_index` setting for `hasAllTokens` and `hasAnyTokens`. Wildcards use substring predicates,
 /// exact trace/span IDs route to indexed equality, and map columns use `key=value`.
 pub fn build_log_search_sql(search: &str) -> Option<String> {
@@ -478,7 +478,7 @@ pub fn build_log_search_sql(search: &str) -> Option<String> {
 /// Plain token groups expand to `hasToken` predicates instead of ClickHouse's
 /// multi-token helpers. `hasAllTokens` and `hasAnyTokens` require
 /// `enable_full_text_index`, which is not enabled on all supported ClickHouse versions
-/// (including the local 26.1 setup). Keeping the expression in terms of `hasToken`
+/// (including the supported 26.6 setup). Keeping the expression in terms of `hasToken`
 /// preserves whole-word AND/OR semantics without a server setting. Mixed groups retain
 /// their specialized ID, wildcard, and attribute predicates.
 fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
@@ -508,7 +508,8 @@ fn log_search_expr_to_sql(expr: &SearchExpr) -> String {
             // When every branch is a plain substring wildcard on Body (e.g. `*foo* OR *bar*`),
             // collapse the OR-of-LIKEs into a single multiSearchAny: one hyperscan-vectorized
             // pass over lower(Body) (computed once) instead of N separate LIKE evaluations.
-            // Same substring semantics, and it still prunes via the idx_body_ngram skip index
+            // Same substring semantics, and it still prunes via the
+            // idx_body_ngram_g4 skip index.
             // for selective needles. Token/ID/key=value/internal-wildcard branches fall back to OR.
             //
             // Validated on 26.6.1 (ntt-japan-prod, 157k granules, needles reset/closed/refused):
@@ -654,7 +655,7 @@ fn log_term_match_sql(term: &str) -> String {
     // 26.6.1 (ntt-japan-prod, 157k granules), `LIKE '%refused%'` is analyzed against
     // the idx_body_text token index (→ 26.5k granules, fast analysis) while the
     // single-needle multiSearchAny form is NOT — despite ClickHouse#106279 — and
-    // falls back to idx_body_ngram only (→ 53.5k granules) with ~28s (warm) index
+    // falls back to idx_body_ngram_g4 only (→ 53.5k granules) with ~28s (warm) index
     // analysis. Do not "upgrade" this to multiSearchAny without re-measuring
     // EXPLAIN indexes=1 on a production-sized logs table.
     if lower.contains('*') {

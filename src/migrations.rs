@@ -2,6 +2,15 @@ use clickhouse::Client;
 
 use crate::config::RushConfig;
 
+const LOG_SERVICE_PROJECTION_NAME: &str = "idx_logs_by_service";
+const LOG_SERVICE_PROJECTION_DDL: &str = "ALTER TABLE observability.logs ADD PROJECTION IF NOT EXISTS idx_logs_by_service (\
+     SELECT tenant_id, ServiceName, Timestamp, _part_offset \
+     ORDER BY (tenant_id, ServiceName, Timestamp))";
+const LOG_BODY_NGRAM_INDEX_NAME: &str = "idx_body_ngram_g4";
+const LOG_BODY_NGRAM_INDEX_DDL: &str = "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
+     idx_body_ngram_g4 lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 4";
+const LEGACY_LOG_BODY_NGRAM_INDEXES: &[&str] = &["idx_body_ngram"];
+
 /// Ordered list of DDL statements to ensure the observability schema exists.
 /// v2: Multi-tenant schema — every table carries tenant_id as the first ORDER BY column.
 /// Starts with DROP TABLE IF EXISTS for all v1 tables, then recreates with v2 schemas.
@@ -303,22 +312,29 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
     `SeverityNumber` UInt8 CODEC(ZSTD(1)),
     `Body` String CODEC(ZSTD(3)),
     `ServiceName` LowCardinality(String) CODEC(ZSTD(1)),
-    `ResourceSchemaUrl` String CODEC(ZSTD(1)),
+    `ResourceSchemaUrl` LowCardinality(String) CODEC(ZSTD(1)),
     `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    `ScopeSchemaUrl` String CODEC(ZSTD(1)),
-    `ScopeName` String CODEC(ZSTD(1)),
-    `ScopeVersion` String CODEC(ZSTD(1)),
+    `ScopeSchemaUrl` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScopeName` LowCardinality(String) CODEC(ZSTD(1)),
+    `ScopeVersion` LowCardinality(String) CODEC(ZSTD(1)),
     `ScopeAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
     `LogAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(1)),
     `EventName` LowCardinality(String) CODEC(ZSTD(1)),
-    `mat_k8s_namespace` String MATERIALIZED ResourceAttributes['k8s.namespace.name'],
+    `mat_k8s_namespace` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.namespace.name'],
     `mat_k8s_pod` String MATERIALIZED ResourceAttributes['k8s.pod.name'],
-    `mat_k8s_container` String MATERIALIZED ResourceAttributes['k8s.container.name'],
-    `mat_k8s_deployment` String MATERIALIZED ResourceAttributes['k8s.deployment.name'],
-    `mat_environment` LowCardinality(String) MATERIALIZED ResourceAttributes['deployment.environment'],
+    `mat_k8s_container` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.container.name'],
+    `mat_k8s_deployment` LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.deployment.name'],
+    `mat_environment` LowCardinality(String) MATERIALIZED coalesce(
+        nullIf(ResourceAttributes['deployment.environment.name'], ''),
+        ResourceAttributes['deployment.environment']
+    ),
     `mat_source_ip` String MATERIALIZED LogAttributes['net.peer.ip'],
     `mat_user_id` String MATERIALIZED LogAttributes['enduser.id'],
     `mat_action` LowCardinality(String) MATERIALIZED LogAttributes['audit.action'],
+    PROJECTION idx_logs_by_service (
+        SELECT tenant_id, ServiceName, Timestamp, _part_offset
+        ORDER BY (tenant_id, ServiceName, Timestamp)
+    ),
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_service_name ServiceName TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_severity SeverityText TYPE set(8) GRANULARITY 4,
@@ -1027,9 +1043,230 @@ pub fn spawn_maintenance(url: String, user: String, password: String, config: Ru
             tracing::error!("background retention TTL application failed: {e}");
         }
         apply_storage_policy(&client, &config).await;
+        apply_log_schema_optimizations(&client).await;
+        apply_log_service_projection(&client).await;
         apply_skip_indexes(&client).await;
         tracing::info!("background maintenance tasks complete");
     });
+}
+
+struct LogColumnOptimization {
+    name: &'static str,
+    expected_type: &'static str,
+    expected_expression_fragment: Option<&'static str>,
+    definition: &'static str,
+}
+
+// Keep existing tables aligned with the definitions selected by the schema
+// benchmark. Repeated metadata uses LowCardinality. Pod names stay plain String
+// because 200,000 distinct values made LowCardinality nearly five times slower.
+// Keep this list in sync with the fresh logs schema above.
+const LOG_COLUMN_OPTIMIZATIONS: &[LogColumnOptimization] = &[
+    LogColumnOptimization {
+        name: "ResourceSchemaUrl",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: None,
+        definition: "LowCardinality(String) CODEC(ZSTD(1))",
+    },
+    LogColumnOptimization {
+        name: "ScopeSchemaUrl",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: None,
+        definition: "LowCardinality(String) CODEC(ZSTD(1))",
+    },
+    LogColumnOptimization {
+        name: "ScopeName",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: None,
+        definition: "LowCardinality(String) CODEC(ZSTD(1))",
+    },
+    LogColumnOptimization {
+        name: "ScopeVersion",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: None,
+        definition: "LowCardinality(String) CODEC(ZSTD(1))",
+    },
+    LogColumnOptimization {
+        name: "mat_k8s_namespace",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: Some("k8s.namespace.name"),
+        definition: "LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.namespace.name']",
+    },
+    LogColumnOptimization {
+        name: "mat_k8s_pod",
+        expected_type: "String",
+        expected_expression_fragment: Some("k8s.pod.name"),
+        definition: "String MATERIALIZED ResourceAttributes['k8s.pod.name']",
+    },
+    LogColumnOptimization {
+        name: "mat_k8s_container",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: Some("k8s.container.name"),
+        definition: "LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.container.name']",
+    },
+    LogColumnOptimization {
+        name: "mat_k8s_deployment",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: Some("k8s.deployment.name"),
+        definition: "LowCardinality(String) MATERIALIZED ResourceAttributes['k8s.deployment.name']",
+    },
+    LogColumnOptimization {
+        name: "mat_environment",
+        expected_type: "LowCardinality(String)",
+        expected_expression_fragment: Some("deployment.environment.name"),
+        definition: "LowCardinality(String) MATERIALIZED coalesce(nullIf(ResourceAttributes['deployment.environment.name'], ''), ResourceAttributes['deployment.environment'])",
+    },
+];
+
+/// Bring existing logs tables up to the storage-efficient column definitions
+/// used by fresh installs. ALTERs run only when system.columns shows a mismatch;
+/// conversion is non-blocking maintenance so API startup is never held hostage by
+/// a large historical table. The environment expression affects new parts. Reads
+/// retain a map fallback for older parts, avoiding an automatic full-table rewrite.
+async fn apply_log_schema_optimizations(client: &Client) {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct ColumnDefinitionRow {
+        type_name: String,
+        default_expression: String,
+    }
+
+    let mut modifications = Vec::new();
+    let mut changed_columns = Vec::new();
+
+    for optimization in LOG_COLUMN_OPTIMIZATIONS {
+        let inspect_sql = format!(
+            "SELECT type AS type_name, default_expression \
+             FROM system.columns \
+             WHERE database = 'observability' AND table = 'logs' \
+               AND name = '{}' LIMIT 1",
+            optimization.name
+        );
+        let current = match client
+            .query(&inspect_sql)
+            .fetch_optional::<ColumnDefinitionRow>()
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::warn!(column = optimization.name, "logs column is missing");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(column = optimization.name, error = %e, "could not inspect logs column");
+                continue;
+            }
+        };
+
+        let type_matches = current.type_name == optimization.expected_type;
+        let expression_matches = optimization
+            .expected_expression_fragment
+            .is_none_or(|fragment| current.default_expression.contains(fragment));
+        if type_matches && expression_matches {
+            continue;
+        }
+
+        tracing::debug!(
+            column = optimization.name,
+            old_type = current.type_name,
+            "logs column needs optimization"
+        );
+        modifications.push(format!(
+            "MODIFY COLUMN `{}` {}",
+            optimization.name, optimization.definition
+        ));
+        changed_columns.push(optimization.name);
+    }
+
+    if modifications.is_empty() {
+        return;
+    }
+
+    // One ALTER creates at most one mutation pass over historical parts. Issuing
+    // one ALTER per column would make a large logs table do the same I/O repeatedly.
+    let alter_sql = format!(
+        "ALTER TABLE observability.logs {}",
+        modifications.join(", ")
+    );
+    tracing::info!(
+        columns = changed_columns.join(","),
+        "optimizing logs columns"
+    );
+    if let Err(e) = client.query(&alter_sql).execute().await {
+        tracing::warn!(
+            columns = changed_columns.join(","),
+            error = %e,
+            "could not optimize logs columns"
+        );
+    }
+}
+
+/// Add the compact service-first projection measured by
+/// `perf/log-service-projection-benchmark.sh`. It stores only the tenant,
+/// service, timestamp, and base-row offset, adding about 5% in the 10-million-row
+/// test while reducing service count and histogram p95 by 57-71%.
+async fn apply_log_service_projection(client: &Client) {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct ProjectionStateRow {
+        definition_count: u64,
+        parent_parts: u64,
+        projected_parts: u64,
+    }
+
+    let inspect_sql = format!(
+        "SELECT \
+           (SELECT count() FROM system.projections \
+            WHERE database = 'observability' AND table = 'logs' \
+              AND name = '{LOG_SERVICE_PROJECTION_NAME}') AS definition_count, \
+           (SELECT count() FROM system.parts \
+            WHERE active AND rows > 0 AND database = 'observability' AND table = 'logs') AS parent_parts, \
+           (SELECT uniqExact(parent_name) FROM system.projection_parts \
+            WHERE active AND database = 'observability' AND table = 'logs' \
+              AND name = '{LOG_SERVICE_PROJECTION_NAME}') AS projected_parts"
+    );
+    let state = match client
+        .query(&inspect_sql)
+        .fetch_one::<ProjectionStateRow>()
+        .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not inspect logs service projection");
+            return;
+        }
+    };
+
+    if state.definition_count == 0 {
+        tracing::info!(
+            projection = LOG_SERVICE_PROJECTION_NAME,
+            "creating lightweight logs service projection"
+        );
+        if let Err(e) = client.query(LOG_SERVICE_PROJECTION_DDL).execute().await {
+            tracing::warn!(
+                projection = LOG_SERVICE_PROJECTION_NAME,
+                error = %e,
+                "failed to create logs service projection"
+            );
+            return;
+        }
+    }
+
+    if state.parent_parts == state.projected_parts {
+        return;
+    }
+
+    // Existing parts need a one-time mutation. Wait inside this background
+    // maintenance task so a failed materialization is retried on the next start.
+    let materialize = format!(
+        "ALTER TABLE observability.logs MATERIALIZE PROJECTION {LOG_SERVICE_PROJECTION_NAME} \
+         SETTINGS mutations_sync = 1"
+    );
+    if let Err(e) = client.query(&materialize).execute().await {
+        tracing::warn!(
+            projection = LOG_SERVICE_PROJECTION_NAME,
+            error = %e,
+            "failed to materialize logs service projection"
+        );
+    }
 }
 
 /// Maintain the free-text search skip indexes on spans and logs. Idempotent
@@ -1110,6 +1347,7 @@ async fn apply_skip_indexes(client: &Client) {
         ngram_ddl: &'static str,
         drop_on_text: &'static [&'static str],
         drop_on_ngram: &'static [&'static str],
+        legacy_ngram_names: &'static [&'static str],
     }
     let plans = [
         // NOTE: spans have NO full-text search index. The attribute-blob text index cost
@@ -1123,22 +1361,24 @@ async fn apply_skip_indexes(client: &Client) {
             text_name: "idx_body_text",
             text_ddl: "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
                 idx_body_text lower(Body) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1",
-            ngram_name: "idx_body_ngram",
-            ngram_ddl: "ALTER TABLE observability.logs ADD INDEX IF NOT EXISTS \
-                idx_body_ngram lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1",
+            ngram_name: LOG_BODY_NGRAM_INDEX_NAME,
+            ngram_ddl: LOG_BODY_NGRAM_INDEX_DDL,
             // On the text path we keep BOTH indexes on lower(Body): the `text` token
             // index for whole-word search AND the ngrambf_v1 substring index for
             // partial-word wildcards (LIKE '%...%'), which the token index cannot serve.
-            // The bloom substring index is tiny (~3.7 GiB full-table at our volume), so it
-            // covers the whole retained table. Drop only the legacy `idx_body` tokenbf.
+            // Granularity 4 kept the same 19 ms rare-search p95 as granularity 1 while
+            // reducing index storage by 87%, so it covers the whole retained table.
+            // Drop only the legacy `idx_body` tokenbf at this stage.
             drop_on_text: &["idx_body"],
-            // On ngram path, keep the existing bloom indexes (idx_body tokenbf is a useful
-            // word index; idx_body_ngram is the desired substring index). Drop only a stale text index.
+            // On the ngram-only path, keep the old ngram until its replacement has been
+            // created and materialized. Drop only the unsupported text index here.
             drop_on_ngram: &["idx_body_text"],
+            legacy_ngram_names: LEGACY_LOG_BODY_NGRAM_INDEXES,
         },
     ];
 
     for p in &plans {
+        let mut wanted_index_materialized_now = false;
         let (want_name, want_ddl, drops): (&str, &str, &[&str]) = if text_supported {
             (p.text_name, p.text_ddl, p.drop_on_text)
         } else {
@@ -1179,12 +1419,14 @@ async fn apply_skip_indexes(client: &Client) {
                 continue; // do NOT drop anything if we couldn't create the replacement
             }
             let materialize = format!(
-                "ALTER TABLE observability.{} MATERIALIZE INDEX {}",
+                "ALTER TABLE observability.{} MATERIALIZE INDEX {} SETTINGS mutations_sync = 2",
                 p.table, want_name
             );
             if let Err(e) = client.query(&materialize).execute().await {
                 tracing::warn!(table = p.table, index = want_name, error = %e, "failed to materialize search index");
+                continue;
             }
+            wanted_index_materialized_now = true;
         }
 
         // 2. Desired index is present — now it's safe to drop superseded ones.
@@ -1211,24 +1453,73 @@ async fn apply_skip_indexes(client: &Client) {
         // 3. On the text path, ALSO ensure the ngrambf_v1 substring index exists alongside
         //    the `text` token index. Partial-word wildcards (LIKE '%foo%') can't use the
         //    token index and otherwise force a full Body scan; the bloom n-gram index prunes
-        //    granules for substrings >= 4 chars. It's a compact fixed-size bloom filter
-        //    (~3.7 GiB across the whole table), so it covers all retained data — no windowing.
-        //    On the non-text path the loop above already created idx_body_ngram as `want`.
-        if text_supported && !index_exists(client, p.table, p.ngram_name).await {
+        //    granules for substrings >= 4 chars. At granularity 4 it measured about
+        //    0.5 GiB per billion comparable rows, so it covers all retained data.
+        //    On the non-text path the loop above already created the n-gram index as `want`.
+        let mut ngram_ready = index_exists(client, p.table, p.ngram_name).await;
+        let mut ngram_materialized_now = want_name == p.ngram_name && wanted_index_materialized_now;
+        if text_supported && !ngram_ready {
             tracing::info!(
                 table = p.table,
                 index = p.ngram_name,
-                "creating substring (ngrambf_v1) index"
+                "creating substring index"
             );
             if let Err(e) = client.query(p.ngram_ddl).execute().await {
                 tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "failed to create substring index");
             } else {
                 let materialize = format!(
-                    "ALTER TABLE observability.{} MATERIALIZE INDEX {}",
+                    "ALTER TABLE observability.{} MATERIALIZE INDEX {} SETTINGS mutations_sync = 2",
                     p.table, p.ngram_name
                 );
-                if let Err(e) = client.query(&materialize).execute().await {
-                    tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "failed to materialize substring index");
+                match client.query(&materialize).execute().await {
+                    Ok(()) => {
+                        ngram_ready = true;
+                        ngram_materialized_now = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "failed to materialize substring index")
+                    }
+                }
+            }
+        }
+
+        let mut legacy_ngram_names = Vec::new();
+        for name in p.legacy_ngram_names {
+            if index_exists(client, p.table, name).await {
+                legacy_ngram_names.push(*name);
+            }
+        }
+
+        // A prior process may have created the new definition but stopped before
+        // materialization completed. Re-run the idempotent materialization before
+        // removing the only known-good legacy index.
+        if ngram_ready && !legacy_ngram_names.is_empty() && !ngram_materialized_now {
+            let materialize = format!(
+                "ALTER TABLE observability.{} MATERIALIZE INDEX {} SETTINGS mutations_sync = 2",
+                p.table, p.ngram_name
+            );
+            if let Err(e) = client.query(&materialize).execute().await {
+                tracing::warn!(table = p.table, index = p.ngram_name, error = %e, "could not verify substring index materialization");
+                ngram_ready = false;
+            }
+        }
+
+        // The versioned granularity-4 index is query-compatible with the old name.
+        // Remove granularity 1 only after the replacement is available, avoiding an
+        // unindexed window for wildcard searches during upgrades.
+        if ngram_ready {
+            for name in legacy_ngram_names {
+                tracing::info!(
+                    table = p.table,
+                    index = name,
+                    "dropping superseded substring index"
+                );
+                let drop_ddl = format!(
+                    "ALTER TABLE observability.{} DROP INDEX IF EXISTS {}",
+                    p.table, name
+                );
+                if let Err(e) = client.query(&drop_ddl).execute().await {
+                    tracing::warn!(table = p.table, index = name, error = %e, "failed to drop superseded substring index");
                 }
             }
         }
@@ -1467,6 +1758,78 @@ async fn apply_storage_policy(client: &Client, config: &RushConfig) {
 #[cfg(test)]
 mod row_policy_tests {
     use super::*;
+
+    #[test]
+    fn log_column_upgrades_match_the_fresh_install_schema() {
+        let fresh_schema = MIGRATIONS
+            .iter()
+            .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS observability.logs"))
+            .expect("logs CREATE TABLE migration");
+
+        for name in [
+            "ResourceSchemaUrl",
+            "ScopeSchemaUrl",
+            "ScopeName",
+            "ScopeVersion",
+            "mat_k8s_namespace",
+            "mat_k8s_container",
+            "mat_k8s_deployment",
+            "mat_environment",
+        ] {
+            let column = LOG_COLUMN_OPTIMIZATIONS
+                .iter()
+                .find(|column| column.name == name)
+                .unwrap_or_else(|| panic!("missing logs optimization for {name}"));
+            assert_eq!(column.expected_type, "LowCardinality(String)");
+            assert!(column.definition.contains("LowCardinality(String)"));
+            assert!(
+                fresh_schema.contains(&format!("`{}` {}", column.name, column.expected_type)),
+                "fresh logs schema does not match the {name} upgrade"
+            );
+        }
+
+        let environment = LOG_COLUMN_OPTIMIZATIONS
+            .iter()
+            .find(|column| column.name == "mat_environment")
+            .expect("mat_environment optimization");
+        assert!(
+            environment
+                .definition
+                .contains("deployment.environment.name")
+        );
+        assert!(environment.definition.contains("deployment.environment']"));
+
+        let pod = LOG_COLUMN_OPTIMIZATIONS
+            .iter()
+            .find(|column| column.name == "mat_k8s_pod")
+            .expect("mat_k8s_pod optimization");
+        assert_eq!(pod.expected_type, "String");
+        assert!(pod.definition.starts_with("String MATERIALIZED"));
+        assert!(fresh_schema.contains("`mat_k8s_pod` String MATERIALIZED"));
+    }
+
+    #[test]
+    fn fresh_logs_schema_has_the_lightweight_service_projection() {
+        let fresh_schema = MIGRATIONS
+            .iter()
+            .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS observability.logs"))
+            .expect("logs CREATE TABLE migration");
+
+        assert!(fresh_schema.contains("PROJECTION idx_logs_by_service"));
+        assert!(fresh_schema.contains("SELECT tenant_id, ServiceName, Timestamp, _part_offset"));
+        assert!(fresh_schema.contains("ORDER BY (tenant_id, ServiceName, Timestamp)"));
+        assert!(LOG_SERVICE_PROJECTION_DDL.contains(LOG_SERVICE_PROJECTION_NAME));
+        assert!(LOG_SERVICE_PROJECTION_DDL.contains("_part_offset"));
+    }
+
+    #[test]
+    fn substring_index_uses_the_benchmarked_granularity() {
+        assert_eq!(LOG_BODY_NGRAM_INDEX_NAME, "idx_body_ngram_g4");
+        assert!(LOG_BODY_NGRAM_INDEX_DDL.contains("ngrambf_v1(4, 32768, 3, 0)"));
+        assert!(LOG_BODY_NGRAM_INDEX_DDL.contains("GRANULARITY 4"));
+        assert!(!LOG_BODY_NGRAM_INDEX_DDL.contains("GRANULARITY 1"));
+        assert!(LEGACY_LOG_BODY_NGRAM_INDEXES.contains(&"idx_body_ngram"));
+    }
 
     #[test]
     fn policy_table_set_covers_all_tenant_telemetry_stores() {
