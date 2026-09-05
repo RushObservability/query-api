@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationChannel {
@@ -70,6 +71,34 @@ pub struct NotificationLogEntry {
     pub error: String,
     pub created_at: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertRoute {
+    pub id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub priorities: Vec<i64>,
+    pub tag_matchers: BTreeMap<String, String>,
+    pub channel_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateAlertRouteRequest {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub priorities: Vec<i64>,
+    #[serde(default)]
+    pub tag_matchers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+}
+
+pub type UpdateAlertRouteRequest = CreateAlertRouteRequest;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateChannelRequest {

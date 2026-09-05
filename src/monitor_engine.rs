@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -6,6 +6,7 @@ use clickhouse::Client;
 
 use crate::alert_engine;
 use crate::clickhouse_config::ConfigDb;
+use crate::models::alert::AlertRoute;
 use crate::models::monitor::{ApmQueryConfig, LogQueryConfig, MetricQueryConfig, Monitor};
 use crate::promql;
 
@@ -557,7 +558,59 @@ async fn handle_no_data(
     }
 }
 
-/// Fire notifications to all configured channels for a monitor.
+fn monitor_tag_map(tags_json: &str) -> BTreeMap<String, String> {
+    let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+    tags.into_iter()
+        .filter_map(|tag| {
+            let pair = tag.split_once(':').or_else(|| tag.split_once('='))?;
+            let key = pair.0.trim();
+            let value = pair.1.trim();
+            (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn alert_route_matches(
+    priority: Option<i64>,
+    tags: &BTreeMap<String, String>,
+    route: &AlertRoute,
+) -> bool {
+    if !route.enabled {
+        return false;
+    }
+    if !route.priorities.is_empty()
+        && !priority.is_some_and(|priority| route.priorities.contains(&priority))
+    {
+        return false;
+    }
+    route
+        .tag_matchers
+        .iter()
+        .all(|(key, value)| tags.get(key) == Some(value))
+}
+
+fn resolve_notification_channel_ids(
+    direct_channels_json: &str,
+    priority: Option<i64>,
+    tags_json: &str,
+    routes: &[AlertRoute],
+) -> Vec<String> {
+    let direct: Vec<String> = serde_json::from_str(direct_channels_json).unwrap_or_default();
+    let tags = monitor_tag_map(tags_json);
+    let mut seen = HashSet::new();
+    direct
+        .into_iter()
+        .chain(
+            routes
+                .iter()
+                .filter(|route| alert_route_matches(priority, &tags, route))
+                .flat_map(|route| route.channel_ids.iter().cloned()),
+        )
+        .filter(|channel_id| seen.insert(channel_id.clone()))
+        .collect()
+}
+
+/// Fire notifications to direct channels and every matching alert route.
 async fn fire_notifications(
     config_db: &ConfigDb,
     monitor: &Monitor,
@@ -570,11 +623,27 @@ async fn fire_notifications(
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
 ) {
-    let channel_ids: Vec<String> =
-        serde_json::from_str(&monitor.notification_channels).unwrap_or_default();
+    let routes = match config_db.list_alert_routes(&monitor.tenant_id).await {
+        Ok(routes) => routes,
+        Err(error) => {
+            tracing::warn!(
+                engine = "monitors",
+                monitor_id = %monitor.id,
+                error = %error,
+                "failed to load alert routes; sending to direct channels only"
+            );
+            Vec::new()
+        }
+    };
+    let channel_ids = resolve_notification_channel_ids(
+        &monitor.notification_channels,
+        monitor.priority,
+        &monitor.tags,
+        &routes,
+    );
 
     for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
+        if let Ok(Some(channel)) = config_db.get_channel(channel_id, &monitor.tenant_id).await {
             if !channel.enabled {
                 continue;
             }
@@ -1703,6 +1772,74 @@ async fn build_preview_series_promql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route(
+        id: &str,
+        priorities: Vec<i64>,
+        tag_matchers: &[(&str, &str)],
+        channel_ids: &[&str],
+    ) -> AlertRoute {
+        AlertRoute {
+            id: id.to_string(),
+            tenant_id: "default".to_string(),
+            name: id.to_string(),
+            enabled: true,
+            priorities,
+            tag_matchers: tag_matchers
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            channel_ids: channel_ids.iter().map(|id| id.to_string()).collect(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn alert_routes_are_additive_and_match_priority_with_tags() {
+        let routes = vec![
+            route("all-p1", vec![1], &[], &["slack-one"]),
+            route(
+                "devops-p1-p2",
+                vec![1, 2],
+                &[("team", "devops")],
+                &["slack-two"],
+            ),
+        ];
+
+        assert_eq!(
+            resolve_notification_channel_ids("[]", Some(1), "[\"team:devops\"]", &routes),
+            vec!["slack-one", "slack-two"]
+        );
+        assert_eq!(
+            resolve_notification_channel_ids("[]", Some(2), "[\"team=devops\"]", &routes),
+            vec!["slack-two"]
+        );
+        assert_eq!(
+            resolve_notification_channel_ids("[]", Some(1), "[\"team:platform\"]", &routes),
+            vec!["slack-one"]
+        );
+    }
+
+    #[test]
+    fn alert_routes_keep_direct_channels_and_deduplicate_destinations() {
+        let mut route = route("all-p1", vec![1], &[], &["shared", "routed"]);
+        assert_eq!(
+            resolve_notification_channel_ids(
+                "[\"direct\",\"shared\"]",
+                Some(1),
+                "[]",
+                &[route.clone()],
+            ),
+            vec!["direct", "shared", "routed"]
+        );
+
+        route.enabled = false;
+        assert_eq!(
+            resolve_notification_channel_ids("[\"direct\"]", Some(1), "[]", &[route]),
+            vec!["direct"]
+        );
+    }
 
     #[test]
     fn test_evaluate_threshold_basic() {

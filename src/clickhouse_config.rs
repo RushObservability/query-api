@@ -2718,6 +2718,21 @@ impl ConfigDb {
                 is_deleted   UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            // ── Additive alert routing ────────────────────────────────────────────
+            "CREATE TABLE IF NOT EXISTS config_alert_routes (
+                id           String,
+                tenant_id    String DEFAULT 'default',
+                name         String,
+                enabled      UInt8 DEFAULT 1,
+                priorities   String DEFAULT '[]',
+                tag_matchers String DEFAULT '{}',
+                channel_ids  String DEFAULT '[]',
+                created_at   String DEFAULT toString(now()),
+                updated_at   String DEFAULT toString(now()),
+                version      UInt64,
+                is_deleted   UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (id)",
             // ── Notification log ──────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_notification_log (
                 id         String,
@@ -7811,6 +7826,126 @@ impl ConfigDb {
             .bind(id).bind(tenant_id).bind(&row.name).bind(&row.channel_type).bind(&row.config)
             .bind(if row.enabled { 1u8 } else { 0u8 }).bind(&now).bind(ver)
             .execute().await?;
+        Ok(true)
+    }
+
+    // ── Alert route operations ────────────────────────────────────────────────
+
+    pub async fn list_alert_routes(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<crate::models::alert::AlertRoute>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            tenant_id: String,
+            name: String,
+            enabled: u8,
+            priorities: String,
+            tag_matchers: String,
+            channel_ids: String,
+            created_at: String,
+            updated_at: String,
+        }
+
+        let rows = self
+            .client
+            .query("SELECT id, tenant_id, name, enabled, priorities, tag_matchers, channel_ids, created_at, updated_at FROM config_alert_routes FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY created_at ASC")
+            .bind(tenant_id)
+            .fetch_all::<Row>()
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::models::alert::AlertRoute {
+                id: row.id,
+                tenant_id: row.tenant_id,
+                name: row.name,
+                enabled: row.enabled != 0,
+                priorities: serde_json::from_str(&row.priorities).unwrap_or_default(),
+                tag_matchers: serde_json::from_str(&row.tag_matchers).unwrap_or_default(),
+                channel_ids: serde_json::from_str(&row.channel_ids).unwrap_or_default(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            })
+            .collect())
+    }
+
+    pub async fn get_alert_route(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<Option<crate::models::alert::AlertRoute>> {
+        Ok(self
+            .list_alert_routes(tenant_id)
+            .await?
+            .into_iter()
+            .find(|route| route.id == id))
+    }
+
+    pub async fn create_alert_route(
+        &self,
+        route: &crate::models::alert::AlertRoute,
+    ) -> anyhow::Result<()> {
+        let priorities = serde_json::to_string(&route.priorities)?;
+        let tag_matchers = serde_json::to_string(&route.tag_matchers)?;
+        let channel_ids = serde_json::to_string(&route.channel_ids)?;
+        let version = Self::next_version();
+        self.client
+            .query("INSERT INTO config_alert_routes (id, tenant_id, name, enabled, priorities, tag_matchers, channel_ids, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&route.id)
+            .bind(&route.tenant_id)
+            .bind(&route.name)
+            .bind(if route.enabled { 1u8 } else { 0u8 })
+            .bind(&priorities)
+            .bind(&tag_matchers)
+            .bind(&channel_ids)
+            .bind(&route.created_at)
+            .bind(&route.updated_at)
+            .bind(version)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_alert_route(
+        &self,
+        route: &crate::models::alert::AlertRoute,
+    ) -> anyhow::Result<bool> {
+        if self
+            .get_alert_route(&route.id, &route.tenant_id)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.create_alert_route(route).await?;
+        Ok(true)
+    }
+
+    pub async fn delete_alert_route(&self, id: &str, tenant_id: &str) -> anyhow::Result<bool> {
+        let Some(route) = self.get_alert_route(id, tenant_id).await? else {
+            return Ok(false);
+        };
+        let priorities = serde_json::to_string(&route.priorities)?;
+        let tag_matchers = serde_json::to_string(&route.tag_matchers)?;
+        let channel_ids = serde_json::to_string(&route.channel_ids)?;
+        let version = Self::next_version();
+        let now = Self::now_str();
+        self.client
+            .query("INSERT INTO config_alert_routes (id, tenant_id, name, enabled, priorities, tag_matchers, channel_ids, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(&route.id)
+            .bind(&route.tenant_id)
+            .bind(&route.name)
+            .bind(if route.enabled { 1u8 } else { 0u8 })
+            .bind(&priorities)
+            .bind(&tag_matchers)
+            .bind(&channel_ids)
+            .bind(&route.created_at)
+            .bind(&now)
+            .bind(version)
+            .execute()
+            .await?;
         Ok(true)
     }
 
