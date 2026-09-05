@@ -2843,6 +2843,16 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/notifications/log",
             get(handlers::alerts::list_notification_log),
         )
+        .route(
+            "/api/v1/alert-routes",
+            get(handlers::alerts::list_alert_routes)
+                .post(handlers::alerts::create_alert_route),
+        )
+        .route(
+            "/api/v1/alert-routes/{id}",
+            put(handlers::alerts::update_alert_route)
+                .delete(handlers::alerts::delete_alert_route),
+        )
         // Legacy alert-rules endpoints removed (system retired in favor of Monitors).
         // Trace Funnels
         .route(

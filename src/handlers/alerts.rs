@@ -10,6 +10,236 @@ use crate::TenantContext;
 use crate::handlers::users::{require_auth, require_write};
 use crate::models::alert::*;
 
+async fn normalize_alert_route(
+    state: &AppState,
+    tenant_id: &str,
+    mut req: CreateAlertRouteRequest,
+) -> Result<CreateAlertRouteRequest, (StatusCode, String)> {
+    req.name = req.name.trim().to_string();
+    if req.name.is_empty() || req.name.len() > 255 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "route name must be between 1 and 255 characters".to_string(),
+        ));
+    }
+
+    req.priorities.sort_unstable();
+    req.priorities.dedup();
+    if req
+        .priorities
+        .iter()
+        .any(|priority| !(1..=5).contains(priority))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "route priorities must be between P1 and P5".to_string(),
+        ));
+    }
+
+    if req.tag_matchers.len() > 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a route can have at most 32 tag matchers".to_string(),
+        ));
+    }
+    let mut tag_matchers = std::collections::BTreeMap::new();
+    for (key, value) in req.tag_matchers {
+        let key = key.trim().to_string();
+        let value = value.trim().to_string();
+        if key.is_empty() || value.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "route tag keys and values must not be empty".to_string(),
+            ));
+        }
+        if key.len() > 128 || value.len() > 255 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "route tag keys must be at most 128 characters and values at most 255".to_string(),
+            ));
+        }
+        tag_matchers.insert(key, value);
+    }
+    req.tag_matchers = tag_matchers;
+
+    let mut channel_ids = Vec::new();
+    for channel_id in req.channel_ids {
+        let channel_id = channel_id.trim().to_string();
+        if channel_id.is_empty() || channel_ids.contains(&channel_id) {
+            continue;
+        }
+        if state
+            .config_db
+            .get_channel(&channel_id, tenant_id)
+            .await
+            .map_err(|e| crate::api_error::internal_legacy("alert_routes", e))?
+            .is_none()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("notification channel does not exist: {channel_id}"),
+            ));
+        }
+        channel_ids.push(channel_id);
+    }
+    if channel_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "select at least one notification channel".to_string(),
+        ));
+    }
+    req.channel_ids = channel_ids;
+    Ok(req)
+}
+
+pub async fn list_alert_routes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_write(&state, &headers).await?;
+    let routes = state
+        .config_db
+        .list_alert_routes(&tenant.tenant_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("alert_routes", e))?;
+    Ok(Json(serde_json::json!({ "routes": routes })))
+}
+
+pub async fn create_alert_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
+    Json(req): Json<CreateAlertRouteRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_write(&state, &headers).await?;
+    let req = normalize_alert_route(&state, &tenant.tenant_id, req).await?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let route = AlertRoute {
+        id: uuid::Uuid::new_v4().to_string(),
+        tenant_id: tenant.tenant_id.clone(),
+        name: req.name,
+        enabled: req.enabled,
+        priorities: req.priorities,
+        tag_matchers: req.tag_matchers,
+        channel_ids: req.channel_ids,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    state
+        .config_db
+        .create_alert_route(&route)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("alert_routes", e))?;
+
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("alert_route.create", "user")
+                .actor(caller.0, caller.1)
+                .tenant(tenant.tenant_id)
+                .resource("alert_route", &route.id)
+                .changes(
+                    serde_json::json!({
+                        "name": route.name,
+                        "enabled": route.enabled,
+                        "priorities": route.priorities,
+                        "tag_matchers": route.tag_matchers,
+                        "channel_ids": route.channel_ids,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    Ok((StatusCode::CREATED, Json(route)))
+}
+
+pub async fn update_alert_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateAlertRouteRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_write(&state, &headers).await?;
+    let existing = state
+        .config_db
+        .get_alert_route(&id, &tenant.tenant_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("alert_routes", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "alert route not found".to_string()))?;
+    let req = normalize_alert_route(&state, &tenant.tenant_id, req).await?;
+    let route = AlertRoute {
+        id: id.clone(),
+        tenant_id: tenant.tenant_id.clone(),
+        name: req.name,
+        enabled: req.enabled,
+        priorities: req.priorities,
+        tag_matchers: req.tag_matchers,
+        channel_ids: req.channel_ids,
+        created_at: existing.created_at,
+        updated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    };
+    state
+        .config_db
+        .update_alert_route(&route)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("alert_routes", e))?;
+
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("alert_route.update", "user")
+                .actor(caller.0, caller.1)
+                .tenant(tenant.tenant_id)
+                .resource("alert_route", &id)
+                .changes(
+                    serde_json::json!({
+                        "name": route.name,
+                        "enabled": route.enabled,
+                        "priorities": route.priorities,
+                        "tag_matchers": route.tag_matchers,
+                        "channel_ids": route.channel_ids,
+                    })
+                    .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    Ok(Json(route))
+}
+
+pub async fn delete_alert_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_write(&state, &headers).await?;
+    let deleted = state
+        .config_db
+        .delete_alert_route(&id, &tenant.tenant_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("alert_routes", e))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "alert route not found".to_string()));
+    }
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("alert_route.delete", "user")
+                .actor(caller.0, caller.1)
+                .tenant(tenant.tenant_id)
+                .resource("alert_route", &id)
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_channels(
     State(state): State<AppState>,
     headers: HeaderMap,
