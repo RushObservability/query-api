@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -287,9 +287,18 @@ async fn evaluate_monitor(
                 _ => monitor.critical_recovery.or(monitor.critical),
             };
 
+            let alert_name = render_monitor_template(
+                &monitor.name,
+                &group_by,
+                group_key,
+                new_state,
+                *value,
+                threshold.unwrap_or(0.0),
+            );
+
             let event_msg = format!(
                 "Monitor '{}'{}: {} -> {} (value={:.4}, threshold={:.4})",
-                monitor.name,
+                alert_name,
                 if group_key.is_empty() {
                     String::new()
                 } else {
@@ -300,6 +309,18 @@ async fn evaluate_monitor(
                 value,
                 threshold.unwrap_or(0.0),
             );
+            let notification_message = if monitor.message.trim().is_empty() {
+                event_msg.clone()
+            } else {
+                render_monitor_template(
+                    &monitor.message,
+                    &group_by,
+                    group_key,
+                    new_state,
+                    *value,
+                    threshold.unwrap_or(0.0),
+                )
+            };
 
             let event_id = uuid::Uuid::new_v4().to_string();
             let _ = config_db
@@ -320,7 +341,8 @@ async fn evaluate_monitor(
             fire_notifications(
                 config_db,
                 monitor,
-                &event_msg,
+                &alert_name,
+                &notification_message,
                 new_state,
                 *value,
                 threshold.unwrap_or(0.0),
@@ -382,6 +404,35 @@ fn worst_state<'a>(states: impl Iterator<Item = &'a str>) -> &'a str {
     worst
 }
 
+fn threshold_matches(value: f64, threshold: f64, comparator: &str) -> bool {
+    match comparator {
+        "above" => value > threshold,
+        "above_or_equal" => value >= threshold,
+        "equal" => value == threshold,
+        "below_or_equal" => value <= threshold,
+        "below" => value < threshold,
+        _ => value > threshold,
+    }
+}
+
+fn threshold_has_recovered(
+    value: f64,
+    trigger_threshold: f64,
+    recovery_threshold: Option<f64>,
+    comparator: &str,
+) -> bool {
+    let boundary = recovery_threshold.unwrap_or(trigger_threshold);
+    match comparator {
+        "above" => value <= boundary,
+        "above_or_equal" => value < boundary,
+        "equal" if recovery_threshold.is_some() => value == boundary,
+        "equal" => value != trigger_threshold,
+        "below_or_equal" => value > boundary,
+        "below" => value >= boundary,
+        _ => value <= boundary,
+    }
+}
+
 /// Hysteresis-based threshold evaluation. Returns the new state string.
 fn evaluate_threshold(
     current_state: &str,
@@ -392,29 +443,15 @@ fn evaluate_threshold(
     warning_recovery: Option<f64>,
     comparator: &str,
 ) -> &'static str {
-    let exceeds = |val: f64, threshold: f64| -> bool {
-        match comparator {
-            "below" => val < threshold,
-            _ => val >= threshold, // "above" (default)
-        }
-    };
-
-    let below = |val: f64, threshold: f64| -> bool {
-        match comparator {
-            "below" => val >= threshold, // recovery means value went back above
-            _ => val < threshold,        // recovery means value went back below
-        }
-    };
-
     match current_state {
         "ok" | "no_data" => {
             if let Some(crit) = critical {
-                if exceeds(value, crit) {
+                if threshold_matches(value, crit, comparator) {
                     return "alert";
                 }
             }
             if let Some(warn) = warning {
-                if exceeds(value, warn) {
+                if threshold_matches(value, warn, comparator) {
                     return "warn";
                 }
             }
@@ -422,27 +459,23 @@ fn evaluate_threshold(
         }
         "warn" => {
             if let Some(crit) = critical {
-                if exceeds(value, crit) {
+                if threshold_matches(value, crit, comparator) {
                     return "alert";
                 }
             }
-            // Recovery from warning
-            let recovery_threshold = warning_recovery.or(warning);
-            if let Some(thresh) = recovery_threshold {
-                if below(value, thresh) {
+            if let Some(warn) = warning {
+                if threshold_has_recovered(value, warn, warning_recovery, comparator) {
                     return "ok";
                 }
             }
             "warn"
         }
         "alert" => {
-            // Recovery from alert
-            let recovery_threshold = critical_recovery.or(critical);
-            if let Some(thresh) = recovery_threshold {
-                if below(value, thresh) {
+            if let Some(crit) = critical {
+                if threshold_has_recovered(value, crit, critical_recovery, comparator) {
                     // Check if we should drop to warn or ok
                     if let Some(warn) = warning {
-                        if exceeds(value, warn) {
+                        if threshold_matches(value, warn, comparator) {
                             return "warn";
                         }
                     }
@@ -499,6 +532,7 @@ async fn handle_no_data(
             fire_notifications(
                 config_db,
                 monitor,
+                &monitor.name,
                 &event_msg,
                 new_state,
                 0.0,
@@ -527,6 +561,7 @@ async fn handle_no_data(
 async fn fire_notifications(
     config_db: &ConfigDb,
     monitor: &Monitor,
+    alert_name: &str,
     message: &str,
     alert_state: &str,
     value: f64,
@@ -546,7 +581,7 @@ async fn fire_notifications(
             let result = alert_engine::send_channel_notification(
                 &channel,
                 message,
-                &monitor.name,
+                alert_name,
                 alert_state,
                 value,
                 threshold,
@@ -580,7 +615,7 @@ async fn fire_notifications(
                     channel_id,
                     &monitor.tenant_id,
                     "monitor",
-                    &monitor.name,
+                    alert_name,
                     alert_state,
                     status,
                     &error_msg,
@@ -666,6 +701,7 @@ async fn evaluate_composite(
         fire_notifications(
             config_db,
             monitor,
+            &monitor.name,
             &event_msg,
             new_state,
             0.0,
@@ -725,6 +761,65 @@ fn eval_boolean_formula(formula: &str, states: &HashMap<char, bool>) -> bool {
 /// Escape a string value for safe use in a ClickHouse SQL literal.
 fn escape_ch(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+pub(crate) fn apm_match_condition(column: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value == "*" {
+        return None;
+    }
+
+    let escaped = escape_ch(value);
+    if value.contains('*') {
+        let pattern = escaped
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('*', "%");
+        Some(format!("{column} LIKE '{pattern}'"))
+    } else {
+        Some(format!("{column} = '{escaped}'"))
+    }
+}
+
+fn render_monitor_template(
+    template: &str,
+    group_by: &[String],
+    group_key: &str,
+    state: &str,
+    value: f64,
+    threshold: f64,
+) -> String {
+    let mut rendered = template
+        .replace("{{group}}", group_key)
+        .replace("{{state}}", state)
+        .replace("{{value}}", &format_template_number(value))
+        .replace("{{threshold}}", &format_template_number(threshold));
+
+    if !group_by.is_empty() {
+        for (field, field_value) in group_by.iter().zip(group_key.splitn(group_by.len(), ':')) {
+            let aliases: &[&str] = match field.as_str() {
+                "service" | "service_name" => &["service", "service_name"],
+                "endpoint" | "http_path" => &["endpoint", "http_path"],
+                "method" | "http_method" => &["method", "http_method"],
+                "status_code" | "http_status_code" => &["status_code", "http_status_code"],
+                _ => &[],
+            };
+            rendered = rendered.replace(&format!("{{{{{field}}}}}"), field_value);
+            for alias in aliases {
+                rendered = rendered.replace(&format!("{{{{{alias}}}}}"), field_value);
+            }
+        }
+    }
+
+    rendered
+}
+
+fn format_template_number(value: f64) -> String {
+    let formatted = format!("{value:.4}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 const MAX_GROUP_BY_FIELDS: usize = 5;
@@ -1100,49 +1195,25 @@ async fn query_apm(
 
     let mut conditions = vec![
         format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
-        format!("service_name = '{}'", escape_ch(&cfg.service)),
         format!(
             "timestamp >= now() - INTERVAL {} SECOND",
             monitor.eval_window_secs
         ),
     ];
 
+    if let Some(condition) = apm_match_condition("service_name", &cfg.service) {
+        conditions.push(condition);
+    }
+
     if let Some(ref ep) = cfg.endpoint_filter {
-        if !ep.is_empty() {
-            conditions.push(format!("http_path = '{}'", escape_ch(ep),));
+        if let Some(condition) = apm_match_condition("http_path", ep) {
+            conditions.push(condition);
         }
     }
 
     let where_clause = conditions.join(" AND ");
 
-    let agg_expr = match cfg.metric.as_str() {
-        "error_rate" => {
-            "countIf(status = 'ERROR' OR JSONExtractInt(attributes, 'http_status_code') >= 500) \
-             * 100.0 / count()"
-        }
-        "error_count" => {
-            "countIf(status = 'ERROR' OR JSONExtractInt(attributes, 'http_status_code') >= 500)"
-        }
-        "request_rate" => {
-            // requests per second over the evaluation window
-            &format!("count() / {}", monitor.eval_window_secs)
-        }
-        "p50_latency" | "p50" => "quantile(0.50)(duration_ns) / 1000000",
-        "p75_latency" | "p75" => "quantile(0.75)(duration_ns) / 1000000",
-        "p90_latency" | "p90" => "quantile(0.90)(duration_ns) / 1000000",
-        "p95_latency" | "p95" => "quantile(0.95)(duration_ns) / 1000000",
-        "p99_latency" | "p99" => "quantile(0.99)(duration_ns) / 1000000",
-        _ => "count()",
-    };
-
-    // Handle request_rate specially since it uses a runtime-computed string
-    let agg_str;
-    let agg = if cfg.metric == "request_rate" {
-        agg_str = format!("count() * 1.0 / {}", monitor.eval_window_secs);
-        &agg_str
-    } else {
-        agg_expr
-    };
+    let agg = apm_aggregation(&cfg.metric, monitor.eval_window_secs);
 
     if !group_by.is_empty() {
         let group_expr = group_expression(group_by, apm_group_expr)?;
@@ -1167,6 +1238,25 @@ async fn query_apm(
     }
 }
 
+const APM_ERROR_CONDITION: &str =
+    "status IN ('ERROR', 'STATUS_CODE_ERROR') OR http_status_code >= 500";
+
+fn apm_aggregation(metric: &str, rate_window_secs: i64) -> String {
+    match metric {
+        "error_rate" => {
+            format!("if(count() = 0, 0.0, countIf({APM_ERROR_CONDITION}) * 100.0 / count())")
+        }
+        "error_count" => format!("countIf({APM_ERROR_CONDITION})"),
+        "request_rate" => format!("count() * 1.0 / {rate_window_secs}"),
+        "p50_latency" | "p50" => "quantile(0.50)(duration_ns) / 1000000".to_string(),
+        "p75_latency" | "p75" => "quantile(0.75)(duration_ns) / 1000000".to_string(),
+        "p90_latency" | "p90" => "quantile(0.90)(duration_ns) / 1000000".to_string(),
+        "p95_latency" | "p95" => "quantile(0.95)(duration_ns) / 1000000".to_string(),
+        "p99_latency" | "p99" => "quantile(0.99)(duration_ns) / 1000000".to_string(),
+        _ => "count()".to_string(),
+    }
+}
+
 /// Execute a monitor query and return current value + time series for preview.
 /// This is used by the /monitors/preview endpoint in the creation wizard.
 pub async fn preview_query(
@@ -1175,7 +1265,9 @@ pub async fn preview_query(
     monitor_type: &str,
     query_config: &serde_json::Value,
     eval_window_secs: i64,
+    lookback_secs: i64,
     group_by: &[String],
+    conditions: PreviewConditions,
 ) -> anyhow::Result<PreviewResult> {
     // Build a temporary Monitor struct for the query functions
     let temp_monitor = Monitor {
@@ -1184,11 +1276,11 @@ pub async fn preview_query(
         name: String::new(),
         monitor_type: monitor_type.to_string(),
         query_config: serde_json::to_string(query_config)?,
-        critical: None,
-        critical_recovery: None,
-        warning: None,
-        warning_recovery: None,
-        comparator: "above".to_string(),
+        critical: conditions.critical,
+        critical_recovery: conditions.critical_recovery,
+        warning: conditions.warning,
+        warning_recovery: conditions.warning_recovery,
+        comparator: conditions.comparator.clone(),
         eval_window_secs,
         eval_interval_secs: 60,
         group_by: serde_json::to_string(group_by)?,
@@ -1221,14 +1313,31 @@ pub async fn preview_query(
 
     let current_value = results.first().map(|(_, v)| *v);
 
-    // Build a simple time series by querying multiple sub-windows
-    let timeseries = build_preview_timeseries(ch, &temp_monitor, eval_window_secs).await;
+    let (series, bucket_secs) =
+        build_preview_series(ch, &temp_monitor, lookback_secs, group_by).await;
+    let timeseries = series
+        .first()
+        .map(|item| item.points.clone())
+        .unwrap_or_default();
+    let simulated_events = simulate_preview_events(&series, &conditions);
 
     Ok(PreviewResult {
         current_value,
         groups: results,
         timeseries,
+        series,
+        simulated_events,
+        bucket_secs,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewConditions {
+    pub critical: Option<f64>,
+    pub critical_recovery: Option<f64>,
+    pub warning: Option<f64>,
+    pub warning_recovery: Option<f64>,
+    pub comparator: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1236,28 +1345,105 @@ pub struct PreviewResult {
     pub current_value: Option<f64>,
     pub groups: Vec<(String, f64)>,
     pub timeseries: Vec<TimeseriesPoint>,
+    pub series: Vec<PreviewSeries>,
+    pub simulated_events: Vec<SimulatedMonitorEvent>,
+    pub bucket_secs: i64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TimeseriesPoint {
     pub timestamp: String,
     pub value: f64,
 }
 
-/// Build a simple timeseries for preview by splitting the window into ~10 buckets.
-async fn build_preview_timeseries(
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PreviewSeries {
+    pub group_key: String,
+    pub points: Vec<TimeseriesPoint>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct SimulatedMonitorEvent {
+    pub timestamp: String,
+    pub group_key: String,
+    pub previous_state: String,
+    pub state: String,
+    pub value: f64,
+    pub threshold: Option<f64>,
+}
+
+const MAX_PREVIEW_POINTS_PER_SERIES: i64 = 720;
+const MAX_PREVIEW_SERIES: usize = 50;
+const MAX_SIMULATED_EVENTS: usize = 1_000;
+
+fn preview_bucket_secs(eval_window_secs: i64, lookback_secs: i64) -> i64 {
+    let capped_point_width =
+        (lookback_secs + MAX_PREVIEW_POINTS_PER_SERIES - 1) / MAX_PREVIEW_POINTS_PER_SERIES;
+    eval_window_secs.max(capped_point_width).max(60)
+}
+
+fn simulate_preview_events(
+    series: &[PreviewSeries],
+    conditions: &PreviewConditions,
+) -> Vec<SimulatedMonitorEvent> {
+    if conditions.critical.is_none() && conditions.warning.is_none() {
+        return vec![];
+    }
+
+    let mut events = Vec::new();
+    for item in series {
+        let mut state = "ok";
+        for point in &item.points {
+            let next_state = evaluate_threshold(
+                state,
+                point.value,
+                conditions.critical,
+                conditions.critical_recovery,
+                conditions.warning,
+                conditions.warning_recovery,
+                &conditions.comparator,
+            );
+            if next_state == state {
+                continue;
+            }
+
+            let threshold = match next_state {
+                "alert" => conditions.critical,
+                "warn" => conditions.warning,
+                "ok" if state == "alert" => conditions.critical_recovery.or(conditions.critical),
+                "ok" => conditions.warning_recovery.or(conditions.warning),
+                _ => None,
+            };
+            events.push(SimulatedMonitorEvent {
+                timestamp: point.timestamp.clone(),
+                group_key: item.group_key.clone(),
+                previous_state: state.to_string(),
+                state: next_state.to_string(),
+                value: point.value,
+                threshold,
+            });
+            state = next_state;
+        }
+    }
+    events.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    events.truncate(MAX_SIMULATED_EVENTS);
+    events
+}
+
+/// Build historical evaluation buckets for the chart and alert backtest.
+async fn build_preview_series(
     ch: &Client,
     monitor: &Monitor,
-    window_secs: i64,
-) -> Vec<TimeseriesPoint> {
-    let bucket_count = 10i64;
-    let bucket_secs = (window_secs / bucket_count).max(1);
+    lookback_secs: i64,
+    group_by: &[String],
+) -> (Vec<PreviewSeries>, i64) {
+    let bucket_secs = preview_bucket_secs(monitor.eval_window_secs, lookback_secs);
 
     // Check if this is an expression-based metric (PromQL)
     if monitor.monitor_type == "metric" {
         let config_value: serde_json::Value = match serde_json::from_str(&monitor.query_config) {
             Ok(v) => v,
-            Err(_) => return vec![],
+            Err(_) => return (vec![], bucket_secs),
         };
         let expr = config_value
             .get("expr")
@@ -1265,8 +1451,17 @@ async fn build_preview_timeseries(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if !expr.trim().is_empty() {
-            return build_preview_timeseries_promql(ch, expr, &monitor.tenant_id, window_secs)
-                .await;
+            return (
+                build_preview_series_promql(
+                    ch,
+                    expr,
+                    &monitor.tenant_id,
+                    lookback_secs,
+                    bucket_secs,
+                )
+                .await,
+                bucket_secs,
+            );
         }
     }
 
@@ -1275,7 +1470,7 @@ async fn build_preview_timeseries(
         "metric" => {
             let cfg: MetricQueryConfig = match serde_json::from_str(&monitor.query_config) {
                 Ok(c) => c,
-                Err(_) => return vec![],
+                Err(_) => return (vec![], bucket_secs),
             };
             let agg = match cfg.aggregation.as_str() {
                 "sum" => "sum(Value)",
@@ -1304,7 +1499,7 @@ async fn build_preview_timeseries(
         "log" => {
             let cfg: LogQueryConfig = match serde_json::from_str(&monitor.query_config) {
                 Ok(c) => c,
-                Err(_) => return vec![],
+                Err(_) => return (vec![], bucket_secs),
             };
             let mut conds = vec![format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id))];
             if !cfg.search.is_empty() {
@@ -1335,7 +1530,7 @@ async fn build_preview_timeseries(
                         field = %f.field,
                         "rejecting unsupported log filter field in preview"
                     );
-                    return vec![];
+                    return (vec![], bucket_secs);
                 };
                 let value = escape_ch(&f.value);
                 match f.op.as_str() {
@@ -1348,7 +1543,7 @@ async fn build_preview_timeseries(
                             operator = %f.op,
                             "rejecting unsupported log filter operator in preview"
                         );
-                        return vec![];
+                        return (vec![], bucket_secs);
                     }
                 }
             }
@@ -1361,31 +1556,21 @@ async fn build_preview_timeseries(
         "apm" => {
             let cfg: ApmQueryConfig = match serde_json::from_str(&monitor.query_config) {
                 Ok(c) => c,
-                Err(_) => return vec![],
+                Err(_) => return (vec![], bucket_secs),
             };
-            let mut conds = vec![
-                format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
-                format!("service_name = '{}'", escape_ch(&cfg.service)),
-            ];
+            let mut conds = vec![format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id))];
+            if let Some(condition) = apm_match_condition("service_name", &cfg.service) {
+                conds.push(condition);
+            }
             if let Some(ref ep) = cfg.endpoint_filter {
-                if !ep.is_empty() {
-                    conds.push(format!("http_path = '{}'", escape_ch(ep)));
+                if let Some(condition) = apm_match_condition("http_path", ep) {
+                    conds.push(condition);
                 }
             }
-            let agg = match cfg.metric.as_str() {
-                "error_rate" => "countIf(status = 'ERROR' OR JSONExtractInt(attributes, 'http_status_code') >= 500) * 100.0 / count()".to_string(),
-                "error_count" => "countIf(status = 'ERROR' OR JSONExtractInt(attributes, 'http_status_code') >= 500)".to_string(),
-                "request_rate" => format!("count() * 1.0 / {}", bucket_secs),
-                "p50_latency" | "p50" => "quantile(0.50)(duration_ns) / 1000000".to_string(),
-                "p75_latency" | "p75" => "quantile(0.75)(duration_ns) / 1000000".to_string(),
-                "p90_latency" | "p90" => "quantile(0.90)(duration_ns) / 1000000".to_string(),
-                "p95_latency" | "p95" => "quantile(0.95)(duration_ns) / 1000000".to_string(),
-                "p99_latency" | "p99" => "quantile(0.99)(duration_ns) / 1000000".to_string(),
-                _ => "count()".to_string(),
-            };
+            let agg = apm_aggregation(&cfg.metric, bucket_secs);
             ("spans".to_string(), agg, conds.join(" AND "))
         }
-        _ => return vec![],
+        _ => return (vec![], bucket_secs),
     };
 
     let time_col = match table.as_str() {
@@ -1394,67 +1579,120 @@ async fn build_preview_timeseries(
         _ => "timestamp",
     };
 
+    let group_expr = match monitor.monitor_type.as_str() {
+        "metric" => {
+            if group_by.iter().any(|field| !is_valid_metric_label(field)) {
+                return (vec![], bucket_secs);
+            }
+            let expressions = group_by
+                .iter()
+                .map(|field| format!("toString(ResourceAttributes['{}'])", escape_ch(field)))
+                .collect::<Vec<_>>();
+            if expressions.is_empty() {
+                "''".to_string()
+            } else {
+                expressions.join(" || ':' || ")
+            }
+        }
+        "log" => match group_expression(group_by, log_field_expr) {
+            Ok(expression) => expression,
+            Err(_) => return (vec![], bucket_secs),
+        },
+        "apm" => match group_expression(group_by, apm_group_expr) {
+            Ok(expression) => expression,
+            Err(_) => return (vec![], bucket_secs),
+        },
+        _ => "''".to_string(),
+    };
+
     let sql = format!(
         "SELECT toString(toStartOfInterval({time_col}, INTERVAL {bucket_secs} SECOND)) AS ts, \
-         {agg_expr} AS value \
+         ({group_expr}) AS group_key, {agg_expr} AS value \
          FROM {table} \
-         WHERE {extra_conditions} AND {time_col} >= now() - INTERVAL {window_secs} SECOND \
-         GROUP BY ts ORDER BY ts"
+         WHERE {extra_conditions} AND {time_col} >= now() - INTERVAL {lookback_secs} SECOND \
+         GROUP BY ts, group_key ORDER BY ts, group_key LIMIT 10000"
     );
 
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct TsRow {
         ts: String,
+        group_key: String,
         value: f64,
     }
 
     match crate::tenant_query(ch, &sql, &monitor.tenant_id)
+        .with_option("max_execution_time", "30")
         .fetch_all::<TsRow>()
         .await
     {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|r| TimeseriesPoint {
-                timestamp: r.ts,
-                value: r.value,
-            })
-            .collect(),
+        Ok(rows) => {
+            let mut grouped = BTreeMap::<String, Vec<TimeseriesPoint>>::new();
+            for row in rows {
+                if !grouped.contains_key(&row.group_key) && grouped.len() >= MAX_PREVIEW_SERIES {
+                    continue;
+                }
+                grouped
+                    .entry(row.group_key)
+                    .or_default()
+                    .push(TimeseriesPoint {
+                        timestamp: row.ts,
+                        value: row.value,
+                    });
+            }
+            (
+                grouped
+                    .into_iter()
+                    .map(|(group_key, points)| PreviewSeries { group_key, points })
+                    .collect(),
+                bucket_secs,
+            )
+        }
         Err(e) => {
             tracing::debug!(engine = "monitors", error = %e, "preview timeseries query failed");
-            vec![]
+            (vec![], bucket_secs)
         }
     }
 }
 
-/// Build a timeseries for preview using the PromQL range query evaluator.
-async fn build_preview_timeseries_promql(
+/// Build preview series using the PromQL range query evaluator.
+async fn build_preview_series_promql(
     ch: &Client,
     expr: &str,
     tenant_id: &str,
-    window_secs: i64,
-) -> Vec<TimeseriesPoint> {
+    lookback_secs: i64,
+    bucket_secs: i64,
+) -> Vec<PreviewSeries> {
     let now = chrono::Utc::now().timestamp() as f64;
-    let start = now - window_secs as f64;
-    let step = (window_secs as f64 / 10.0).max(1.0);
+    let start = now - lookback_secs as f64;
+    let step = bucket_secs as f64;
 
     match promql::evaluate_range_query(ch, expr, start, now, step, tenant_id).await {
-        Ok(series) => {
-            // Take the first series and convert its samples to TimeseriesPoints
-            if let Some(ts) = series.first() {
-                ts.samples
+        Ok(series) => series
+            .into_iter()
+            .take(MAX_PREVIEW_SERIES)
+            .map(|item| {
+                let group_key = item
+                    .labels
                     .iter()
-                    .map(|(t, v)| {
-                        let dt = chrono::DateTime::from_timestamp(*t as i64, 0).unwrap_or_default();
+                    .filter(|(key, _)| key.as_str() != "__name__")
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let points = item
+                    .samples
+                    .into_iter()
+                    .map(|(timestamp, value)| {
+                        let datetime = chrono::DateTime::from_timestamp(timestamp as i64, 0)
+                            .unwrap_or_default();
                         TimeseriesPoint {
-                            timestamp: dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                            value: *v,
+                            timestamp: datetime.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            value,
                         }
                     })
-                    .collect()
-            } else {
-                vec![]
-            }
-        }
+                    .collect();
+                PreviewSeries { group_key, points }
+            })
+            .collect(),
         Err(e) => {
             tracing::debug!(engine = "monitors", error = %e, "preview promql timeseries failed");
             vec![]
@@ -1539,6 +1777,149 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_threshold_strict_inclusive_and_equal_boundaries() {
+        assert_eq!(
+            evaluate_threshold("ok", 1.0, Some(1.0), None, None, None, "above"),
+            "ok"
+        );
+        assert_eq!(
+            evaluate_threshold("ok", 1.0, Some(1.0), None, None, None, "above_or_equal"),
+            "alert"
+        );
+        assert_eq!(
+            evaluate_threshold("ok", 1.0, Some(1.0), None, None, None, "below"),
+            "ok"
+        );
+        assert_eq!(
+            evaluate_threshold("ok", 1.0, Some(1.0), None, None, None, "below_or_equal"),
+            "alert"
+        );
+        assert_eq!(
+            evaluate_threshold("ok", 0.0, Some(0.0), None, None, None, "equal"),
+            "alert"
+        );
+        assert_eq!(
+            evaluate_threshold("ok", 1.0, Some(0.0), None, None, None, "equal"),
+            "ok"
+        );
+        assert_eq!(
+            evaluate_threshold("alert", 1.0, Some(0.0), None, None, None, "equal"),
+            "ok"
+        );
+        assert_eq!(
+            evaluate_threshold("alert", 1.0, Some(0.0), Some(1.0), None, None, "equal"),
+            "ok"
+        );
+        assert_eq!(
+            evaluate_threshold("alert", 2.0, Some(0.0), Some(1.0), None, None, "equal"),
+            "alert"
+        );
+    }
+
+    #[test]
+    fn preview_backtest_records_alert_warning_and_recovery_transitions() {
+        let series = vec![PreviewSeries {
+            group_key: "gateway:/checkout".to_string(),
+            points: vec![
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:00:00".to_string(),
+                    value: 100.0,
+                },
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:05:00".to_string(),
+                    value: 350.0,
+                },
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:10:00".to_string(),
+                    value: 550.0,
+                },
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:15:00".to_string(),
+                    value: 350.0,
+                },
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:20:00".to_string(),
+                    value: 150.0,
+                },
+            ],
+        }];
+        let conditions = PreviewConditions {
+            critical: Some(500.0),
+            critical_recovery: Some(400.0),
+            warning: Some(300.0),
+            warning_recovery: Some(200.0),
+            comparator: "above".to_string(),
+        };
+
+        let events = simulate_preview_events(&series, &conditions);
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            (events[0].previous_state.as_str(), events[0].state.as_str()),
+            ("warn", "ok")
+        );
+        assert_eq!(
+            (events[1].previous_state.as_str(), events[1].state.as_str()),
+            ("alert", "warn")
+        );
+        assert_eq!(
+            (events[2].previous_state.as_str(), events[2].state.as_str()),
+            ("warn", "alert")
+        );
+        assert_eq!(
+            (events[3].previous_state.as_str(), events[3].state.as_str()),
+            ("ok", "warn")
+        );
+        assert_eq!(events[0].threshold, Some(200.0));
+        assert_eq!(events[0].group_key, "gateway:/checkout");
+        assert!(events[0].timestamp > events[1].timestamp);
+    }
+
+    #[test]
+    fn preview_backtest_supports_below_thresholds() {
+        let series = vec![PreviewSeries {
+            group_key: String::new(),
+            points: vec![
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:00:00".to_string(),
+                    value: 99.0,
+                },
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:05:00".to_string(),
+                    value: 10.0,
+                },
+                TimeseriesPoint {
+                    timestamp: "2026-09-04 10:10:00".to_string(),
+                    value: 30.0,
+                },
+            ],
+        }];
+        let conditions = PreviewConditions {
+            critical: Some(20.0),
+            critical_recovery: Some(25.0),
+            warning: None,
+            warning_recovery: None,
+            comparator: "below".to_string(),
+        };
+
+        let events = simulate_preview_events(&series, &conditions);
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.state.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ok", "alert"]
+        );
+    }
+
+    #[test]
+    fn preview_buckets_follow_the_evaluation_window_and_cap_long_ranges() {
+        assert_eq!(preview_bucket_secs(300, 43_200), 300);
+        assert_eq!(preview_bucket_secs(60, 604_800), 840);
+    }
+
+    #[test]
     fn test_eval_boolean_formula() {
         let mut states = HashMap::new();
         states.insert('A', true);
@@ -1586,6 +1967,47 @@ mod tests {
         assert_eq!(apm_group_expr("http_status_code"), Some("http_status_code"));
         assert_eq!(apm_group_expr("tenant_id"), None);
         assert_eq!(apm_group_expr("http_path, sleep(10)"), None);
+    }
+
+    #[test]
+    fn apm_error_aggregations_use_the_typed_span_fields() {
+        let rate = apm_aggregation("error_rate", 300);
+        let count = apm_aggregation("error_count", 300);
+
+        for expression in [&rate, &count] {
+            assert!(expression.contains("http_status_code >= 500"));
+            assert!(expression.contains("STATUS_CODE_ERROR"));
+            assert!(!expression.contains("JSONExtract"));
+        }
+        assert!(rate.contains("* 100.0 / count()"));
+    }
+
+    #[test]
+    fn apm_wildcards_build_safe_match_conditions() {
+        assert_eq!(apm_match_condition("service_name", "*"), None);
+        assert_eq!(
+            apm_match_condition("service_name", "checkout-*"),
+            Some("service_name LIKE 'checkout-%'".to_string())
+        );
+        assert_eq!(
+            apm_match_condition("service_name", "api_gateway"),
+            Some("service_name = 'api_gateway'".to_string())
+        );
+    }
+
+    #[test]
+    fn monitor_templates_include_group_values() {
+        let fields = vec!["service_name".to_string(), "endpoint".to_string()];
+        let rendered = render_monitor_template(
+            "{{service}} {{endpoint}} is {{state}} at {{value}} over {{threshold}}",
+            &fields,
+            "checkout:/api/orders",
+            "alert",
+            512.25,
+            500.0,
+        );
+
+        assert_eq!(rendered, "checkout /api/orders is alert at 512.25 over 500");
     }
 
     #[test]

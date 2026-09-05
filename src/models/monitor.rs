@@ -234,8 +234,20 @@ pub struct PreviewMonitorRequest {
     pub query_config: serde_json::Value,
     #[serde(default = "default_eval_window")]
     pub eval_window_secs: i64,
+    #[serde(default = "default_preview_lookback")]
+    pub lookback_secs: i64,
     #[serde(default = "default_empty_array")]
     pub group_by: serde_json::Value,
+    #[serde(default)]
+    pub critical: Option<f64>,
+    #[serde(default)]
+    pub critical_recovery: Option<f64>,
+    #[serde(default)]
+    pub warning: Option<f64>,
+    #[serde(default)]
+    pub warning_recovery: Option<f64>,
+    #[serde(default = "default_comparator")]
+    pub comparator: String,
 }
 
 // ── Query config structs (deserialized from the JSON blob) ──
@@ -295,6 +307,10 @@ fn default_comparator() -> String {
 
 fn default_eval_window() -> i64 {
     300
+}
+
+fn default_preview_lookback() -> i64 {
+    10_800
 }
 
 fn default_eval_interval() -> i64 {

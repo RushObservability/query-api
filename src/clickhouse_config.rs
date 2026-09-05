@@ -1903,6 +1903,18 @@ pub struct MonitorRow {
     pub updated_at: String,
 }
 
+const SLO_INSERT_SQL: &str = "INSERT INTO config_slos (id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)";
+
+#[cfg(test)]
+mod sql_shape_tests {
+    use super::SLO_INSERT_SQL;
+
+    #[test]
+    fn slo_insert_has_one_placeholder_for_every_bound_column() {
+        assert_eq!(SLO_INSERT_SQL.matches('?').count(), 27);
+    }
+}
+
 pub struct ConfigDb {
     pub client: Client,
     /// Tenant name-or-id → flags. Negative results are cached too so unknown
@@ -8369,16 +8381,36 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_slos (id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(&existing.tenant_id).bind(name).bind(description).bind(if enabled { 1u8 } else { 0u8 })
-            .bind(slo_type).bind(indicator_type).bind(service_name).bind(metric_name)
-            .bind(window_type).bind(target_percentage).bind(threshold_ms).bind(threshold_value)
-            .bind(threshold_op.unwrap_or("")).bind(error_filters).bind(total_filters)
-            .bind(eval_interval_secs).bind(notification_channel_ids)
-            .bind(&existing.state).bind(existing.error_budget_remaining).bind(existing.error_count).bind(existing.total_count)
-            .bind(existing.last_eval_at.unwrap_or_default()).bind(existing.last_breached_at.unwrap_or_default())
-            .bind(&existing.created_at).bind(&now).bind(ver)
-            .execute().await?;
+            .query(SLO_INSERT_SQL)
+            .bind(id)
+            .bind(&existing.tenant_id)
+            .bind(name)
+            .bind(description)
+            .bind(if enabled { 1u8 } else { 0u8 })
+            .bind(slo_type)
+            .bind(indicator_type)
+            .bind(service_name)
+            .bind(metric_name)
+            .bind(window_type)
+            .bind(target_percentage)
+            .bind(threshold_ms)
+            .bind(threshold_value)
+            .bind(threshold_op.unwrap_or(""))
+            .bind(error_filters)
+            .bind(total_filters)
+            .bind(eval_interval_secs)
+            .bind(notification_channel_ids)
+            .bind(&existing.state)
+            .bind(existing.error_budget_remaining)
+            .bind(existing.error_count)
+            .bind(existing.total_count)
+            .bind(existing.last_eval_at.unwrap_or_default())
+            .bind(existing.last_breached_at.unwrap_or_default())
+            .bind(&existing.created_at)
+            .bind(&now)
+            .bind(ver)
+            .execute()
+            .await?;
         Ok(true)
     }
 
@@ -8463,16 +8495,36 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_slos (id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(&slo.id).bind(&slo.tenant_id).bind(&slo.name).bind(&slo.description).bind(if slo.enabled { 1u8 } else { 0u8 })
-            .bind(&slo.slo_type).bind(&slo.indicator_type).bind(&slo.service_name).bind(&slo.metric_name)
-            .bind(&slo.window_type).bind(slo.target_percentage).bind(slo.threshold_ms).bind(slo.threshold_value)
-            .bind(slo.threshold_op.clone().unwrap_or_default()).bind(&slo.error_filters).bind(&slo.total_filters)
-            .bind(slo.eval_interval_secs).bind(&slo.notification_channel_ids)
-            .bind(state).bind(error_budget_remaining).bind(error_count).bind(total_count)
-            .bind(last_eval_at).bind(slo.last_breached_at.clone().unwrap_or_default())
-            .bind(&slo.created_at).bind(&now).bind(ver)
-            .execute().await?;
+            .query(SLO_INSERT_SQL)
+            .bind(&slo.id)
+            .bind(&slo.tenant_id)
+            .bind(&slo.name)
+            .bind(&slo.description)
+            .bind(if slo.enabled { 1u8 } else { 0u8 })
+            .bind(&slo.slo_type)
+            .bind(&slo.indicator_type)
+            .bind(&slo.service_name)
+            .bind(&slo.metric_name)
+            .bind(&slo.window_type)
+            .bind(slo.target_percentage)
+            .bind(slo.threshold_ms)
+            .bind(slo.threshold_value)
+            .bind(slo.threshold_op.clone().unwrap_or_default())
+            .bind(&slo.error_filters)
+            .bind(&slo.total_filters)
+            .bind(slo.eval_interval_secs)
+            .bind(&slo.notification_channel_ids)
+            .bind(state)
+            .bind(error_budget_remaining)
+            .bind(error_count)
+            .bind(total_count)
+            .bind(last_eval_at)
+            .bind(slo.last_breached_at.clone().unwrap_or_default())
+            .bind(&slo.created_at)
+            .bind(&now)
+            .bind(ver)
+            .execute()
+            .await?;
         Ok(())
     }
 
