@@ -15,6 +15,41 @@ const VALID_SLO_TYPES: [&str; 2] = ["trace", "metric"];
 const VALID_INDICATOR_TYPES: [&str; 3] = ["availability", "latency", "threshold"];
 const VALID_THRESHOLD_OPS: [&str; 4] = ["lt", "lte", "gt", "gte"];
 
+fn uses_metric_promql_pair(slo_type: &str, indicator_type: &str) -> bool {
+    slo_type == "metric" && matches!(indicator_type, "availability" | "latency")
+}
+
+fn validate_metric_promql_pair(
+    slo_type: &str,
+    indicator_type: &str,
+    error_promql: &str,
+    total_promql: &str,
+) -> Result<(), (StatusCode, String)> {
+    if !uses_metric_promql_pair(slo_type, indicator_type) {
+        return Ok(());
+    }
+
+    for (label, query) in [
+        ("total_promql", total_promql),
+        ("error_promql", error_promql),
+    ] {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{label} is required for metric SLOs"),
+            ));
+        }
+        promql_parser::parser::parse(query)
+            .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid {label}: {error}")))?;
+    }
+    Ok(())
+}
+
+fn stored_query_config(query: &str) -> serde_json::Value {
+    serde_json::json!({ "promql": query.trim() })
+}
+
 pub async fn list_slos(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -61,6 +96,12 @@ pub async fn create_slo(
             "target_percentage must be between 0 and 100".to_string(),
         ));
     }
+    validate_metric_promql_pair(
+        &req.slo_type,
+        &req.indicator_type,
+        &req.error_promql,
+        &req.total_promql,
+    )?;
     // Latency requires threshold_ms > 0
     if req.indicator_type == "latency" {
         match req.threshold_ms {
@@ -102,7 +143,9 @@ pub async fn create_slo(
 
     // For trace/availability SLOs with no error_filters, default to http_status_code >= 500.
     // Without this, error_filters == total_filters == all requests, causing 100% error rate.
-    let effective_error_filters = if req.slo_type == "trace"
+    let effective_error_filters = if uses_metric_promql_pair(&req.slo_type, &req.indicator_type) {
+        stored_query_config(&req.error_promql)
+    } else if req.slo_type == "trace"
         && req.indicator_type == "availability"
         && req.error_filters.as_array().map_or(true, |a| a.is_empty())
     {
@@ -111,9 +154,14 @@ pub async fn create_slo(
         req.error_filters.clone()
     };
 
+    let effective_total_filters = if uses_metric_promql_pair(&req.slo_type, &req.indicator_type) {
+        stored_query_config(&req.total_promql)
+    } else {
+        req.total_filters.clone()
+    };
     let error_filters = serde_json::to_string(&effective_error_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let total_filters = serde_json::to_string(&req.total_filters)
+    let total_filters = serde_json::to_string(&effective_total_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let channel_ids = serde_json::to_string(&req.notification_channel_ids)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -226,6 +274,12 @@ pub async fn update_slo(
             "target_percentage must be between 0 and 100".to_string(),
         ));
     }
+    validate_metric_promql_pair(
+        &req.slo_type,
+        &req.indicator_type,
+        &req.error_promql,
+        &req.total_promql,
+    )?;
     if req.indicator_type == "latency" {
         match req.threshold_ms {
             Some(ms) if ms > 0.0 => {}
@@ -261,7 +315,9 @@ pub async fn update_slo(
         }
     }
 
-    let effective_error_filters = if req.slo_type == "trace"
+    let effective_error_filters = if uses_metric_promql_pair(&req.slo_type, &req.indicator_type) {
+        stored_query_config(&req.error_promql)
+    } else if req.slo_type == "trace"
         && req.indicator_type == "availability"
         && req.error_filters.as_array().map_or(true, |a| a.is_empty())
     {
@@ -270,9 +326,14 @@ pub async fn update_slo(
         req.error_filters.clone()
     };
 
+    let effective_total_filters = if uses_metric_promql_pair(&req.slo_type, &req.indicator_type) {
+        stored_query_config(&req.total_promql)
+    } else {
+        req.total_filters.clone()
+    };
     let error_filters = serde_json::to_string(&effective_error_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let total_filters = serde_json::to_string(&req.total_filters)
+    let total_filters = serde_json::to_string(&effective_total_filters)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let channel_ids = serde_json::to_string(&req.notification_channel_ids)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -376,4 +437,45 @@ pub async fn list_slo_events(
         .await
         .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
     Ok(Json(serde_json::json!({ "events": events })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_availability_requires_two_valid_promql_expressions() {
+        assert!(
+            validate_metric_promql_pair(
+                "metric",
+                "availability",
+                "sum(rate(errors_total[5m]))",
+                "sum(rate(requests_total[5m]))",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_metric_promql_pair(
+                "metric",
+                "availability",
+                "",
+                "sum(rate(requests_total[5m]))",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_metric_promql_pair(
+                "metric",
+                "availability",
+                "not valid PromQL (",
+                "sum(rate(requests_total[5m]))",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn trace_slos_do_not_require_promql() {
+        assert!(validate_metric_promql_pair("trace", "availability", "", "").is_ok());
+    }
 }
