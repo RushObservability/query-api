@@ -53,7 +53,7 @@ async fn eval_trace_availability(
     total_filters: &[Filter],
     from: &str,
     to: &str,
-) -> anyhow::Result<(i64, i64)> {
+) -> anyhow::Result<(f64, f64)> {
     let base = build_where_clause(common_filters, from, to);
     let error_clauses = build_where_clause(error_filters, from, to);
     let total_clauses = build_where_clause(total_filters, from, to);
@@ -67,7 +67,7 @@ async fn eval_trace_availability(
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
-    Ok((row.bad as i64, row.total as i64))
+    Ok((row.bad as f64, row.total as f64))
 }
 
 /// trace + latency: COUNT(duration_ns > threshold) / COUNT total on spans — ONE scan.
@@ -80,7 +80,7 @@ async fn eval_trace_latency(
     threshold_ns: i64,
     from: &str,
     to: &str,
-) -> anyhow::Result<(i64, i64)> {
+) -> anyhow::Result<(f64, f64)> {
     let total_clauses = build_where_clause(total_filters, from, to);
     let sql = format!(
         "SELECT countIf(duration_ns > {threshold_ns}) as bad, count() as total FROM spans {}",
@@ -90,7 +90,7 @@ async fn eval_trace_latency(
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
-    Ok((row.bad as i64, row.total as i64))
+    Ok((row.bad as f64, row.total as f64))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ async fn eval_metric_availability(
     total_filters: &[Filter],
     from: &str,
     to: &str,
-) -> anyhow::Result<(i64, i64)> {
+) -> anyhow::Result<(f64, f64)> {
     let base = build_metrics_where_clause(common_filters, from, to);
     let error_clauses = build_metrics_where_clause(error_filters, from, to);
     let total_clauses = build_metrics_where_clause(total_filters, from, to);
@@ -146,7 +146,7 @@ async fn eval_metric_availability(
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<SumBadTotalRow>()
         .await?;
-    Ok((row.bad as i64, row.total as i64))
+    Ok((row.bad, row.total))
 }
 
 /// metric + latency: histogram bucket query on metrics_histogram — ONE scan.
@@ -163,7 +163,7 @@ async fn eval_metric_latency(
     threshold_ms: f64,
     from: &str,
     to: &str,
-) -> anyhow::Result<(i64, i64)> {
+) -> anyhow::Result<(f64, f64)> {
     let clauses = build_metrics_where_clause(total_filters, from, to);
 
     // Histogram ExplicitBounds are in the metric's unit; we pass threshold_ms directly.
@@ -180,12 +180,12 @@ async fn eval_metric_latency(
         .fetch_one::<HistTotalFastRow>()
         .await?;
 
-    let total_count = row.total as i64;
-    let fast_count = row.fast as i64;
+    let total_count = row.total;
+    let fast_count = row.fast;
 
     // slow_count = total - fast (error count for budget)
     let slow_count = total_count - fast_count;
-    Ok((slow_count.max(0), total_count))
+    Ok((slow_count.max(0.0), total_count))
 }
 
 /// metric + threshold: COUNT violating / COUNT total on metrics_gauge — ONE scan.
@@ -199,7 +199,7 @@ async fn eval_metric_threshold(
     threshold_op: &str,
     from: &str,
     to: &str,
-) -> anyhow::Result<(i64, i64)> {
+) -> anyhow::Result<(f64, f64)> {
     let clauses = build_metrics_where_clause(total_filters, from, to);
 
     // "good" condition based on threshold_op (what good means)
@@ -220,7 +220,61 @@ async fn eval_metric_threshold(
         .with_option("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
-    Ok((row.bad as i64, row.total as i64))
+    Ok((row.bad as f64, row.total as f64))
+}
+
+async fn eval_metric_promql_pair(
+    ch: &Client,
+    tenant_id: &str,
+    error_promql: &str,
+    total_promql: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+    lookback_secs: f64,
+) -> anyhow::Result<(f64, f64)> {
+    let eval_time = now.timestamp_millis() as f64 / 1_000.0;
+    let (error_result, total_result) = tokio::join!(
+        crate::promql::evaluate_instant_query(
+            ch,
+            error_promql,
+            eval_time,
+            lookback_secs,
+            tenant_id,
+        ),
+        crate::promql::evaluate_instant_query(
+            ch,
+            total_promql,
+            eval_time,
+            lookback_secs,
+            tenant_id,
+        ),
+    );
+    let error_series =
+        error_result.map_err(|error| anyhow::anyhow!("error PromQL failed: {error}"))?;
+    let total_series =
+        total_result.map_err(|error| anyhow::anyhow!("total PromQL failed: {error}"))?;
+    let error_value = sum_latest(&error_series);
+    let total_value = sum_latest(&total_series);
+
+    if !error_value.is_finite() || !total_value.is_finite() {
+        anyhow::bail!("PromQL returned a non-finite value");
+    }
+    if error_value < 0.0 || total_value < 0.0 {
+        anyhow::bail!("PromQL SLO values must be non-negative");
+    }
+    if error_value > total_value {
+        anyhow::bail!(
+            "error PromQL value ({error_value}) exceeds total PromQL value ({total_value})"
+        );
+    }
+
+    Ok((error_value, total_value))
+}
+
+fn sum_latest(series: &[crate::promql::types::TimeSeries]) -> f64 {
+    series
+        .iter()
+        .filter_map(|series| series.samples.last().map(|(_, value)| *value))
+        .sum()
 }
 
 /// Write SLO gauge metrics to ClickHouse so they can be graphed over time.
@@ -232,8 +286,8 @@ async fn write_slo_metrics(
     slo_name: &str,
     current_pct: f64,
     error_budget_remaining: f64,
-    error_count: i64,
-    total_count: i64,
+    error_count: f64,
+    total_count: f64,
     compliant: bool,
     now_nanos: i64,
 ) {
@@ -245,8 +299,8 @@ async fn write_slo_metrics(
             "rush_slo_error_budget_remaining",
             error_budget_remaining * 100.0,
         ),
-        ("rush_slo_error_count", error_count as f64),
-        ("rush_slo_total_count", total_count as f64),
+        ("rush_slo_error_count", error_count),
+        ("rush_slo_total_count", total_count),
         ("rush_slo_compliant", if compliant { 1.0 } else { 0.0 }),
     ];
     let values: Vec<String> = metrics
@@ -408,13 +462,22 @@ async fn persist_no_data(
 ) -> anyhow::Result<bool> {
     if slo.state != "no_data" {
         config_db
-            .update_slo_state(&slo.id, &slo.tenant_id, "no_data", 0.0, 0, 0, now_str, None)
+            .update_slo_state(
+                &slo.id,
+                &slo.tenant_id,
+                "no_data",
+                0.0,
+                0.0,
+                0.0,
+                now_str,
+                None,
+            )
             .await?;
         return Ok(true);
     }
     if should_flush {
         config_db
-            .persist_slo_eval(slo, "no_data", 0.0, 0, 0, now_str)
+            .persist_slo_eval(slo, "no_data", 0.0, 0.0, 0.0, now_str)
             .await?;
         return Ok(true);
     }
@@ -438,19 +501,42 @@ async fn eval_one_slo(
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
 
-    // Parse filters
-    let mut error_filters: Vec<Filter> = match serde_json::from_str(&slo.error_filters) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("slo {}: bad error_filters: {e}", slo.id);
-            return Ok(false);
+    let metric_promql_pair = if slo.slo_type == "metric"
+        && matches!(slo.indicator_type.as_str(), "availability" | "latency")
+    {
+        match (
+            crate::models::slo::stored_promql(&slo.error_filters),
+            crate::models::slo::stored_promql(&slo.total_filters),
+        ) {
+            (Some(error), Some(total)) => Some((error, total)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // PromQL-backed metric SLOs store query objects in these legacy columns so
+    // existing ClickHouse deployments do not need a config-table rewrite.
+    let mut error_filters: Vec<Filter> = if metric_promql_pair.is_some() {
+        Vec::new()
+    } else {
+        match serde_json::from_str(&slo.error_filters) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("slo {}: bad error_filters: {e}", slo.id);
+                return Ok(false);
+            }
         }
     };
-    let mut total_filters: Vec<Filter> = match serde_json::from_str(&slo.total_filters) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("slo {}: bad total_filters: {e}", slo.id);
-            return Ok(false);
+    let mut total_filters: Vec<Filter> = if metric_promql_pair.is_some() {
+        Vec::new()
+    } else {
+        match serde_json::from_str(&slo.total_filters) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("slo {}: bad total_filters: {e}", slo.id);
+                return Ok(false);
+            }
         }
     };
 
@@ -510,28 +596,52 @@ async fn eval_one_slo(
             .await
         }
         ("metric", "availability") => {
-            eval_metric_availability(
-                read_ch,
-                &slo.tenant_id,
-                &common_filters,
-                &error_filters,
-                &total_filters,
-                &from,
-                now_str,
-            )
-            .await
+            if let Some((error_promql, total_promql)) = &metric_promql_pair {
+                eval_metric_promql_pair(
+                    read_ch,
+                    &slo.tenant_id,
+                    error_promql,
+                    total_promql,
+                    &now,
+                    minutes as f64 * 60.0,
+                )
+                .await
+            } else {
+                eval_metric_availability(
+                    read_ch,
+                    &slo.tenant_id,
+                    &common_filters,
+                    &error_filters,
+                    &total_filters,
+                    &from,
+                    now_str,
+                )
+                .await
+            }
         }
         ("metric", "latency") => {
-            let threshold_ms = slo.threshold_ms.unwrap_or(0.0);
-            eval_metric_latency(
-                read_ch,
-                &slo.tenant_id,
-                &total_filters,
-                threshold_ms,
-                &from,
-                now_str,
-            )
-            .await
+            if let Some((error_promql, total_promql)) = &metric_promql_pair {
+                eval_metric_promql_pair(
+                    read_ch,
+                    &slo.tenant_id,
+                    error_promql,
+                    total_promql,
+                    &now,
+                    minutes as f64 * 60.0,
+                )
+                .await
+            } else {
+                let threshold_ms = slo.threshold_ms.unwrap_or(0.0);
+                eval_metric_latency(
+                    read_ch,
+                    &slo.tenant_id,
+                    &total_filters,
+                    threshold_ms,
+                    &from,
+                    now_str,
+                )
+                .await
+            }
         }
         ("metric", "threshold") => {
             let threshold_value = slo.threshold_value.unwrap_or(0.0);
@@ -570,11 +680,11 @@ async fn eval_one_slo(
     // error_budget = 1 - target/100 (allowed error rate)
     // consumed = error_count / total_count (actual error rate)
     // remaining = error_budget - consumed
-    let (new_state, error_budget_remaining) = if total_count == 0 {
+    let (new_state, error_budget_remaining) = if total_count <= 0.0 {
         ("no_data", 0.0_f64)
     } else {
         let error_budget = 1.0 - slo.target_percentage / 100.0;
-        let consumed = error_count as f64 / total_count as f64;
+        let consumed = error_count / total_count;
         // Express remaining as fraction of the allowed budget (1.0 = 100% remaining, 0 = exhausted).
         let remaining = if error_budget <= 0.0 {
             0.0
@@ -709,8 +819,8 @@ async fn eval_one_slo(
     }
 
     // Write SLO gauge metrics for graphing
-    let current_pct = if total_count > 0 {
-        ((total_count - error_count) as f64 / total_count as f64) * 100.0
+    let current_pct = if total_count > 0.0 {
+        ((total_count - error_count) / total_count) * 100.0
     } else {
         0.0
     };
@@ -734,6 +844,7 @@ async fn eval_one_slo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn incident_events_only_open_on_breach_and_close_on_recovery() {
@@ -806,5 +917,20 @@ mod tests {
             "base scan pruned by service: {}",
             base.to_sql()
         );
+    }
+
+    #[test]
+    fn promql_pair_sums_latest_value_from_each_series() {
+        let series = vec![
+            crate::promql::types::TimeSeries {
+                labels: BTreeMap::new(),
+                samples: vec![(1.0, 2.5), (2.0, 3.5)],
+            },
+            crate::promql::types::TimeSeries {
+                labels: BTreeMap::new(),
+                samples: vec![(2.0, 1.25)],
+            },
+        ];
+        assert_eq!(sum_latest(&series), 4.75);
     }
 }
