@@ -744,6 +744,8 @@ pub async fn autocomplete(
                 "mat_level",
                 "mat_component",
                 "mat_environment",
+                "mat_source_ip",
+                "mat_action",
             ];
             known_fields
                 .into_iter()

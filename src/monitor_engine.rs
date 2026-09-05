@@ -750,6 +750,8 @@ fn log_field_expr(field: &str) -> Option<&'static str> {
         "mat_level" => Some("mat_level"),
         "mat_component" => Some("mat_component"),
         "mat_environment" => Some("mat_environment"),
+        "mat_source_ip" => Some("mat_source_ip"),
+        "mat_action" => Some("mat_action"),
         _ => None,
     }
 }
@@ -1567,6 +1569,8 @@ mod tests {
         assert_eq!(log_field_expr("service_name"), Some("ServiceName"));
         assert_eq!(log_field_expr("SeverityText"), Some("SeverityText"));
         assert_eq!(log_field_expr("trace_id"), Some("TraceId"));
+        assert_eq!(log_field_expr("mat_source_ip"), Some("mat_source_ip"));
+        assert_eq!(log_field_expr("mat_action"), Some("mat_action"));
         assert_eq!(log_field_expr("Body) OR 1 = 1 --"), None);
 
         let groups = vec!["ServiceName".to_string(), "SeverityText".to_string()];
