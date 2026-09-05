@@ -55,8 +55,7 @@ pub async fn create_monitor(
     }
 
     // Validate comparator
-    let valid_comparators = ["above", "below"];
-    if !valid_comparators.contains(&req.comparator.as_str()) {
+    if !is_valid_comparator(&req.comparator) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("invalid comparator: {}", req.comparator),
@@ -82,18 +81,18 @@ pub async fn create_monitor(
         }
     }
 
-    let group_by = parse_group_by(&req.group_by)?;
+    let mut group_by = parse_group_by(&req.group_by)?;
+    normalize_apm_groups(&req.monitor_type, &req.query_config, &mut group_by);
 
     // Validate query_config and every field that can influence query construction.
     validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
 
-    // Non-composite monitors must have at least a critical threshold
-    if req.monitor_type != "composite" && req.critical.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "critical threshold is required for non-composite monitors".to_string(),
-        ));
-    }
+    validate_threshold_order(
+        &req.monitor_type,
+        &req.comparator,
+        req.critical,
+        req.warning,
+    )?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let query_config = serde_json::to_string(&req.query_config)
@@ -210,8 +209,7 @@ pub async fn update_monitor(
         ));
     }
 
-    let valid_comparators = ["above", "below"];
-    if !valid_comparators.contains(&req.comparator.as_str()) {
+    if !is_valid_comparator(&req.comparator) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("invalid comparator: {}", req.comparator),
@@ -235,15 +233,16 @@ pub async fn update_monitor(
         }
     }
 
-    let group_by = parse_group_by(&req.group_by)?;
+    let mut group_by = parse_group_by(&req.group_by)?;
+    normalize_apm_groups(&req.monitor_type, &req.query_config, &mut group_by);
     validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
 
-    if req.monitor_type != "composite" && req.critical.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "critical threshold is required for non-composite monitors".to_string(),
-        ));
-    }
+    validate_threshold_order(
+        &req.monitor_type,
+        &req.comparator,
+        req.critical,
+        req.warning,
+    )?;
 
     let query_config = serde_json::to_string(&req.query_config)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -374,7 +373,27 @@ pub async fn preview_monitor(
     Json(req): Json<PreviewMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let group_by = parse_group_by(&req.group_by)?;
+    if !(60..=604_800).contains(&req.eval_window_secs) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "eval_window_secs must be between 60 seconds and 7 days".to_string(),
+        ));
+    }
+    if !(300..=604_800).contains(&req.lookback_secs) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "lookback_secs must be between 5 minutes and 7 days".to_string(),
+        ));
+    }
+    if !is_valid_comparator(&req.comparator) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "comparator must be one of: above, above_or_equal, equal, below_or_equal, below"
+                .to_string(),
+        ));
+    }
+    let mut group_by = parse_group_by(&req.group_by)?;
+    normalize_apm_groups(&req.monitor_type, &req.query_config, &mut group_by);
     validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
 
     let result = monitor_engine::preview_query(
@@ -383,7 +402,15 @@ pub async fn preview_monitor(
         &req.monitor_type,
         &req.query_config,
         req.eval_window_secs,
+        req.lookback_secs,
         &group_by,
+        monitor_engine::PreviewConditions {
+            critical: req.critical,
+            critical_recovery: req.critical_recovery,
+            warning: req.warning,
+            warning_recovery: req.warning_recovery,
+            comparator: req.comparator,
+        },
     )
     .await
     .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
@@ -392,6 +419,9 @@ pub async fn preview_monitor(
         "current_value": result.current_value,
         "groups": result.groups,
         "timeseries": result.timeseries,
+        "series": result.series,
+        "simulated_events": result.simulated_events,
+        "bucket_secs": result.bucket_secs,
     })))
 }
 
@@ -434,6 +464,56 @@ pub async fn unmute_monitor(
 }
 
 // ── Validation helpers ──
+
+const VALID_COMPARATORS: [&str; 5] = [
+    "above",
+    "above_or_equal",
+    "equal",
+    "below_or_equal",
+    "below",
+];
+
+fn is_valid_comparator(comparator: &str) -> bool {
+    VALID_COMPARATORS.contains(&comparator)
+}
+
+fn validate_threshold_order(
+    monitor_type: &str,
+    comparator: &str,
+    critical: Option<f64>,
+    warning: Option<f64>,
+) -> Result<(), (StatusCode, String)> {
+    if monitor_type == "composite" {
+        return Ok(());
+    }
+
+    let Some(critical) = critical else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "critical threshold is required for non-composite monitors".to_string(),
+        ));
+    };
+    let Some(warning) = warning else {
+        return Ok(());
+    };
+
+    let invalid = match comparator {
+        "above" | "above_or_equal" => warning > critical,
+        "below" | "below_or_equal" => warning < critical,
+        "equal" => false,
+        _ => false,
+    };
+    if invalid {
+        let message = if matches!(comparator, "below" | "below_or_equal") {
+            "warning threshold must be at or above the alert threshold when lower values are worse"
+        } else {
+            "warning threshold must be at or below the alert threshold"
+        };
+        return Err((StatusCode::BAD_REQUEST, message.to_string()));
+    }
+
+    Ok(())
+}
 
 fn validate_query_config(
     monitor_type: &str,
@@ -561,6 +641,46 @@ fn validate_query_config(
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
 
     Ok(())
+}
+
+fn normalize_apm_groups(
+    monitor_type: &str,
+    config: &serde_json::Value,
+    group_by: &mut Vec<String>,
+) {
+    if monitor_type != "apm" {
+        return;
+    }
+
+    let service_is_wildcard = config
+        .get("service")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.contains('*'));
+    let endpoint_filter = config
+        .get("endpoint_filter")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+    let endpoint_is_wildcard = endpoint_filter.contains('*');
+
+    if endpoint_filter.is_empty() {
+        group_by.retain(|field| !matches!(field.as_str(), "endpoint" | "http_path"));
+    }
+
+    let has_service_group = group_by
+        .iter()
+        .any(|field| matches!(field.as_str(), "service" | "service_name"));
+    let has_endpoint_group = group_by
+        .iter()
+        .any(|field| matches!(field.as_str(), "endpoint" | "http_path"));
+
+    if service_is_wildcard && !has_service_group {
+        group_by.insert(0, "service_name".to_string());
+    }
+    if endpoint_is_wildcard && !has_endpoint_group {
+        let insert_at = usize::from(service_is_wildcard && !group_by.is_empty());
+        group_by.insert(insert_at, "endpoint".to_string());
+    }
 }
 
 fn parse_group_by(group_by: &serde_json::Value) -> Result<Vec<String>, (StatusCode, String)> {
@@ -702,12 +822,20 @@ pub async fn autocomplete(
                 .unwrap_or_default()
         }
         "endpoint" => {
-            let service = escape_ch(&params.service);
+            let mut conditions = vec![
+                format!("tenant_id = '{tenant_id}'"),
+                format!("http_path LIKE '{prefix}%'"),
+            ];
+            if let Some(condition) =
+                monitor_engine::apm_match_condition("service_name", &params.service)
+            {
+                conditions.push(condition);
+            }
             let sql = format!(
                 "SELECT DISTINCT http_path AS value FROM spans \
-                 WHERE tenant_id = '{tenant_id}' AND service_name = '{service}' \
-                 AND http_path LIKE '{prefix}%' \
-                 LIMIT 20"
+                 WHERE {} \
+                 LIMIT 20",
+                conditions.join(" AND ")
             );
             crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
                 .fetch_all::<StringRow>()
@@ -925,5 +1053,91 @@ mod tests {
                 .0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn warning_is_optional_and_cannot_cross_the_alert_threshold() {
+        assert!(validate_threshold_order("apm", "above", Some(500.0), None).is_ok());
+        assert!(validate_threshold_order("apm", "above", Some(500.0), Some(300.0)).is_ok());
+        assert!(validate_threshold_order("apm", "above", Some(500.0), Some(500.0)).is_ok());
+        assert_eq!(
+            validate_threshold_order("apm", "above", Some(500.0), Some(501.0))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn below_thresholds_keep_warning_less_severe_than_alert() {
+        assert!(validate_threshold_order("apm", "below", Some(20.0), Some(30.0)).is_ok());
+        assert_eq!(
+            validate_threshold_order("apm", "below", Some(20.0), Some(19.0))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn inclusive_and_equal_comparators_are_valid() {
+        for comparator in ["above_or_equal", "equal", "below_or_equal"] {
+            assert!(is_valid_comparator(comparator));
+        }
+        assert!(!is_valid_comparator("not_equal"));
+
+        assert!(validate_threshold_order("metric", "equal", Some(0.0), Some(1.0)).is_ok());
+        assert!(
+            validate_threshold_order("metric", "above_or_equal", Some(1.0), Some(2.0)).is_err()
+        );
+        assert!(
+            validate_threshold_order("metric", "below_or_equal", Some(0.0), Some(-1.0)).is_err()
+        );
+    }
+
+    #[test]
+    fn apm_wildcards_add_service_and_endpoint_groups() {
+        let config = serde_json::json!({
+            "service": "checkout-*",
+            "metric": "p95_latency",
+            "endpoint_filter": "*"
+        });
+        let mut group_by = Vec::new();
+
+        normalize_apm_groups("apm", &config, &mut group_by);
+
+        assert_eq!(group_by, vec!["service_name", "endpoint"]);
+    }
+
+    #[test]
+    fn apm_wildcard_groups_do_not_duplicate_aliases() {
+        let config = serde_json::json!({
+            "service": "*",
+            "metric": "error_rate",
+            "endpoint_filter": "/api/*"
+        });
+        let mut group_by = vec!["service".to_string(), "http_path".to_string()];
+
+        normalize_apm_groups("apm", &config, &mut group_by);
+
+        assert_eq!(group_by, vec!["service", "http_path"]);
+    }
+
+    #[test]
+    fn apm_empty_endpoint_filter_removes_endpoint_grouping() {
+        let config = serde_json::json!({
+            "service": "checkout-api",
+            "metric": "p95_latency",
+            "endpoint_filter": "  "
+        });
+        let mut group_by = vec![
+            "service_name".to_string(),
+            "endpoint".to_string(),
+            "http_path".to_string(),
+        ];
+
+        normalize_apm_groups("apm", &config, &mut group_by);
+
+        assert_eq!(group_by, vec!["service_name"]);
     }
 }

@@ -351,7 +351,7 @@ async fn eval_slos(
         .collect();
 
     let now_str_ref = now_str.as_str();
-    let outcomes: Vec<(String, bool)> =
+    let outcomes: Vec<(String, bool, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(slo, should_flush)| async move {
             let evaluated = crate::query_governor::run_background(
                 &slo.tenant_id,
@@ -367,25 +367,32 @@ async fn eval_slos(
                 ),
             )
             .await;
-            let persisted = match evaluated {
-                Ok(Ok(p)) => p,
+            let (persisted, succeeded) = match evaluated {
+                Ok(Ok(p)) => (p, true),
                 Ok(Err(e)) => {
                     tracing::warn!("slo {}: evaluation error: {e}", slo.id);
-                    false
+                    (false, false)
                 }
                 Err(e) => {
                     tracing::warn!("slo {}: background admission rejected: {e:?}", slo.id);
-                    false
+                    (false, false)
                 }
             };
-            (slo.id, persisted)
+            (slo.id, persisted, succeeded)
         }))
         .buffer_unordered(ENGINE_CONCURRENCY)
         .collect()
         .await;
 
-    for (id, persisted) in outcomes {
+    let mut failures = 0usize;
+    for (id, persisted, succeeded) in outcomes {
         eval_state.record(id, now, persisted);
+        if !succeeded {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} SLO evaluation job(s) failed");
     }
 
     Ok(())
