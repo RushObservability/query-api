@@ -1,7 +1,7 @@
 use crate::self_metrics::{MetricKind, SelfMetrics};
 use crate::spool::IngestBuffer;
 use clickhouse::Client;
-use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -291,15 +291,27 @@ const CH_HEALTH_PROBES: &[(&str, &str)] = &[
     ),
     (
         "rush_ch_active_merges",
-        "SELECT toFloat64(count()) AS v FROM system.merges",
+        "SELECT toFloat64(count()) AS v FROM system.merges WHERE database = 'observability'",
     ),
     (
         "rush_ch_active_mutations",
-        "SELECT toFloat64(count()) AS v FROM system.mutations WHERE is_done = 0",
+        "SELECT toFloat64(count()) AS v FROM system.mutations WHERE database = 'observability' AND is_done = 0",
+    ),
+    (
+        "rush_ch_oldest_mutation_secs",
+        "SELECT toFloat64(if(count() = 0, 0, dateDiff('second', min(create_time), now()))) AS v FROM system.mutations WHERE database = 'observability' AND is_done = 0",
+    ),
+    (
+        "rush_ch_mutation_parts_to_do",
+        "SELECT toFloat64(sum(parts_to_do)) AS v FROM system.mutations WHERE database = 'observability' AND is_done = 0",
+    ),
+    (
+        "rush_ch_failed_mutations",
+        "SELECT toFloat64(countIf(latest_fail_reason != '')) AS v FROM system.mutations WHERE database = 'observability' AND is_done = 0",
     ),
     (
         "rush_ch_longest_running_merge_secs",
-        "SELECT toFloat64(max(elapsed)) AS v FROM system.merges",
+        "SELECT toFloat64(max(elapsed)) AS v FROM system.merges WHERE database = 'observability'",
     ),
     (
         "rush_ch_delayed_inserts",
@@ -307,7 +319,7 @@ const CH_HEALTH_PROBES: &[(&str, &str)] = &[
     ),
     (
         "rush_ch_rejected_inserts_total",
-        "SELECT toFloat64(value) AS v FROM system.events WHERE event = 'RejectedInserts'",
+        "SELECT toFloat64(sumIf(value, event = 'RejectedInserts')) AS v FROM system.events",
     ),
     (
         "rush_ch_memory_resident_bytes",
@@ -354,78 +366,104 @@ const CH_HEALTH_PROBES: &[(&str, &str)] = &[
         "SELECT toFloat64(value) AS v FROM system.metrics WHERE metric = 'BackgroundMergesAndMutationsPoolTask'",
     ),
     (
+        "rush_ch_background_pool_size",
+        "SELECT toFloat64(value) AS v FROM system.server_settings WHERE name = 'background_pool_size'",
+    ),
+    (
+        "rush_ch_parts_delay_threshold",
+        "SELECT toFloat64(value) AS v FROM system.merge_tree_settings WHERE name = 'parts_to_delay_insert'",
+    ),
+    (
+        "rush_ch_parts_throw_threshold",
+        "SELECT toFloat64(value) AS v FROM system.merge_tree_settings WHERE name = 'parts_to_throw_insert'",
+    ),
+    (
+        "rush_ch_max_concurrent_select_queries",
+        "SELECT toFloat64(value) AS v FROM system.server_settings WHERE name = 'max_concurrent_select_queries'",
+    ),
+    (
         "rush_ch_active_queries",
-        "SELECT toFloat64(count()) AS v FROM system.processes",
+        "SELECT toFloat64(count()) AS v FROM system.processes WHERE query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_longest_running_query_secs",
-        "SELECT toFloat64(max(elapsed)) AS v FROM system.processes",
+        "SELECT toFloat64(max(elapsed)) AS v FROM system.processes WHERE query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_active_query_memory_bytes",
-        "SELECT toFloat64(sum(memory_usage)) AS v FROM system.processes",
+        "SELECT toFloat64(sum(memory_usage)) AS v FROM system.processes WHERE query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_active_query_read_rows",
-        "SELECT toFloat64(sum(read_rows)) AS v FROM system.processes",
+        "SELECT toFloat64(sum(read_rows)) AS v FROM system.processes WHERE query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_active_query_read_bytes",
-        "SELECT toFloat64(sum(read_bytes)) AS v FROM system.processes",
+        "SELECT toFloat64(sum(read_bytes)) AS v FROM system.processes WHERE query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_disk_local_used_bytes",
         "SELECT toFloat64(sum(total_space - free_space)) AS v FROM system.disks WHERE type = 'Local'",
     ),
+    (
+        "rush_ch_max_disk_used_pct",
+        "SELECT toFloat64(max(if(total_space > 0, (total_space - free_space) * 100.0 / total_space, 0))) AS v FROM system.disks WHERE type = 'Local'",
+    ),
+    (
+        "rush_ch_memory_capacity_bytes",
+        "SELECT toFloat64(if(maxIf(value, metric = 'CGroupMemoryTotal') > 0, maxIf(value, metric = 'CGroupMemoryTotal'), maxIf(value, metric = 'OSMemoryTotal'))) AS v FROM system.asynchronous_metrics WHERE metric IN ('CGroupMemoryTotal', 'OSMemoryTotal')",
+    ),
     // Query-log fields are optional: query_log may be disabled or have a shorter
     // retention window, so unavailable probes are intentionally non-fatal.
     (
         "rush_ch_query_log_recent_queries",
-        "SELECT toFloat64(countIf(type = 'QueryFinish')) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND is_initial_query = 1",
+        "SELECT toFloat64(countIf(type = 'QueryFinish')) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_p50_duration_ms",
-        "SELECT quantile(0.50)(toFloat64(QueryDurationMicroseconds)) / 1000.0 AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+        "SELECT toFloat64(quantile(0.50)(query_duration_ms)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_p95_duration_ms",
-        "SELECT quantile(0.95)(toFloat64(QueryDurationMicroseconds)) / 1000.0 AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+        "SELECT toFloat64(quantile(0.95)(query_duration_ms)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_read_rows",
-        "SELECT toFloat64(sum(read_rows)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+        "SELECT toFloat64(sum(read_rows)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_read_bytes",
-        "SELECT toFloat64(sum(read_bytes)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+        "SELECT toFloat64(sum(read_bytes)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_result_rows",
-        "SELECT toFloat64(sum(result_rows)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+        "SELECT toFloat64(sum(result_rows)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_result_bytes",
-        "SELECT toFloat64(sum(result_bytes)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+        "SELECT toFloat64(sum(result_bytes)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_memory_p95_bytes",
-        "SELECT quantile(0.95)(toFloat64(memory_usage)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1",
+        "SELECT quantile(0.95)(toFloat64(memory_usage)) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND type = 'QueryFinish' AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
     (
         "rush_ch_query_log_recent_errors",
-        "SELECT toFloat64(countIf(type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing'))) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND is_initial_query = 1",
+        "SELECT toFloat64(countIf(type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing'))) AS v FROM system.query_log WHERE event_time >= now() - INTERVAL 5 MINUTE AND is_initial_query = 1 AND query_kind = 'Select' AND query_id NOT LIKE 'rush-stats-%'",
     ),
 ];
 
+const CH_HEALTH_PROBE_CONCURRENCY: usize = 4;
+const STATS_QUERY_ID_PREFIX: &str = "rush-stats-";
+
 async fn collect_ch_health(ch: &Client, self_metrics: &SelfMetrics) {
-    // Probes are independent, so issue them together rather than adding their round-trip
-    // latencies. `join_all` keeps this fan-out bounded by the fixed probe list.
-    join_all(
-        CH_HEALTH_PROBES
-            .iter()
-            .map(|(name, sql)| run_ch_probe(ch, self_metrics, name, sql)),
-    )
-    .await;
+    // A small concurrency bound keeps the collector quick without making its own
+    // system-table fan-out look like user query pressure.
+    stream::iter(CH_HEALTH_PROBES.iter().copied())
+        .for_each_concurrent(CH_HEALTH_PROBE_CONCURRENCY, |(name, sql)| {
+            run_ch_probe(ch, self_metrics, name, sql)
+        })
+        .await;
 }
 
 async fn run_ch_probe(
@@ -435,7 +473,13 @@ async fn run_ch_probe(
     sql: &'static str,
 ) {
     let start = Instant::now();
-    match ch.query(sql).fetch_optional::<F64Row>().await {
+    let query_id = format!("{STATS_QUERY_ID_PREFIX}{name}");
+    match ch
+        .query(sql)
+        .with_option("query_id", query_id)
+        .fetch_optional::<F64Row>()
+        .await
+    {
         Ok(Some(row)) => {
             self_metrics.set_gauge(name, &[], row.v);
             record_ch_probe(self_metrics, name, start, true);
@@ -668,6 +712,34 @@ mod tests {
                 .iter()
                 .all(|(name, sql)| { name.starts_with("rush_ch_") && sql.contains(" AS v") })
         );
+    }
+
+    #[test]
+    fn read_pressure_probes_exclude_the_stats_collector() {
+        for name in [
+            "rush_ch_active_queries",
+            "rush_ch_longest_running_query_secs",
+            "rush_ch_query_log_p50_duration_ms",
+            "rush_ch_query_log_p95_duration_ms",
+        ] {
+            let sql = CH_HEALTH_PROBES
+                .iter()
+                .find_map(|(probe_name, sql)| (*probe_name == name).then_some(*sql))
+                .expect("read pressure probe");
+            assert!(sql.contains("query_id NOT LIKE 'rush-stats-%'"));
+            assert!(sql.contains("query_kind = 'Select'"));
+        }
+    }
+
+    #[test]
+    fn query_latency_uses_the_clickhouse_duration_column() {
+        let sql = CH_HEALTH_PROBES
+            .iter()
+            .find_map(|(name, sql)| (*name == "rush_ch_query_log_p95_duration_ms").then_some(*sql))
+            .expect("p95 probe");
+        assert!(sql.contains("query_duration_ms"));
+        assert!(!sql.contains("QueryDurationMicroseconds"));
+        assert!(CH_HEALTH_PROBE_CONCURRENCY < 8);
     }
 
     #[test]
