@@ -289,7 +289,7 @@ pub async fn get_features(State(state): State<AppState>, headers: HeaderMap) -> 
             .flatten()
             .map(|v| v == "true")
             .unwrap_or(false);
-    let kubernetes_logging_enabled = crate::handlers::kubernetes_access::available();
+    let kubernetes_logging_enabled = crate::edition::kubernetes_logging_available();
 
     let cloudwatch_enabled = std::env::var("CLOUDWATCH_ENABLED")
         .map(|v| v == "true" || v == "1")
@@ -375,8 +375,13 @@ pub async fn get_runtime_config(
         )
         .await;
     let license = crate::license::evaluate();
-    let manager_enabled = state.collectors.enabled();
-    let descriptors = crate::integrations::descriptors();
+    let managed_integrations_available = crate::edition::managed_integrations_available();
+    let manager_enabled = managed_integrations_available && state.collectors.enabled();
+    let descriptors = if managed_integrations_available {
+        crate::integrations::descriptors()
+    } else {
+        Vec::new()
+    };
     let mut target_counts = std::collections::HashMap::new();
     for descriptor in &descriptors {
         let count = state
@@ -412,23 +417,6 @@ pub async fn get_runtime_config(
         config_entry("RUSH_CONFIG", Some("./rush.toml"), false, false),
         config_entry("RUSH_ALLOWED_ORIGINS", Some("same-origin"), false, false),
         config_entry("SRE_AGENT_URL", Some("http://localhost:8081"), false, true),
-        config_entry(
-            "RUSH_COLLECTOR_OTLP_ENDPOINT",
-            Some("http://localhost:8080"),
-            false,
-            true,
-        ),
-        config_entry(
-            "RUSH_COLLECTOR_MANAGER_ENABLED",
-            Some("false"),
-            false,
-            false,
-        ),
-        config_entry("RUSH_POSTGRES_COLLECTOR_BIN", None, false, false),
-        config_entry("RUSH_POSTGRES_COLLECTOR_CONFIG", None, false, false),
-        config_entry("RUSH_MYSQL_COLLECTOR_BIN", None, false, false),
-        config_entry("RUSH_MYSQL_COLLECTOR_CONFIG", None, false, false),
-        config_entry("RUSH_COLLECTOR_TENANT", Some("default"), false, false),
         config_entry("RUSH_SPOOL_DIR", Some("./data/spool"), false, false),
         config_entry("RUSH_BUFFER_BACKEND", Some("disk"), false, false),
         config_entry("RUSH_SESSION_IDLE_TIMEOUT_SECS", Some("1800"), false, false),
@@ -450,25 +438,46 @@ pub async fn get_runtime_config(
         config_entry("RUSH_LICENSE_KEY", None, true, false),
         config_entry("RUSH_API_KEY_SECRET", None, true, false),
         config_entry("RUSH_SSO_TRANSACTION_SECRET", None, true, false),
-        config_entry(
-            "RUSH_INTEGRATION_ENCRYPTION_KEY_ID",
-            Some("primary"),
-            false,
-            false,
-        ),
-        config_entry("RUSH_INTEGRATION_ENCRYPTION_KEY", None, true, false),
-        config_entry(
-            "RUSH_INTEGRATION_ENCRYPTION_PREVIOUS_KEYS",
-            None,
-            true,
-            false,
-        ),
         config_entry("RUSH_AUDIT_HMAC_SECRET", None, true, false),
-        config_entry("RUSH_COLLECTOR_API_KEY", None, true, false),
         config_entry("RUSH_SRE_AGENT_INTERNAL_TOKEN", None, true, false),
         config_entry("RUSH_SMTP_PASS", None, true, false),
         config_entry("RUSH_BUFFER_S3_SECRET_KEY", None, true, false),
     ]);
+    if managed_integrations_available {
+        runtime.extend([
+            config_entry(
+                "RUSH_COLLECTOR_OTLP_ENDPOINT",
+                Some("http://localhost:8080"),
+                false,
+                true,
+            ),
+            config_entry(
+                "RUSH_COLLECTOR_MANAGER_ENABLED",
+                Some("false"),
+                false,
+                false,
+            ),
+            config_entry("RUSH_POSTGRES_COLLECTOR_BIN", None, false, false),
+            config_entry("RUSH_POSTGRES_COLLECTOR_CONFIG", None, false, false),
+            config_entry("RUSH_MYSQL_COLLECTOR_BIN", None, false, false),
+            config_entry("RUSH_MYSQL_COLLECTOR_CONFIG", None, false, false),
+            config_entry("RUSH_COLLECTOR_TENANT", Some("default"), false, false),
+            config_entry(
+                "RUSH_INTEGRATION_ENCRYPTION_KEY_ID",
+                Some("primary"),
+                false,
+                false,
+            ),
+            config_entry("RUSH_INTEGRATION_ENCRYPTION_KEY", None, true, false),
+            config_entry(
+                "RUSH_INTEGRATION_ENCRYPTION_PREVIOUS_KEYS",
+                None,
+                true,
+                false,
+            ),
+            config_entry("RUSH_COLLECTOR_API_KEY", None, true, false),
+        ]);
+    }
 
     Ok(Json(serde_json::json!({
         "tenant": caller.3,

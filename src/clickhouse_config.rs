@@ -336,8 +336,6 @@ const DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_SESSION_RENEWAL_INTERVAL_SECS: i64 = 5 * 60;
 const SESSION_ROTATION_GRACE_SECS: i64 = 60;
 const MAX_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 31 * 24 * 60 * 60;
-const DEFAULT_KUBERNETES_ACCESS_RETENTION_DAYS: u16 = 30;
-const MAX_KUBERNETES_ACCESS_RETENTION_DAYS: u16 = 3650;
 const KUBERNETES_ACCESS_FULL_COLUMNS: &str = "id, tenant_id, cluster_id, gateway_id, session_id, actor_user_id, actor_name, actor_type, kube_username, kube_groups, source_kind, client_reported, observed_network, http_method, verb, api_group, api_version, resource, subresource, namespace, name, request_query, user_agent, status_code, duration_ms, request_bytes, response_bytes, result_summary, result_truncated, redaction_count, recording_state, created_at";
 const KUBERNETES_ACCESS_COMPACT_COLUMNS: &str = "id, tenant_id, cluster_id, gateway_id, session_id, actor_user_id, actor_name, actor_type, kube_username, '[]' AS kube_groups, source_kind, '{}' AS client_reported, '{}' AS observed_network, http_method, verb, api_group, api_version, resource, subresource, namespace, name, '{}' AS request_query, '' AS user_agent, status_code, duration_ms, request_bytes, response_bytes, 'null' AS result_summary, result_truncated, redaction_count, recording_state, created_at";
 
@@ -347,30 +345,6 @@ fn kubernetes_access_columns(include_evidence: bool) -> &'static str {
     } else {
         KUBERNETES_ACCESS_COMPACT_COLUMNS
     }
-}
-
-fn kubernetes_access_retention_days_from(raw: Option<&str>) -> u16 {
-    raw.and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|days| (1..=MAX_KUBERNETES_ACCESS_RETENTION_DAYS).contains(days))
-        .unwrap_or(DEFAULT_KUBERNETES_ACCESS_RETENTION_DAYS)
-}
-
-fn kubernetes_access_retention_days() -> u16 {
-    let raw = std::env::var("KUBERNETES_ACCESS_RETENTION_DAYS").ok();
-    let days = kubernetes_access_retention_days_from(raw.as_deref());
-    if raw.as_deref().is_some_and(|value| {
-        value
-            .trim()
-            .parse::<u16>()
-            .map_or(true, |configured| configured != days)
-    }) {
-        tracing::warn!(
-            configured = raw.as_deref().unwrap_or_default(),
-            fallback_days = days,
-            "invalid KUBERNETES_ACCESS_RETENTION_DAYS; using the safe default"
-        );
-    }
-    days
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,16 +696,6 @@ mod auth_storage_tests {
     use super::*;
 
     #[test]
-    fn kubernetes_access_retention_is_always_bounded() {
-        assert_eq!(kubernetes_access_retention_days_from(None), 30);
-        assert_eq!(kubernetes_access_retention_days_from(Some("1")), 1);
-        assert_eq!(kubernetes_access_retention_days_from(Some("3650")), 3650);
-        assert_eq!(kubernetes_access_retention_days_from(Some("0")), 30);
-        assert_eq!(kubernetes_access_retention_days_from(Some("3651")), 30);
-        assert_eq!(kubernetes_access_retention_days_from(Some("invalid")), 30);
-    }
-
-    #[test]
     fn kubernetes_cluster_selectors_match_exact_all_and_wildcards() {
         assert!(kubernetes_cluster_selector_matches(
             "single",
@@ -772,28 +736,6 @@ mod auth_storage_tests {
             "*",
             "west-production"
         ));
-    }
-
-    #[test]
-    fn kubernetes_access_tables_create_and_migrate_retention_and_actor_type() {
-        let source = include_str!("clickhouse_config.rs");
-        assert!(source.contains(
-            "TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
-        ));
-        assert!(source.contains(
-            "ALTER TABLE config_kubernetes_access_events MODIFY TTL parseDateTimeBestEffort(created_at)"
-        ));
-        assert!(source.contains(
-            "ALTER TABLE config_kubernetes_session_chunks MODIFY TTL parseDateTimeBestEffort(created_at)"
-        ));
-        assert!(source.contains(
-            "ADD COLUMN IF NOT EXISTS actor_type LowCardinality(String) DEFAULT 'unknown'"
-        ));
-        assert!(source.contains("CREATE TABLE IF NOT EXISTS config_kubernetes_login_requests"));
-        assert!(source.contains("CREATE TABLE IF NOT EXISTS config_kubernetes_login_revocations"));
-        assert!(source.contains("device_code_hash     String"));
-        assert!(source.contains("ADD COLUMN IF NOT EXISTS client_reported String DEFAULT '{}'"));
-        assert!(!source.contains(&["device_code", "          String"].concat()));
     }
 
     #[test]
@@ -2143,72 +2085,6 @@ impl ConfigDb {
     }
 
     async fn run_migrations(&self) -> anyhow::Result<()> {
-        let access_retention_days = kubernetes_access_retention_days();
-        let access_event_ddl = format!(
-            "CREATE TABLE IF NOT EXISTS config_kubernetes_access_events (
-                id                String,
-                tenant_id         String,
-                cluster_id        String,
-                gateway_id        String,
-                session_id        String,
-                actor_user_id     String,
-                actor_name        String,
-                actor_type        LowCardinality(String),
-                kube_username     String,
-                kube_groups       String DEFAULT '[]',
-                source_kind       LowCardinality(String),
-                client_reported   String DEFAULT '{{}}',
-                observed_network  String DEFAULT '{{}}',
-                http_method       LowCardinality(String),
-                verb              LowCardinality(String),
-                api_group         LowCardinality(String),
-                api_version       LowCardinality(String),
-                resource          LowCardinality(String),
-                subresource       LowCardinality(String),
-                namespace         String,
-                name              String,
-                request_query     String DEFAULT '{{}}',
-                user_agent        String,
-                status_code       UInt16,
-                duration_ms       UInt64,
-                request_bytes     UInt64,
-                response_bytes    UInt64,
-                result_summary    String DEFAULT 'null',
-                result_truncated  UInt8 DEFAULT 0,
-                redaction_count   UInt32 DEFAULT 0,
-                recording_state   LowCardinality(String),
-                created_at        String
-            ) ENGINE = MergeTree
-            ORDER BY (tenant_id, created_at, id)
-            TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
-        );
-        let access_chunk_ddl = format!(
-            "CREATE TABLE IF NOT EXISTS config_kubernetes_session_chunks (
-                id                String,
-                tenant_id         String,
-                session_id        String,
-                event_id          String,
-                gateway_id        String,
-                sequence          UInt64,
-                stream            LowCardinality(String),
-                encoding          LowCardinality(String) DEFAULT 'utf8',
-                provenance        String DEFAULT '{{}}',
-                recording_state   LowCardinality(String) DEFAULT 'partial',
-                offset_ms         UInt64,
-                data              String,
-                byte_count        UInt64,
-                redaction_count   UInt32 DEFAULT 0,
-                created_at        String
-            ) ENGINE = MergeTree
-            ORDER BY (tenant_id, session_id, sequence, id)
-            TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
-        );
-        let access_event_ttl_migration = format!(
-            "ALTER TABLE config_kubernetes_access_events MODIFY TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
-        );
-        let access_chunk_ttl_migration = format!(
-            "ALTER TABLE config_kubernetes_session_chunks MODIFY TTL parseDateTimeBestEffort(created_at) + INTERVAL {access_retention_days} DAY DELETE"
-        );
         let ddls = vec![
             // ── Tenants ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_tenants (
@@ -2312,65 +2188,6 @@ impl ConfigDb {
             ) ENGINE = MergeTree()
             ORDER BY (token)
             TTL parseDateTimeBestEffort(expires_at) + INTERVAL 0 SECOND",
-            // Browser-approved kubectl credentials. Only a SHA-256 digest of
-            // the bearer is stored; the raw device credential stays with the
-            // CLI that initiated the login. ReplacingMergeTree makes approval
-            // visible to every query-api replica without process-local state.
-            "CREATE TABLE IF NOT EXISTS config_kubernetes_login_requests (
-                device_code_hash     String,
-                user_code            String,
-                cluster_id           String,
-                state                LowCardinality(String) DEFAULT 'pending',
-                tenant_id            String DEFAULT '',
-                user_id              String DEFAULT '',
-                username             String DEFAULT '',
-                role                 String DEFAULT '',
-                client_reported      String DEFAULT '{}',
-                created_at           String,
-                expires_at           String,
-                approved_at          String DEFAULT '',
-                credential_expires_at String DEFAULT '',
-                version              UInt64,
-                is_deleted           UInt8 DEFAULT 0
-            ) ENGINE = ReplacingMergeTree(version)
-            ORDER BY (device_code_hash)
-            TTL parseDateTimeBestEffort(expires_at) + INTERVAL 1 DAY",
-            "ALTER TABLE config_kubernetes_login_requests ADD COLUMN IF NOT EXISTS client_reported String DEFAULT '{}' AFTER role",
-            // Revocations live separately from mutable client enrichment. This
-            // makes de-auth fail closed even if an enrichment write races with
-            // an administrator revoking the same credential.
-            "CREATE TABLE IF NOT EXISTS config_kubernetes_login_revocations (
-                device_code_hash String,
-                tenant_id        String,
-                revoked_at       String,
-                version          UInt64
-            ) ENGINE = ReplacingMergeTree(version)
-            ORDER BY (device_code_hash)
-            TTL parseDateTimeBestEffort(revoked_at) + INTERVAL 2 DAY",
-            // Rush group mappings to native Kubernetes RBAC. The gateway reads
-            // these rows through its internal API and reconciles ClusterRoles
-            // and bindings in the target cluster.
-            "CREATE TABLE IF NOT EXISTS config_kubernetes_rbac_grants (
-                id          String,
-                tenant_id   String,
-                group_id    String,
-                cluster_id  String,
-                cluster_match LowCardinality(String) DEFAULT 'single',
-                cluster_pattern String DEFAULT '',
-                name        String,
-                role_kind   LowCardinality(String),
-                role_name   String DEFAULT '',
-                scope       LowCardinality(String),
-                namespaces  String DEFAULT '[]',
-                rules       String DEFAULT '[]',
-                created_at  String,
-                updated_at  String,
-                version     UInt64,
-                is_deleted  UInt8 DEFAULT 0
-            ) ENGINE = ReplacingMergeTree(version)
-            ORDER BY (tenant_id, id)",
-            "ALTER TABLE config_kubernetes_rbac_grants ADD COLUMN IF NOT EXISTS cluster_match LowCardinality(String) DEFAULT 'single' AFTER cluster_id",
-            "ALTER TABLE config_kubernetes_rbac_grants ADD COLUMN IF NOT EXISTS cluster_pattern String DEFAULT '' AFTER cluster_match",
             // Shared login-attempt ledger. Identifiers are keyed hashes, never
             // raw usernames or addresses, and expire after one day. IP rows
             // count every request; account rows count failed credentials only.
@@ -2525,22 +2342,6 @@ impl ConfigDb {
                 is_deleted UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (key)",
-            // ── API-managed integration targets ────────────────────────────────
-            // DSNs are encrypted by query-api before they are written here.
-            "CREATE TABLE IF NOT EXISTS config_integration_targets (
-                id             String,
-                tenant_id      String,
-                integration    String,
-                name           String,
-                dsn_encrypted  String,
-                environment    String DEFAULT 'production',
-                enabled        UInt8 DEFAULT 1,
-                created_at     String DEFAULT toString(now()),
-                updated_at     String DEFAULT toString(now()),
-                version        UInt64,
-                is_deleted     UInt8 DEFAULT 0
-            ) ENGINE = ReplacingMergeTree(version)
-            ORDER BY (tenant_id, integration, id)",
             // ── LLM providers and selectable models ──────────────────────────
             // Provider credentials are AES-256-GCM encrypted by query-api.
             "CREATE TABLE IF NOT EXISTS config_llm_providers (
@@ -2908,38 +2709,6 @@ impl ConfigDb {
                 is_deleted               UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
-            // ── Postgres EXPLAIN jobs (collector-run plan queue) ───────────────────
-            "CREATE TABLE IF NOT EXISTS config_pg_explain_jobs (
-                id           String,
-                tenant_id    String DEFAULT 'default',
-                server_name  String,
-                db           String DEFAULT '',
-                query        String,
-                status       String DEFAULT 'pending',
-                plan_json    String DEFAULT '',
-                error        String DEFAULT '',
-                created_at   String DEFAULT '',
-                updated_at   String DEFAULT '',
-                version      UInt64,
-                is_deleted   UInt8 DEFAULT 0
-            ) ENGINE = ReplacingMergeTree(version)
-            ORDER BY (id)",
-            // ── MySQL EXPLAIN jobs (collector-run plan queue) ─────────────────────
-            "CREATE TABLE IF NOT EXISTS config_mysql_explain_jobs (
-                id           String,
-                tenant_id    String DEFAULT 'default',
-                server_name  String,
-                db           String DEFAULT '',
-                query        String,
-                status       String DEFAULT 'pending',
-                plan_json    String DEFAULT '',
-                error        String DEFAULT '',
-                created_at   String DEFAULT '',
-                updated_at   String DEFAULT '',
-                version      UInt64,
-                is_deleted   UInt8 DEFAULT 0
-            ) ENGINE = ReplacingMergeTree(version)
-            ORDER BY (id)",
             // ── SLO events ────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_slo_events (
                 id                     String,
@@ -3086,11 +2855,6 @@ impl ConfigDb {
                 is_deleted UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
-            access_event_ddl.as_str(),
-            access_chunk_ddl.as_str(),
-            "ALTER TABLE config_kubernetes_access_events ADD COLUMN IF NOT EXISTS actor_type LowCardinality(String) DEFAULT 'unknown' AFTER actor_name",
-            access_event_ttl_migration.as_str(),
-            access_chunk_ttl_migration.as_str(),
         ];
 
         for ddl in ddls {
@@ -3100,6 +2864,7 @@ impl ConfigDb {
                 .await
                 .map_err(|e| anyhow::anyhow!("DDL failed: {e}\nSQL: {ddl}"))?;
         }
+        crate::edition::run_migrations(&self.client).await?;
         Ok(())
     }
 
