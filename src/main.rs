@@ -1883,6 +1883,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Licensed builds replace the community edition hook and fail here before
+    // migrations, background work, or the HTTP listener can start.
+    rush_api::edition::validate_startup()?;
+    tracing::info!(
+        edition = rush_api::edition::BUILD_EDITION,
+        "starting Rush API"
+    );
+
     let cors_policy = Arc::new(
         CorsPolicy::from_env()
             .map_err(|error| anyhow::anyhow!("invalid CORS configuration: {error}"))?,
@@ -3020,33 +3028,9 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/internal/repository-access-audit",
             post(handlers::repository_access::audit_repository_access),
         )
-        .route(
-            "/api/v1/internal/kubernetes-access-events",
-            get(handlers::kubernetes_access::list_agent_access_events),
-        )
         // Feature flags (public — no auth)
         .route("/api/v1/features", get(handlers::settings::get_features))
         .route("/api/v1/license", get(handlers::license::get_license))
-        .route("/api/v1/integrations/registry", get(handlers::integrations::registry))
-        .route(
-            "/api/v1/integrations/{integration}/targets",
-            get(handlers::integrations::list_targets)
-                .post(handlers::integrations::create_target),
-        )
-        .route(
-            "/api/v1/integrations/{integration}/targets/{id}",
-            put(handlers::integrations::update_target)
-                .delete(handlers::integrations::delete_target),
-        )
-        // Postgres EXPLAIN job queue (UI submit/poll-result; collector poll/post)
-        .route("/api/v1/integrations/postgres/explain", post(handlers::pg_explain::submit))
-        .route("/api/v1/integrations/postgres/explain/poll", get(handlers::pg_explain::poll))
-        .route("/api/v1/integrations/postgres/explain/{id}", get(handlers::pg_explain::get_job))
-        .route("/api/v1/integrations/postgres/explain/{id}/result", post(handlers::pg_explain::post_result))
-        .route("/api/v1/integrations/mysql/explain", post(handlers::mysql_explain::submit))
-        .route("/api/v1/integrations/mysql/explain/poll", get(handlers::mysql_explain::poll))
-        .route("/api/v1/integrations/mysql/explain/{id}", get(handlers::mysql_explain::get_job))
-        .route("/api/v1/integrations/mysql/explain/{id}/result", post(handlers::mysql_explain::post_result))
         // Export row cap (admin-only setter; value also exposed via /features)
         .route("/api/v1/settings/export-max-rows", put(handlers::settings::set_export_max_rows))
         .route(
@@ -3103,32 +3087,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/settings/cloudwatch",
             get(handlers::settings::get_cloudwatch_setting).put(handlers::settings::set_cloudwatch_setting),
-        )
-        .route(
-            "/api/v1/settings/kubernetes-logging",
-            get(handlers::kubernetes_access::get_kubernetes_logging_settings)
-                .put(handlers::kubernetes_access::set_kubernetes_logging_settings)
-                .delete(handlers::kubernetes_access::revoke_all_kubernetes_clients),
-        )
-        .route(
-            "/api/v1/settings/kubernetes-logging/clients/{id}",
-            delete(handlers::kubernetes_access::revoke_kubernetes_client),
-        )
-        .route(
-            "/api/v1/settings/kubernetes-logging/roles",
-            post(handlers::kubernetes_access::create_kubernetes_rbac_grant).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_KUBERNETES_RBAC_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/settings/kubernetes-logging/roles/{id}",
-            put(handlers::kubernetes_access::update_kubernetes_rbac_grant)
-                .delete(handlers::kubernetes_access::delete_kubernetes_rbac_grant)
-                .layer(DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_KUBERNETES_RBAC_BODY_BYTES,
-                )),
         )
         // API Keys (settings)
         .route(
@@ -3278,106 +3236,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/kubernetes/namespaces", get(handlers::kubernetes::list_namespaces))
         .route("/api/v1/kubernetes/resources/{kind}", get(handlers::kubernetes::list_resources))
         .route("/api/v1/kubernetes/resources/{kind}/{namespace}/{name}", get(handlers::kubernetes::get_resource))
-        .route(
-            "/api/v1/kubernetes/login/start",
-            post(handlers::kubernetes_access::start_kubernetes_login).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/login/approve",
-            post(handlers::kubernetes_access::approve_kubernetes_login).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/login/details",
-            post(handlers::kubernetes_access::get_kubernetes_login_details).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/login/token",
-            post(handlers::kubernetes_access::poll_kubernetes_login).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_KUBERNETES_LOGIN_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/access-events/ingest",
-            post(handlers::kubernetes_access::ingest_access_event).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_ACCESS_EVENT_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/gateway/authorize",
-            post(handlers::kubernetes_access::authorize_gateway_request).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_GATEWAY_AUTHORIZE_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/gateway/ready",
-            post(handlers::kubernetes_access::gateway_recording_ready).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_GATEWAY_AUTHORIZE_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/gateway/rbac",
-            get(handlers::kubernetes_access::list_gateway_kubernetes_rbac_grants),
-        )
-        .route(
-            "/api/v1/kubernetes/gateway/rbac/reconcile",
-            post(handlers::kubernetes_access::record_gateway_kubernetes_rbac_reconcile).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_GATEWAY_AUTHORIZE_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/access-events/client",
-            post(handlers::kubernetes_access::ingest_client_event).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_CLIENT_ENRICHMENT_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/session-chunks/ingest",
-            post(handlers::kubernetes_access::ingest_session_chunk).layer(
-                DefaultBodyLimit::max(
-                    handlers::kubernetes_access::MAX_SESSION_CHUNK_BODY_BYTES,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/kubernetes/access-events",
-            get(handlers::kubernetes_access::list_access_events),
-        )
-        .route(
-            "/api/v1/kubernetes/access-events/{id}",
-            get(handlers::kubernetes_access::get_access_event),
-        )
-        .route(
-            "/api/v1/kubernetes/sessions/{id}/chunks",
-            get(handlers::kubernetes_access::get_session_chunks),
-        )
-        .route(
-            "/api/v1/kubernetes/access-events/export",
-            post(handlers::kubernetes_access::export_access_events),
-        )
         // Stats
         .route("/api/v1/stats", post(handlers::stats::get_stats))
         .route("/api/v1/stats/partitions", axum::routing::get(handlers::stats::get_storage_partitions))
@@ -3499,7 +3357,11 @@ async fn main() -> anyhow::Result<()> {
                 "unmatched request"
             );
             (axum::http::StatusCode::NOT_FOUND, "not found")
-        })
+        });
+
+    // Edition routes receive the same auth, tenant, CSRF, CORS, limits, and
+    // observability layers as core routes.
+    let inner = rush_api::edition::routes(inner)
         // The outer tenant middleware resolves credentials and rewrites
         // `/t/{tenant}` before routing. Enforce the resulting tenant policy here
         // so the CORS/security/metrics layers below still wrap rejected requests.
@@ -3520,7 +3382,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn(security_headers_middleware))
         // API RED self-metrics (rush_http_*). Applied as a router layer so the
         // MatchedPath (templated route) is populated by routing before it runs.
-        .layer(axum::middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            http_metrics_middleware,
+        ))
         .layer(TraceLayer::new_for_http().make_span_with(
             |request: &axum::http::Request<axum::body::Body>| {
                 tracing::info_span!(
