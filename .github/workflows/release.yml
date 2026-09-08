@@ -16,6 +16,14 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# NOTE: These workflow-level permissions only *narrow* the permissions granted to
+# GITHUB_TOKEN; they cannot elevate them beyond the repository's configured ceiling.
+# For "build-and-push" to be able to push to ghcr.io, the repository (or
+# organization) setting at Settings > Actions > General > Workflow permissions
+# must be set to "Read and write permissions". Repositories created after
+# February 2023 default to read-only, which causes GHCR pushes to fail with
+# "denied: permission_denied: write_package" even though `packages: write` is
+# requested here.
 permissions:
   contents: write
   packages: write
