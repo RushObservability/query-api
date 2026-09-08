@@ -1746,6 +1746,8 @@ struct ExplainClaimRow {
     id: String,
     db: String,
     query: String,
+    /// 1 = run EXPLAIN ANALYZE, which executes the statement.
+    analyze: u8,
 }
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct ExplainStatusRow {
@@ -6474,12 +6476,13 @@ impl ConfigDb {
         server: &str,
         db: &str,
         query: &str,
+        analyze: bool,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Self::now_str();
         self.client
-            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, plan_json, error, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'pending', '', '', ?, ?, ?, 0)")
-            .bind(&id).bind(tenant_id).bind(server).bind(db).bind(query).bind(&now).bind(&now).bind(Self::next_version())
+            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, analyze, status, plan_json, error, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 'pending', '', '', ?, ?, ?, 0)")
+            .bind(&id).bind(tenant_id).bind(server).bind(db).bind(query).bind(u8::from(analyze)).bind(&now).bind(&now).bind(Self::next_version())
             .execute().await?;
         Ok(id)
     }
@@ -6489,19 +6492,22 @@ impl ConfigDb {
         &self,
         tenant_id: &str,
         server: &str,
-    ) -> anyhow::Result<Option<(String, String, String)>> {
+    ) -> anyhow::Result<Option<(String, String, String, bool)>> {
         let row = self.client
-            .query("SELECT id, db, query FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
+            .query("SELECT id, db, query, analyze FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
             .bind(tenant_id).bind(server)
             .fetch_all::<ExplainClaimRow>().await?
             .into_iter().next();
         if let Some(r) = &row {
+            // `analyze` must be re-stated: this is a ReplacingMergeTree, so any
+            // column left out of the row that replaces the old one reverts to
+            // its default and the collector would silently stop analyzing.
             self.client
-                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0)")
-                .bind(&r.id).bind(tenant_id).bind(server).bind(&r.db).bind(&r.query).bind(Self::now_str()).bind(Self::next_version())
+                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, analyze, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, 0)")
+                .bind(&r.id).bind(tenant_id).bind(server).bind(&r.db).bind(&r.query).bind(r.analyze).bind(Self::now_str()).bind(Self::next_version())
                 .execute().await?;
         }
-        Ok(row.map(|r| (r.id, r.db, r.query)))
+        Ok(row.map(|r| (r.id, r.db, r.query, r.analyze != 0)))
     }
 
     /// Requeue jobs whose collector lease expired. Collector-side EXPLAIN is
@@ -6514,7 +6520,7 @@ impl ConfigDb {
     ) -> anyhow::Result<u64> {
         let rows = self
             .client
-            .query("SELECT id, db, query FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'running' AND is_deleted = 0 AND updated_at < toString(now() - INTERVAL 2 MINUTE) LIMIT 20")
+            .query("SELECT id, db, query, analyze FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'running' AND is_deleted = 0 AND updated_at < toString(now() - INTERVAL 2 MINUTE) LIMIT 20")
             .bind(tenant_id)
             .bind(server)
             .fetch_all::<ExplainClaimRow>()
@@ -6522,12 +6528,13 @@ impl ConfigDb {
         let mut count = 0;
         for row in rows {
             self.client
-                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 0)")
+                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, analyze, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0)")
                 .bind(&row.id)
                 .bind(tenant_id)
                 .bind(server)
                 .bind(&row.db)
                 .bind(&row.query)
+                .bind(row.analyze)
                 .bind(Self::now_str())
                 .bind(Self::next_version())
                 .execute()
