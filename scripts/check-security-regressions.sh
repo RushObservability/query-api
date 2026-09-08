@@ -31,9 +31,27 @@ while IFS= read -r path; do
   esac
 done < <(perl -0777 -ne 'while (/\.route\(\s*"([^"]+)"/g) { print "$1\n" }' src/main.rs | sort -u)
 
-for sensitive_file in users groups tenants sso audit settings integrations; do
-  if ! rg -q "require_(auth|write|admin)" "src/handlers/${sensitive_file}.rs" 2>/dev/null; then
+# Handler families that must exist here and must gate on an explicit guard. A
+# missing file is a failure: renaming one out from under this list would
+# otherwise drop its authorization check silently.
+for sensitive_file in users groups tenants sso audit settings; do
+  handler="src/handlers/${sensitive_file}.rs"
+  if [[ ! -f "$handler" ]]; then
+    echo "sensitive handler family is missing: $handler" >&2
+    failed=1
+  elif ! rg -q "require_(auth|write|admin)" "$handler"; then
     echo "sensitive handler family lacks an explicit authorization guard: $sensitive_file" >&2
+    failed=1
+  fi
+done
+
+# Families that only ship in the licensed edition. Guarded when present, skipped
+# when the edition split has moved them out of this repository — checked
+# separately so an absent file cannot be mistaken for a guarded one.
+for optional_file in integrations; do
+  handler="src/handlers/${optional_file}.rs"
+  if [[ -f "$handler" ]] && ! rg -q "require_(auth|write|admin)" "$handler"; then
+    echo "sensitive handler family lacks an explicit authorization guard: $optional_file" >&2
     failed=1
   fi
 done
