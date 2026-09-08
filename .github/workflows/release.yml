@@ -120,6 +120,15 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # github.repository keeps the owner's casing (RushObservability/query-api),
+      # but an OCI reference must be lowercase. docker/metadata-action lowercases
+      # its own tags, which is why the push succeeds, so the mismatch only shows
+      # up in the steps that build a reference by hand: the Trivy scan, the SBOM,
+      # and both attestations. Overriding IMAGE_NAME here fixes all of them at
+      # once and keeps working if the repository is ever renamed.
+      - name: Normalise the image name to lower case
+        run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
