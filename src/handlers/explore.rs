@@ -59,6 +59,8 @@ pub struct ExploreSearchRequest {
     pub interval: String,
     #[serde(default)]
     pub group_by: Option<String>,
+    #[serde(default)]
+    pub display_fields: Vec<String>,
     /// Existing clients keep the coordinated two-query response. The UI can
     /// request rows and summaries separately so rows paint as soon as their
     /// ClickHouse query finishes.
@@ -764,7 +766,7 @@ fn build_log_plan(
     let predicate = clauses.to_sql();
     let rows_sql = format!(
         "SELECT {} FROM logs {predicate} ORDER BY Timestamp DESC, ServiceName DESC, TraceId DESC, SpanId DESC, hex(SHA256(Body)) DESC LIMIT {limit}",
-        super::logs::LOG_LIST_SELECT_COLS
+        super::logs::log_list_select(&req.display_fields)?
     );
     let group_expr = req
         .group_by
@@ -918,6 +920,7 @@ mod tests {
             limit: 100,
             interval: "1m".to_string(),
             group_by: None,
+            display_fields: Vec::new(),
             include_rows: true,
             include_summary: true,
         }
@@ -962,6 +965,43 @@ mod tests {
         assert!(plan.summary_sql.contains("tenant_id = 'tenant-b'"));
         assert_clickhouse_sql_parses(&plan.rows_sql);
         assert_clickhouse_sql_parses(&plan.summary_sql);
+    }
+
+    #[test]
+    fn log_view_columns_and_filters_apply_to_rows_and_summary() {
+        let mut req = request(ExploreSignal::Logs);
+        req.filters = vec![
+            Filter {
+                field: "type".into(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("event_data"),
+            },
+            Filter {
+                field: "status".into(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("delayed"),
+            },
+        ];
+        req.search = Some("delayed OR cancelled".into());
+        req.display_fields = vec!["log.airline".into(), "body.flight_number".into()];
+        let plan = build_plan(&req, "tenant-flights").unwrap();
+        for sql in [&plan.rows_sql, &plan.summary_sql] {
+            assert!(sql.contains("tenant_id = 'tenant-flights'"));
+            assert!(sql.contains("= 'event_data'"));
+            assert!(sql.contains("= 'delayed'"));
+            assert_clickhouse_sql_parses(sql);
+        }
+        assert!(plan.rows_sql.contains("toString(LogAttributes['airline'])"));
+        assert!(
+            plan.rows_sql
+                .contains("JSON_VALUE(Body, '$.flight_number')")
+        );
+        assert!(!plan.summary_sql.contains("AS DisplayValues"));
+        req.display_fields = vec!["airline".into(); 21];
+        assert_eq!(
+            build_plan(&req, "tenant-flights").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

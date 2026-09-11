@@ -28,6 +28,7 @@ pub mod kubernetes;
 pub mod license;
 pub mod llm_providers;
 pub mod logs;
+pub mod log_views;
 pub mod maintenance;
 pub mod metric_firewall;
 pub mod metrics;

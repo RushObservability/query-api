@@ -31,6 +31,94 @@ fn default_limit() -> u64 {
     20
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LogSuggestRequest {
+    pub field: String,
+    #[serde(default)]
+    pub prefix: String,
+    pub time_range: crate::models::query::TimeRange,
+    #[serde(default)]
+    pub filters: Vec<crate::models::query::Filter>,
+}
+
+fn log_suggest_sql(req: &LogSuggestRequest, tenant: &str) -> Result<String, (StatusCode, String)> {
+    super::log_views::validate_field(&req.field)?;
+    if req.prefix.len() > 200 || req.filters.len() > 20 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Suggestion prefix or filter count exceeds its limit".into(),
+        ));
+    }
+    let clauses = super::logs::build_log_where(
+        &req.filters,
+        &req.time_range.from,
+        &req.time_range.to,
+        None,
+        tenant,
+    );
+    let field = super::logs::resolve_log_field(&req.field);
+    let prefix = crate::query_builder::escape_string_literal(&req.prefix);
+    // Bound distinct-value work to recent matching rows. The inner predicate
+    // applies the same tenant, time range and saved-view filters as Explore.
+    Ok(format!(
+        "SELECT DISTINCT val FROM (SELECT toString({field}) AS val FROM logs {} \
+         ORDER BY Timestamp DESC LIMIT 20000) \
+         WHERE val != '' AND length(val) <= 512 AND startsWith(lowerUTF8(val), lowerUTF8('{prefix}')) \
+         ORDER BY val LIMIT 20",
+        clauses.to_sql()
+    ))
+}
+
+pub async fn suggest_log_values(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(req): Json<LogSuggestRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let sql = log_suggest_sql(&req, &tenant.tenant_id)?;
+    let rows = crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
+        .fetch_all::<StringValueRow>()
+        .await
+        .map_err(|error| crate::api_error::internal_legacy("log_suggest.query", error))?;
+    Ok(Json(rows.into_iter().map(|row| row.val).collect()))
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn log_suggestions_scope_custom_fields_to_tenant_time_and_view() {
+        let mut req: LogSuggestRequest = serde_json::from_value(serde_json::json!({
+            "field": "body.airline", "prefix": "Ex'_%",
+            "time_range": {"from": "2026-09-11T00:00:00Z", "to": "2026-09-11T01:00:00Z"},
+            "filters": [{"field": "type", "op": "=", "value": "event_data"}]
+        }))
+        .unwrap();
+        let sql = log_suggest_sql(&req, "tenant'one").unwrap();
+        assert!(sql.contains("tenant_id = 'tenant''one'"));
+        assert!(sql.contains("2026-09-11T00:00:00Z"));
+        assert!(sql.contains("2026-09-11T01:00:00Z"));
+        assert!(sql.contains("= 'event_data'"));
+        assert!(sql.contains("JSON_VALUE(Body, '$.airline')"));
+        assert!(sql.contains("lowerUTF8('Ex''_%')"));
+        assert!(sql.contains("LIMIT 20000"));
+        assert!(sql.ends_with("LIMIT 20"));
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, &sql)
+            .unwrap();
+        req.field = "airline".into();
+        assert!(
+            log_suggest_sql(&req, "default")
+                .unwrap()
+                .contains("LogAttributes['airline']")
+        );
+        req.prefix = "x".repeat(201);
+        assert_eq!(
+            log_suggest_sql(&req, "default").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
 pub async fn suggest_values(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,

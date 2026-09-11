@@ -69,4 +69,7 @@ pub struct LogListRecord {
     /// latter is the compact cityHash locator used by lazy detail lookup.
     #[serde(rename = "CursorHash")]
     pub cursor_hash: String,
+    /// Only explicitly requested display fields, not the full attribute maps.
+    #[serde(rename = "DisplayValues", serialize_with = "vec_pairs_as_map")]
+    pub display_values: Vec<(String, String)>,
 }
