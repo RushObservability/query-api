@@ -2723,12 +2723,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
         .route("/api/v1/explore/search", post(handlers::explore::search))
+        .route("/api/v1/settings/log-views", get(handlers::log_views::get).put(handlers::log_views::put))
         // Export current query + results (CSV/JSON), capped by export_max_rows
         .route("/api/v1/query/export", post(handlers::query::export_query))
         // BubbleUp comparison analysis
         .route("/api/v1/bubbleup", post(handlers::bubbleup::bubbleup))
         // Log endpoints
         .route("/api/v1/logs", post(handlers::logs::query_logs))
+        .route("/api/v1/logs/suggest", post(handlers::suggest::suggest_log_values))
         .route("/api/v1/logs/detail", post(handlers::logs::get_log_detail))
         .route("/api/v1/logs/context", post(handlers::logs::get_log_context))
         .route("/api/v1/logs/count", post(handlers::logs::count_logs))

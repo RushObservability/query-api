@@ -43,6 +43,42 @@ The API manages tenants, users, SSO through SAML or OIDC, API keys, RBAC groups,
 dashboards, alerts, SLOs, anomaly and SIEM detection rules, deploy markers, and
 retention caps. It stores this state in ClickHouse `config_*` tables.
 
+### Saved log views
+
+`GET /api/v1/settings/log-views` reads the active tenant's saved log views.
+`PUT` on the same path replaces that tenant's collection and requires an admin
+session. Saves emit a `log_view.update` audit event without recording filter
+values. No new environment variables or database migrations are needed.
+
+```json
+{
+  "views": [{
+    "id": "33333333-3333-4333-8333-333333333333",
+    "name": "Flights",
+    "filters": [{ "field": "type", "op": "=", "value": "event_data" }],
+    "columns": [
+      { "field": "timestamp", "label": "Time" },
+      { "field": "log.airline", "label": "Airline" },
+      { "field": "log.flight_number", "label": "Flight number" },
+      { "field": "log.status", "label": "Status" }
+    ]
+  }]
+}
+```
+
+Limits: 50 views per tenant, 20 columns and 20 base filters per view. Base
+filters accept string values with `=`, `!=`, `LIKE`, and `NOT LIKE`; all must
+match. View IDs must be unique UUIDs. Names are unique within the tenant.
+
+The frontend combines base filters with the user's filters for every log
+search. Views do not restrict access to the underlying logs. Log queries accept
+`display_fields` on `/api/v1/explore/search` (signal `logs`) and
+`/api/v1/logs` with `slim: true`. These return a `DisplayValues` map with
+only the requested fields alongside the standard slim row. Fields support
+builtins, `log.*`, `resource.*`, and scalar JSON paths such as
+`body.flight.number`. Unprefixed attributes check log attributes first, then
+resource attributes. The full record remains available through log detail.
+
 ## Quick start
 
 ClickHouse in Docker, the API on your host with reload:

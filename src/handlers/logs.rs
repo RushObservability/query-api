@@ -15,6 +15,7 @@ use crate::query_builder::{QueryClauses, build_log_search_sql, format_value, san
 /// Uses materialized columns for common resource attributes (avoids Map lookups).
 pub(crate) fn resolve_log_field(field: &str) -> String {
     match field {
+        "time" | "timestamp" | "Timestamp" => "Timestamp".to_string(),
         "service_name" | "ServiceName" => "ServiceName".to_string(),
         "severity" | "severity_text" | "SeverityText" => "SeverityText".to_string(),
         "severity_number" | "SeverityNumber" => "SeverityNumber".to_string(),
@@ -35,10 +36,21 @@ pub(crate) fn resolve_log_field(field: &str) -> String {
                         // key. Keep those rows queryable without forcing a full-table rewrite.
                         "if(notEmpty(mat_environment), mat_environment, ResourceAttributes['deployment.environment.name'])".to_string()
                     }
-                    _ => format!("ResourceAttributes['{attr}']"),
+                    _ => format!(
+                        "ResourceAttributes['{}']",
+                        crate::query_builder::escape_string_literal(attr)
+                    ),
                 }
             } else if let Some(attr) = field.strip_prefix("log.") {
-                format!("LogAttributes['{attr}']")
+                format!(
+                    "LogAttributes['{}']",
+                    crate::query_builder::escape_string_literal(attr)
+                )
+            } else if let Some(path) = field.strip_prefix("body.") {
+                format!(
+                    "JSON_VALUE(Body, '{}')",
+                    crate::query_builder::escape_string_literal(&format!("$.{path}"))
+                )
             } else {
                 // Unqualified key: check both LogAttributes and ResourceAttributes
                 let escaped = crate::query_builder::escape_string_literal(&field);
@@ -149,16 +161,36 @@ pub struct LogQueryRequest {
     /// Omit large attribute maps and return lazy-detail locators.
     #[serde(default)]
     pub slim: bool,
+    #[serde(default)]
+    pub display_fields: Vec<String>,
 }
 
 fn default_limit() -> u64 {
     100
 }
 
-pub(crate) const LOG_LIST_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
+pub(crate) const LOG_LIST_BASE_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
     SeverityNumber, ServiceName, Body, toString(toUnixTimestamp64Nano(Timestamp)) AS TimestampNs, \
     toString(_block_number) AS BlockNumber, toString(_block_offset) AS BlockOffset, \
     toString(cityHash64(Body)) AS BodyHash, hex(SHA256(Body)) AS CursorHash";
+
+pub(crate) fn log_list_select(fields: &[String]) -> Result<String, (StatusCode, String)> {
+    super::log_views::validate_fields(fields)?;
+    let values = fields
+        .iter()
+        .map(|field| {
+            format!(
+                "'{}', toString({})",
+                crate::query_builder::escape_string_literal(field),
+                resolve_log_field(field)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "{LOG_LIST_BASE_COLS}, CAST(map({values}), 'Map(String, String)') AS DisplayValues"
+    ))
+}
 
 const LOG_DETAIL_SELECT_COLS: &str = "Timestamp, TraceId, SpanId, SeverityText, \
     SeverityNumber, ServiceName, Body, ResourceAttributes, ScopeName, LogAttributes";
@@ -284,9 +316,9 @@ pub async fn query_logs(
     let limit = req.limit.clamp(1, 1000);
     let fetch_limit = limit + 1;
     let select_cols = if req.slim {
-        LOG_LIST_SELECT_COLS
+        log_list_select(&req.display_fields)?
     } else {
-        LOG_DETAIL_SELECT_COLS
+        LOG_DETAIL_SELECT_COLS.to_string()
     };
 
     // Fast path: try a narrow recent window first. The base table's time-first
@@ -699,11 +731,12 @@ pub async fn get_log_context(
     let older = clauses.with_where_extra(&format!("{tuple} <= {anchor}"));
     let ascending =
         "Timestamp ASC, ServiceName ASC, TraceId ASC, SpanId ASC, hex(SHA256(Body)) ASC";
+    let select_cols = log_list_select(&[])?;
     let sql = format!(
         "SELECT * FROM (\
-           (SELECT {LOG_LIST_SELECT_COLS} FROM logs {} ORDER BY {ascending} LIMIT {before}) \
+           (SELECT {select_cols} FROM logs {} ORDER BY {ascending} LIMIT {before}) \
            UNION ALL \
-           (SELECT {LOG_LIST_SELECT_COLS} FROM logs {} ORDER BY {LOG_ORDER} LIMIT {after})\
+           (SELECT {select_cols} FROM logs {} ORDER BY {LOG_ORDER} LIMIT {after})\
          ) ORDER BY {LOG_ORDER}",
         newer.to_sql(),
         older.to_sql(),
@@ -1317,15 +1350,28 @@ mod tests {
 
     #[test]
     fn slim_projection_excludes_attribute_maps() {
-        assert!(!LOG_LIST_SELECT_COLS.contains("ResourceAttributes"));
-        assert!(!LOG_LIST_SELECT_COLS.contains("LogAttributes"));
-        assert!(
-            LOG_LIST_SELECT_COLS
-                .contains("toString(toUnixTimestamp64Nano(Timestamp)) AS TimestampNs")
-        );
-        assert!(LOG_LIST_SELECT_COLS.contains("toString(_block_number) AS BlockNumber"));
-        assert!(LOG_LIST_SELECT_COLS.contains("toString(_block_offset) AS BlockOffset"));
-        assert!(LOG_LIST_SELECT_COLS.contains("toString(cityHash64(Body)) AS BodyHash"));
+        let cols = log_list_select(&[]).unwrap();
+        assert!(!cols.contains("ResourceAttributes"));
+        assert!(!cols.contains("LogAttributes"));
+        assert!(cols.contains("toString(toUnixTimestamp64Nano(Timestamp)) AS TimestampNs"));
+        assert!(cols.contains("toString(_block_number) AS BlockNumber"));
+        assert!(cols.contains("toString(_block_offset) AS BlockOffset"));
+        assert!(cols.contains("toString(cityHash64(Body)) AS BodyHash"));
+    }
+
+    #[test]
+    fn custom_columns_project_only_requested_fields_and_escape_keys() {
+        let sql = log_list_select(&[
+            "log.airline".into(),
+            "resource.flight'number".into(),
+            "body.status".into(),
+        ])
+        .unwrap();
+        assert!(sql.contains("LogAttributes['airline']"));
+        assert!(sql.contains("ResourceAttributes['flight''number']"));
+        assert!(sql.contains("JSON_VALUE(Body, '$.status')"));
+        assert!(sql.contains("AS DisplayValues"));
+        assert!(log_list_select(&vec!["body".into(); 21]).is_err());
     }
 
     #[test]
