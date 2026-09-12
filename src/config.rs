@@ -73,6 +73,8 @@ pub struct RetentionConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetentionDefaults {
+    #[serde(default = "default_profile_days")]
+    pub profiles_days: u32,
     #[serde(default = "default_30")]
     pub metrics_days: u32,
     #[serde(default = "default_30")]
@@ -85,6 +87,7 @@ impl Default for RetentionDefaults {
     fn default() -> Self {
         Self {
             metrics_days: 30,
+            profiles_days: 7,
             traces_days: 30,
             logs_days: 30,
         }
@@ -93,6 +96,10 @@ impl Default for RetentionDefaults {
 
 fn default_30() -> u32 {
     30
+}
+
+fn default_profile_days() -> u32 {
+    7
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

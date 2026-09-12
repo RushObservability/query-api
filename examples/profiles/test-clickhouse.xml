@@ -1,0 +1,4 @@
+<!-- Only for the isolated profile storage smoke test, not production setup. -->
+<clickhouse>
+  <custom_settings_prefixes>rush_</custom_settings_prefixes>
+</clickhouse>

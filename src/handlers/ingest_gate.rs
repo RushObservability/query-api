@@ -13,13 +13,14 @@ use std::time::Instant;
 
 /// Map the internal signal category ("apm") to the `signal` label value used by the
 /// `rush_ingest_*` self-metrics ("spans"). Other categories pass through unchanged.
-/// Returns a small, finite set: logs | spans | metrics | rum.
+/// Returns a small, finite set: logs | spans | metrics | rum | profiles.
 fn signal_label(cat: &str) -> &'static str {
     match cat {
         "logs" => "logs",
         "apm" => "spans",
         "metrics" => "metrics",
         "rum" => "rum",
+        "profiles" => "profiles",
         _ => "other",
     }
 }

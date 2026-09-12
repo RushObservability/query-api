@@ -36,6 +36,7 @@ pub mod monitors;
 pub mod otlp;
 pub mod parse_promql;
 pub mod parse_query;
+pub mod profiles;
 pub mod query;
 pub mod remote_write;
 pub mod repository_access;

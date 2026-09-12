@@ -1,0 +1,29 @@
+# Collector contrib 0.151.0. Run separately from older telemetry collectors.
+receivers:
+  pprof:
+    endpoint: ${env:PPROF_ENDPOINT}
+    collection_interval: 30s
+processors:
+  resource/profiles:
+    attributes:
+      - key: service.name
+        value: ${env:PROFILE_SERVICE}
+        action: upsert
+      - key: service.version
+        value: ${env:PROFILE_VERSION}
+        action: upsert
+exporters:
+  otlp_http/rush:
+    profiles_endpoint: ${env:RUSH_PROFILE_ENDPOINT}/v1development/profiles
+    headers:
+      Authorization: Bearer ${env:RUSH_PROFILE_API_KEY}
+      X-Rush-Tenant: ${env:RUSH_PROFILE_TENANT}
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+service:
+  pipelines:
+    profiles:
+      receivers: [pprof]
+      processors: [resource/profiles]
+      exporters: [otlp_http/rush]

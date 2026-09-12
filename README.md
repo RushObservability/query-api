@@ -384,3 +384,8 @@ cargo test              # or: make test
 ## License
 
 [Business Source License 1.1](LICENSE).
+# CPU profiling
+
+Free, built-in CPU profiling is available under **Observe → Profiles**.
+See [profiling setup](docs/profiling.md) for the collector configuration, synthetic
+demo, supported alpha protocol, tenant controls, and retention.

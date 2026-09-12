@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 
-pub const INGEST_SIGNALS: [&str; 5] = ["logs", "traces", "metrics", "rum", "collector"];
+pub const INGEST_SIGNALS: [&str; 6] = ["logs", "traces", "metrics", "rum", "collector", "profiles"];
 
 pub fn env_flag(name: &str) -> bool {
     std::env::var(name)

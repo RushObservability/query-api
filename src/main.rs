@@ -830,6 +830,7 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
         || path.starts_with("/api/v1/explore/")
         || path.starts_with("/api/v1/logs")
         || path.starts_with("/api/v1/traces")
+        || path.starts_with("/api/v1/profiles")
         || path.starts_with("/api/v1/services")
         || path.starts_with("/api/v1/bubbleup")
         || path.starts_with("/api/v1/suggest")
@@ -1075,6 +1076,9 @@ fn ingest_signal_for_route(method: &axum::http::Method, path: &str) -> Option<&'
     if is_explain_collector_route(method, path) {
         return Some("collector");
     }
+    if path == "/v1development/profiles" {
+        return Some("profiles");
+    }
     if matches!(
         path,
         "/v1/logs" | "/api/v1/ingest/logs" | "/datadog/v1/input" | "/api/v2/logs"
@@ -1164,7 +1168,11 @@ fn ingest_source_for_route(path: &str) -> &'static str {
         "rum"
     } else if matches!(
         path,
-        "/v1/logs" | "/v1/traces" | "/v1/metrics" | "/api/v1/ingest/logs"
+        "/v1/logs"
+            | "/v1/traces"
+            | "/v1/metrics"
+            | "/v1development/profiles"
+            | "/api/v1/ingest/logs"
     ) {
         "otlp"
     } else {
@@ -2069,6 +2077,28 @@ async fn main() -> anyhow::Result<()> {
             .context("audit logger initialization failed")?,
     );
     audit.spawn_replayer();
+    // Finish the profile upgrade before buffered inserts or profile queries run.
+    // The audit logger must be ready before this persistent schema change.
+    if migrations::upgrade_profile_sample_type(&admin_ch, &clickhouse_db)
+        .await
+        .context("profile sample-type migration failed")?
+    {
+        audit
+            .log(
+                rush_api::audit::AuditEvent::new("schema.migrate", "system")
+                    .resource("table", format!("{clickhouse_db}.profile_samples"))
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "migration": "profile_sample_type",
+                            "added_column": "profile_type",
+                            "legacy_default": "cpu"
+                        })
+                        .to_string(),
+                    ),
+            )
+            .await;
+    }
     let export_jobs = Arc::new(handlers::export::ExportJobs::from_env()?);
     export_jobs.spawn_janitor(audit.clone());
     let invalidated_sessions = config_db.invalidate_legacy_session_tokens().await?;
@@ -3265,6 +3295,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/traces",  post(handlers::otlp::ingest_otlp_traces))
         .route("/v1/logs",    post(handlers::otlp::ingest_otlp_logs))
         .route("/v1/metrics", post(handlers::otlp::ingest_otlp_metrics))
+        .route("/v1development/profiles", post(handlers::profiles::ingest))
+        .route("/api/v1/profiles", get(handlers::profiles::query))
+        .route("/api/v1/profiles/series", get(handlers::profiles::series))
         // Vector JSON logs
         .route("/api/v1/ingest/logs", post(handlers::otlp::ingest_vector_logs))
         // ═══ AWS CloudWatch Logs Ingestion (Kinesis Data Firehose HTTP endpoint) ═══
@@ -3567,6 +3600,7 @@ mod tenant_auth_tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     const INGEST_ROUTES: &[(&str, &str)] = &[
+        ("/v1development/profiles", "profiles"),
         ("/v1/logs", "logs"),
         ("/api/v1/ingest/logs", "logs"),
         ("/datadog/v1/input", "logs"),

@@ -9,6 +9,7 @@ pub mod kubernetes_access;
 pub mod log;
 pub mod metrics;
 pub mod monitor;
+pub mod profile;
 pub mod query;
 pub mod rum;
 pub mod service_link;

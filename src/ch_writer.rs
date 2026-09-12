@@ -22,6 +22,7 @@ use crate::models::ingest::{
     ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, RumReplayChunk, SumRow, SummaryRow,
     TraceInsertRow,
 };
+use crate::models::profile::ProfileRow;
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
 use crate::shutdown::{ShutdownController, ShutdownPhase};
@@ -62,6 +63,7 @@ pub enum SpoolBatch {
     Histogram(Vec<HistogramRow>),
     ExpHistogram(Vec<ExpHistogramRow>),
     Summary(Vec<SummaryRow>),
+    Profiles(Vec<ProfileRow>),
 }
 
 impl SpoolBatch {
@@ -78,6 +80,7 @@ impl SpoolBatch {
             SpoolBatch::Histogram(_) => "metrics_histogram",
             SpoolBatch::ExpHistogram(_) => "metrics_exp_histogram",
             SpoolBatch::Summary(_) => "metrics_summary",
+            SpoolBatch::Profiles(_) => "profile_samples",
         }
     }
 
@@ -94,6 +97,7 @@ impl SpoolBatch {
             SpoolBatch::Histogram(v) => v.len(),
             SpoolBatch::ExpHistogram(v) => v.len(),
             SpoolBatch::Summary(v) => v.len(),
+            SpoolBatch::Profiles(v) => v.len(),
         }
     }
 
@@ -120,12 +124,13 @@ impl SpoolBatch {
             SpoolBatch::Histogram(_) => size_of::<HistogramRow>(),
             SpoolBatch::ExpHistogram(_) => size_of::<ExpHistogramRow>(),
             SpoolBatch::Summary(_) => size_of::<SummaryRow>(),
+            SpoolBatch::Profiles(_) => size_of::<ProfileRow>(),
         };
         (self.len() as u64).saturating_mul(per_row as u64)
     }
 
     /// Canonical ingest-signal category for this batch variant. One of
-    /// "logs", "apm", "metrics", "rum" — used by the per-tenant signal gate.
+    /// "logs", "apm", "metrics", "rum", "profiles" — used by the per-tenant signal gate.
     /// `apm` covers traces (spans), `metrics` covers all metric types.
     pub fn signal_category(&self) -> &'static str {
         match self {
@@ -137,6 +142,7 @@ impl SpoolBatch {
             | SpoolBatch::ExpHistogram(_)
             | SpoolBatch::Summary(_) => "metrics",
             SpoolBatch::Rum(_) | SpoolBatch::RumReplay(_) => "rum",
+            SpoolBatch::Profiles(_) => "profiles",
         }
     }
 
@@ -155,11 +161,12 @@ impl SpoolBatch {
             SpoolBatch::Histogram(_) => 7,
             SpoolBatch::ExpHistogram(_) => 8,
             SpoolBatch::Summary(_) => 9,
+            SpoolBatch::Profiles(_) => 10,
         }
     }
 
     /// Number of distinct per-table buffer slots.
-    const SLOTS: usize = 10;
+    const SLOTS: usize = 11;
 
     /// Append the rows of `other` (same variant) into `self`. Both args must be
     /// the same variant — callers guarantee this via `slot()`.
@@ -175,6 +182,7 @@ impl SpoolBatch {
             (SpoolBatch::Histogram(a), SpoolBatch::Histogram(b)) => a.extend(b),
             (SpoolBatch::ExpHistogram(a), SpoolBatch::ExpHistogram(b)) => a.extend(b),
             (SpoolBatch::Summary(a), SpoolBatch::Summary(b)) => a.extend(b),
+            (SpoolBatch::Profiles(a), SpoolBatch::Profiles(b)) => a.extend(b),
             // Variant mismatch is a programming error (slots keep them apart).
             _ => debug_assert!(
                 false,
@@ -710,6 +718,13 @@ impl ChWriter {
 /// This is used both by `ChWriter::write` (normal path) and the replayer.
 pub async fn try_insert(ch: &Client, batch: &SpoolBatch) -> Result<(), clickhouse::error::Error> {
     match batch {
+        SpoolBatch::Profiles(rows) => {
+            let mut ins = ch.insert("profile_samples")?;
+            for r in rows {
+                ins.write(r).await?;
+            }
+            ins.end().await
+        }
         SpoolBatch::SpansRaw(rows) => {
             let mut ins = ch.insert("spans_raw")?;
             for r in rows {
@@ -788,6 +803,17 @@ pub async fn try_insert(ch: &Client, batch: &SpoolBatch) -> Result<(), clickhous
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    #[test]
+    fn profiles_have_a_distinct_signal_slot_and_spool_round_trip() {
+        let batch = SpoolBatch::Profiles(vec![]);
+        assert_eq!(batch.signal_category(), "profiles");
+        assert_eq!(batch.table(), "profile_samples");
+        assert_ne!(batch.slot(), SpoolBatch::Logs(vec![]).slot());
+        assert!(matches!(
+            decode_spool(&encode_spool(&batch).unwrap()).unwrap(),
+            SpoolBatch::Profiles(_)
+        ));
+    }
     use crate::models::ingest::GaugeRow;
 
     fn gauge(n: usize) -> SpoolBatch {
