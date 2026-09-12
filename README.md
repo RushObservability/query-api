@@ -45,10 +45,24 @@ retention caps. It stores this state in ClickHouse `config_*` tables.
 
 ### Saved log views
 
-`GET /api/v1/settings/log-views` reads the active tenant's saved log views.
-`PUT` on the same path replaces that tenant's collection and requires an admin
-session. Saves emit a `log_view.update` audit event without recording filter
-values. No new environment variables or database migrations are needed.
+`GET /api/v1/settings/log-views` returns shared views for the active tenant plus
+the signed-in user's personal views in that tenant. Each returned view includes
+`scope: "tenant" | "personal"`; the response also includes `tenant_id`.
+Anonymous requests to deliberately public tenants receive only shared views.
+
+`PUT /api/v1/settings/log-views?scope=tenant` replaces the shared collection and
+requires an admin session. `?scope=personal` replaces only the signed-in user's
+personal collection in that tenant, including for users with the viewer role.
+Omitting `scope` preserves the existing shared-write behavior. Send only the
+views from the chosen scope; never send the combined GET collection to PUT.
+
+The tenant comes from the authorized `X-Rush-Tenant` context. Personal ownership
+comes from the session, never a supplied user ID. A rejected explicit tenant
+selection fails instead of silently saving under the session's default tenant.
+Personal views are not included in another user's list, even for admins.
+Existing stored views stay shared. Saves and deletions emit `log_view.update`
+events with scope, IDs, and counts, without filter values. No new environment
+variables or database migrations are needed.
 
 ```json
 {
@@ -66,9 +80,11 @@ values. No new environment variables or database migrations are needed.
 }
 ```
 
-Limits: 50 views per tenant, 20 columns and 20 base filters per view. Base
+Limits: 50 shared views per tenant and 50 personal views per user per tenant,
+20 columns and 20 base filters per view. Base
 filters accept string values with `=`, `!=`, `LIKE`, and `NOT LIKE`; all must
-match. View IDs must be unique UUIDs. Names are unique within the tenant.
+match. View IDs must be unique UUIDs within a collection. Names are unique within
+each collection, so a personal copy can have the same name as a shared view.
 
 The frontend combines base filters with the user's filters for every log
 search. Views do not restrict access to the underlying logs. Log queries accept
