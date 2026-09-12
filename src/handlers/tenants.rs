@@ -21,6 +21,8 @@ pub struct SignalFlags {
     pub metrics: bool,
     #[serde(default = "default_true")]
     pub rum: bool,
+    #[serde(default = "default_true")]
+    pub profiles: bool,
 }
 
 fn default_true() -> bool {
@@ -34,6 +36,7 @@ impl Default for SignalFlags {
             apm: true,
             metrics: true,
             rum: true,
+            profiles: true,
         }
     }
 }
@@ -56,6 +59,10 @@ async fn resolve_signal_flags(state: &AppState, tenant_id: &str) -> SignalFlags 
         rum: state
             .config_db
             .tenant_signal_enabled(tenant_id, "rum")
+            .await,
+        profiles: state
+            .config_db
+            .tenant_signal_enabled(tenant_id, "profiles")
             .await,
     }
 }
@@ -236,6 +243,7 @@ pub async fn create_tenant(
             ("apm", flags.apm),
             ("metrics", flags.metrics),
             ("rum", flags.rum),
+            ("profiles", flags.profiles),
         ] {
             if !enabled {
                 state
@@ -494,6 +502,7 @@ pub struct DroppedCounts {
     pub apm: u64,
     pub metrics: u64,
     pub rum: u64,
+    pub profiles: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -511,6 +520,7 @@ pub struct SetSignalsRequest {
     pub apm: Option<bool>,
     pub metrics: Option<bool>,
     pub rum: Option<bool>,
+    pub profiles: Option<bool>,
 }
 
 /// Best-effort dropped-event counts (last 24h) from the usage store. Returns
@@ -526,7 +536,7 @@ async fn dropped_counts(state: &AppState, tenant_id: &str) -> DroppedCounts {
         "SELECT signal, sum(events_count) AS events \
          FROM observability.tenant_usage \
          WHERE tenant_id = '{escaped}' \
-           AND signal IN ('logs_dropped','apm_dropped','metrics_dropped','rum_dropped') \
+           AND signal IN ('logs_dropped','apm_dropped','metrics_dropped','rum_dropped','profiles_dropped') \
            AND bucket >= now() - INTERVAL 24 HOUR \
          GROUP BY signal"
     );
@@ -542,6 +552,7 @@ async fn dropped_counts(state: &AppState, tenant_id: &str) -> DroppedCounts {
                     "apm_dropped" => out.apm = r.events,
                     "metrics_dropped" => out.metrics = r.events,
                     "rum_dropped" => out.rum = r.events,
+                    "profiles_dropped" => out.profiles = r.events,
                     _ => {}
                 }
             }
@@ -604,6 +615,7 @@ pub async fn set_tenant_signals(
         ("apm", req.apm),
         ("metrics", req.metrics),
         ("rum", req.rum),
+        ("profiles", req.profiles),
     ] {
         if let Some(enabled) = maybe_enabled {
             state
@@ -629,7 +641,7 @@ pub async fn set_tenant_signals(
                 .resource("tenant", id.clone())
                 .changes(
                     serde_json::json!({
-                        "logs": req.logs, "apm": req.apm, "metrics": req.metrics, "rum": req.rum
+                        "logs": req.logs, "apm": req.apm, "metrics": req.metrics, "rum": req.rum, "profiles": req.profiles
                     })
                     .to_string(),
                 )

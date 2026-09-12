@@ -26,7 +26,7 @@ done
 # a new top-level route that bypasses that review entirely.
 while IFS= read -r path; do
   case "$path" in
-    /api/v1/*|/api/v2/*|/auth/sso/*|/cloudwatch/firehose/*|/datadog/*|/healthz|/readyz|/metrics|/shutdown|/jaeger/api/*|/prom/api/*|/v1/logs|/v1/metrics|/v1/traces) ;;
+    /api/v1/*|/api/v2/*|/auth/sso/*|/cloudwatch/firehose/*|/datadog/*|/healthz|/readyz|/metrics|/shutdown|/jaeger/api/*|/prom/api/*|/v1/logs|/v1/metrics|/v1/traces|/v1development/profiles) ;;
     *) echo "unclassified externally reachable route: $path" >&2; failed=1 ;;
   esac
 done < <(perl -0777 -ne 'while (/\.route\(\s*"([^"]+)"/g) { print "$1\n" }' src/main.rs | sort -u)

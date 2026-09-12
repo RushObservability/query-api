@@ -614,7 +614,7 @@ pub async fn get_storage_partitions(
          LEFT JOIN system.disks AS d ON p.disk_name = d.name \
          WHERE p.database = 'observability' AND p.active \
            AND p.table IN ('logs','spans','metrics_gauge','metrics_sum','metrics_histogram', \
-                           'metrics_exp_histogram','metrics_summary','rum','rum_replay') \
+                           'metrics_exp_histogram','metrics_summary','rum','rum_replay','profile_samples') \
          GROUP BY table, partition \
          ORDER BY table, partition DESC",
         )
@@ -638,6 +638,7 @@ pub async fn get_storage_partitions(
             let (signal, move_days, retention_days) = match r.table.as_str() {
                 "logs" => ("logs", tiering.logs_move_after_days, ret.logs_days),
                 "spans" => ("traces", tiering.traces_move_after_days, ret.traces_days),
+                "profile_samples" => ("profiles", 0, ret.profiles_days),
                 "rum" | "rum_replay" => ("traces", tiering.traces_move_after_days, ret.traces_days),
                 t if t.starts_with("metrics_") => {
                     ("metrics", tiering.metrics_move_after_days, ret.metrics_days)

@@ -2,6 +2,153 @@ use clickhouse::Client;
 
 use crate::config::RushConfig;
 
+#[cfg(test)]
+mod profile_storage_tests {
+    use super::*;
+    use crate::{
+        ch_writer::{SpoolBatch, try_insert},
+        models::profile::ProfileRow,
+    };
+
+    #[test]
+    fn profile_upgrade_is_additive_and_preserves_legacy_cpu_values() {
+        assert!(PROFILE_SAMPLE_TYPE_UPGRADE.contains(
+            "ADD COLUMN IF NOT EXISTS profile_type LowCardinality(String) DEFAULT 'cpu' AFTER pod"
+        ));
+        assert!(!PROFILE_SAMPLE_TYPE_UPGRADE.contains("DROP"));
+        assert!(!PROFILE_SAMPLE_TYPE_UPGRADE.contains("MODIFY ORDER"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ClickHouse at RUSH_TEST_CLICKHOUSE_URL"]
+    async fn profiles_upgrade_legacy_and_fresh_tables_idempotently() -> anyhow::Result<()> {
+        let client = Client::default().with_url(std::env::var("RUSH_TEST_CLICKHOUSE_URL")?);
+        let database = format!("profiles_upgrade_{}", uuid::Uuid::new_v4().simple());
+        client
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let result: anyhow::Result<()> = async {
+            let fresh = MIGRATIONS.iter().find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS observability.profile_samples")).unwrap()
+                .replace("observability.profile_samples", &format!("{database}.profile_samples"));
+            let legacy = fresh.replace("        profile_type LowCardinality(String),\n", "")
+                .replace("pod, profile_type, profile_id", "pod, profile_id");
+            client.query(&legacy).execute().await?;
+            client.query(&format!("INSERT INTO {database}.profile_samples (tenant_id, timestamp, service_name, profile_id, cpu_nanoseconds, frames) VALUES ('default', now64(9), 'legacy', 'legacy-id', 25, ['main', 'work'])")).execute().await?;
+            assert!(upgrade_profile_sample_type(&client, &database).await?);
+            assert!(!upgrade_profile_sample_type(&client, &database).await?);
+            let old_cpu = client.query(&format!("SELECT sum(cpu_nanoseconds) FROM {database}.profile_samples FINAL WHERE service_name = 'legacy' AND profile_type = 'cpu'"))
+                .fetch_one::<u64>().await?;
+            assert_eq!(old_cpu, 25);
+            client.query(&format!("INSERT INTO {database}.profile_samples (tenant_id, timestamp, service_name, profile_type, profile_id, cpu_nanoseconds, frames) VALUES ('default', now64(9), 'demo', 'sampled_cpu', 'new-id', 1000000, ['main', 'decodeDatabaseRows'])")).execute().await?;
+            let sampled_cpu = client.query(&format!("SELECT sum(cpu_nanoseconds) FROM {database}.profile_samples FINAL WHERE profile_type = 'sampled_cpu'"))
+                .fetch_one::<u64>().await?;
+            assert_eq!(sampled_cpu, 1000000);
+            let series = client.query(&format!("SELECT DISTINCT profile_type FROM {database}.profile_samples ORDER BY profile_type")).fetch_all::<String>().await?;
+            assert_eq!(series, ["cpu", "sampled_cpu"]);
+            // A fresh table already has the column and needs no upgrade.
+            client.query(&fresh.replace(".profile_samples", ".fresh_samples")).execute().await?;
+            client.query(&format!("RENAME TABLE {database}.profile_samples TO {database}.upgraded_samples, {database}.fresh_samples TO {database}.profile_samples")).execute().await?;
+            assert!(!upgrade_profile_sample_type(&client, &database).await?);
+            Ok(())
+        }.await;
+        client
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ClickHouse at RUSH_TEST_CLICKHOUSE_URL with rush_ custom settings"]
+    async fn profiles_store_deduplicate_and_isolate_tenants() -> anyhow::Result<()> {
+        let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let database = format!("profiles_test_{id}");
+        let user = format!("profiles_read_{id}");
+        let admin = Client::default().with_url(&url);
+        admin
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let ddl = MIGRATIONS
+            .iter()
+            .find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS observability.profile_samples"))
+            .unwrap()
+            .replace(
+                "observability.profile_samples",
+                &format!("{database}.profile_samples"),
+            );
+        admin.query(&ddl).execute().await?;
+        admin
+            .query(&format!("CREATE USER {user}"))
+            .execute()
+            .await?;
+        admin
+            .query(&format!(
+                "GRANT SELECT ON {database}.profile_samples TO {user}"
+            ))
+            .execute()
+            .await?;
+        admin.query(&format!("CREATE ROW POLICY tenant_isolation ON {database}.profile_samples USING tenant_id = getSetting('rush_tenant_id') TO {user}")).execute().await?;
+        let writer = admin.clone().with_database(&database);
+        let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let row = ProfileRow {
+            tenant_id: "tenant_a".into(),
+            timestamp,
+            service_name: "test".into(),
+            service_version: "v1".into(),
+            pod: "pod".into(),
+            profile_type: "cpu".into(),
+            profile_id: "one".into(),
+            sample_index: 0,
+            value_index: 0,
+            duration_nano: 100,
+            cpu_nanoseconds: 25,
+            frames: vec!["main".into(), "work".into()],
+            trace_id: String::new(),
+            span_id: String::new(),
+        };
+        try_insert(
+            &writer,
+            &SpoolBatch::Profiles(vec![
+                row.clone(),
+                row.clone(),
+                ProfileRow {
+                    tenant_id: "tenant_b".into(),
+                    cpu_nanoseconds: 999,
+                    ..row
+                },
+            ]),
+        )
+        .await?;
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct Aggregate {
+            tenant: String,
+            cpu: u64,
+            frames: Vec<String>,
+        }
+        let read = Client::default()
+            .with_url(&url)
+            .with_database(&database)
+            .with_user(&user);
+        crate::mark_row_policy_enforced();
+        let rows = crate::tenant_query(&read, "SELECT tenant_id AS tenant, sum(cpu_nanoseconds) AS cpu, any(frames) AS frames FROM profile_samples FINAL GROUP BY tenant_id", "tenant_a").fetch_all::<Aggregate>().await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tenant, "tenant_a");
+        assert_eq!(rows[0].cpu, 25);
+        assert_eq!(rows[0].frames, ["main", "work"]);
+        let read_back = crate::tenant_query(&read, "SELECT frames, sum(toFloat64(cpu_nanoseconds))/1e9 AS cpu_seconds FROM profile_samples FINAL WHERE tenant_id = ? AND timestamp >= fromUnixTimestamp64Milli(?) AND timestamp < fromUnixTimestamp64Milli(?) AND service_name = ? AND profile_type = ? GROUP BY frames", "tenant_a").bind("tenant_a").bind(timestamp / 1_000_000 - 1).bind(timestamp / 1_000_000 + 1).bind("test").bind("cpu").fetch_all::<crate::handlers::profiles::StackResult>().await?;
+        assert_eq!(read_back.len(), 1);
+        admin
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await?;
+        admin.query(&format!("DROP USER {user}")).execute().await?;
+        Ok(())
+    }
+}
+
 const LOG_SERVICE_PROJECTION_NAME: &str = "idx_logs_by_service";
 const LOG_SERVICE_PROJECTION_DDL: &str = "ALTER TABLE observability.logs ADD PROJECTION IF NOT EXISTS idx_logs_by_service (\
      SELECT tenant_id, ServiceName, Timestamp, _part_offset \
@@ -11,12 +158,58 @@ const LOG_BODY_NGRAM_INDEX_DDL: &str = "ALTER TABLE observability.logs ADD INDEX
      idx_body_ngram_g4 lower(Body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 4";
 const LEGACY_LOG_BODY_NGRAM_INDEXES: &[&str] = &["idx_body_ngram"];
 
+const PROFILE_SAMPLE_TYPE_UPGRADE: &str =
+    "ADD COLUMN IF NOT EXISTS profile_type LowCardinality(String) DEFAULT 'cpu' AFTER pod";
+
+/// Upgrade the pre-measurement profile schema without rebuilding stored parts.
+/// Called after audit initialization, before the writer or HTTP server starts.
+/// Existing rows already store normalized CPU nanoseconds, so they default to cpu.
+/// Keep the legacy sorting key: profile IDs identify each single-type profile.
+pub async fn upgrade_profile_sample_type(client: &Client, database: &str) -> anyhow::Result<bool> {
+    validate_clickhouse_identifier(database)?;
+    let exists = client.query("SELECT count() FROM system.columns WHERE database = ? AND table = 'profile_samples' AND name = 'profile_type'")
+        .bind(database).fetch_one::<u64>().await?;
+    if exists > 0 {
+        return Ok(false);
+    }
+    client
+        .query(&format!(
+            "ALTER TABLE `{database}`.profile_samples {PROFILE_SAMPLE_TYPE_UPGRADE}"
+        ))
+        .execute()
+        .await?;
+    tracing::info!(
+        database,
+        "upgraded profile_samples: added profile_type with legacy CPU default"
+    );
+    Ok(true)
+}
+
 /// Ordered list of DDL statements to ensure the observability schema exists.
 /// v2: Multi-tenant schema — every table carries tenant_id as the first ORDER BY column.
 /// Starts with DROP TABLE IF EXISTS for all v1 tables, then recreates with v2 schemas.
 const MIGRATIONS: &[&str] = &[
     // ── Database ──
     "CREATE DATABASE IF NOT EXISTS observability",
+    r"CREATE TABLE IF NOT EXISTS observability.profile_samples (
+        tenant_id LowCardinality(String),
+        timestamp DateTime64(9) CODEC(Delta, ZSTD(1)),
+        service_name LowCardinality(String),
+        service_version LowCardinality(String),
+        pod LowCardinality(String),
+        profile_type LowCardinality(String),
+        profile_id String,
+        sample_index UInt64,
+        value_index UInt64,
+        duration_nano UInt64,
+        cpu_nanoseconds UInt64,
+        frames Array(LowCardinality(String)) CODEC(ZSTD(1)),
+        trace_id String,
+        span_id String
+    ) ENGINE = ReplacingMergeTree
+    PARTITION BY toDate(timestamp)
+    ORDER BY (tenant_id, service_name, timestamp, service_version, pod, profile_type, profile_id, sample_index, value_index)
+    TTL toDateTime(timestamp) + INTERVAL 7 DAY DELETE",
     // ── OTel traces ──
     // NOTE: `spans_raw` (the OTel-native landing table) and its `spans_mv` transform are
     // GONE. query-api now reshapes OTel spans into the wide `spans` row in Rust at ingest
@@ -650,6 +843,7 @@ const ROW_POLICY_TABLES: &[&str] = &[
     "metrics_sum_1h",
     "rum",
     "rum_replay",
+    "profile_samples",
     "signal_usage",
     "tenant_usage",
 ];
@@ -1570,6 +1764,10 @@ async fn ttl_matches(client: &Client, table: &str, days: u32) -> bool {
 /// Skips tables whose TTL already matches the desired interval to avoid
 /// blocking on redundant ALTER TABLE mutations at every boot.
 async fn apply_retention_ttl(client: &Client, config: &RushConfig) -> anyhow::Result<()> {
+    let days = config.retention.defaults.profiles_days.clamp(1, 3650);
+    if !ttl_matches(client, "profile_samples", days).await {
+        client.query(&format!("ALTER TABLE observability.profile_samples MODIFY TTL toDateTime(timestamp) + INTERVAL {days} DAY DELETE SETTINGS materialize_ttl_after_modify = 0")).execute().await?;
+    }
     apply_retention_ttls(
         client,
         config.effective_logs_ttl_days(),

@@ -55,7 +55,7 @@ fn map_write_err(e: WriteError) -> (StatusCode, String) {
 /// Decode an incoming request body as protobuf, returning 415 for JSON and
 /// 400 for other decode failures. Honors `Content-Encoding: gzip` (the OTel
 /// Collector's otlphttp exporter compresses by default), bounded by MAX_OTLP_BODY.
-async fn decode_proto<T: Message + Default + Send + 'static>(
+pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
     limits: &crate::ingest_limits::IngestLimits,
     headers: &HeaderMap,
     body: Bytes,
