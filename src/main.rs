@@ -1257,6 +1257,7 @@ fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
         }
         Method::GET => {
             path == "/api/v1/services"
+                || path == "/api/v1/profiles"
                 || path == "/api/v1/services/graph"
                 || path.starts_with("/api/v1/traces/")
                 || path.starts_with("/prom/api/v1/query")
@@ -3644,6 +3645,7 @@ mod tenant_auth_tests {
     #[test]
     fn internal_sre_credential_is_confined_to_read_and_investigation_routes() {
         for (method, path) in [
+            (Method::GET, "/api/v1/profiles"),
             (Method::POST, "/api/v1/query"),
             (Method::POST, "/api/v1/query/timeseries"),
             (Method::POST, "/api/v1/logs"),
@@ -3661,6 +3663,10 @@ mod tenant_auth_tests {
         }
 
         for (method, path) in [
+            (Method::POST, "/v1development/profiles"),
+            (Method::POST, "/api/v1/profiles"),
+            (Method::DELETE, "/api/v1/profiles"),
+            (Method::GET, "/api/v1/profiles/export"),
             (Method::POST, "/v1/logs"),
             (Method::POST, "/api/v1/investigate"),
             (Method::POST, "/api/v1/logs/export"),
