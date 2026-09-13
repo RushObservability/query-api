@@ -557,6 +557,13 @@ pub async fn login(
         .await;
 
     let cookie = session_cookie(&issued.token, issued.max_age_seconds);
+    let session = state
+        .config_db
+        .browser_session_policy(&issued.token)
+        .await
+        .map_err(|error| {
+            public_auth_error(StatusCode::SERVICE_UNAVAILABLE, "session_policy", error)
+        })?;
 
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
@@ -571,9 +578,7 @@ pub async fn login(
                 tenant_id,
                 role,
             },
-            "session": {
-                "activity_interval_seconds": state.config_db.session_activity_interval_seconds(),
-            },
+            "session": session,
         })),
     ))
 }
@@ -674,10 +679,87 @@ pub async fn me(
             tenant_id,
             role,
         },
-        "session": {
-            "activity_interval_seconds": state.config_db.session_activity_interval_seconds(),
-        },
+        "session": state.config_db.browser_session_policy(&token).await
+            .map_err(|error| public_auth_error(StatusCode::SERVICE_UNAVAILABLE, "session_policy", error))?,
     })))
+}
+
+/// POST /api/v1/auth/activity. Only explicit user activity renews the cookie;
+/// GET /auth/me and background queries validate without extending its life.
+pub async fn activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = crate::handlers::users::require_auth(&state, &headers).await?;
+    let token = extract_session_cookie(&headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "not authenticated".to_string()))?;
+    let mut session = state
+        .config_db
+        .browser_session_policy(&token)
+        .await
+        .map_err(|error| {
+            public_auth_error(StatusCode::SERVICE_UNAVAILABLE, "session_policy", error)
+        })?;
+    if session.idle_remaining_seconds <= 0 {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "session expired or invalid".to_string(),
+        ));
+    }
+    let rotated = match state.config_db.rotate_session_if_due(&token).await {
+        Ok(rotated) => rotated,
+        Err(error) => {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("session.rotate", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "session_store_unavailable" })
+                                .to_string(),
+                        )
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err(public_auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session_rotate",
+                error,
+            ));
+        }
+    };
+    let mut response_headers = HeaderMap::new();
+    if let Some(rotated) = rotated {
+        response_headers.insert(
+            header::SET_COOKIE,
+            session_cookie(&rotated.issued.token, rotated.issued.max_age_seconds)
+                .parse()
+                .unwrap(),
+        );
+        state.audit.log(
+            crate::audit::AuditEvent::new("session.rotate", "user")
+                .actor(rotated.user_id, rotated.username)
+                .tenant(rotated.tenant_id)
+                .resource("session", rotated.session_id)
+                .outcome("success")
+                .changes(serde_json::json!({ "idle_timeout_seconds": rotated.issued.max_age_seconds }).to_string())
+                .description("browser activity renewed session")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        ).await;
+        session.idle_remaining_seconds = rotated.issued.max_age_seconds;
+    }
+    Ok((
+        response_headers,
+        Json(serde_json::json!({
+            "user": UserInfo {
+                id: caller.0, username: caller.1, display_name: caller.2,
+                tenant_id: caller.3, role: caller.4,
+            },
+            "session": session,
+        })),
+    ))
 }
 
 /// GET /api/v1/auth/sessions — active sessions for the current user.

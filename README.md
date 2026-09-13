@@ -148,7 +148,7 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `RUSH_LOGIN_RATE_LIMIT_SECRET` | falls back to SSO/API-key secret | stable 32+ byte HMAC key for privacy-preserving distributed login-limit identifiers |
 | `RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE` | `10` | maximum login attempts against one normalized account per minute across replicas |
 | `RUSH_LOGIN_IP_LIMIT_PER_MINUTE` | `50` | maximum login attempts from one resolved client address per minute across replicas |
-| `RUSH_SESSION_IDLE_TIMEOUT_SECS` | `1800` | inactivity window for browser sessions; accepted range is 60 seconds through 31 days |
+| `RUSH_SESSION_IDLE_TIMEOUT_SECS` | `7200` | initial inactivity window for browser sessions; Settings → Users → Idle logout overrides it; must be at least 60 seconds and no longer than the absolute lifetime |
 | `RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS` | `86400` | hard browser-session lifetime; must be at least the idle timeout and no more than 31 days |
 | `RUSH_SESSION_RENEWAL_INTERVAL_SECS` | `300` | minimum activity interval before the HttpOnly bearer is rotated; must be 30 seconds or more and less than the idle timeout |
 | `RUSH_TRUSTED_PROXY_CIDRS` | _(empty)_ | comma-separated proxy networks allowed to supply `X-Forwarded-For`/`X-Real-IP`; other peers' forwarding headers are ignored |
@@ -224,9 +224,21 @@ names, payload data, or decoder errors.
 
 ### Browser sessions
 
-Browser sessions have both an idle deadline and a hard absolute deadline.
-Successful authenticated activity renews the idle deadline after the configured
-renewal interval and replaces the opaque bearer in the HttpOnly cookie. Renewal
+Browser sessions default to a two-hour idle timeout and a 24-hour absolute
+lifetime. Admins can change the idle timeout in **Settings → Users → Idle
+logout**, in whole minutes. The setting applies globally to local and SSO
+sessions, persists across restarts, and overrides `RUSH_SESSION_IDLE_TIMEOUT_SECS`.
+Other API replicas pick up changes within 30 seconds. A shorter timeout rejects
+existing sessions that have already been idle too long on their next request;
+increasing it never revives an expired session.
+
+Keyboard input, clicks, and scrolling trigger `POST /api/v1/auth/activity`,
+which renews the idle deadline after the configured renewal interval and
+replaces the opaque bearer in the HttpOnly cookie. Background data refreshes
+and `GET /api/v1/auth/me` do not renew sessions. The frontend checks the server's
+deadline even on quiet pages and after sleep, and respects activity in another
+tab sharing the same cookie. Deploy the updated frontend with this API so it
+uses the activity endpoint. Renewal
 never moves the absolute deadline. Password changes, user disablement, logout,
 and manual session revocation are visible immediately because session
 authorization is checked against the current user version on every request.
