@@ -90,6 +90,9 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
 
+      - name: Test advisory scan reporting
+        run: python3 scripts/test-summarize-trivy.py
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -167,14 +170,37 @@ jobs:
           provenance: mode=max
           sbom: true
 
-      - name: Scan immutable image for fixable high and critical vulnerabilities
+      # Image findings are advisory. Rust tests and dependency policy above
+      # remain release gates; a Trivy outage must not prevent the SBOM either.
+      - name: Report image vulnerabilities with Trivy
+        id: trivy
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          format: table
+          format: json
+          output: trivy-report.json
+          scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          exit-code: "1"
+          exit-code: "0"
+
+      - name: Summarize advisory image scan
+        if: ${{ !cancelled() && steps.push.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+        run: bash scripts/summarize-trivy.sh trivy-report.json
+
+      - name: Upload Trivy report
+        if: ${{ !cancelled() && steps.push.outcome == 'success' && hashFiles('trivy-report.json') != '' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rush-api-${{ needs.security-gate.outputs.tag }}-trivy
+          path: trivy-report.json
+          retention-days: 90
+          if-no-files-found: warn
 
       - name: Attest image build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4

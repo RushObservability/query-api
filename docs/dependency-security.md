@@ -55,9 +55,12 @@ YAML 1.2 input for the collector.
 
 Every tag build publishes a multi-platform image and records its immutable
 `ghcr.io/<owner>/<repo>@sha256:...` coordinate in the workflow summary. The
-release fails when Trivy finds a fixable high or critical vulnerability in that
-digest. BuildKit also publishes maximum-mode provenance and an image SBOM as OCI
-referrers.
+Trivy scan of that digest is advisory. Fixable high and critical findings appear
+as warning annotations and counts in the job summary, without failing the
+release. The full JSON report is saved as `rush-api-<tag>-trivy` for 90 days.
+Scanner failures also produce a warning and an unknown status, not a clean scan.
+Rust tests, RustSec scanning, and dependency policy remain release gates.
+BuildKit also publishes maximum-mode provenance and an image SBOM as OCI referrers.
 
 The workflow generates an SPDX JSON SBOM directly from the pushed digest,
 stores it in the `rush-api-<tag>-sbom` workflow artifact for 90 days, and
