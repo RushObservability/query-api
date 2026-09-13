@@ -258,6 +258,37 @@ struct ServiceTimeBreakdownDatabaseBucket {
     pub database_calls: u64,
 }
 
+fn database_impact_per_request(raw_database_ms: f64, requests: u64, average_wall_ms: f64) -> f64 {
+    if requests == 0 {
+        return 0.0;
+    }
+    // Both stacked portions must be per-request averages. Capping the raw
+    // interval total against an average makes busy buckets appear all database.
+    (raw_database_ms / requests as f64).min(average_wall_ms)
+}
+
+#[cfg(test)]
+mod time_breakdown_tests {
+    use super::database_impact_per_request;
+
+    #[test]
+    fn database_impact_uses_the_same_request_denominator_as_wall_time() {
+        assert_eq!(database_impact_per_request(800.0, 100, 300.0), 8.0);
+        assert_eq!(database_impact_per_request(8000.0, 1000, 300.0), 8.0);
+    }
+
+    #[test]
+    fn parallel_database_calls_cannot_exceed_average_wall_time() {
+        assert_eq!(database_impact_per_request(5000.0, 10, 100.0), 100.0);
+    }
+
+    #[test]
+    fn empty_buckets_have_no_database_impact() {
+        assert_eq!(database_impact_per_request(100.0, 0, 0.0), 0.0);
+        assert_eq!(database_impact_per_request(0.0, 10, 100.0), 0.0);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ServiceTimeBreakdownTimeseriesResponse {
     pub service_name: String,
@@ -474,7 +505,13 @@ pub async fn service_time_breakdown_timeseries(
         .map(|server| {
             let database = database_by_bucket.get(&server.bucket);
             let database_time_ms = database
-                .map(|bucket| bucket.database_call_time_ms.min(server.wall_time_ms))
+                .map(|bucket| {
+                    database_impact_per_request(
+                        bucket.database_call_time_ms,
+                        server.request_count,
+                        server.wall_time_ms,
+                    )
+                })
                 .unwrap_or(0.0);
             ServiceTimeBreakdownBucket {
                 bucket: server.bucket,
