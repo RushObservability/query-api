@@ -13,10 +13,9 @@ use axum::{
     response::Response,
 };
 use clickhouse::Client;
-use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -513,8 +512,6 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         .or(url_tenant);
     let session_token: Option<String> = handlers::auth::extract_session_cookie(req.headers());
     let internal_sre = rush_api::internal_auth::sre_agent_token_matches(req.headers());
-    let session_audit_context = rush_api::audit::actor_context_from_headers(req.headers());
-    let request_path = req.uri().path().to_string();
 
     let resolution = if internal_sre {
         let Some(tenant) = rush_tenant.as_deref().map(str::trim) else {
@@ -546,8 +543,6 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         )
         .await
     };
-    let session_authenticated = resolution.credential == CredentialKind::Session;
-    let resolved_tenant = resolution.tenant_id.clone();
     let request_identity = match (&resolution.credential, resolution.api_key.as_ref()) {
         (CredentialKind::Session, _) => RequestIdentity {
             tenant_id: resolution.tenant_id.clone(),
@@ -587,103 +582,9 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
     });
     req.extensions_mut().insert(request_identity);
     req.extensions_mut().insert(resolution);
-    let mut response = next.run(req).await;
-
-    // Rotate only after a downstream handler successfully validated and used
-    // the old session. Login/logout and SSO callback responses manage their own
-    // cookies and must never receive a second competing session cookie.
-    let manages_own_session_cookie = matches!(
-        request_path.as_str(),
-        "/api/v1/auth/login" | "/api/v1/auth/logout" | "/auth/sso/callback" | "/auth/sso/acs"
-    );
-    if session_authenticated
-        && response.status().as_u16() < 400
-        && !manages_own_session_cookie
-        && let Some(token) = session_token
-        && should_check_session_rotation(&state, &token)
-    {
-        let checked_key = state.config_db.session_request_key(&token);
-        match state.config_db.rotate_session_if_due(&token).await {
-            Ok(Some(rotated)) => {
-                state.session_rotation_checks.insert(
-                    state.config_db.session_request_key(&rotated.issued.token),
-                    Instant::now(),
-                );
-                let cookie = handlers::auth::session_cookie(
-                    &rotated.issued.token,
-                    rotated.issued.max_age_seconds,
-                );
-                if let Ok(value) = HeaderValue::from_str(&cookie) {
-                    response.headers_mut().append(header::SET_COOKIE, value);
-                    state
-                        .audit
-                        .log(
-                            rush_api::audit::AuditEvent::new("session.rotate", "user")
-                                .actor(rotated.user_id, rotated.username)
-                                .tenant(rotated.tenant_id)
-                                .resource("session", rotated.session_id)
-                                .outcome("success")
-                                .changes(
-                                    serde_json::json!({
-                                        "idle_timeout_seconds": rotated.issued.max_age_seconds,
-                                    })
-                                    .to_string(),
-                                )
-                                .description("active session bearer rotated")
-                                .context(session_audit_context.clone()),
-                        )
-                        .await;
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                state.session_rotation_checks.remove(&checked_key);
-                tracing::error!(%error, "session renewal failed");
-                state
-                    .audit
-                    .log(
-                        rush_api::audit::AuditEvent::new("session.rotate", "anonymous")
-                            .actor_name("existing session")
-                            .tenant(resolved_tenant)
-                            .resource("session", "unknown")
-                            .outcome("failure")
-                            .changes(
-                                serde_json::json!({ "reason": "session_store_unavailable" })
-                                    .to_string(),
-                            )
-                            .description("active session bearer rotation failed")
-                            .context(session_audit_context),
-                    )
-                    .await;
-            }
-        }
-    }
-    response
-}
-
-fn should_check_session_rotation(state: &AppState, token: &str) -> bool {
-    let interval =
-        Duration::from_secs(state.config_db.session_activity_interval_seconds().max(1) as u64);
-    let key = state.config_db.session_request_key(token);
-    if state.session_rotation_checks.len() > 10_000 {
-        state
-            .session_rotation_checks
-            .retain(|_, checked_at| checked_at.elapsed() < interval.saturating_mul(2));
-    }
-    match state.session_rotation_checks.entry(key) {
-        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-            if entry.get().elapsed() < interval {
-                false
-            } else {
-                entry.insert(Instant::now());
-                true
-            }
-        }
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(Instant::now());
-            true
-        }
-    }
+    // Background telemetry reads must not renew idle browser sessions.
+    // Only the explicit, authenticated /auth/activity endpoint rotates them.
+    next.run(req).await
 }
 
 fn explicit_ingest_tenant(path: &str) -> Option<String> {
@@ -2727,7 +2628,6 @@ async fn main() -> anyhow::Result<()> {
         login_ip_limit_per_minute,
         trusted_proxy_cidrs,
         ingest_key_limiter,
-        session_rotation_checks: Arc::new(DashMap::new()),
         audit,
         self_metrics,
         query_governor,
@@ -3072,6 +2972,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/v1/settings/config", get(handlers::settings::get_runtime_config))
         .route(
+            "/api/v1/settings/session-policy",
+            get(handlers::settings::get_session_policy).put(handlers::settings::set_session_policy),
+        )
+        .route(
             "/api/v1/settings/sre-agent",
             get(handlers::settings::get_sre_agent_settings).put(handlers::settings::set_sre_agent_settings),
         )
@@ -3359,6 +3263,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/auth/login", post(handlers::auth::login))
         .route("/api/v1/auth/logout", post(handlers::auth::logout))
         .route("/api/v1/auth/me", get(handlers::auth::me))
+        .route("/api/v1/auth/activity", post(handlers::auth::activity))
         .route(
             "/api/v1/auth/sessions",
             get(handlers::auth::list_sessions),
@@ -4123,8 +4028,17 @@ mod tenant_auth_tests {
 
     #[test]
     fn authenticated_only_routes_are_not_accidentally_exempted() {
+        assert!(!allows_unauthenticated_tenant_request(
+            &Method::POST,
+            "/api/v1/auth/activity"
+        ));
+        assert!(!allows_unauthenticated_tenant_request(
+            &Method::PUT,
+            "/api/v1/settings/session-policy"
+        ));
         for path in [
             "/api/v1/auth/me",
+            "/api/v1/settings/session-policy",
             "/api/v1/sso/providers",
             "/api/v1/sso/setup-token",
             "/api/v1/sso/setup-token/example/complete",

@@ -331,7 +331,8 @@ pub fn validate_password_policy(password: &str) -> Result<(), PasswordPolicyErro
 const SESSION_IDLE_TIMEOUT_ENV: &str = "RUSH_SESSION_IDLE_TIMEOUT_SECS";
 const SESSION_ABSOLUTE_TIMEOUT_ENV: &str = "RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS";
 const SESSION_RENEWAL_INTERVAL_ENV: &str = "RUSH_SESSION_RENEWAL_INTERVAL_SECS";
-const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: i64 = 30 * 60;
+pub const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: i64 = 2 * 60 * 60;
+pub const SESSION_IDLE_TIMEOUT_SETTING: &str = "session_idle_timeout_seconds";
 const DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_SESSION_RENEWAL_INTERVAL_SECS: i64 = 5 * 60;
 const SESSION_ROTATION_GRACE_SECS: i64 = 60;
@@ -428,6 +429,14 @@ pub fn kubernetes_cluster_selector_matches(
 }
 
 impl SessionPolicy {
+    pub fn with_idle_timeout(self, seconds: i64) -> anyhow::Result<Self> {
+        Self::new(
+            seconds,
+            self.absolute_timeout_secs,
+            self.renewal_interval_secs.min((seconds / 2).max(30)),
+        )
+    }
+
     fn new(
         idle_timeout_secs: i64,
         absolute_timeout_secs: i64,
@@ -482,10 +491,17 @@ impl SessionPolicy {
         )
     }
 
-    fn activity_touch_interval_secs(self) -> i64 {
+    pub fn activity_touch_interval_secs(self) -> i64 {
         self.renewal_interval_secs
             .min((self.idle_timeout_secs / 2).max(30))
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BrowserSessionPolicy {
+    pub idle_timeout_seconds: i64,
+    pub activity_interval_seconds: i64,
+    pub idle_remaining_seconds: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -825,6 +841,41 @@ mod auth_storage_tests {
                 .activity_touch_interval_secs(),
             30
         );
+    }
+
+    #[test]
+    fn session_policy_defaults_to_two_hours_and_bounds_admin_overrides() {
+        assert_eq!(DEFAULT_SESSION_IDLE_TIMEOUT_SECS, 7_200);
+        let base = SessionPolicy::new(DEFAULT_SESSION_IDLE_TIMEOUT_SECS, 86_400, 300).unwrap();
+        assert_eq!(
+            base.with_idle_timeout(60).unwrap().renewal_interval_secs,
+            30
+        );
+        assert_eq!(base.with_idle_timeout(7_200).unwrap(), base);
+        assert!(base.with_idle_timeout(86_400).is_ok());
+        for invalid in [-1, 0, 59, 86_401, i64::MAX] {
+            assert!(base.with_idle_timeout(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn session_policy_lowering_is_checked_during_authorization_and_rotation() {
+        let source = include_str!("clickhouse_config.rs");
+        let auth = source
+            .rsplit_once("async fn get_session_user_inner(")
+            .unwrap()
+            .1
+            .split("pub async fn list_auth_sessions(")
+            .next()
+            .unwrap();
+        assert!(auth.contains("effective_session_policy().await.ok()?"));
+        assert!(auth.contains("AND s.last_seen_at > ?"));
+        assert!(auth.contains("AND s.expires_at > ?"));
+        let rotate = source
+            .rsplit_once("pub async fn rotate_session_if_due(")
+            .unwrap()
+            .1;
+        assert!(rotate.contains("idle_age >= policy.idle_timeout_secs"));
     }
 
     #[test]
@@ -1888,6 +1939,9 @@ pub struct ConfigDb {
     sso_claim_cleanup_counter: AtomicU64,
     config_cache_maintenance_counter: AtomicU64,
     session_policy: SessionPolicy,
+    /// Global administrator policy, shared through config_settings. Reload at
+    /// most every 30 seconds on each replica; user/session validity is uncached.
+    session_policy_cache: tokio::sync::Mutex<Option<(SessionPolicy, Instant)>>,
     /// Dedicated key for one-way session bearer storage. The raw bearer exists
     /// only in the issuing response/cookie and is never sent to ClickHouse.
     session_hmac_secret: Vec<u8>,
@@ -1977,8 +2031,61 @@ impl ConfigDb {
         &self.session_hmac_secret
     }
 
-    pub fn session_activity_interval_seconds(&self) -> i64 {
-        self.session_policy.activity_touch_interval_secs()
+    pub async fn effective_session_policy(&self) -> anyhow::Result<SessionPolicy> {
+        let mut cache = self.session_policy_cache.lock().await;
+        if let Some((policy, updated)) = *cache
+            && updated.elapsed() < std::time::Duration::from_secs(30)
+        {
+            return Ok(policy);
+        }
+        let policy = match self.get_setting(SESSION_IDLE_TIMEOUT_SETTING).await? {
+            Some(value) => self.session_policy.with_idle_timeout(value.parse()?)?,
+            None => self.session_policy,
+        };
+        *cache = Some((policy, Instant::now()));
+        Ok(policy)
+    }
+
+    pub fn validate_session_idle_timeout(&self, seconds: i64) -> anyhow::Result<SessionPolicy> {
+        self.session_policy.with_idle_timeout(seconds)
+    }
+
+    pub async fn set_session_idle_timeout(&self, seconds: i64) -> anyhow::Result<()> {
+        let policy = self.validate_session_idle_timeout(seconds)?;
+        let mut cache = self.session_policy_cache.lock().await;
+        self.set_setting(SESSION_IDLE_TIMEOUT_SETTING, &seconds.to_string())
+            .await?;
+        *cache = Some((policy, Instant::now()));
+        Ok(())
+    }
+
+    pub async fn browser_session_policy(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<BrowserSessionPolicy> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            last_seen: i64,
+            expires: i64,
+            absolute_expires: i64,
+        }
+        let policy = self.effective_session_policy().await?;
+        let row = self.client
+            .query("SELECT toInt64(toUnixTimestamp(parseDateTimeBestEffort(last_seen_at))) AS last_seen, toInt64(toUnixTimestamp(parseDateTimeBestEffort(expires_at))) AS expires, toInt64(toUnixTimestamp(parseDateTimeBestEffort(absolute_expires_at))) AS absolute_expires FROM config_sessions WHERE token = ? ORDER BY expires_at DESC LIMIT 1")
+            .bind(self.session_request_key(token))
+            .fetch_one::<Row>().await?;
+        let deadline = row
+            .last_seen
+            .saturating_add(policy.idle_timeout_secs)
+            .min(row.expires)
+            .min(row.absolute_expires);
+        Ok(BrowserSessionPolicy {
+            idle_timeout_seconds: policy.idle_timeout_secs,
+            activity_interval_seconds: policy.activity_touch_interval_secs(),
+            idle_remaining_seconds: deadline
+                .saturating_sub(chrono::Utc::now().timestamp())
+                .max(0),
+        })
     }
 
     /// One-way, process-stable identity for a session bearer. Request-scoped
@@ -2009,6 +2116,7 @@ impl ConfigDb {
             sso_claim_cleanup_counter: AtomicU64::new(0),
             config_cache_maintenance_counter: AtomicU64::new(0),
             session_policy,
+            session_policy_cache: tokio::sync::Mutex::new(None),
             session_hmac_secret,
         };
         db.run_migrations().await?;
@@ -3963,6 +4071,7 @@ impl ConfigDb {
         auth_method: &str,
         provider_id: &str,
     ) -> anyhow::Result<IssuedSession> {
+        let policy = self.effective_session_policy().await?;
         let token: String = {
             use rand::Rng;
             let mut rng = rand::rng();
@@ -3973,9 +4082,8 @@ impl ConfigDb {
         let session_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let created_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
-        let absolute_expires =
-            now + chrono::Duration::seconds(self.session_policy.absolute_timeout_secs);
-        let idle_expires = now + chrono::Duration::seconds(self.session_policy.idle_timeout_secs);
+        let absolute_expires = now + chrono::Duration::seconds(policy.absolute_timeout_secs);
+        let idle_expires = now + chrono::Duration::seconds(policy.idle_timeout_secs);
         let expires_at = idle_expires
             .min(absolute_expires)
             .format("%Y-%m-%d %H:%M:%S")
@@ -3998,7 +4106,7 @@ impl ConfigDb {
             .await?;
         Ok(IssuedSession {
             token,
-            max_age_seconds: self.session_policy.idle_timeout_secs,
+            max_age_seconds: policy.idle_timeout_secs,
         })
     }
 
@@ -4059,6 +4167,13 @@ impl ConfigDb {
         token: &str,
         metrics: Option<&crate::self_metrics::SelfMetrics>,
     ) -> Option<SessionUser> {
+        // Fail closed on a policy-store error. Lowering the global timeout
+        // applies to existing sessions too, without reviving expired bearers.
+        let policy = self.effective_session_policy().await.ok()?;
+        let idle_cutoff = (chrono::Utc::now()
+            - chrono::Duration::seconds(policy.idle_timeout_secs))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
         let stored_token = session_storage_key(&self.session_hmac_secret, token);
         // Session authorization is deliberately not cached. Password changes,
         // user disables, and logout must become visible to every API replica
@@ -4110,6 +4225,7 @@ impl ConfigDb {
                      AND u.is_deleted = 0
                      AND s.expires_at > ?
                      AND s.absolute_expires_at > ?
+                     AND s.last_seen_at > ?
                      AND s.session_id NOT IN (
                          SELECT session_id FROM config_session_revocations WHERE expires_at > ?
                      )
@@ -4124,6 +4240,7 @@ impl ConfigDb {
             .bind(&stored_token)
             .bind(&now)
             .bind(&now)
+            .bind(&idle_cutoff)
             .bind(&now)
             .bind(&now)
             .fetch_one::<Row>()
@@ -4174,8 +4291,14 @@ impl ConfigDb {
         user_id: Option<&str>,
         current_token: &str,
     ) -> anyhow::Result<Vec<AuthSessionInfo>> {
+        let policy = self.effective_session_policy().await?;
+        let idle_cutoff = (chrono::Utc::now()
+            - chrono::Duration::seconds(policy.idle_timeout_secs))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
         let now = Self::now_str();
         let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) AND s.token NOT IN (SELECT token FROM config_session_rotation_grace WHERE grace_expires_at <= ?)";
+        let base = format!("{base} AND s.last_seen_at > ?");
         let rows = if let Some(user_id) = user_id {
             self.client
                 .query(&format!(
@@ -4185,6 +4308,7 @@ impl ConfigDb {
                 .bind(&now)
                 .bind(&now)
                 .bind(&now)
+                .bind(&idle_cutoff)
                 .bind(user_id)
                 .fetch_all::<AuthSessionRow>()
                 .await?
@@ -4195,15 +4319,23 @@ impl ConfigDb {
                 .bind(&now)
                 .bind(&now)
                 .bind(&now)
+                .bind(&idle_cutoff)
                 .fetch_all::<AuthSessionRow>()
                 .await?
         };
         let mut seen = std::collections::HashSet::new();
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .filter(|row| seen.insert(row.session_id.clone()))
-            .map(|row| row.into_info(&self.session_hmac_secret, current_token))
-            .collect())
+            .map(|mut row| {
+                let last_seen =
+                    chrono::NaiveDateTime::parse_from_str(&row.last_seen_at, "%Y-%m-%d %H:%M:%S")?;
+                let deadline = (last_seen + chrono::Duration::seconds(policy.idle_timeout_secs))
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string();
+                row.expires_at = row.expires_at.min(deadline);
+                Ok(row.into_info(&self.session_hmac_secret, current_token))
+            })
+            .collect()
     }
 
     /// Revoke one public session id. When `user_id` is provided, ownership is
@@ -4271,6 +4403,7 @@ impl ConfigDb {
         &self,
         token: &str,
     ) -> anyhow::Result<Option<RotatedSession>> {
+        let policy = self.effective_session_policy().await?;
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             session_id: String,
@@ -4304,7 +4437,8 @@ impl ConfigDb {
         let Some(row) = row else {
             return Ok(None);
         };
-        if now_unix.saturating_sub(row.last_seen_unix) < self.session_policy.renewal_interval_secs {
+        let idle_age = now_unix.saturating_sub(row.last_seen_unix);
+        if idle_age >= policy.idle_timeout_secs || idle_age < policy.renewal_interval_secs {
             return Ok(None);
         }
         match row.auth_method.as_str() {
@@ -4330,10 +4464,7 @@ impl ConfigDb {
         if remaining_absolute <= 0 {
             return Ok(None);
         }
-        let max_age_seconds = self
-            .session_policy
-            .idle_timeout_secs
-            .min(remaining_absolute);
+        let max_age_seconds = policy.idle_timeout_secs.min(remaining_absolute);
         let expires_at = (now + chrono::Duration::seconds(max_age_seconds))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();

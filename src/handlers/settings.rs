@@ -947,6 +947,128 @@ pub async fn set_query_limits(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSessionPolicy {
+    pub idle_timeout_seconds: i64,
+}
+
+fn session_policy_response(policy: crate::clickhouse_config::SessionPolicy) -> serde_json::Value {
+    serde_json::json!({
+        "idle_timeout_seconds": policy.idle_timeout_secs,
+        "absolute_timeout_seconds": policy.absolute_timeout_secs,
+        "min_idle_timeout_seconds": 60,
+        "default_idle_timeout_seconds": crate::clickhouse_config::DEFAULT_SESSION_IDLE_TIMEOUT_SECS,
+    })
+}
+
+pub async fn get_session_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+    let policy = state
+        .config_db
+        .effective_session_policy()
+        .await
+        .map_err(|error| crate::api_error::internal_legacy("session_policy.read", error))?;
+    Ok(Json(session_policy_response(policy)))
+}
+
+pub async fn set_session_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(config): Json<UpdateSessionPolicy>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_admin(&state, &headers).await?;
+    let key = crate::clickhouse_config::SESSION_IDLE_TIMEOUT_SETTING;
+    let policy = match state
+        .config_db
+        .validate_session_idle_timeout(config.idle_timeout_seconds)
+    {
+        Ok(policy) => policy,
+        Err(_) => {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("settings.update", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("setting", key)
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "invalid_idle_timeout" }).to_string(),
+                        )
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((StatusCode::BAD_REQUEST,
+                "Idle timeout must be at least 60 seconds and no longer than the absolute session lifetime.".to_string()));
+        }
+    };
+    let before = state
+        .config_db
+        .effective_session_policy()
+        .await
+        .map_err(|error| crate::api_error::internal_legacy("session_policy.read", error))?;
+    state
+        .config_db
+        .set_session_idle_timeout(config.idle_timeout_seconds)
+        .await
+        .map_err(|error| crate::api_error::internal_legacy("session_policy.write", error))?;
+    state.audit.log(
+        crate::audit::AuditEvent::new("settings.update", "user")
+            .actor(caller.0, caller.1).tenant(caller.3)
+            .resource("setting", key).outcome("success")
+            .changes(serde_json::json!({
+                "key": key, "before": before.idle_timeout_secs, "after": policy.idle_timeout_secs,
+            }).to_string())
+            .description("global idle session timeout updated")
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+    Ok(Json(session_policy_response(policy)))
+}
+
+#[cfg(test)]
+mod session_policy_tests {
+    use super::UpdateSessionPolicy;
+
+    #[test]
+    fn session_policy_accepts_only_an_integer_timeout_and_known_fields() {
+        assert_eq!(
+            serde_json::from_str::<UpdateSessionPolicy>(r#"{"idle_timeout_seconds":7200}"#)
+                .unwrap()
+                .idle_timeout_seconds,
+            7200
+        );
+        for payload in [
+            r#"{}"#,
+            r#"{"idle_timeout_seconds":1.5}"#,
+            r#"{"idle_timeout_seconds":"7200"}"#,
+            r#"{"idle_timeout_seconds":7200,"tenant":"other"}"#,
+        ] {
+            assert!(serde_json::from_str::<UpdateSessionPolicy>(payload).is_err());
+        }
+    }
+
+    #[test]
+    fn session_policy_writes_require_admin_and_emit_an_audit_event() {
+        let source = include_str!("settings.rs");
+        let setter = source
+            .split("pub async fn set_session_policy(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(setter.contains("require_admin(&state, &headers).await?"));
+        assert!(setter.contains(".set_session_idle_timeout("));
+        assert!(setter.contains("AuditEvent::new(\"settings.update\", \"user\")"));
+        assert!(setter.contains(".outcome(\"success\")"));
+        assert!(setter.contains(".outcome(\"failure\")"));
+    }
+}
+
 /// Defaults + clamps for the SRE agent's per-investigation cost budget. Must
 /// stay in sync with sre-agent's LoopBudget (which re-clamps defensively).
 const SRE_AGENT_DEFAULT_MAX_TOOL_STEPS: u64 = 40;
