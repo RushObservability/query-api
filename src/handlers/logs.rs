@@ -474,6 +474,7 @@ pub async fn query_logs(
     // next_cursor because exact counts intentionally do not rescan the range.
     let total = offset + rows.len() as u64 + u64::from(has_more);
     has_more &= next_cursor.is_some();
+    let duration_ms = start.elapsed().as_millis() as u64;
 
     tracing::info!(
         signal = "logs",
@@ -481,7 +482,7 @@ pub async fn query_logs(
         query = "log_search",
         rows = rows.len(),
         total = total,
-        duration_ms = start.elapsed().as_millis() as u64,
+        duration_ms,
         "log search completed"
     );
 
@@ -494,7 +495,7 @@ pub async fn query_logs(
         "logs",
         req.search.as_ref().map(|s| s.chars().count()),
         rows.len() as u64,
-        start.elapsed().as_millis() as u64,
+        duration_ms,
         true,
     );
 
@@ -511,7 +512,14 @@ pub async fn query_logs(
             })
             .collect();
         let signals = crate::usage_tracker::extract_span_signals(&filter_pairs);
-        state.usage.track_many(tenant_id, signals, "log", "explore");
+        state.usage.track_many_with_stats(
+            tenant_id,
+            signals,
+            "log",
+            "explore",
+            duration_ms,
+            rows.len() as u64,
+        );
     }
 
     #[derive(serde::Serialize)]

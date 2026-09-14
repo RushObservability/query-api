@@ -25,6 +25,14 @@ pub struct UsageEvent {
     pub signal_name: String,
     pub signal_type: String, // "metric", "span", "log"
     pub source: String,      // "explore", "dashboard", "alert", "prom_api"
+    pub query_stats: Option<QueryStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryStats {
+    pub event_id: String,
+    pub duration_ms: u64,
+    pub result_rows: u64,
 }
 
 /// Handle for sending usage events without blocking request handlers.
@@ -82,6 +90,35 @@ impl UsageTracker {
                 signal_name: name,
                 signal_type: signal_type.to_string(),
                 source: source.to_string(),
+                query_stats: None,
+            });
+        }
+    }
+
+    /// Track multiple signal names from one completed query with exact performance
+    /// samples. Each signal gets a stable event ID so a retried writer batch does not
+    /// inflate its aggregate statistics.
+    pub fn track_many_with_stats(
+        &self,
+        tenant_id: &str,
+        names: Vec<String>,
+        signal_type: &str,
+        source: &str,
+        duration_ms: u64,
+        result_rows: u64,
+    ) {
+        let query_id = uuid::Uuid::new_v4();
+        for (index, name) in names.into_iter().enumerate() {
+            self.track(UsageEvent {
+                tenant_id: tenant_id.to_string(),
+                signal_name: name,
+                signal_type: signal_type.to_string(),
+                source: source.to_string(),
+                query_stats: Some(QueryStats {
+                    event_id: format!("{query_id}:{index}"),
+                    duration_ms,
+                    result_rows,
+                }),
             });
         }
     }
@@ -254,16 +291,44 @@ fn build_insert_sql(events: &[UsageEvent]) -> Option<(String, usize)> {
     ))
 }
 
+fn build_query_stats_insert_sql(events: &[UsageEvent]) -> Option<String> {
+    let values: Vec<String> = events
+        .iter()
+        .filter_map(|event| {
+            let stats = event.query_stats.as_ref()?;
+            let escaped_tenant = crate::query_builder::escape_string_literal(&event.tenant_id);
+            let escaped_event_id = crate::query_builder::escape_string_literal(&stats.event_id);
+            let escaped_name = crate::query_builder::escape_string_literal(&event.signal_name);
+            let escaped_type = crate::query_builder::escape_string_literal(&event.signal_type);
+            let escaped_source = crate::query_builder::escape_string_literal(&event.source);
+            Some(format!(
+                "('{escaped_tenant}', '{escaped_event_id}', '{escaped_name}', '{escaped_type}', '{escaped_source}', now64(3), {}, {})",
+                stats.duration_ms, stats.result_rows
+            ))
+        })
+        .collect();
+
+    (!values.is_empty()).then(|| {
+        format!(
+            "INSERT INTO observability.signal_query_stats (tenant_id, event_id, signal_name, signal_type, source, queried_at, duration_ms, result_rows) VALUES {}",
+            values.join(", ")
+        )
+    })
+}
+
 /// Flush a batch of usage events to ClickHouse.
 async fn flush(ch: &Client, events: &[UsageEvent]) -> Result<usize, String> {
     let Some((sql, unique_entries)) = build_insert_sql(events) else {
         return Ok(0);
     };
-    ch.query(&sql)
-        .execute()
-        .await
-        .map(|_| unique_entries)
-        .map_err(|e| e.to_string())
+    ch.query(&sql).execute().await.map_err(|e| e.to_string())?;
+    if let Some(stats_sql) = build_query_stats_insert_sql(events) {
+        ch.query(&stats_sql)
+            .execute()
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(unique_entries)
 }
 
 /// Extract all metric names from a PromQL query string.
@@ -303,6 +368,7 @@ mod tests {
             signal_name: name.to_string(),
             signal_type: "metric".to_string(),
             source: "prom_api".to_string(),
+            query_stats: None,
         }
     }
 
@@ -332,6 +398,23 @@ mod tests {
         assert_eq!(pending.pop_front().unwrap().signal_name, "old-1");
         assert_eq!(pending.pop_front().unwrap().signal_name, "old-2");
         assert_eq!(pending.pop_front().unwrap().signal_name, "new");
+    }
+
+    #[test]
+    fn query_stats_insert_keeps_exact_samples_and_stable_event_ids() {
+        let mut sample = event("tenant-a", "service_name=gateway");
+        sample.signal_type = "log".to_string();
+        sample.source = "explore".to_string();
+        sample.query_stats = Some(QueryStats {
+            event_id: "query-1:0".to_string(),
+            duration_ms: 42,
+            result_rows: 100,
+        });
+
+        let sql = build_query_stats_insert_sql(&[sample]).expect("stats insert");
+        assert!(sql.contains("observability.signal_query_stats"));
+        assert!(sql.contains("'query-1:0'"));
+        assert!(sql.contains(", 42, 100)"));
     }
 
     #[tokio::test]

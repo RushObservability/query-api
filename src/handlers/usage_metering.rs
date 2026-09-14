@@ -21,6 +21,8 @@ pub struct SummaryParams {
     pub to: Option<String>,
     /// When true, returns usage across ALL tenants (ignores X-Rush-Tenant header).
     pub global: Option<bool>,
+    /// Admin-only override for inspecting one tenant without changing UI context.
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +31,10 @@ pub struct BreakdownParams {
     pub to: Option<String>,
     pub interval: Option<String>, // "hour" or "day"
     pub signal: Option<String>,
+    /// When true, returns usage across ALL tenants (ignores X-Rush-Tenant header).
+    pub global: Option<bool>,
+    /// Admin-only override for inspecting one tenant without changing UI context.
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +70,14 @@ struct TenantSignalRow {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Row)]
+struct TenantBreakdownRow {
+    ts: String,
+    tenant_id: String,
+    events: u64,
+    bytes: u64,
+}
+
 // ── Response types ──
 
 #[derive(Debug, Serialize)]
@@ -95,6 +109,18 @@ pub struct UsageBreakdownResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct TenantBreakdownBucket {
+    pub timestamp: String,
+    pub tenants: HashMap<String, SignalCounts>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TenantBreakdownResponse {
+    pub interval: String,
+    pub buckets: Vec<TenantBreakdownBucket>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TenantUsageEntry {
     pub tenant_id: String,
     pub events_count: u64,
@@ -107,6 +133,53 @@ pub struct UsageTenantsResponse {
     pub tenants: Vec<TenantUsageEntry>,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct MeteringScope {
+    tenant_id: String,
+    global: bool,
+    requires_admin: bool,
+}
+
+impl MeteringScope {
+    pub(crate) fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    pub(crate) fn is_global(&self) -> bool {
+        self.global
+    }
+
+    pub(crate) fn requires_admin(&self) -> bool {
+        self.requires_admin
+    }
+}
+
+pub(crate) fn resolve_metering_scope(
+    current_tenant: &str,
+    global: Option<bool>,
+    requested_tenant: Option<&str>,
+) -> MeteringScope {
+    if global.unwrap_or(false) {
+        return MeteringScope {
+            tenant_id: "all".into(),
+            global: true,
+            requires_admin: true,
+        };
+    }
+
+    let tenant_id = requested_tenant
+        .map(str::trim)
+        .filter(|tenant_id| !tenant_id.is_empty())
+        .unwrap_or(current_tenant)
+        .to_string();
+
+    MeteringScope {
+        requires_admin: tenant_id != current_tenant,
+        tenant_id,
+        global: false,
+    }
+}
+
 // ── Handlers ──
 
 /// GET /api/v1/usage/summary — Per-tenant totals for all signals in a time range.
@@ -116,14 +189,17 @@ pub async fn usage_summary(
     headers: HeaderMap,
     Query(params): Query<SummaryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let is_global = params.global.unwrap_or(false);
-    if is_global {
+    let scope = resolve_metering_scope(
+        &tenant.tenant_id,
+        params.global,
+        params.tenant_id.as_deref(),
+    );
+    if scope.requires_admin {
         require_admin(&state, &headers).await?;
     } else {
         require_auth(&state, &headers).await?;
     }
-    let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = escape_string_literal(tenant_id);
+    let escaped_tenant = escape_string_literal(&scope.tenant_id);
 
     let now = chrono::Utc::now();
     let from = sanitize_datetime(
@@ -133,7 +209,7 @@ pub async fn usage_summary(
     );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
 
-    let tenant_filter = if is_global {
+    let tenant_filter = if scope.global {
         String::new()
     } else {
         format!("tenant_id = '{escaped_tenant}' AND ")
@@ -150,10 +226,10 @@ pub async fn usage_summary(
          GROUP BY signal"
     );
 
-    let query = if is_global {
+    let query = if scope.requires_admin {
         state.admin_ch.query(&sql)
     } else {
-        crate::tenant_query(&state.ch, &sql, tenant_id)
+        crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
     };
     let rows = query.fetch_all::<SignalUsageRow>().await.map_err(|e| {
         tracing::error!(error = %e, handler = "usage_summary", "query failed");
@@ -177,7 +253,7 @@ pub async fn usage_summary(
     }
 
     Ok(Json(UsageSummaryResponse {
-        tenant_id: tenant_id.clone(),
+        tenant_id: scope.tenant_id,
         from,
         to,
         signals,
@@ -195,9 +271,17 @@ pub async fn usage_breakdown(
     headers: HeaderMap,
     Query(params): Query<BreakdownParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
-    let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = escape_string_literal(tenant_id);
+    let scope = resolve_metering_scope(
+        &tenant.tenant_id,
+        params.global,
+        params.tenant_id.as_deref(),
+    );
+    if scope.requires_admin {
+        require_admin(&state, &headers).await?;
+    } else {
+        require_auth(&state, &headers).await?;
+    }
+    let escaped_tenant = escape_string_literal(&scope.tenant_id);
 
     let now = chrono::Utc::now();
     let from = sanitize_datetime(
@@ -213,6 +297,12 @@ pub async fn usage_breakdown(
         _ => "toStartOfHour(bucket)",
     };
 
+    let tenant_filter = if scope.global {
+        String::new()
+    } else {
+        format!("tenant_id = '{escaped_tenant}' AND ")
+    };
+
     let mut sql = format!(
         "SELECT \
             toString({ts_expr}) AS ts, \
@@ -220,8 +310,7 @@ pub async fn usage_breakdown(
             sum(events_count) AS events, \
             sum(bytes_count) AS bytes \
          FROM observability.tenant_usage \
-         WHERE tenant_id = '{escaped_tenant}' \
-           AND bucket >= parseDateTimeBestEffort('{from}') \
+         WHERE {tenant_filter}bucket >= parseDateTimeBestEffort('{from}') \
            AND bucket <= parseDateTimeBestEffort('{to}')"
     );
 
@@ -232,13 +321,15 @@ pub async fn usage_breakdown(
 
     sql.push_str(&format!(" GROUP BY ts, signal ORDER BY ts"));
 
-    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-        .fetch_all::<BreakdownRow>()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, handler = "usage_breakdown", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-        })?;
+    let query = if scope.requires_admin {
+        state.admin_ch.query(&sql)
+    } else {
+        crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
+    };
+    let rows = query.fetch_all::<BreakdownRow>().await.map_err(|e| {
+        tracing::error!(error = %e, handler = "usage_breakdown", "query failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+    })?;
 
     // Group by timestamp
     let mut buckets_map: HashMap<String, HashMap<String, SignalCounts>> = HashMap::new();
@@ -262,9 +353,79 @@ pub async fn usage_breakdown(
     buckets.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
     Ok(Json(UsageBreakdownResponse {
-        tenant_id: tenant_id.clone(),
+        tenant_id: scope.tenant_id,
         interval: interval.to_string(),
         buckets,
+    }))
+}
+
+fn pivot_tenant_breakdown(rows: Vec<TenantBreakdownRow>) -> Vec<TenantBreakdownBucket> {
+    let mut buckets_map: HashMap<String, HashMap<String, SignalCounts>> = HashMap::new();
+    for row in rows {
+        buckets_map.entry(row.ts.clone()).or_default().insert(
+            row.tenant_id,
+            SignalCounts {
+                events_count: row.events,
+                bytes_count: row.bytes,
+            },
+        );
+    }
+
+    let mut buckets: Vec<TenantBreakdownBucket> = buckets_map
+        .into_iter()
+        .map(|(timestamp, tenants)| TenantBreakdownBucket { timestamp, tenants })
+        .collect();
+    buckets.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    buckets
+}
+
+/// GET /api/v1/usage/tenant-breakdown — Ingest time series grouped by tenant.
+pub async fn usage_tenant_breakdown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<BreakdownParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers).await?;
+
+    let now = chrono::Utc::now();
+    let from = sanitize_datetime(
+        &params
+            .from
+            .unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339()),
+    );
+    let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
+    let interval = params.interval.as_deref().unwrap_or("hour");
+    let ts_expr = match interval {
+        "day" => "toStartOfDay(bucket)",
+        _ => "toStartOfHour(bucket)",
+    };
+
+    let sql = format!(
+        "SELECT \
+            toString({ts_expr}) AS ts, \
+            tenant_id, \
+            sum(events_count) AS events, \
+            sum(bytes_count) AS bytes \
+         FROM observability.tenant_usage \
+         WHERE bucket >= parseDateTimeBestEffort('{from}') \
+           AND bucket <= parseDateTimeBestEffort('{to}') \
+         GROUP BY ts, tenant_id \
+         ORDER BY ts, tenant_id"
+    );
+
+    let rows = state
+        .admin_ch
+        .query(&sql)
+        .fetch_all::<TenantBreakdownRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, handler = "usage_tenant_breakdown", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
+
+    Ok(Json(TenantBreakdownResponse {
+        interval: interval.to_string(),
+        buckets: pivot_tenant_breakdown(rows),
     }))
 }
 
@@ -337,4 +498,81 @@ pub async fn usage_tenants(
     tenants.truncate(limit as usize);
 
     Ok(Json(UsageTenantsResponse { tenants }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metering_scope_defaults_to_the_active_tenant() {
+        assert_eq!(
+            resolve_metering_scope("default", None, None),
+            MeteringScope {
+                tenant_id: "default".into(),
+                global: false,
+                requires_admin: false,
+            }
+        );
+    }
+
+    #[test]
+    fn metering_scope_all_tenants_requires_admin() {
+        assert_eq!(
+            resolve_metering_scope("default", Some(true), Some("production")),
+            MeteringScope {
+                tenant_id: "all".into(),
+                global: true,
+                requires_admin: true,
+            }
+        );
+    }
+
+    #[test]
+    fn metering_scope_other_tenant_requires_admin() {
+        assert_eq!(
+            resolve_metering_scope("default", None, Some(" production ")),
+            MeteringScope {
+                tenant_id: "production".into(),
+                global: false,
+                requires_admin: true,
+            }
+        );
+    }
+
+    #[test]
+    fn metering_scope_active_or_blank_tenant_does_not_require_admin() {
+        assert!(!resolve_metering_scope("default", None, Some("default")).requires_admin);
+        assert!(!resolve_metering_scope("default", None, Some("  ")).requires_admin);
+    }
+
+    #[test]
+    fn tenant_breakdown_groups_tenants_and_sorts_buckets() {
+        let buckets = pivot_tenant_breakdown(vec![
+            TenantBreakdownRow {
+                ts: "2026-09-13 11:00:00".into(),
+                tenant_id: "default".into(),
+                events: 4,
+                bytes: 40,
+            },
+            TenantBreakdownRow {
+                ts: "2026-09-13 10:00:00".into(),
+                tenant_id: "test".into(),
+                events: 2,
+                bytes: 20,
+            },
+            TenantBreakdownRow {
+                ts: "2026-09-13 10:00:00".into(),
+                tenant_id: "default".into(),
+                events: 3,
+                bytes: 30,
+            },
+        ]);
+
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].timestamp, "2026-09-13 10:00:00");
+        assert_eq!(buckets[0].tenants["default"].bytes_count, 30);
+        assert_eq!(buckets[0].tenants["test"].events_count, 2);
+        assert_eq!(buckets[1].tenants["default"].bytes_count, 40);
+    }
 }
