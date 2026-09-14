@@ -60,7 +60,7 @@ regex = "1"
 dotenvy = "0.15"
 urlencoding = "2"
 toml = "0.8"
-prost = "0.13"
+prost = "0.14"
 snap = "1"
 flate2 = "1"
 rmp-serde = "1"
@@ -80,7 +80,7 @@ openssl = "0.10"
 # SAML Response (signature + reference digest) and guards against XSW / dup-ID.
 opensaml = "0.3.0"
 dashmap = "6"
-opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
 hex = "0.4"
 # Drop-in global allocator. glibc malloc fragments badly under tokio's
 # multi-thread churn (many short-lived per-request Vec/String allocations in the

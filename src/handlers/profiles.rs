@@ -620,6 +620,7 @@ mod tests {
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("demo".into())),
                         }),
+                        ..Default::default()
                     }],
                     ..Default::default()
                 }),

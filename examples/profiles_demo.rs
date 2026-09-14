@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
                 value: Some(AnyValue {
                     value: Some(Value::StringValue(value.into())),
                 }),
+                ..Default::default()
             })
             .collect();
             resources.push(ResourceProfiles {
