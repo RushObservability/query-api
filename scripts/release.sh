@@ -5,19 +5,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 version="${VERSION:-}"
-version="${version#v}"
 dry_run="${DRY_RUN:-0}"
-
-if [[ -z "$version" ]]; then
-  echo "Usage: make release VERSION=0.1.26" >&2
-  exit 2
-fi
-
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-  echo "Invalid version: $version" >&2
-  echo "Use a semantic version such as 0.1.26 or 0.2.0-rc.1." >&2
-  exit 2
-fi
 
 for required_command in git cargo gh awk mktemp; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
@@ -25,6 +13,40 @@ for required_command in git cargo gh awk mktemp; do
     exit 1
   fi
 done
+
+latest_semver_tag() {
+  local tag normalized
+  while IFS= read -r tag; do
+    normalized="${tag#v}"
+    if [[ "$normalized" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+      printf '%s\n' "$tag"
+      return 0
+    fi
+  done < <(git tag --list --sort=-version:refname)
+  return 1
+}
+
+if [[ -z "$version" ]]; then
+  git fetch origin --tags
+  if ! latest_tag="$(latest_semver_tag)"; then
+    echo "No semantic-version tags were found. Set VERSION explicitly for the first release." >&2
+    exit 2
+  fi
+  latest_version="${latest_tag#v}"
+  if [[ ! "$latest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+    echo "Could not parse semantic-version tag: $latest_tag" >&2
+    exit 2
+  fi
+  version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((10#${BASH_REMATCH[3]} + 1))"
+  echo "No VERSION supplied; bumping $latest_tag to v$version."
+fi
+version="${version#v}"
+
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo "Invalid version: $version" >&2
+  echo "Use a semantic version such as 0.1.26 or 0.2.0-rc.1." >&2
+  exit 2
+fi
 
 read_version() {
   local file="$1"
