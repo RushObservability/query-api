@@ -145,6 +145,10 @@ fn any_value_to_string(v: &AnyValue) -> String {
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
+        // This variant references the profiling signal's string table. It is not
+        // meaningful for traces, logs, or metrics, so OTLP receivers are expected
+        // to treat it as an empty value for those signals.
+        Some(Value::StringValueStrindex(_)) => String::new(),
         None => String::new(),
     }
 }
@@ -1205,5 +1209,16 @@ mod tests {
             error,
             (StatusCode::BAD_REQUEST, "invalid OTLP payload".into())
         );
+    }
+
+    #[test]
+    fn profile_string_reference_is_ignored_for_non_profile_signals() {
+        let value = AnyValue {
+            value: Some(
+                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValueStrindex(7),
+            ),
+        };
+
+        assert_eq!(any_value_to_string(&value), "");
     }
 }
