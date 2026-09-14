@@ -1,6 +1,6 @@
 //! Admin-only read + verification API for the tamper-evident audit log.
 //!
-//! - `GET /api/v1/audit`        → filtered, paginated, newest-first event list.
+//! - `GET /api/v1/audit`        → filtered, paginated user-activity event list.
 //! - `GET /api/v1/audit/verify` → recompute the whole hash chain and report
 //!   whether it is intact (and the first broken seq if not).
 //!
@@ -40,6 +40,13 @@ pub struct AuditQuery {
     pub offset: Option<u64>,
 }
 
+// Filter before pagination, not in the UI. Historical ingestion failures and
+// system activity remain in the append-only chain but are not user activity.
+const USER_ACTIVITY_FILTER: &str = "actor_type != 'system' \
+    AND NOT startsWith(action, 'ingest.') \
+    AND NOT (action IN ('apikey.scope_denied', 'sre_agent.scope_denied') \
+        AND JSONExtractString(metadata, 'signal') NOT IN ('', 'collector'))";
+
 /// GET /api/v1/audit — list audit events (admin only), newest first.
 pub async fn list_audit(
     State(state): State<AppState>,
@@ -48,7 +55,46 @@ pub async fn list_audit(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    let mut conds: Vec<String> = Vec::new();
+    let where_clause = audit_where_clause(&params);
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0);
+
+    // Convert the DateTime64 `timestamp` to Int64 nanos for the driver, via a
+    // subquery so the alias never collides with the source column of the same
+    // name (ClickHouse 26.1 rejects `toUnixTimestamp64Nano(timestamp) AS timestamp`
+    // with an AMBIGUOUS_COLUMN_NAME / block-structure-mismatch error).
+    let sql = format!(
+        "SELECT id, seq, ts AS timestamp, tenant_id, \
+         actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
+         ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
+         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events {where_clause}) \
+         ORDER BY seq DESC LIMIT {limit} OFFSET {offset}"
+    );
+
+    let rows = state
+        .admin_ch
+        .query(&sql)
+        .fetch_all::<AuditRow>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "audit list query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        })?;
+
+    let events: Vec<serde_json::Value> = rows.iter().map(audit_row_json).collect();
+
+    Ok(Json(serde_json::json!({
+        "events": events,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+fn audit_where_clause(params: &AuditQuery) -> String {
+    let mut conds: Vec<String> = vec![USER_ACTIVITY_FILTER.to_string()];
 
     if let Some(from) = params.from.as_deref().filter(|s| !s.is_empty()) {
         conds.push(format!(
@@ -101,47 +147,7 @@ pub async fn list_audit(
         ));
     }
 
-    let where_clause = if conds.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conds.join(" AND "))
-    };
-
-    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
-    let offset = params.offset.unwrap_or(0);
-
-    // Convert the DateTime64 `timestamp` to Int64 nanos for the driver, via a
-    // subquery so the alias never collides with the source column of the same
-    // name (ClickHouse 26.1 rejects `toUnixTimestamp64Nano(timestamp) AS timestamp`
-    // with an AMBIGUOUS_COLUMN_NAME / block-structure-mismatch error).
-    let sql = format!(
-        "SELECT id, seq, ts AS timestamp, tenant_id, \
-         actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
-         ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
-         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events {where_clause}) \
-         ORDER BY seq DESC LIMIT {limit} OFFSET {offset}"
-    );
-
-    let rows = state
-        .admin_ch
-        .query(&sql)
-        .fetch_all::<AuditRow>()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "audit list query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
-            )
-        })?;
-
-    let events: Vec<serde_json::Value> = rows.iter().map(audit_row_json).collect();
-
-    Ok(Json(serde_json::json!({
-        "events": events,
-        "limit": limit,
-        "offset": offset,
-    })))
+    format!("WHERE {}", conds.join(" AND "))
 }
 
 /// GET /api/v1/audit/verify — recompute the full hash chain (admin only).
@@ -233,4 +239,94 @@ fn audit_row_json(row: &AuditRow) -> serde_json::Value {
         "prev_hash": row.prev_hash,
         "hash": row.hash,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_activity_filter_is_always_applied_before_pagination() {
+        let clause = audit_where_clause(&AuditQuery::default());
+        assert_eq!(clause, format!("WHERE {USER_ACTIVITY_FILTER}"));
+        let filtered = audit_where_clause(&AuditQuery {
+            action: Some("apikey.*".into()),
+            outcome: Some("failure".into()),
+            offset: Some(100),
+            ..Default::default()
+        });
+        assert!(filtered.starts_with(&clause));
+        assert!(filtered.contains("startsWith(action, 'apikey.')"));
+        assert!(filtered.contains("outcome = 'failure'"));
+        assert!(!filtered.contains("OFFSET"));
+    }
+
+    #[test]
+    fn user_filters_remain_escaped() {
+        let clause = audit_where_clause(&AuditQuery {
+            actor: Some("alice' OR 1=1 --".into()),
+            ..Default::default()
+        });
+        assert!(clause.starts_with(&format!("WHERE {USER_ACTIVITY_FILTER} AND ")));
+        assert!(clause.contains(&escape_string_literal("alice' OR 1=1 --")));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local ClickHouse at RUSH_TEST_CLICKHOUSE_URL or localhost:8123"]
+    async fn user_activity_filter_matches_clickhouse_events() {
+        let client = clickhouse::Client::default()
+            .with_url(
+                std::env::var("RUSH_TEST_CLICKHOUSE_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8123".into()),
+            )
+            .with_user(
+                std::env::var("RUSH_TEST_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()),
+            )
+            .with_password(std::env::var("RUSH_TEST_CLICKHOUSE_PASSWORD").unwrap_or_default());
+        // Constant rows only: this test never reads or changes stored audit data.
+        for (actor, action, metadata, expected) in [
+            ("user", "settings.update", "", 1),
+            ("user", "user.delete", "", 1),
+            ("user", "group.delete", "", 1),
+            ("user", "tenant.ingest_auth_required_change", "", 1),
+            ("user", "apikey.create", "", 1),
+            ("user", "auth.login.success", "", 1),
+            ("anonymous", "auth.login.failure", "", 1),
+            ("api_key", "settings.update", "", 1),
+            ("system", "schema.migrate", "", 0),
+            ("system", "user.create", "", 0),
+            ("anonymous", "ingest.auth_denied", "", 0),
+            ("user", "ingest.auth_denied", "", 0),
+            ("api_key", "apikey.scope_denied", r#"{"signal":"logs"}"#, 0),
+            (
+                "api_key",
+                "apikey.scope_denied",
+                r#"{"signal":"metrics","reason":"rate_limit_exceeded"}"#,
+                0,
+            ),
+            (
+                "api_key",
+                "apikey.scope_denied",
+                r#"{"signal":"control"}"#,
+                0,
+            ),
+            (
+                "api_key",
+                "apikey.scope_denied",
+                r#"{"signal":"collector"}"#,
+                1,
+            ),
+            ("api_key", "apikey.scope_denied", r#"{"signal":null}"#, 1),
+            ("api_key", "apikey.scope_denied", "", 1),
+        ] {
+            let sql = format!(
+                "SELECT count() FROM (SELECT '{}' AS actor_type, '{}' AS action, '{}' AS metadata) WHERE {USER_ACTIVITY_FILTER}",
+                escape_string_literal(actor),
+                escape_string_literal(action),
+                escape_string_literal(metadata),
+            );
+            let count = client.query(&sql).fetch_one::<u64>().await.unwrap();
+            assert_eq!(count, expected, "{actor}: {action} {metadata}");
+        }
+    }
 }

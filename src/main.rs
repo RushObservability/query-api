@@ -1181,6 +1181,12 @@ fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
     }
 }
 
+fn should_audit_route_denial(signal: Option<&str>) -> bool {
+    // Collector execution/control is security-sensitive, not telemetry ingest.
+    // Keep query/configuration access denials, but leave ingest failures in logs.
+    signal.is_none() || signal == Some("collector")
+}
+
 async fn audit_api_key_denial(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1188,6 +1194,16 @@ async fn audit_api_key_denial(
     reason: &str,
     signal: Option<&str>,
 ) {
+    if !should_audit_route_denial(signal) {
+        tracing::warn!(
+            tenant_id = %resolution.tenant_id,
+            signal,
+            reason,
+            credential_type = ?resolution.credential,
+            "ingestion request rejected"
+        );
+        return;
+    }
     let (action, actor_type) = match resolution.credential {
         CredentialKind::QueryKey | CredentialKind::IngestKey => ("apikey.scope_denied", "api_key"),
         CredentialKind::Session => ("ingest.auth_denied", "user"),
@@ -3496,14 +3512,25 @@ mod tenant_auth_tests {
         credential_route_denial, effective_route_ingest_auth_required, explicit_ingest_tenant,
         ingest_signal_for_route, internal_sre_route_allowed, is_explain_collector_route,
         is_state_changing_method, query_workload_for_request, request_log_path,
-        request_origin_allowed_with_policy, requires_csrf_origin, should_reject_for_tenant_auth,
-        should_reject_interactive_llm, trust_forwarded_origin_headers, validate_request_time_range,
+        request_origin_allowed_with_policy, requires_csrf_origin, should_audit_route_denial,
+        should_reject_for_tenant_auth, should_reject_interactive_llm,
+        trust_forwarded_origin_headers, validate_request_time_range,
     };
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, Method, Request, header};
     use rush_api::clickhouse_config::ApiKeyGrant;
     use rush_api::cors::CorsPolicy;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn ingestion_denials_do_not_create_user_audit_events() {
+        for (_, signal) in INGEST_ROUTES {
+            assert!(!should_audit_route_denial(Some(signal)), "{signal}");
+        }
+        assert!(!should_audit_route_denial(Some("control")));
+        assert!(should_audit_route_denial(None));
+        assert!(should_audit_route_denial(Some("collector")));
+    }
 
     const INGEST_ROUTES: &[(&str, &str)] = &[
         ("/v1development/profiles", "profiles"),
