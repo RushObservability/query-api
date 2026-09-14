@@ -3198,6 +3198,7 @@ async fn main() -> anyhow::Result<()> {
         // Usage metering (per-tenant ingest volume)
         .route("/api/v1/usage/summary", get(handlers::usage_metering::usage_summary))
         .route("/api/v1/usage/breakdown", get(handlers::usage_metering::usage_breakdown))
+        .route("/api/v1/usage/tenant-breakdown", get(handlers::usage_metering::usage_tenant_breakdown))
         .route("/api/v1/usage/tenants", get(handlers::usage_metering::usage_tenants))
         // ═══ Datadog Agent Ingestion ═══
         // Logs (agent log forwarder sends to {logs_dd_url}/api/v2/logs)

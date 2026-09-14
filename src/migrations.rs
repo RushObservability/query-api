@@ -563,6 +563,24 @@ ENGINE = ReplacingMergeTree(last_queried_at)
 ORDER BY (tenant_id, signal_type, signal_name, source)
 TTL toDateTime(last_queried_at) + INTERVAL 90 DAY DELETE
 SETTINGS index_granularity = 8192",
+    // Exact per-query samples back the low/average/high latency and result-count
+    // summaries on the Usage page. event_id makes writer retries idempotent.
+    r"CREATE TABLE IF NOT EXISTS observability.signal_query_stats
+(
+    `tenant_id` LowCardinality(String) DEFAULT 'default',
+    `event_id` String,
+    `signal_name` LowCardinality(String),
+    `signal_type` LowCardinality(String),
+    `source` LowCardinality(String),
+    `queried_at` DateTime64(3) DEFAULT now64(3),
+    `duration_ms` UInt64,
+    `result_rows` UInt64
+)
+ENGINE = ReplacingMergeTree(queried_at)
+PARTITION BY toYYYYMM(queried_at)
+ORDER BY (tenant_id, event_id)
+TTL toDateTime(queried_at) + INTERVAL 90 DAY DELETE
+SETTINGS index_granularity = 8192",
     // ── RUM (Real User Monitoring) events (v2: multi-tenant) ──
     r"CREATE TABLE IF NOT EXISTS observability.rum
 (
@@ -845,6 +863,7 @@ const ROW_POLICY_TABLES: &[&str] = &[
     "rum_replay",
     "profile_samples",
     "signal_usage",
+    "signal_query_stats",
     "tenant_usage",
 ];
 
@@ -2048,6 +2067,7 @@ mod row_policy_tests {
             "rum",
             "rum_replay",
             "signal_usage",
+            "signal_query_stats",
             "tenant_usage",
         ] {
             assert!(ROW_POLICY_TABLES.contains(&table), "missing {table}");

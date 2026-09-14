@@ -122,6 +122,7 @@ async fn prom_query_inner(
                 signal_name: name,
                 signal_type: "metric".to_string(),
                 source: "prom_api".to_string(),
+                query_stats: None,
             });
         }
     }
@@ -234,6 +235,7 @@ async fn prom_query_range_inner(
                 signal_name: name,
                 signal_type: "metric".to_string(),
                 source: "prom_api".to_string(),
+                query_stats: None,
             });
         }
     }

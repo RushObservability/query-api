@@ -516,9 +516,14 @@ fn finish_response<T: Serialize>(
         } else {
             "span"
         };
-        state
-            .usage
-            .track_many(tenant_id, signals, signal_type, "explore_coordinator");
+        state.usage.track_many_with_stats(
+            tenant_id,
+            signals,
+            signal_type,
+            "explore_coordinator",
+            elapsed_ms,
+            row_count,
+        );
     }
 
     let matched_rows = count.value;
