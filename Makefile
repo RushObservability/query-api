@@ -3,6 +3,12 @@ VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 FEATURES ?= oss
 CARGO_FEATURES := --no-default-features --features $(FEATURES)
+LICENSE_ROOT ?= ../query-api-license
+LICENSE_FILE ?= .rush-license.jwt
+LICENSE_PUBLIC_KEY_FILE ?= ../license-service/license-pub.pem
+LICENSED_TARGET_DIR ?= $(abspath $(LICENSE_ROOT))/target
+LICENSED_BINARY := $(LICENSED_TARGET_DIR)/debug/$(BINARY)
+LICENSED_PORT ?= 8080
 
 # Local development wiring. These values are used only by `make dev` and
 # `make watch`; `make run` sources the production-style `.env` file instead.
@@ -18,7 +24,7 @@ DEV_ALLOWED_ORIGINS           := http://localhost:5173,http://localhost:8080
 DEV_ALLOW_ANONYMOUS_DEFAULT  := true
 
 .PHONY: build build-release release run run-anomaly dev check test fmt lint security security-audit security-policy clean docker package \
-        up up-full down deps logs run-local watch watch-anomaly
+        up up-full down deps logs run-local watch watch-anomaly licensed-check licensed-test licensed-build licensed-dev dev-license
 
 ## Development — local binary + ClickHouse in Docker
 
@@ -44,6 +50,37 @@ dev: deps             ## Run the community query-api with local development wiri
 	cargo run $(CARGO_FEATURES) --bin $(BINARY)
 
 run-local: dev        ## Backwards-compatible alias for dev
+
+licensed-check:       ## Type-check the licensed query-api overlay
+	@$(MAKE) -C "$(LICENSE_ROOT)" check QUERY_API_ROOT="$(CURDIR)"
+
+licensed-test:        ## Run the licensed query-api test suite
+	@$(MAKE) -C "$(LICENSE_ROOT)" test QUERY_API_ROOT="$(CURDIR)"
+
+licensed-build:       ## Build the licensed query-api overlay
+	@$(MAKE) -C "$(LICENSE_ROOT)" build QUERY_API_ROOT="$(CURDIR)"
+
+licensed-dev: licensed-build ## Run the licensed query-api in the foreground with the normal dev environment
+	@test -s "$(LICENSE_FILE)" || { echo "Missing $(LICENSE_FILE). Run 'make issue-dev-license' in ../license-service." >&2; exit 1; }
+	@test -s "$(LICENSE_PUBLIC_KEY_FILE)" || { echo "Missing $(LICENSE_PUBLIC_KEY_FILE). Run 'make keys' in ../license-service." >&2; exit 1; }
+	@if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; \
+	if [ -f ./.env ]; then set -a; . ./.env; set +a; fi; \
+	RUSH_LICENSE_KEY="$$(tr -d '\r\n' < "$(LICENSE_FILE)")" \
+	RUSH_LICENSE_PUBKEY="$$(cat "$(LICENSE_PUBLIC_KEY_FILE)")" \
+	RUSH_PORT=$(LICENSED_PORT) \
+	CLICKHOUSE_URL="$${CLICKHOUSE_URL:-$(DEV_CLICKHOUSE_URL)}" \
+	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
+	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
+	RUSH_COLLECTOR_MANAGER_ENABLED=$(DEV_COLLECTOR_MANAGER) \
+	RUSH_INTEGRATION_ENCRYPTION_KEY=$(DEV_INTEGRATION_KEY) \
+	RUSH_CONFIG_ENCRYPTION_KEY="$${RUSH_CONFIG_ENCRYPTION_KEY:-$(DEV_CONFIG_ENCRYPTION_KEY)}" \
+	RUSH_ALLOW_PRIVATE_NOTIFICATION_URLS=$(DEV_ALLOW_PRIVATE_NOTIFICATION_URLS) \
+	RUSH_ALLOWED_ORIGINS=$(DEV_ALLOWED_ORIGINS) \
+	RUSH_ALLOW_ANONYMOUS_DEFAULT=$(DEV_ALLOW_ANONYMOUS_DEFAULT) \
+	RUST_LOG=rush_api=debug,tower_http=debug \
+	"$(LICENSED_BINARY)"
+
+dev-license: licensed-dev ## Alias for licensed-dev
 
 build:                ## Build debug binary
 	cargo build $(CARGO_FEATURES)

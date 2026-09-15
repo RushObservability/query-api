@@ -3,6 +3,7 @@ wide_config.db
 wide_config.db-shm
 wide_config.db-wal
 .env
+.rush-license.jwt
 rush_config.db
 rush_config.db-shm
 rush_config.db-wal
