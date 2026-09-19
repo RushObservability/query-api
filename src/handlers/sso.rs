@@ -328,6 +328,7 @@ async fn find_namespaced_external_user(
     provider_id: &str,
     issuer: &str,
     subject: &str,
+    username: &str,
     auth_provider: &str,
 ) -> Result<(Option<String>, String), (StatusCode, String)> {
     let identity_key = external_identity_key(provider_id, issuer, subject);
@@ -389,6 +390,58 @@ async fn find_namespaced_external_user(
                         })
                         .to_string(),
                     )
+                    .context(crate::audit::actor_context_from_headers(headers)),
+            )
+            .await;
+        return Ok((Some(user_id), identity_key));
+    }
+
+    // An administrator may pre-provision an SSO user for a deny-by-default
+    // provider. Bind that account only after a verified assertion supplies the
+    // expected canonical username for this exact provider.
+    let pending_identity =
+        crate::clickhouse_config::pending_sso_identity_key(provider_id, username);
+    let pending = state
+        .config_db
+        .find_user_by_external_id(&pending_identity, auth_provider)
+        .await
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sso_pending_identity_lookup",
+                error,
+                "SSO authentication could not be completed",
+            )
+        })?;
+    if let Some(user_id) = pending {
+        state
+            .config_db
+            .update_user_external_identity(&user_id, auth_provider, &identity_key)
+            .await
+            .map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sso_pending_identity_claim",
+                    error,
+                    "SSO authentication could not be completed",
+                )
+            })?;
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.identity_claim", "system")
+                    .tenant("default")
+                    .resource("user", user_id.clone())
+                    .outcome("success")
+                    .changes(
+                        serde_json::json!({
+                            "auth_provider": auth_provider,
+                            "provider_id": provider_id,
+                            "preprovisioned": true,
+                        })
+                        .to_string(),
+                    )
+                    .description("pre-provisioned SSO identity claimed after verified login")
                     .context(crate::audit::actor_context_from_headers(headers)),
             )
             .await;
@@ -499,6 +552,46 @@ async fn revoke_sso_provider_sessions(
 
 // ── SSO Types ──
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SsoAdmissionPolicy {
+    GlobalViewer,
+    Group,
+    Deny,
+}
+
+fn configured_admission_policy(
+    jit_provisioning: bool,
+    default_group_id: &str,
+) -> SsoAdmissionPolicy {
+    if !jit_provisioning {
+        SsoAdmissionPolicy::Deny
+    } else if default_group_id.is_empty() {
+        SsoAdmissionPolicy::GlobalViewer
+    } else {
+        SsoAdmissionPolicy::Group
+    }
+}
+
+fn fallback_groups_for_policy(
+    policy: SsoAdmissionPolicy,
+    default_group_id: &str,
+    mut mapped_group_ids: Vec<String>,
+) -> Result<Vec<String>, &'static str> {
+    if !mapped_group_ids.is_empty() || policy == SsoAdmissionPolicy::Deny {
+        return Ok(mapped_group_ids);
+    }
+    match policy {
+        SsoAdmissionPolicy::GlobalViewer => mapped_group_ids.push("viewers".to_string()),
+        SsoAdmissionPolicy::Group if !default_group_id.is_empty() => {
+            mapped_group_ids.push(default_group_id.to_string());
+        }
+        SsoAdmissionPolicy::Group => return Err("default group is required"),
+        SsoAdmissionPolicy::Deny => unreachable!("deny returned before fallback"),
+    }
+    Ok(mapped_group_ids)
+}
+
 #[derive(Serialize)]
 pub struct SsoProviderResponse {
     pub id: String,
@@ -514,6 +607,7 @@ pub struct SsoProviderResponse {
     pub last_name_claim: String,
     pub jit_provisioning: bool,
     pub default_group_id: String,
+    pub admission_policy: SsoAdmissionPolicy,
     pub created_at: String,
     // SAML-specific fields
     pub saml_idp_metadata_url: String,
@@ -538,6 +632,7 @@ pub struct SaveSsoProviderRequest {
     pub last_name_claim: Option<String>,
     pub jit_provisioning: Option<bool>,
     pub default_group_id: Option<String>,
+    pub admission_policy: Option<SsoAdmissionPolicy>,
     // SAML-specific fields
     pub saml_idp_metadata_url: Option<String>,
     pub saml_idp_sso_url: Option<String>,
@@ -1063,6 +1158,48 @@ async fn audit_sso_failure(
         .await;
 }
 
+fn group_memberships_changed(current: &[String], requested: &[String]) -> bool {
+    let mut current = current.to_vec();
+    let mut requested = requested.to_vec();
+    current.sort();
+    current.dedup();
+    requested.sort();
+    requested.dedup();
+    current != requested
+}
+
+async fn audit_sso_group_sync(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: &str,
+    auth_provider: &str,
+    provider_id: &str,
+    previous_group_ids: &[String],
+    group_ids: &[String],
+) {
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("user.role_change", "system")
+                .tenant("default")
+                .resource("user", user_id)
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "auth_provider": auth_provider,
+                        "provider_id": provider_id,
+                        "previous_group_ids": previous_group_ids,
+                        "group_ids": group_ids,
+                        "source": "sso_login",
+                    })
+                    .to_string(),
+                )
+                .description("SSO login synchronized user group memberships")
+                .context(crate::audit::actor_context_from_headers(headers)),
+        )
+        .await;
+}
+
 /// GET /auth/sso/callback?code=...&state=... -- Exchange code for tokens, JIT provision user
 pub async fn sso_callback(
     State(state): State<AppState>,
@@ -1282,8 +1419,10 @@ async fn sso_callback_inner(
         })
         .unwrap_or_default();
 
-    // 7. Map IdP groups to Rush groups
-    let mut mapped_group_ids = state
+    // 7. Map IdP groups to Rush groups and apply the provider's explicit
+    // admission policy when no IdP mapping matches.
+    let admission_policy = configured_admission_policy(jit_provisioning, &default_group_id);
+    let mapped_group_ids = state
         .config_db
         .resolve_idp_groups(&idp_groups, &provider_id)
         .await
@@ -1296,15 +1435,9 @@ async fn sso_callback_inner(
             )
         })?;
 
-    // If no mappings match, use default_group_id from provider config
-    if mapped_group_ids.is_empty() && !default_group_id.is_empty() {
-        mapped_group_ids.push(default_group_id);
-    }
-
-    // If still nothing, fall back to the built-in viewers group
-    if mapped_group_ids.is_empty() {
-        mapped_group_ids.push("viewers".to_string());
-    }
+    let mapped_group_ids =
+        fallback_groups_for_policy(admission_policy, &default_group_id, mapped_group_ids)
+            .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?;
 
     // 8. JIT provision: find or create user
     let (existing_user, identity_key) = find_namespaced_external_user(
@@ -1313,16 +1446,17 @@ async fn sso_callback_inner(
         &provider_id,
         &issuer_url,
         &external_id,
+        &username,
         "oidc",
     )
     .await?;
     let (user_id, jit_created) = match existing_user {
         Some(uid) => (uid, false),
         None => {
-            if !jit_provisioning {
+            if admission_policy == SsoAdmissionPolicy::Deny {
                 return Err((
                     StatusCode::FORBIDDEN,
-                    "JIT provisioning is disabled and user does not exist".to_string(),
+                    "this SSO account has not been provisioned by an administrator".to_string(),
                 ));
             }
             let id = state
@@ -1363,19 +1497,66 @@ async fn sso_callback_inner(
             .await;
     }
 
-    // 9. Update the user's group memberships with the mapped set
-    state
-        .config_db
-        .update_user_groups_from_idp(&user_id, &mapped_group_ids)
-        .await
-        .map_err(|error| {
-            public_sso_internal_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "oidc_group_update",
-                error,
-                "SSO authentication could not be completed",
+    // Deny mode preserves the groups an administrator assigned during
+    // pre-provisioning. The other modes synchronize IdP mappings or their
+    // configured fallback on each login.
+    if admission_policy == SsoAdmissionPolicy::Deny {
+        let assigned_groups = state
+            .config_db
+            .get_user_groups(&user_id)
+            .await
+            .map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "oidc_group_lookup",
+                    error,
+                    "SSO authentication could not be completed",
+                )
+            })?;
+        if assigned_groups.is_empty() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "this SSO account has no assigned group".to_string(),
+            ));
+        }
+    } else {
+        let previous_groups = state
+            .config_db
+            .get_user_groups(&user_id)
+            .await
+            .map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "oidc_group_lookup",
+                    error,
+                    "SSO authentication could not be completed",
+                )
+            })?;
+        if group_memberships_changed(&previous_groups, &mapped_group_ids) {
+            state
+                .config_db
+                .update_user_groups_from_idp(&user_id, &mapped_group_ids)
+                .await
+                .map_err(|error| {
+                    public_sso_internal_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "oidc_group_update",
+                        error,
+                        "SSO authentication could not be completed",
+                    )
+                })?;
+            audit_sso_group_sync(
+                &state,
+                &headers,
+                &user_id,
+                "oidc",
+                &provider_id,
+                &previous_groups,
+                &mapped_group_ids,
             )
-        })?;
+            .await;
+        }
+    }
 
     // 10. Create a session (same as local auth)
     let issued = state
@@ -1651,6 +1832,7 @@ pub async fn list_sso_providers(
                     first_name_claim,
                     last_name_claim,
                     jit_provisioning: jit,
+                    admission_policy: configured_admission_policy(jit, &default_group_id),
                     default_group_id,
                     created_at,
                     saml_idp_metadata_url: saml_meta,
@@ -1698,11 +1880,14 @@ pub async fn save_sso_provider(
     } else {
         None
     };
-    if admin_result.is_err() && setup_session.is_none() {
-        return Err(admin_result.unwrap_err());
+    if let (Err(error), None) = (&admin_result, &setup_session) {
+        return Err(error.clone());
     }
     let is_update = req.id.is_some();
-    let id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let id = req
+        .id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let protocol = req.protocol.as_deref().unwrap_or("oidc");
     if !matches!(protocol, "oidc" | "saml") {
         return Err((
@@ -1727,26 +1912,84 @@ pub async fn save_sso_provider(
         }
     }
 
-    // If updating and no new secret provided, keep the existing one
-    let client_secret = match &req.client_secret {
-        Some(s) if !s.is_empty() => s.clone(),
-        _ => {
-            // Try to load existing secret
-            state
+    let existing_provider = if is_update {
+        state
+            .config_db
+            .get_sso_provider(&id)
+            .await
+            .map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sso_provider_secret_lookup",
+                    error,
+                    "SSO provider could not be saved",
+                )
+            })?
+    } else {
+        None
+    };
+
+    let inherited_jit = req
+        .jit_provisioning
+        .or_else(|| existing_provider.as_ref().map(|provider| provider.12))
+        .unwrap_or(true);
+    let inherited_default_group = req
+        .default_group_id
+        .as_deref()
+        .or_else(|| {
+            existing_provider
+                .as_ref()
+                .map(|provider| provider.13.as_str())
+        })
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let admission_policy = req
+        .admission_policy
+        .unwrap_or_else(|| configured_admission_policy(inherited_jit, &inherited_default_group));
+    let (jit_provisioning, default_group_id) = match admission_policy {
+        SsoAdmissionPolicy::GlobalViewer => (true, String::new()),
+        SsoAdmissionPolicy::Group => {
+            if inherited_default_group.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "default_group_id is required when admission_policy is 'group'".to_string(),
+                ));
+            }
+            let group_exists = state
                 .config_db
-                .get_sso_provider(&id)
+                .get_group(&inherited_default_group)
                 .await
                 .map_err(|error| {
                     public_sso_internal_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "sso_provider_secret_lookup",
+                        "sso_default_group_lookup",
                         error,
                         "SSO provider could not be saved",
                     )
                 })?
-                .map(|p| p.5)
-                .unwrap_or_default()
+                .is_some();
+            if !group_exists {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "default_group_id does not identify an existing group".to_string(),
+                ));
+            }
+            (true, inherited_default_group)
         }
+        SsoAdmissionPolicy::Deny => (false, String::new()),
+    };
+    let admission_settings_changed = existing_provider
+        .as_ref()
+        .is_some_and(|provider| provider.12 != jit_provisioning || provider.13 != default_group_id);
+
+    // If updating and no new secret provided, keep the existing one
+    let client_secret = match &req.client_secret {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => existing_provider
+            .as_ref()
+            .map(|provider| provider.5.clone())
+            .unwrap_or_default(),
     };
 
     if enabled && protocol == "saml" {
@@ -1926,9 +2169,15 @@ pub async fn save_sso_provider(
                 "SSO provider change is temporarily unavailable",
             )
         })?;
-    if let Some((provider_id, reason)) =
-        provider_session_revocation(is_update, &id, enabled, active_before_change.as_deref())
+    let session_revocation = if is_update
+        && admission_settings_changed
+        && active_before_change.as_deref() == Some(id.as_str())
     {
+        Some((id.clone(), "sso_admission_policy_changed"))
+    } else {
+        provider_session_revocation(is_update, &id, enabled, active_before_change.as_deref())
+    };
+    if let Some((provider_id, reason)) = session_revocation {
         revoke_sso_provider_sessions(
             &state,
             &headers,
@@ -1956,8 +2205,8 @@ pub async fn save_sso_provider(
             req.email_claim.as_deref().unwrap_or("email"),
             req.first_name_claim.as_deref().unwrap_or("given_name"),
             req.last_name_claim.as_deref().unwrap_or("family_name"),
-            req.jit_provisioning.unwrap_or(true),
-            req.default_group_id.as_deref().unwrap_or(""),
+            jit_provisioning,
+            &default_group_id,
             req.saml_idp_metadata_url.as_deref().unwrap_or(""),
             req.saml_idp_sso_url.as_deref().unwrap_or(""),
             req.saml_idp_cert.as_deref().unwrap_or(""),
@@ -1991,6 +2240,8 @@ pub async fn save_sso_provider(
         "issuer_url": req.issuer_url.as_deref().unwrap_or(""),
         "client_id": req.client_id.as_deref().unwrap_or(""),
         "client_secret_set": req.client_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+        "admission_policy": admission_policy,
+        "default_group_id": default_group_id,
         "previous_active_provider_id": previous_active_provider_id,
         "active_provider_id": active_provider_id,
     })
@@ -2488,7 +2739,8 @@ async fn sso_acs_inner(
 
     tracing::info!(provider_id = %provider_id, "SAML assertion validated");
 
-    let mut mapped_group_ids = state
+    let admission_policy = configured_admission_policy(jit_provisioning, &default_group_id);
+    let mapped_group_ids = state
         .config_db
         .resolve_idp_groups(&assertion.groups, &provider_id)
         .await
@@ -2501,16 +2753,13 @@ async fn sso_acs_inner(
             )
         })?;
 
-    if mapped_group_ids.is_empty() {
-        if !default_group_id.is_empty() {
-            mapped_group_ids.push(default_group_id);
-        } else {
-            mapped_group_ids.push("viewers".to_string());
-        }
-    }
+    let mapped_group_ids =
+        fallback_groups_for_policy(admission_policy, &default_group_id, mapped_group_ids)
+            .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message.to_string()))?;
 
     let external_id = &assertion.name_id;
     let auth_provider = "saml";
+    let username = assertion.email.as_deref().unwrap_or(&assertion.name_id);
 
     let (existing_user, identity_key) = find_namespaced_external_user(
         &state,
@@ -2518,23 +2767,23 @@ async fn sso_acs_inner(
         &provider_id,
         &assertion.issuer,
         external_id,
+        username,
         auth_provider,
     )
     .await?;
     let (user_id, jit_created) = match existing_user {
         Some(uid) => (uid, false),
         None => {
-            if !jit_provisioning {
+            if admission_policy == SsoAdmissionPolicy::Deny {
                 return Err((
                     StatusCode::FORBIDDEN,
-                    "user not found and JIT provisioning is disabled".to_string(),
+                    "this SSO account has not been provisioned by an administrator".to_string(),
                 ));
             }
-            let email = assertion.email.as_deref().unwrap_or(&assertion.name_id);
-            let display = assertion.display_name.as_deref().unwrap_or(email);
+            let display = assertion.display_name.as_deref().unwrap_or(username);
             let id = state
                 .config_db
-                .create_sso_user(email, display, &identity_key, auth_provider, "default")
+                .create_sso_user(username, display, &identity_key, auth_provider, "default")
                 .await
                 .map_err(|error| {
                     public_sso_internal_error(
@@ -2549,7 +2798,6 @@ async fn sso_acs_inner(
     };
 
     if jit_created {
-        let username = assertion.email.as_deref().unwrap_or(&assertion.name_id);
         state
             .audit
             .log(
@@ -2571,18 +2819,63 @@ async fn sso_acs_inner(
             .await;
     }
 
-    state
-        .config_db
-        .update_user_groups_from_idp(&user_id, &mapped_group_ids)
-        .await
-        .map_err(|error| {
-            public_sso_internal_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "saml_group_update",
-                error,
-                "SSO authentication could not be completed",
+    if admission_policy == SsoAdmissionPolicy::Deny {
+        let assigned_groups = state
+            .config_db
+            .get_user_groups(&user_id)
+            .await
+            .map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "saml_group_lookup",
+                    error,
+                    "SSO authentication could not be completed",
+                )
+            })?;
+        if assigned_groups.is_empty() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "this SSO account has no assigned group".to_string(),
+            ));
+        }
+    } else {
+        let previous_groups = state
+            .config_db
+            .get_user_groups(&user_id)
+            .await
+            .map_err(|error| {
+                public_sso_internal_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "saml_group_lookup",
+                    error,
+                    "SSO authentication could not be completed",
+                )
+            })?;
+        if group_memberships_changed(&previous_groups, &mapped_group_ids) {
+            state
+                .config_db
+                .update_user_groups_from_idp(&user_id, &mapped_group_ids)
+                .await
+                .map_err(|error| {
+                    public_sso_internal_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "saml_group_update",
+                        error,
+                        "SSO authentication could not be completed",
+                    )
+                })?;
+            audit_sso_group_sync(
+                &state,
+                &headers,
+                &user_id,
+                auth_provider,
+                &provider_id,
+                &previous_groups,
+                &mapped_group_ids,
             )
-        })?;
+            .await;
+        }
+    }
 
     let issued = state
         .config_db
@@ -3384,6 +3677,66 @@ mod tests {
             first,
             external_identity_key("provider-a", "https://idp.example.com", "subject-1")
         );
+    }
+
+    #[test]
+    fn admission_policy_preserves_legacy_provider_configuration() {
+        assert_eq!(
+            configured_admission_policy(true, ""),
+            SsoAdmissionPolicy::GlobalViewer
+        );
+        assert_eq!(
+            configured_admission_policy(true, "engineering"),
+            SsoAdmissionPolicy::Group
+        );
+        assert_eq!(
+            configured_admission_policy(false, "engineering"),
+            SsoAdmissionPolicy::Deny
+        );
+    }
+
+    #[test]
+    fn admission_policy_applies_only_the_selected_fallback() {
+        assert_eq!(
+            fallback_groups_for_policy(SsoAdmissionPolicy::GlobalViewer, "", Vec::new()).unwrap(),
+            vec!["viewers".to_string()]
+        );
+        assert_eq!(
+            fallback_groups_for_policy(SsoAdmissionPolicy::Group, "engineering", Vec::new())
+                .unwrap(),
+            vec!["engineering".to_string()]
+        );
+        assert_eq!(
+            fallback_groups_for_policy(SsoAdmissionPolicy::Deny, "", Vec::new()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(fallback_groups_for_policy(SsoAdmissionPolicy::Group, "", Vec::new()).is_err());
+    }
+
+    #[test]
+    fn idp_mappings_take_precedence_over_fallback_groups() {
+        let mapped = vec!["operators".to_string()];
+        assert_eq!(
+            fallback_groups_for_policy(SsoAdmissionPolicy::GlobalViewer, "viewers", mapped.clone())
+                .unwrap(),
+            mapped
+        );
+    }
+
+    #[test]
+    fn group_membership_comparison_is_order_and_duplicate_insensitive() {
+        assert!(!group_memberships_changed(
+            &["viewers".to_string(), "operators".to_string()],
+            &[
+                "operators".to_string(),
+                "viewers".to_string(),
+                "viewers".to_string(),
+            ]
+        ));
+        assert!(group_memberships_changed(
+            &["viewers".to_string()],
+            &["operators".to_string()]
+        ));
     }
 
     #[test]

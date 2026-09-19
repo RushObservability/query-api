@@ -90,6 +90,9 @@ pub async fn create_dashboard(
     Json(req): Json<CreateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
+    req.defaults
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     if req.name.trim().is_empty() {
@@ -139,6 +142,7 @@ pub async fn create_dashboard(
             visibility,
             &tags_json,
             &vars_json,
+            &req.defaults,
         )
         .await
         .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
@@ -163,7 +167,7 @@ pub async fn create_dashboard(
                 .tenant(tenant.tenant_id.clone())
                 .resource("dashboard", id.clone())
                 .changes(
-                    serde_json::json!({ "name": req.name, "visibility": visibility }).to_string(),
+                    serde_json::json!({ "name": req.name, "visibility": visibility, "defaults": req.defaults }).to_string(),
                 )
                 .description("dashboard created")
                 .context(crate::audit::actor_context_from_headers(&headers)),
@@ -208,6 +212,11 @@ pub async fn update_dashboard(
     Json(req): Json<UpdateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
+    if let Some(defaults) = &req.defaults {
+        defaults
+            .validate()
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
     let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
 
     let tags_json =
@@ -227,6 +236,7 @@ pub async fn update_dashboard(
             &tenant.tenant_id,
             &user_id,
             &role,
+            req.defaults.as_ref(),
         )
         .await
         .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
@@ -254,7 +264,7 @@ pub async fn update_dashboard(
                 .tenant(tenant.tenant_id.clone())
                 .resource("dashboard", id.clone())
                 .changes(
-                    serde_json::json!({ "name": req.name, "visibility": req.visibility })
+                    serde_json::json!({ "name": req.name, "visibility": req.visibility, "defaults": dashboard.defaults })
                         .to_string(),
                 )
                 .description("dashboard updated")
@@ -495,12 +505,27 @@ pub async fn import_dashboard(
     Json(req): Json<ImportDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let (user_id, _, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
+    let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
     let dashboard = state
         .config_db
         .import_dashboard(&req, &tenant.tenant_id, &user_id, &role)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("dashboard.import", "user")
+                .actor(user_id, username)
+                .tenant(tenant.tenant_id.clone())
+                .resource("dashboard", &dashboard.id)
+                .outcome("success")
+                .changes(
+                    serde_json::json!({ "name": dashboard.name, "defaults": dashboard.defaults })
+                        .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     Ok((StatusCode::CREATED, Json(dashboard)))
 }
 
@@ -527,7 +552,7 @@ pub async fn create_from_template(
     Json(req): Json<CreateFromTemplateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     let template = state
         .config_db
@@ -557,6 +582,17 @@ pub async fn create_from_template(
         .unwrap_or_else(|| "[]".to_string());
 
     // Create dashboard
+    let defaults: DashboardDefaults = serde_json::from_value(
+        template
+            .template_json
+            .get("defaults")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    defaults
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let dash_id = uuid::Uuid::new_v4().to_string();
     let tags = serde_json::to_string(&template.tags).unwrap_or_else(|_| "[]".to_string());
     state
@@ -570,6 +606,7 @@ pub async fn create_from_template(
             "tenant",
             &tags,
             &vars,
+            &defaults,
         )
         .await
         .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
@@ -602,5 +639,20 @@ pub async fn create_from_template(
             )
         })?;
 
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("dashboard.create", "user")
+                .actor(user_id, username)
+                .tenant(tenant.tenant_id.clone())
+                .resource("dashboard", &dash_id)
+                .outcome("success")
+                .changes(
+                    serde_json::json!({ "template_id": template_id, "defaults": defaults })
+                        .to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     Ok((StatusCode::CREATED, Json(dashboard)))
 }
