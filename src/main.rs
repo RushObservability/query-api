@@ -1812,6 +1812,10 @@ async fn main() -> anyhow::Result<()> {
     // Licensed builds replace the community edition hook and fail here before
     // migrations, background work, or the HTTP listener can start.
     rush_api::edition::validate_startup()?;
+    let production = rush_api::api_key_auth::production_mode();
+    let api_key_secret = std::env::var("RUSH_API_KEY_SECRET").ok();
+    rush_api::api_key_auth::validate_api_key_secret(api_key_secret.as_deref(), production)
+        .map_err(|error| anyhow::anyhow!("invalid API-key security configuration: {error}"))?;
     tracing::info!(
         edition = rush_api::edition::BUILD_EDITION,
         "starting Rush API"
@@ -3404,24 +3408,6 @@ async fn main() -> anyhow::Result<()> {
     rush_api::handlers::sso::validate_base_url_config()
         .map_err(|error| anyhow::anyhow!("invalid canonical URL configuration: {error}"))?;
 
-    // R01: Warn when RUSH_API_KEY_SECRET is unset or too short.
-    // An empty or short secret means HMAC-SHA256 provides no real keyed-hash protection.
-    match std::env::var("RUSH_API_KEY_SECRET") {
-        Ok(s) if s.len() >= 32 => {}
-        Ok(s) if s.is_empty() => tracing::warn!(
-            "RUSH_API_KEY_SECRET is not set. API key hashes are stored with an empty HMAC key. \
-             Set RUSH_API_KEY_SECRET to a random 32+ character secret before deployment."
-        ),
-        Ok(_) => tracing::warn!(
-            "RUSH_API_KEY_SECRET is shorter than 32 characters. \
-             Use a random secret of at least 32 characters for adequate HMAC security."
-        ),
-        Err(_) => tracing::warn!(
-            "RUSH_API_KEY_SECRET is not set. API key hashes are stored with an empty HMAC key. \
-             Set RUSH_API_KEY_SECRET to a random 32+ character secret before deployment."
-        ),
-    }
-
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         port = port,
@@ -3522,6 +3508,26 @@ mod tenant_auth_tests {
     use rush_api::clickhouse_config::ApiKeyGrant;
     use rush_api::cors::CorsPolicy;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn startup_validates_api_key_secret_before_running_migrations() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split_once("async fn main() -> anyhow::Result<()> {")
+            .expect("main function")
+            .1
+            .split("#[cfg(test)]\nmod tenant_auth_tests")
+            .next()
+            .expect("main function body");
+        let validation = main_body
+            .find("validate_api_key_secret")
+            .expect("API-key secret validation");
+        let migrations = main_body
+            .find("migrations::run")
+            .expect("schema migrations");
+
+        assert!(validation < migrations);
+    }
 
     #[test]
     fn ingestion_denials_do_not_create_user_audit_events() {
