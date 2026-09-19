@@ -113,6 +113,13 @@ async fn sso_config_changes_revoke_sessions_across_replicas() -> anyhow::Result<
             .await?;
         assert_eq!(
             other_replica
+                .list_auth_sessions(Some(&user), &privileged.token)
+                .await?
+                .len(),
+            1
+        );
+        assert_eq!(
+            other_replica
                 .get_session_user(&privileged.token)
                 .await
                 .unwrap()
@@ -127,6 +134,12 @@ async fn sso_config_changes_revoke_sessions_across_replicas() -> anyhow::Result<
                 .get_session_user(&privileged.token)
                 .await
                 .is_none()
+        );
+        assert!(
+            other_replica
+                .list_auth_sessions(Some(&user), &privileged.token)
+                .await?
+                .is_empty()
         );
         assert!(
             other_replica

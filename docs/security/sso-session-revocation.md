@@ -57,7 +57,7 @@ RUSH_CONFIG_ENCRYPTION_KEY=test-only-encryption-key-not-for-deployment \
 cargo test --test sso_session_revocation -- --ignored
 ```
 
-The security workflow runs this test against its own ClickHouse service on PRs.
-It covers both OIDC and SAML session provenance, mapping changes, trust-setting
+The database test is opt-in and needs the explicit command above. It covers
+both OIDC and SAML session provenance, mapping changes, trust-setting
 changes, stale callback revisions, bearer rotation, upgrades, and local-session
 isolation. Separate unit tests cover identity lookup and revision fingerprints.
