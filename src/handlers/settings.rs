@@ -75,10 +75,11 @@ fn generate_api_key(key_type: &str) -> String {
 /// Produces a consistent hash for lookups while preventing offline
 /// dictionary attacks against a stolen database.
 ///
-/// # Panics in debug builds / warns in release if RUSH_API_KEY_SECRET is absent or weak.
+/// Production startup rejects a missing or weak secret. Explicit development
+/// environments retain the warning below so local use remains possible.
 pub fn hash_api_key(key: &str) -> String {
     let secret = std::env::var("RUSH_API_KEY_SECRET").unwrap_or_default();
-    if secret.len() < 32 {
+    if !crate::api_key_auth::api_key_secret_is_strong(Some(&secret)) {
         // An empty or short key makes HMAC equivalent to a plain hash, enabling
         // offline dictionary attacks against a stolen api_keys table. Warn ONCE —
         // this runs on every API-key hash (every ingest request), so a per-call

@@ -3,6 +3,7 @@
 use std::net::IpAddr;
 
 pub const INGEST_SIGNALS: [&str; 6] = ["logs", "traces", "metrics", "rum", "collector", "profiles"];
+pub const MIN_API_KEY_SECRET_BYTES: usize = 32;
 
 pub fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -41,6 +42,20 @@ pub fn is_production_environment(environment: Option<&str>) -> bool {
             .as_str(),
         "development" | "dev" | "local" | "test"
     )
+}
+
+pub fn api_key_secret_is_strong(secret: Option<&str>) -> bool {
+    secret.is_some_and(|value| value.len() >= MIN_API_KEY_SECRET_BYTES)
+}
+
+pub fn validate_api_key_secret(secret: Option<&str>, production: bool) -> Result<(), String> {
+    if api_key_secret_is_strong(secret) || !production {
+        return Ok(());
+    }
+
+    Err(format!(
+        "RUSH_API_KEY_SECRET must contain at least {MIN_API_KEY_SECRET_BYTES} bytes in production"
+    ))
 }
 
 pub fn normalize_signals(signals: &[String]) -> Result<Vec<String>, String> {
@@ -170,6 +185,21 @@ mod tests {
         assert!(is_production_environment(Some("staging")));
         assert!(!is_production_environment(Some("development")));
         assert!(!is_production_environment(Some("local")));
+    }
+
+    #[test]
+    fn production_rejects_missing_or_weak_api_key_secrets() {
+        assert!(validate_api_key_secret(None, true).is_err());
+        assert!(validate_api_key_secret(Some(""), true).is_err());
+        assert!(validate_api_key_secret(Some("short"), true).is_err());
+        assert!(validate_api_key_secret(Some(&"x".repeat(31)), true).is_err());
+        assert!(validate_api_key_secret(Some(&"x".repeat(32)), true).is_ok());
+    }
+
+    #[test]
+    fn explicit_development_mode_allows_a_weak_api_key_secret() {
+        assert!(validate_api_key_secret(None, false).is_ok());
+        assert!(validate_api_key_secret(Some("development-only"), false).is_ok());
     }
 
     #[test]
