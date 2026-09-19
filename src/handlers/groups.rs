@@ -79,7 +79,7 @@ pub async fn list_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
 
     let rows = state.config_db.list_groups().await.map_err(|e| {
         tracing::error!(error = %e, "internal error");
@@ -87,6 +87,19 @@ pub async fn list_groups(
     })?;
 
     let groups: Vec<GroupResponse> = rows.into_iter().map(group_response).collect();
+
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("group.inventory_read", "user")
+                .actor(caller.0, caller.1)
+                .tenant(caller.3)
+                .resource("group_inventory", "all")
+                .changes(serde_json::json!({ "group_count": groups.len() }).to_string())
+                .description("group permission catalog read")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "groups": groups })))
 }
@@ -295,6 +308,10 @@ pub struct SetGroupTenantsRequest {
     pub tenant_ids: Vec<String>,
 }
 
+fn can_read_user_groups(caller_id: &str, caller_role: &str, target_user_id: &str) -> bool {
+    caller_role == "admin" || caller_id == target_user_id
+}
+
 /// PUT /api/v1/groups/{id}/tenants
 pub async fn set_group_tenants(
     State(state): State<AppState>,
@@ -357,7 +374,28 @@ pub async fn get_user_groups(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    let caller = require_auth(&state, &headers).await?;
+    if !can_read_user_groups(&caller.0, &caller.4, &user_id) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.group_membership_read", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", user_id)
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({ "reason": "another_user_requires_admin" }).to_string(),
+                    )
+                    .description("user group membership read rejected")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "you can only view your own group memberships".to_string(),
+        ));
+    }
 
     let group_ids = state
         .config_db
@@ -418,4 +456,37 @@ pub async fn set_user_groups(
         .await;
 
     Ok(Json(serde_json::json!({ "group_ids": group_ids })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_read_user_groups;
+
+    #[test]
+    fn users_can_read_only_their_own_group_memberships() {
+        assert!(can_read_user_groups("user-a", "viewer", "user-a"));
+        assert!(can_read_user_groups("user-a", "write", "user-a"));
+        assert!(!can_read_user_groups("user-a", "viewer", "user-b"));
+        assert!(!can_read_user_groups("user-a", "write", "user-b"));
+    }
+
+    #[test]
+    fn admins_can_read_any_users_group_memberships() {
+        assert!(can_read_user_groups("admin-a", "admin", "user-b"));
+    }
+
+    #[test]
+    fn group_catalog_requires_admin_access() {
+        let source = include_str!("groups.rs");
+        let endpoint = source
+            .split_once("pub async fn list_groups(")
+            .expect("list_groups endpoint")
+            .1
+            .split("pub async fn create_group(")
+            .next()
+            .expect("list_groups body");
+
+        assert!(endpoint.contains("require_admin(&state, &headers).await?"));
+        assert!(!endpoint.contains("require_auth(&state, &headers).await?"));
+    }
 }
