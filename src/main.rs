@@ -1816,6 +1816,22 @@ async fn main() -> anyhow::Result<()> {
     let api_key_secret = std::env::var("RUSH_API_KEY_SECRET").ok();
     rush_api::api_key_auth::validate_api_key_secret(api_key_secret.as_deref(), production)
         .map_err(|error| anyhow::anyhow!("invalid API-key security configuration: {error}"))?;
+    if rush_api::api_key_auth::api_key_secret_is_strong(api_key_secret.as_deref()) {
+        tracing::info!(
+            minimum_bytes = rush_api::api_key_auth::MIN_API_KEY_SECRET_BYTES,
+            "RUSH_API_KEY_SECRET is configured and meets the HMAC security minimum"
+        );
+    } else {
+        tracing::warn!(
+            "RUSH_API_KEY_SECRET is missing or shorter than 32 bytes; this is allowed only in the explicitly configured development environment"
+        );
+    }
+    let insecure_tenant_reads = rush_api::api_key_auth::allow_insecure_tenant_reads();
+    rush_api::api_key_auth::validate_insecure_tenant_read_override(
+        insecure_tenant_reads,
+        production,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid tenant-isolation configuration: {error}"))?;
     tracing::info!(
         edition = rush_api::edition::BUILD_EDITION,
         "starting Rush API"
@@ -1891,14 +1907,6 @@ async fn main() -> anyhow::Result<()> {
     // custom-setting support, every strict policy, and read-principal behavior
     // must verify before HTTP traffic is accepted. Local development may opt in
     // to the visibly insecure compatibility mode explicitly.
-    let insecure_tenant_reads = std::env::var("RUSH_ALLOW_INSECURE_TENANT_READS")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes"
-            )
-        })
-        .unwrap_or(false);
     let read_user = std::env::var("CLICKHOUSE_READ_USER")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -3394,17 +3402,6 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    // FINDING-13: Warn when ClickHouse row policies are not active.
-    // Without row policies, tenant isolation is enforced only at the API layer.
-    // Configure `custom_settings_prefixes = 'rush_'` in ClickHouse for DB-layer isolation.
-    if !rush_api::row_policy_supported() {
-        tracing::warn!(
-            row_policies = rush_api::row_policy_supported(),
-            "ClickHouse row-level security policies are NOT active. \
-             Tenant isolation relies solely on API-layer WHERE injection. \
-             Set custom_settings_prefixes = 'rush_' in ClickHouse config to enable row policies."
-        );
-    }
     rush_api::handlers::sso::validate_base_url_config()
         .map_err(|error| anyhow::anyhow!("invalid canonical URL configuration: {error}"))?;
 
@@ -3522,6 +3519,26 @@ mod tenant_auth_tests {
         let validation = main_body
             .find("validate_api_key_secret")
             .expect("API-key secret validation");
+        let migrations = main_body
+            .find("migrations::run")
+            .expect("schema migrations");
+
+        assert!(validation < migrations);
+    }
+
+    #[test]
+    fn startup_rejects_insecure_tenant_reads_before_running_migrations() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split_once("async fn main() -> anyhow::Result<()> {")
+            .expect("main function")
+            .1
+            .split("#[cfg(test)]\nmod tenant_auth_tests")
+            .next()
+            .expect("main function body");
+        let validation = main_body
+            .find("validate_insecure_tenant_read_override")
+            .expect("tenant-isolation override validation");
         let migrations = main_body
             .find("migrations::run")
             .expect("schema migrations");

@@ -19,6 +19,7 @@ DEV_SRE_AGENT_INTERNAL_TOKEN := dev-local-agent-token
 DEV_COLLECTOR_MANAGER        := false
 DEV_INTEGRATION_KEY           := rush-local-integration-key-change-me
 DEV_CONFIG_ENCRYPTION_KEY     := rush-local-config-encryption-key-32-bytes
+DEV_API_KEY_SECRET            := rush-local-api-key-hmac-secret-change-me
 DEV_ALLOW_PRIVATE_NOTIFICATION_URLS := true
 DEV_ALLOWED_ORIGINS           := http://localhost:5173,http://localhost:8080
 DEV_ALLOW_ANONYMOUS_DEFAULT  := true
@@ -37,6 +38,8 @@ deps:                 ## Start ClickHouse in Docker
 dev: deps             ## Run the community query-api with local development wiring
 	if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; \
 	RUSH_PORT=$(DEV_RUSH_PORT) \
+	RUSH_ENVIRONMENT=development \
+	RUSH_API_KEY_SECRET="$${RUSH_API_KEY_SECRET:-$(DEV_API_KEY_SECRET)}" \
 	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
 	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
 	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
@@ -68,6 +71,8 @@ licensed-dev: licensed-build ## Run the licensed query-api in the foreground wit
 	RUSH_LICENSE_KEY="$$(tr -d '\r\n' < "$(LICENSE_FILE)")" \
 	RUSH_LICENSE_PUBKEY="$$(cat "$(LICENSE_PUBLIC_KEY_FILE)")" \
 	RUSH_PORT=$(LICENSED_PORT) \
+	RUSH_ENVIRONMENT=development \
+	RUSH_API_KEY_SECRET="$${RUSH_API_KEY_SECRET:-$(DEV_API_KEY_SECRET)}" \
 	CLICKHOUSE_URL="$${CLICKHOUSE_URL:-$(DEV_CLICKHOUSE_URL)}" \
 	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
 	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
@@ -106,6 +111,8 @@ run-anomaly:          ## Run anomaly engine in debug mode
 watch:                 ## Watch the community query-api with local development wiring
 	if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; \
 	RUSH_PORT=$(DEV_RUSH_PORT) \
+	RUSH_ENVIRONMENT=development \
+	RUSH_API_KEY_SECRET="$${RUSH_API_KEY_SECRET:-$(DEV_API_KEY_SECRET)}" \
 	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
 	SRE_AGENT_URL=$(DEV_SRE_AGENT_URL) \
 	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
