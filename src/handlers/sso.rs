@@ -248,7 +248,16 @@ fn insecure_cookies_enabled() -> bool {
 }
 
 fn sso_transaction_cookie(value: &str, protocol: &str, max_age: i64) -> Result<String, String> {
-    if insecure_cookies_enabled() {
+    sso_transaction_cookie_with_mode(value, protocol, max_age, insecure_cookies_enabled())
+}
+
+fn sso_transaction_cookie_with_mode(
+    value: &str,
+    protocol: &str,
+    max_age: i64,
+    insecure: bool,
+) -> Result<String, String> {
+    if insecure {
         if protocol == "saml" && max_age > 0 {
             return Err(
                 "SAML SSO requires HTTPS so its cross-site callback cookie is secure".into(),
@@ -1727,6 +1736,19 @@ async fn verify_and_decode_jwt(
     client_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
     use jsonwebtoken::jwk::JwkSet;
+
+    // Fetch the JSON Web Key Set
+    let jwks: JwkSet = fetch_bounded_oidc_json(&discovery.jwks_uri, "OIDC JWKS").await?;
+
+    verify_oidc_token_with_jwks(token, &jwks, issuer_url, client_id)
+}
+
+fn verify_oidc_token_with_jwks(
+    token: &str,
+    jwks: &jsonwebtoken::jwk::JwkSet,
+    issuer_url: &str,
+    client_id: &str,
+) -> anyhow::Result<serde_json::Value> {
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 
     // Parse the JWT header to get `kid` and `alg` — does not verify signature
@@ -1746,9 +1768,6 @@ async fn verify_and_decode_jwt(
         | Algorithm::ES384 => {}
         alg => anyhow::bail!("JWT algorithm {alg:?} is not accepted for OIDC"),
     }
-
-    // Fetch the JSON Web Key Set
-    let jwks: JwkSet = fetch_bounded_oidc_json(&discovery.jwks_uri, "OIDC JWKS").await?;
 
     // A missing `kid` is safe only when the set has one unambiguous key that
     // is suitable for this exact signature algorithm. Likewise, a named key
@@ -3604,6 +3623,127 @@ mod tests {
         assert!(select_oidc_jwk(&duplicate, Some("key"), Algorithm::RS256).is_err());
     }
 
+    fn oidc_signing_fixture(kid: &str) -> (Vec<u8>, jsonwebtoken::jwk::JwkSet) {
+        let rsa = openssl::rsa::Rsa::generate(2048).expect("RSA key generation");
+        let private_pem = rsa.private_key_to_pem().expect("private key PEM");
+        let modulus = URL_SAFE_NO_PAD.encode(rsa.n().to_vec());
+        let exponent = URL_SAFE_NO_PAD.encode(rsa.e().to_vec());
+        let jwks = oidc_jwks(serde_json::json!([{
+            "kty": "RSA",
+            "kid": kid,
+            "use": "sig",
+            "key_ops": ["verify"],
+            "alg": "RS256",
+            "n": modulus,
+            "e": exponent,
+        }]));
+        (private_pem, jwks)
+    }
+
+    fn sign_oidc_token(private_pem: &[u8], kid: &str, claims: &serde_json::Value) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        jsonwebtoken::encode(
+            &header,
+            claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(private_pem).expect("RSA encoding key"),
+        )
+        .expect("signed OIDC token")
+    }
+
+    #[test]
+    fn oidc_signed_token_contract_validates_signature_issuer_audience_and_expiry() {
+        let (private_pem, jwks) = oidc_signing_fixture("current-key");
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://idp.example.com",
+            "aud": "rush-client",
+            "sub": "subject-1",
+            "iat": now,
+            "exp": now + 300,
+            "nonce": "nonce-1",
+            "email": "person@example.com",
+            "email_verified": true,
+        });
+        let token = sign_oidc_token(&private_pem, "current-key", &claims);
+
+        let verified =
+            verify_oidc_token_with_jwks(&token, &jwks, "https://idp.example.com", "rush-client")
+                .expect("valid provider token");
+        assert_eq!(verified["sub"], "subject-1");
+        assert!(
+            verify_oidc_token_with_jwks(
+                &token,
+                &jwks,
+                "https://other-idp.example.com",
+                "rush-client",
+            )
+            .is_err()
+        );
+        assert!(
+            verify_oidc_token_with_jwks(&token, &jwks, "https://idp.example.com", "other-client",)
+                .is_err()
+        );
+
+        let expired = sign_oidc_token(
+            &private_pem,
+            "current-key",
+            &serde_json::json!({
+                "iss": "https://idp.example.com",
+                "aud": "rush-client",
+                "sub": "subject-1",
+                "iat": now - 600,
+                "exp": now - 300,
+            }),
+        );
+        assert!(
+            verify_oidc_token_with_jwks(&expired, &jwks, "https://idp.example.com", "rush-client",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn oidc_signed_token_contract_rejects_wrong_keys_and_symmetric_algorithms() {
+        let (private_pem, _) = oidc_signing_fixture("current-key");
+        let (_, attacker_jwks) = oidc_signing_fixture("current-key");
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://idp.example.com",
+            "aud": "rush-client",
+            "sub": "subject-1",
+            "iat": now,
+            "exp": now + 300,
+        });
+        let token = sign_oidc_token(&private_pem, "current-key", &claims);
+        assert!(
+            verify_oidc_token_with_jwks(
+                &token,
+                &attacker_jwks,
+                "https://idp.example.com",
+                "rush-client",
+            )
+            .is_err()
+        );
+
+        let hmac_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"attacker-controlled-secret"),
+        )
+        .unwrap();
+        assert!(
+            verify_oidc_token_with_jwks(
+                &hmac_token,
+                &attacker_jwks,
+                "https://idp.example.com",
+                "rush-client",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not accepted")
+        );
+    }
+
     #[test]
     fn oidc_profile_uses_configured_claims_and_verified_email() {
         let claims = serde_json::json!({
@@ -3769,6 +3909,23 @@ mod tests {
                 1_700_000_100
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn sso_transaction_cookie_contract_preserves_oidc_and_saml_callback_security() {
+        assert_eq!(
+            sso_transaction_cookie_with_mode("token", "oidc", 600, false).unwrap(),
+            "__Host-rush_sso_tx=token; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600"
+        );
+        assert_eq!(
+            sso_transaction_cookie_with_mode("token", "saml", 600, false).unwrap(),
+            "__Host-rush_sso_tx=token; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=600"
+        );
+        assert!(sso_transaction_cookie_with_mode("token", "saml", 600, true).is_err());
+        assert_eq!(
+            sso_transaction_cookie_with_mode("", "saml", 0, true).unwrap(),
+            "rush_sso_tx=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
         );
     }
 

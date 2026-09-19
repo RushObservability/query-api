@@ -15,6 +15,11 @@ required_tests=(
   open_query_tenants_still_require_interactive_auth_for_llm_parsing
   production_rejects_missing_or_weak_api_key_secrets
   startup_validates_api_key_secret_before_running_migrations
+  auth_and_sso_route_contract_is_complete
+  session_cookie_contract_covers_issue_revoke_and_prefix_confusion
+  oidc_signed_token_contract_validates_signature_issuer_audience_and_expiry
+  oidc_signed_token_contract_rejects_wrong_keys_and_symmetric_algorithms
+  saml_signed_response_contract_verifies_and_rejects_tampering
 )
 for test_name in "${required_tests[@]}"; do
   if ! rg -q --fixed-strings "$test_name" src; then
