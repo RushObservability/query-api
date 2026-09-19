@@ -11,6 +11,40 @@ use crate::handlers::auth::extract_session_cookie;
 use crate::handlers::users::{require_auth, require_write};
 use crate::models::dashboard::*;
 
+const WIDGET_TYPES: &[&str] = &[
+    "timeseries",
+    "heatmap",
+    "histogram",
+    "pie",
+    "bar",
+    "table",
+    "counter",
+];
+
+#[cfg(test)]
+mod widget_type_tests {
+    use super::*;
+
+    #[test]
+    fn pie_is_a_supported_widget_with_donut_as_a_display_option() {
+        assert!(WIDGET_TYPES.contains(&"pie"));
+        assert!(WIDGET_TYPES.contains(&"histogram"));
+        assert!(!WIDGET_TYPES.contains(&"donut"));
+        assert!(!WIDGET_TYPES.contains(&"unknown"));
+    }
+
+    #[test]
+    fn pie_display_options_survive_export_round_trip() {
+        let json = serde_json::json!({
+            "title": "Traffic share", "widget_type": "pie",
+            "query_config": {"source": "metrics"}, "position": {},
+            "display_config": {"pie_style": "donut", "pie_calculation": "last", "pie_sort": "descending", "pie_legend_position": "right", "unit": "req/s"}
+        });
+        let widget: WidgetExport = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(widget).unwrap(), json);
+    }
+}
+
 /// Extract the calling user from the session cookie.
 /// Returns (user_id, username, display_name, tenant_id, role).
 /// Falls back to anonymous/default context when no session exists (backward compat).
@@ -284,15 +318,7 @@ pub async fn create_widget(
         .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
 
-    let valid_types = [
-        "timeseries",
-        "heatmap",
-        "histogram",
-        "bar",
-        "table",
-        "counter",
-    ];
-    if !valid_types.contains(&req.widget_type.as_str()) {
+    if !WIDGET_TYPES.contains(&req.widget_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("invalid widget_type: {}", req.widget_type),
@@ -354,15 +380,7 @@ pub async fn update_widget(
     Json(req): Json<UpdateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let valid_types = [
-        "timeseries",
-        "heatmap",
-        "histogram",
-        "bar",
-        "table",
-        "counter",
-    ];
-    if !valid_types.contains(&req.widget_type.as_str()) {
+    if !WIDGET_TYPES.contains(&req.widget_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("invalid widget_type: {}", req.widget_type),
