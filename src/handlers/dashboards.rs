@@ -274,7 +274,7 @@ pub async fn create_widget(
     Json(req): Json<CreateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     // Verify dashboard exists and user has visibility
     state
@@ -284,7 +284,7 @@ pub async fn create_widget(
         .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
 
-    let valid_types = ["timeseries", "bar", "table", "counter"];
+    let valid_types = ["timeseries", "heatmap", "histogram", "bar", "table", "counter"];
     if !valid_types.contains(&req.widget_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -327,17 +327,27 @@ pub async fn create_widget(
         )
     })?;
 
+    state.audit.log(
+        crate::audit::AuditEvent::new("dashboard_widget.create", "user")
+            .actor(user_id, username)
+            .tenant(tenant.tenant_id.clone())
+            .resource("dashboard_widget", id)
+            .changes(serde_json::json!({ "dashboard_id": dashboard_id, "title": req.title, "widget_type": req.widget_type }).to_string())
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(WidgetResponse::from(widget))))
 }
 
 pub async fn update_widget(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path((dashboard_id, widget_id)): Path<(String, String)>,
     Json(req): Json<UpdateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let valid_types = ["timeseries", "bar", "table", "counter"];
+    let valid_types = ["timeseries", "heatmap", "histogram", "bar", "table", "counter"];
     if !valid_types.contains(&req.widget_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -369,6 +379,16 @@ pub async fn update_widget(
         return Err((StatusCode::NOT_FOUND, "widget not found".to_string()));
     }
 
+    let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    state.audit.log(
+        crate::audit::AuditEvent::new("dashboard_widget.update", "user")
+            .actor(user_id, username)
+            .tenant(tenant.tenant_id.clone())
+            .resource("dashboard_widget", widget_id.clone())
+            .changes(serde_json::json!({ "dashboard_id": dashboard_id, "title": req.title, "widget_type": req.widget_type }).to_string())
+            .context(crate::audit::actor_context_from_headers(&headers)),
+    ).await;
+
     let widgets = state
         .config_db
         .list_widgets(&dashboard_id)
@@ -389,6 +409,7 @@ pub async fn update_widget(
 
 pub async fn delete_widget(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
     Path((dashboard_id, widget_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -401,6 +422,18 @@ pub async fn delete_widget(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "widget not found".to_string()));
     }
+    let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("dashboard_widget.delete", "user")
+                .actor(user_id, username)
+                .tenant(tenant.tenant_id.clone())
+                .resource("dashboard_widget", widget_id)
+                .changes(serde_json::json!({ "dashboard_id": dashboard_id }).to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
