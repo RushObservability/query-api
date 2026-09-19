@@ -57,9 +57,18 @@ tracked for removal during dependency upgrades:
 
 | Crate | Dependency path | Disposition |
 |---|---|---|
-| `backoff 0.4` / `instant 0.1` | `kube-runtime 0.98` | Remove during the planned kube major-version upgrade. Runtime retry behavior is covered by existing Kubernetes integration tests. |
-| `rustls-pemfile 2.2` | `kube-client 0.98` | Remove with the same kube upgrade; query-api does not call it directly. |
+| `rustls-pemfile 2.2` | `kube-client 0.98` | Remove during a kube upgrade; query-api does not call it directly. This crate has no patched release. |
 | `bincode 1.3` | build-time parser generator under `promql-parser` | The direct application dependency was removed. Track upstream `promql-parser` migration; the crate is used to build generated parser tables, not to decode untrusted runtime payloads. |
+
+The unused kube `runtime` and `derive` features have been removed. Query API uses
+the dynamic API client, not controllers, watchers, or custom-resource derives.
+This removes `kube-runtime`, `backoff`, and `instant` from the dependency graph
+without changing the Kubernetes, Argo CD, or Flux client APIs.
+
+The September 2026 security update pins the lockfile to `cryptoki 0.12.1` and
+`rustls 0.23.45`, fixing `RUSTSEC-2026-0286` and `RUSTSEC-2026-0285` respectively.
+No advisory exceptions were added for these fixes or the remaining maintenance
+warnings.
 
 Deprecated `serde_yaml` and direct `bincode` usage have been removed from Query
 API. Managed collector configuration is emitted as JSON, which remains valid
