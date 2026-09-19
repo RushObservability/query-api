@@ -1237,4 +1237,29 @@ mod tests {
             Some("attacker")
         );
     }
+
+    #[test]
+    fn session_cookie_contract_covers_issue_revoke_and_prefix_confusion() {
+        let issued = session_cookie_with_mode("session-token", 3600, false);
+        assert!(issued.starts_with("__Host-rush_session=session-token;"));
+        assert!(issued.contains("; HttpOnly;"));
+        assert!(issued.contains("; Secure;"));
+        assert!(issued.contains("; SameSite=Lax;"));
+        assert!(issued.contains("; Path=/;"));
+        assert!(issued.ends_with("Max-Age=3600"));
+        assert!(!issued.contains("Domain="));
+
+        let revoked = session_cookie_with_mode("", 0, false);
+        assert!(revoked.starts_with("__Host-rush_session=;"));
+        assert!(revoked.ends_with("Max-Age=0"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "x__Host-rush_session=prefix-confusion; __Host-rush_session=; rush_session=plain"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(extract_session_cookie_with_mode(&headers, false), None);
+    }
 }

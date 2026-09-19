@@ -584,13 +584,11 @@ mod tests {
     }
 
     // ── Signature verification tests ──
-    // Positive verification (a genuinely IdP-signed Response verifies) is
-    // exercised against live IdP responses, and opensaml/bergshamra's own suite
-    // covers exc-c14n + reference-digest correctness. These cover the negative
-    // paths through our wrapper: no-signature and present-but-invalid.
+    // Generate the signing material and XML signatures in-process so CI covers
+    // the same certificate-pinned verification path used for IdP responses.
 
-    /// Self-signed RSA cert + key, returned as a PEM cert string for `verify_signature`.
-    fn test_cert_pem() -> String {
+    /// Self-signed RSA key and certificate for signature contract tests.
+    fn test_signing_material() -> (Vec<u8>, String) {
         use openssl::asn1::Asn1Time;
         use openssl::bn::BigNum;
         use openssl::hash::MessageDigest;
@@ -616,7 +614,14 @@ mod tests {
         b.set_not_after(&Asn1Time::days_from_now(365).expect("na"))
             .expect("na");
         b.sign(&pkey, MessageDigest::sha256()).expect("sign");
-        String::from_utf8(b.build().to_pem().expect("to_pem")).expect("utf8")
+        let private_key = pkey.private_key_to_pem_pkcs8().expect("private key PEM");
+        let certificate =
+            String::from_utf8(b.build().to_pem().expect("certificate PEM")).expect("utf8");
+        (private_key, certificate)
+    }
+
+    fn test_cert_pem() -> String {
+        test_signing_material().1
     }
 
     #[test]
@@ -646,6 +651,64 @@ mod tests {
         );
         let res = verify_signature(xml, &test_cert_pem());
         assert!(res.is_err(), "bogus signature must not verify: {res:?}");
+    }
+
+    #[test]
+    fn saml_signed_response_contract_verifies_and_rejects_tampering() {
+        let now = 1_700_000_000;
+        let recipient = "https://rush.example.com/auth/sso/acs";
+        let audience = "https://rush.example.com";
+        let response = constrained_response(
+            "_request-1",
+            audience,
+            recipient,
+            "2023-11-14T22:11:20Z",
+            "2023-11-14T22:18:20Z",
+        );
+        let signature = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="#_response-1">
+        <ds:Transforms>
+          <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+          <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue></ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue></ds:SignatureValue>
+  </ds:Signature>"##;
+        let template = response.replacen(
+            ">\n  <samlp:Status>",
+            &format!(">\n  {signature}\n  <samlp:Status>"),
+            1,
+        );
+        let (private_key, certificate) = test_signing_material();
+        let key =
+            bergshamra::keys::loader::load_rsa_private_pem(&private_key).expect("SAML signing key");
+        let mut keys = bergshamra::KeysManager::new();
+        keys.add_key(key);
+        let context = bergshamra::DsigContext::new_permissive(keys);
+        let signed = bergshamra::sign(&context, &template).expect("signed SAML response");
+
+        let verified = verify_signature(&signed, &certificate).expect("verified SAML response");
+        let assertion = validate_signed_assertion(
+            &verified,
+            "groups",
+            "_request-1",
+            recipient,
+            audience,
+            "https://idp.example.com",
+            now,
+        )
+        .expect("validated signed SAML assertion");
+        assert_eq!(assertion.name_id, "jane@acme.com");
+        assert_eq!(assertion.groups, ["operators"]);
+
+        let tampered = signed.replace("jane@acme.com", "attacker@example.com");
+        assert!(verify_signature(&tampered, &certificate).is_err());
     }
 
     fn constrained_response(

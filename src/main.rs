@@ -3596,6 +3596,27 @@ mod tenant_auth_tests {
     }
 
     #[test]
+    fn auth_and_sso_route_contract_is_complete() {
+        let source = include_str!("main.rs");
+        for route in [
+            ".route(\"/auth/sso/login\", get(handlers::sso::sso_login))",
+            ".route(\"/auth/sso/callback\", get(handlers::sso::sso_callback))",
+            ".route(\"/auth/sso/acs\", post(handlers::sso::sso_acs))",
+            ".route(\"/auth/sso/metadata\", get(handlers::sso::sso_metadata))",
+            ".route(\"/api/v1/sso/status\", get(handlers::sso::sso_status))",
+            ".route(\"/api/v1/auth/login\", post(handlers::auth::login))",
+            ".route(\"/api/v1/auth/logout\", post(handlers::auth::logout))",
+            ".route(\"/api/v1/auth/me\", get(handlers::auth::me))",
+            ".route(\"/api/v1/auth/activity\", post(handlers::auth::activity))",
+        ] {
+            assert!(
+                source.contains(route),
+                "missing auth route contract: {route}"
+            );
+        }
+    }
+
+    #[test]
     fn explain_collector_routes_are_exact_and_method_scoped() {
         for (method, path) in [
             (Method::GET, "/api/v1/integrations/postgres/explain/poll"),
