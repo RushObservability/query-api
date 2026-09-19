@@ -1,0 +1,48 @@
+name: Update PR security report
+
+on:
+  workflow_run:
+    workflows: [Rust security and quality]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: security-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      # Only trusted default-branch code runs with the comment-writing token.
+      # Never check out the PR head or execute files from the scan artifact.
+      - name: Check out trusted reporting code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Download report data
+        continue-on-error: true
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: dependency-security-report
+          path: ${{ runner.temp }}/dependency-security-report
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Create or update the single security comment
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          SECURITY_REPORT_DIR: ${{ runner.temp }}/dependency-security-report
+        with:
+          script: |
+            const publish = require('./scripts/publish-security-report.cjs');
+            await publish({ github, context, core });

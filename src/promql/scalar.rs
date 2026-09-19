@@ -90,75 +90,108 @@ pub fn apply_scalar_op(func: ScalarFunc, v: f64, args: &[f64]) -> f64 {
 }
 
 /// Compute histogram_quantile from a set of histogram bucket series.
-/// Groups series by labels (excluding "le"), then interpolates across buckets.
+/// Groups buckets by labels and evaluation timestamp. Never carry a bucket from
+/// one step into another: missing data must not become a fabricated observation.
 fn compute_histogram_quantile(phi: f64, series: &[TimeSeries]) -> Vec<TimeSeries> {
     use std::collections::BTreeMap;
 
-    // Group series by labels excluding "le" and "__name__"
-    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<(f64, f64)>> = BTreeMap::new();
+    // Each sample is (timestamp, upper bound, cumulative count).
+    type BucketSamples = Vec<(f64, f64, f64)>;
+    let mut groups: BTreeMap<BTreeMap<String, String>, BucketSamples> = BTreeMap::new();
 
     for ts in series {
         let mut group_labels = ts.labels.clone();
-        let le_str = group_labels.remove("le").unwrap_or_default();
+        let Some(le_str) = group_labels.remove("le") else {
+            continue;
+        };
         group_labels.remove("__name__");
 
-        let le: f64 = if le_str == "+Inf" {
-            f64::INFINITY
-        } else {
-            le_str.parse().unwrap_or(0.0)
+        let Ok(le) = le_str.parse::<f64>() else {
+            continue;
         };
-        let value = ts.samples.last().map(|(_, v)| *v).unwrap_or(0.0);
-
-        groups.entry(group_labels).or_default().push((le, value));
+        if le.is_nan() || ts.samples.is_empty() {
+            continue;
+        }
+        groups.entry(group_labels).or_default().extend(
+            ts.samples
+                .iter()
+                .map(|&(timestamp, count)| (timestamp, le, count)),
+        );
     }
 
     groups
         .into_iter()
-        .filter_map(|(labels, mut buckets)| {
-            buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-            if buckets.is_empty() {
-                return None;
-            }
-
-            let total = buckets.last().map(|(_, v)| *v).unwrap_or(0.0);
-            if total == 0.0 {
-                return None;
-            }
-
-            let target = phi * total;
-
-            // Find the bucket where cumulative count exceeds target
-            let mut prev_le = 0.0_f64;
-            let mut prev_count = 0.0_f64;
-            let mut result = f64::NAN;
-
-            for &(le, count) in &buckets {
-                if count >= target {
-                    // Linear interpolation within this bucket
-                    let bucket_count = count - prev_count;
-                    if bucket_count > 0.0 {
-                        let fraction = (target - prev_count) / bucket_count;
-                        result = prev_le + (le - prev_le) * fraction;
-                    } else {
-                        result = prev_le;
-                    }
-                    break;
-                }
-                prev_le = le;
-                prev_count = count;
-            }
-
-            let eval_time = series
-                .first()
-                .and_then(|s| s.samples.last().map(|(t, _)| *t))
-                .unwrap_or(0.0);
-            Some(TimeSeries {
-                labels,
-                samples: vec![(eval_time, result)],
-            })
+        .map(|(labels, mut points)| {
+            points.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let samples = points
+                .chunk_by(|a, b| a.0 == b.0)
+                .map(|step| {
+                    let buckets = step.iter().map(|&(_, le, count)| (le, count)).collect();
+                    (step[0].0, classic_bucket_quantile(phi, buckets))
+                })
+                .collect();
+            TimeSeries { labels, samples }
         })
         .collect()
+}
+
+/// Classic cumulative histogram semantics documented by Prometheus:
+/// https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile
+fn classic_bucket_quantile(phi: f64, mut buckets: Vec<(f64, f64)>) -> f64 {
+    if phi.is_nan() {
+        return f64::NAN;
+    }
+    if phi < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if phi > 1.0 {
+        return f64::INFINITY;
+    }
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if buckets.last().is_none_or(|b| b.0 != f64::INFINITY) {
+        return f64::NAN;
+    }
+    // Different string representations of the same bound are one bucket.
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(buckets.len());
+    for (bound, count) in buckets {
+        if let Some(last) = merged.last_mut().filter(|last| last.0 == bound) {
+            last.1 += count;
+        } else {
+            merged.push((bound, count));
+        }
+    }
+    if merged.len() < 2 {
+        return f64::NAN;
+    }
+    // Ignore relative rounding differences up to 1e-12 and repair decreases
+    // in cumulative counts, as Prometheus does before interpolation.
+    for i in 1..merged.len() {
+        let previous = merged[i - 1].1;
+        let current = merged[i].1;
+        let close = previous.is_finite()
+            && current.is_finite()
+            && (current - previous).abs() <= 1e-12 * (current.abs() + previous.abs());
+        if current < previous || close {
+            merged[i].1 = previous;
+        }
+    }
+    let total = merged.last().unwrap().1;
+    if total == 0.0 || total.is_nan() {
+        return f64::NAN;
+    }
+    let target = phi * total;
+    for (i, &(upper, count)) in merged[..merged.len() - 1].iter().enumerate() {
+        if count >= target {
+            if i == 0 && upper <= 0.0 {
+                return upper;
+            }
+            let (lower, previous_count) = if i == 0 { (0.0, 0.0) } else { merged[i - 1] };
+            return lower
+                + (upper - lower) * ((target - previous_count) / (count - previous_count));
+        }
+    }
+    // A quantile in the unbounded bucket is the highest finite boundary.
+    merged[merged.len() - 2].0
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -366,8 +399,8 @@ mod tests {
 
     // ── histogram_quantile ──
     //
-    // Classic cumulative buckets (same non-le labels), one sample each — the impl reads
-    // samples.last(). Counts: le 0.1→1, 0.5→2, 1→5, +Inf→10 (total 10).
+    // Classic cumulative buckets with the same non-le labels.
+    // Counts: le 0.1→1, 0.5→2, 1→5, +Inf→10 (total 10).
     //
     // Interpolation (mirroring compute_histogram_quantile): target = phi*total; find the
     // first bucket whose cumulative count >= target, then linearly interpolate within it:
@@ -423,10 +456,175 @@ mod tests {
 
     #[test]
     fn test_histogram_quantile_p90_in_inf_bucket() {
-        // phi=0.9 → target=9. First cumulative count >= 9 is +Inf (count 10).
-        // prev=(le 1, count 5). bucket_count=5. fraction=(9-5)/5=0.8.
-        // result = 1 + (+Inf - 1)*0.8 = +Inf (target lands in the unbounded top bucket).
+        // Prometheus returns the penultimate boundary for the unbounded bucket.
         let result = apply_scalar_func(classic_buckets(), ScalarFunc::HistogramQuantile, &[0.9]);
-        assert!(result[0].samples[0].1.is_infinite() && result[0].samples[0].1 > 0.0);
+        assert_eq!(result[0].samples[0].1, 1.0);
+    }
+
+    #[test]
+    fn histogram_quantile_evaluates_every_timestamp_and_preserves_groups() {
+        let mut series = Vec::new();
+        for (service, multiplier) in [("payments", 1.0), ("articles", 2.0)] {
+            for (le, values) in [
+                ("1", [2.0, 8.0, 0.0]),
+                ("2", [10.0, 10.0, 0.0]),
+                ("+Inf", [10.0, 10.0, 0.0]),
+            ] {
+                let mut ts = bucket(le, 0.0);
+                ts.labels.insert("service".into(), service.into());
+                ts.samples = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (100.25 + i as f64 * 15.0, v * multiplier))
+                    .collect();
+                series.push(ts);
+            }
+        }
+        series.reverse();
+        let result = apply_scalar_func(series, ScalarFunc::HistogramQuantile, &[0.5]);
+        assert_eq!(result.len(), 2);
+        for ts in result {
+            assert_eq!(ts.labels.len(), 1);
+            assert!(ts.labels.contains_key("service"));
+            assert_eq!(ts.samples.len(), 3);
+            assert_eq!(ts.samples[0], (100.25, 1.375));
+            assert_eq!(ts.samples[1], (115.25, 0.625));
+            assert_eq!(ts.samples[2].0, 130.25);
+            assert!(ts.samples[2].1.is_nan());
+        }
+    }
+
+    #[test]
+    fn histogram_quantile_never_reuses_buckets_from_other_steps() {
+        let mut finite = bucket("1", 10.0);
+        finite.samples = vec![(100.0, 10.0), (110.0, 10.0)];
+        let mut infinite = bucket("+Inf", 10.0);
+        infinite.samples = vec![(100.0, 10.0), (120.0, 10.0)];
+        let result = apply_scalar_func(
+            vec![finite, infinite],
+            ScalarFunc::HistogramQuantile,
+            &[0.5],
+        );
+        assert_eq!(result[0].samples.len(), 3);
+        assert_eq!(result[0].samples[0], (100.0, 0.5));
+        assert!(result[0].samples[1].1.is_nan());
+        assert!(result[0].samples[2].1.is_nan());
+    }
+
+    #[test]
+    fn histogram_quantile_ignores_invalid_or_missing_bucket_labels() {
+        let mut no_le = bucket("1", 99.0);
+        no_le.labels.remove("le");
+        let result = apply_scalar_func(
+            vec![no_le, bucket("bad", 99.0), bucket("NaN", 99.0)],
+            ScalarFunc::HistogramQuantile,
+            &[0.5],
+        );
+        assert!(result.is_empty());
+        let mut empty = bucket("1", 0.0);
+        empty.samples.clear();
+        assert!(apply_scalar_func(vec![empty], ScalarFunc::HistogramQuantile, &[0.5]).is_empty());
+    }
+
+    #[test]
+    fn histogram_quantile_classic_edge_cases() {
+        let valid = vec![(1.0, 5.0), (2.0, 10.0), (f64::INFINITY, 10.0)];
+        assert_eq!(
+            classic_bucket_quantile(-0.1, valid.clone()),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(classic_bucket_quantile(1.1, valid.clone()), f64::INFINITY);
+        assert!(classic_bucket_quantile(f64::NAN, valid.clone()).is_nan());
+        assert_eq!(classic_bucket_quantile(0.0, valid.clone()), 0.0);
+        assert_eq!(classic_bucket_quantile(1.0, valid), 2.0);
+        for buckets in [
+            vec![],
+            vec![(f64::INFINITY, 10.0)],
+            vec![(1.0, 10.0)],
+            vec![(1.0, 0.0), (f64::INFINITY, 0.0)],
+        ] {
+            assert!(classic_bucket_quantile(0.5, buckets).is_nan());
+        }
+        assert_eq!(
+            classic_bucket_quantile(0.25, vec![(-2.0, 5.0), (0.0, 10.0), (f64::INFINITY, 10.0)]),
+            -2.0
+        );
+        assert_eq!(
+            classic_bucket_quantile(0.75, vec![(-2.0, 5.0), (0.0, 10.0), (f64::INFINITY, 10.0)]),
+            -1.0
+        );
+    }
+
+    #[test]
+    fn histogram_quantile_merges_equal_bounds_and_repairs_cumulative_counts() {
+        assert_eq!(
+            classic_bucket_quantile(
+                0.5,
+                vec![(f64::INFINITY, 10.0), (1.0, 3.0), (1.0, 2.0), (2.0, 10.0)]
+            ),
+            1.0
+        );
+        assert_eq!(
+            classic_bucket_quantile(0.9, vec![(1.0, 10.0), (2.0, 5.0), (f64::INFINITY, 10.0)]),
+            0.9
+        );
+        // Tiny increases and decreases must both be treated as rounding noise.
+        for delta in [-1e-13, 1e-13] {
+            assert_eq!(
+                classic_bucket_quantile(
+                    1.0,
+                    vec![
+                        (1.0, 10.0),
+                        (2.0, 10.0 + delta),
+                        (f64::INFINITY, 10.0 + delta)
+                    ]
+                ),
+                1.0
+            );
+        }
+    }
+
+    #[test]
+    fn histogram_quantile_of_aggregated_rates_returns_a_full_curve() {
+        use crate::promql::{aggregate::aggregate_series, compute::compute_rate, types::AggOp};
+
+        let steps = [60.0, 90.0, 120.0];
+        let mut rates = Vec::new();
+        for instance in ["a", "b"] {
+            for (le, counts) in [
+                ("1", [0.0, 2.0, 4.0, 1.0, 3.0]),
+                ("2", [0.0, 10.0, 20.0, 5.0, 15.0]),
+                ("+Inf", [0.0, 10.0, 20.0, 5.0, 15.0]),
+            ] {
+                let mut ts = bucket(le, 0.0);
+                ts.labels.insert("instance".into(), instance.into());
+                let raw: Vec<_> = counts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as f64 * 30.0, *v))
+                    .collect();
+                ts.samples = steps
+                    .iter()
+                    .map(|&t| {
+                        let window: Vec<_> = raw
+                            .iter()
+                            .copied()
+                            .filter(|(st, _)| *st > t - 60.0 && *st <= t)
+                            .collect();
+                        (t, compute_rate(&window).unwrap())
+                    })
+                    .collect();
+                rates.push(ts);
+            }
+        }
+        let sums = aggregate_series(rates, AggOp::Sum, &["le".into()], false, &steps, None);
+        let result = apply_scalar_func(sums, ScalarFunc::HistogramQuantile, &[0.95]);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].labels.is_empty());
+        assert_eq!(result[0].samples.len(), steps.len());
+        for ((timestamp, value), expected_time) in result[0].samples.iter().zip(steps) {
+            assert_eq!(*timestamp, expected_time);
+            assert_approx(*value, 1.9375, 1e-9);
+        }
     }
 }
