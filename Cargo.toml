@@ -71,8 +71,8 @@ object_store = { version = "0.14.1", features = ["aws"] }
 bytes = "1"
 # Only the dynamic API client is used; watcher/controller and CRD derive
 # features add unused dependencies, including unmaintained retry crates.
-kube = { version = "0.98", features = ["client"] }
-k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube = { version = "1.1", features = ["client"] }
+k8s-openapi = { version = "0.25", features = ["v1_32"] }
 base64 = "0.22"
 quick-xml = "0.41"
 url = "2"

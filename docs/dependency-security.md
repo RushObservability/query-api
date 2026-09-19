@@ -57,8 +57,11 @@ tracked for removal during dependency upgrades:
 
 | Crate | Dependency path | Disposition |
 |---|---|---|
-| `rustls-pemfile 2.2` | `kube-client 0.98` | Remove during a kube upgrade; query-api does not call it directly. This crate has no patched release. |
-| `bincode 1.3` | build-time parser generator under `promql-parser` | The direct application dependency was removed. Track upstream `promql-parser` migration; the crate is used to build generated parser tables, not to decode untrusted runtime payloads. |
+| `bincode 1.3` | `promql-parser 0.7.4 -> lrpar 0.13.10` | Serializes generated parser tables, not user payloads. As of September 19, 2026, published `promql-parser 0.10.0` still requires `lrpar 0.13`. Upgrading the parser alone does not remove this warning. Track adoption of `lrpar 0.15`, which uses `wincode`; `lrpar 0.14` still uses `bincode 2`, also covered by the advisory. |
+
+`kube 1.1` and matching `k8s-openapi 0.25` remove `rustls-pemfile` from the
+dependency tree. The Kubernetes API feature remains `v1_32`, and the client
+continues to use rustls. No advisory suppression is needed for this removal.
 
 The unused kube `runtime` and `derive` features have been removed. Query API uses
 the dynamic API client, not controllers, watchers, or custom-resource derives.
