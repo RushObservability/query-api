@@ -34,6 +34,8 @@ services:
       - CLICKHOUSE_DATABASE=observability
       - CLICKHOUSE_USER=${CLICKHOUSE_USER:-rushdev}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-rush-local-clickhouse-password}
+      - RUSH_ENVIRONMENT=development
+      - RUSH_API_KEY_SECRET=${RUSH_API_KEY_SECRET:-rush-local-api-key-hmac-secret-change-me}
       # Local single-tenant compatibility only. Production must configure the
       # distinct CLICKHOUSE_READ_* principal and verified row policies.
       - RUSH_ALLOW_INSECURE_TENANT_READS=true

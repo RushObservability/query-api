@@ -20,6 +20,10 @@ pub fn allow_anonymous_default() -> bool {
     env_flag("RUSH_ALLOW_ANONYMOUS_DEFAULT")
 }
 
+pub fn allow_insecure_tenant_reads() -> bool {
+    env_flag("RUSH_ALLOW_INSECURE_TENANT_READS")
+}
+
 pub fn default_tenant_auth_required(allow_anonymous: bool) -> bool {
     !allow_anonymous
 }
@@ -56,6 +60,19 @@ pub fn validate_api_key_secret(secret: Option<&str>, production: bool) -> Result
     Err(format!(
         "RUSH_API_KEY_SECRET must contain at least {MIN_API_KEY_SECRET_BYTES} bytes in production"
     ))
+}
+
+pub fn validate_insecure_tenant_read_override(
+    allow_insecure: bool,
+    production: bool,
+) -> Result<(), String> {
+    if allow_insecure && production {
+        return Err(
+            "RUSH_ALLOW_INSECURE_TENANT_READS is restricted to explicit development, local, or test environments"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub fn normalize_signals(signals: &[String]) -> Result<Vec<String>, String> {
@@ -200,6 +217,13 @@ mod tests {
     fn explicit_development_mode_allows_a_weak_api_key_secret() {
         assert!(validate_api_key_secret(None, false).is_ok());
         assert!(validate_api_key_secret(Some("development-only"), false).is_ok());
+    }
+
+    #[test]
+    fn production_rejects_insecure_tenant_read_override() {
+        assert!(validate_insecure_tenant_read_override(true, true).is_err());
+        assert!(validate_insecure_tenant_read_override(false, true).is_ok());
+        assert!(validate_insecure_tenant_read_override(true, false).is_ok());
     }
 
     #[test]

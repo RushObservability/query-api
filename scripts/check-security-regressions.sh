@@ -14,7 +14,9 @@ required_tests=(
   no_auth_ingestion_accepts_anonymous_across_every_ingest_family
   open_query_tenants_still_require_interactive_auth_for_llm_parsing
   production_rejects_missing_or_weak_api_key_secrets
+  production_rejects_insecure_tenant_read_override
   startup_validates_api_key_secret_before_running_migrations
+  startup_rejects_insecure_tenant_reads_before_running_migrations
 )
 for test_name in "${required_tests[@]}"; do
   if ! rg -q --fixed-strings "$test_name" src; then
