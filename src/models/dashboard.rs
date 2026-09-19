@@ -1,7 +1,37 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DashboardDefaults {
+    pub time_range_minutes: u32,
+    pub refresh_interval_secs: u32,
+}
+
+impl Default for DashboardDefaults {
+    fn default() -> Self {
+        Self {
+            time_range_minutes: 60,
+            refresh_interval_secs: 0,
+        }
+    }
+}
+
+impl DashboardDefaults {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=525_600).contains(&self.time_range_minutes) {
+            return Err("default time range must be between 1 and 525600 minutes");
+        }
+        if !matches!(self.refresh_interval_secs, 0 | 30 | 60 | 300) {
+            return Err("default refresh interval must be 0, 30, 60, or 300 seconds");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dashboard {
+    #[serde(default)]
+    pub defaults: DashboardDefaults,
     pub id: String,
     pub name: String,
     pub description: String,
@@ -90,6 +120,8 @@ pub struct DashboardExport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardExportMeta {
+    #[serde(default)]
+    pub defaults: DashboardDefaults,
     pub name: String,
     pub description: String,
     pub visibility: String,
@@ -109,6 +141,8 @@ pub struct WidgetExport {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateDashboardRequest {
+    #[serde(default)]
+    pub defaults: DashboardDefaults,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -130,6 +164,8 @@ fn default_empty_array() -> serde_json::Value {
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateDashboardRequest {
+    /// Omitted by older clients and metadata-only edits; keep the saved defaults.
+    pub defaults: Option<DashboardDefaults>,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -175,4 +211,95 @@ pub struct CreateFromTemplateRequest {
 
 fn default_empty_object() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
+}
+
+#[cfg(test)]
+mod dashboard_defaults_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_create_and_import_use_one_hour_and_no_refresh() {
+        let create: CreateDashboardRequest =
+            serde_json::from_value(json!({"name": "Legacy"})).unwrap();
+        assert_eq!(create.defaults, DashboardDefaults::default());
+        let import: ImportDashboardRequest = serde_json::from_value(json!({
+            "format_version": "v1", "dashboard": {"name": "Legacy", "description": "", "visibility": "tenant", "tags": []}, "widgets": []
+        })).unwrap();
+        assert_eq!(import.dashboard.defaults, DashboardDefaults::default());
+        assert_eq!(
+            serde_json::from_str::<DashboardDefaults>("{}").unwrap(),
+            DashboardDefaults::default()
+        );
+    }
+
+    #[test]
+    fn metadata_edits_can_omit_defaults_and_refresh_can_be_turned_off() {
+        let edit: UpdateDashboardRequest =
+            serde_json::from_value(json!({"name": "Renamed"})).unwrap();
+        assert!(edit.defaults.is_none());
+        let edit: UpdateDashboardRequest = serde_json::from_value(json!({"name": "Renamed", "defaults": {"time_range_minutes": 10080, "refresh_interval_secs": 0}})).unwrap();
+        assert_eq!(
+            edit.defaults.unwrap(),
+            DashboardDefaults {
+                time_range_minutes: 10080,
+                refresh_interval_secs: 0
+            }
+        );
+    }
+
+    #[test]
+    fn defaults_survive_export_import() {
+        let meta: DashboardExportMeta = serde_json::from_value(json!({
+            "name": "Traffic", "description": "", "visibility": "tenant", "tags": [],
+            "defaults": {"time_range_minutes": 10080, "refresh_interval_secs": 30}
+        }))
+        .unwrap();
+        let exported = serde_json::to_value(meta).unwrap();
+        let imported: DashboardExportMeta = serde_json::from_value(exported).unwrap();
+        assert_eq!(
+            imported.defaults,
+            DashboardDefaults {
+                time_range_minutes: 10080,
+                refresh_interval_secs: 30
+            }
+        );
+    }
+
+    #[test]
+    fn reject_unsafe_ranges_and_refresh_intervals() {
+        for minutes in [0, 525_601, u32::MAX] {
+            assert!(
+                DashboardDefaults {
+                    time_range_minutes: minutes,
+                    refresh_interval_secs: 0
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for seconds in [1, 5, 29, 301, u32::MAX] {
+            assert!(
+                DashboardDefaults {
+                    time_range_minutes: 60,
+                    refresh_interval_secs: seconds
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for seconds in [0, 30, 60, 300] {
+            assert!(
+                DashboardDefaults {
+                    time_range_minutes: 525_600,
+                    refresh_interval_secs: seconds
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        assert!(
+            serde_json::from_value::<DashboardDefaults>(json!({"time_range_minutes": -1})).is_err()
+        );
+    }
 }

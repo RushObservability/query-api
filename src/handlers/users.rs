@@ -11,8 +11,12 @@ use crate::handlers::auth::extract_session_cookie;
 #[derive(serde::Deserialize)]
 pub struct CreateUserRequest {
     pub username: String,
+    #[serde(default)]
     pub password: String,
     pub display_name: Option<String>,
+    pub auth_provider: Option<String>,
+    pub sso_provider_id: Option<String>,
+    pub group_ids: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -138,8 +142,17 @@ pub async fn create_user(
             ),
         ));
     }
+    let auth_provider = req.auth_provider.as_deref().unwrap_or("local").trim();
+    if !matches!(auth_provider, "local" | "oidc" | "saml") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "auth_provider must be 'local', 'oidc', or 'saml'".to_string(),
+        ));
+    }
     let password = req.password.clone();
-    if let Err(error) = crate::clickhouse_config::validate_password_policy(&password) {
+    if auth_provider == "local"
+        && let Err(error) = crate::clickhouse_config::validate_password_policy(&password)
+    {
         state
             .audit
             .log(
@@ -162,6 +175,12 @@ pub async fn create_user(
             .await;
         return Err((StatusCode::BAD_REQUEST, error.to_string()));
     }
+    if auth_provider != "local" && !password.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "password must be omitted for an SSO-managed user".to_string(),
+        ));
+    }
 
     let display_name = req.display_name.as_deref().unwrap_or("").to_string();
     if display_name.len() > 255 {
@@ -171,11 +190,91 @@ pub async fn create_user(
         ));
     }
 
-    let id = match state
-        .config_db
-        .create_user(&username, &password, &display_name)
-        .await
-    {
+    let mut group_ids = req.group_ids.unwrap_or_else(|| {
+        if auth_provider == "local" {
+            vec!["viewers".to_string()]
+        } else {
+            Vec::new()
+        }
+    });
+    group_ids.sort();
+    group_ids.dedup();
+    if auth_provider != "local" && group_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "at least one group is required for an SSO-managed user".to_string(),
+        ));
+    }
+    for group_id in &group_ids {
+        if state
+            .config_db
+            .get_group(group_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            })?
+            .is_none()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("group '{group_id}' does not exist"),
+            ));
+        }
+    }
+
+    let sso_provider_id = req.sso_provider_id.as_deref().unwrap_or("").trim();
+    let create_result = if auth_provider == "local" {
+        if !sso_provider_id.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "sso_provider_id is only valid for an SSO-managed user".to_string(),
+            ));
+        }
+        state
+            .config_db
+            .create_user(&username, &password, &display_name)
+            .await
+    } else {
+        if sso_provider_id.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "sso_provider_id is required for an SSO-managed user".to_string(),
+            ));
+        }
+        let provider = state
+            .config_db
+            .get_sso_provider(sso_provider_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            })?
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "sso_provider_id does not identify an existing provider".to_string(),
+                )
+            })?;
+        if provider.2 != auth_provider {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "auth_provider does not match the SSO provider protocol".to_string(),
+            ));
+        }
+        state
+            .config_db
+            .create_preprovisioned_sso_user(
+                &username,
+                &display_name,
+                sso_provider_id,
+                auth_provider,
+                "default",
+            )
+            .await
+    };
+
+    let id = match create_result {
         Ok(id) => id,
         Err(error)
             if error
@@ -222,13 +321,32 @@ pub async fn create_user(
         }
     };
 
-    // New users default to the viewers group
-    if let Err(error) = state
-        .config_db
-        .set_user_groups(&id, &["viewers".to_string()])
-        .await
-    {
-        tracing::error!(user_id = %id, %error, "failed to assign default user group");
+    // SSO users must have an explicit group before deny-mode authentication.
+    // Local users retain the built-in viewers default unless groups were sent.
+    if let Err(error) = state.config_db.set_user_groups(&id, &group_ids).await {
+        tracing::error!(user_id = %id, %error, "failed to assign user groups");
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.create", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", id.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "username": username,
+                            "auth_provider": auth_provider,
+                            "reason": "group_assignment_failed",
+                            "user_row_created": true,
+                        })
+                        .to_string(),
+                    )
+                    .description("user created but group assignment failed")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()));
     }
 
     let row = state
@@ -262,8 +380,14 @@ pub async fn create_user(
                 .tenant(caller.3.clone())
                 .resource("user", id.clone())
                 .changes(
-                    serde_json::json!({ "username": username, "display_name": display_name })
-                        .to_string(),
+                    serde_json::json!({
+                        "username": username,
+                        "display_name": display_name,
+                        "auth_provider": auth_provider,
+                        "sso_provider_id": if sso_provider_id.is_empty() { None } else { Some(sso_provider_id) },
+                        "group_ids": group_ids,
+                    })
+                    .to_string(),
                 )
                 .description("user created")
                 .context(crate::audit::actor_context_from_headers(&headers)),
@@ -663,6 +787,27 @@ pub async fn toggle_user(
         .await;
 
     Ok(Json(user_response(row)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreateUserRequest;
+
+    #[test]
+    fn sso_user_can_be_preprovisioned_without_a_password() {
+        let request: CreateUserRequest = serde_json::from_value(serde_json::json!({
+            "username": "alice@example.com",
+            "auth_provider": "oidc",
+            "sso_provider_id": "provider-a",
+            "group_ids": ["operators"]
+        }))
+        .unwrap();
+
+        assert!(request.password.is_empty());
+        assert_eq!(request.auth_provider.as_deref(), Some("oidc"));
+        assert_eq!(request.sso_provider_id.as_deref(), Some("provider-a"));
+        assert_eq!(request.group_ids.unwrap(), vec!["operators"]);
+    }
 }
 
 #[cfg(test)]

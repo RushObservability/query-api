@@ -1249,6 +1249,21 @@ mod auth_storage_tests {
     }
 
     #[test]
+    fn pending_sso_identity_is_provider_scoped_and_username_canonical() {
+        let key = pending_sso_identity_key("provider-a", " Alice@Example.COM ");
+        assert!(key.starts_with("pending:"));
+        assert_eq!(
+            key,
+            pending_sso_identity_key("provider-a", "alice@example.com")
+        );
+        assert_ne!(
+            key,
+            pending_sso_identity_key("provider-b", "alice@example.com")
+        );
+        assert!(!key.contains("alice@example.com"));
+    }
+
+    #[test]
     fn missing_identity_dummy_hash_performs_real_argon2_verification() {
         let hash = dummy_password_hash();
         assert!(PasswordHash::new(hash).is_ok());
@@ -1519,6 +1534,19 @@ fn hash_password(password: &str) -> anyhow::Result<String> {
 
 fn canonical_username(username: &str) -> String {
     username.trim().to_lowercase()
+}
+
+/// Opaque marker used for an SSO user that an administrator created before the
+/// user's first successful assertion. The marker is scoped to both the SSO
+/// provider and the canonical username, so another provider cannot claim it.
+pub fn pending_sso_identity_key(provider_id: &str, username: &str) -> String {
+    let mut digest = Sha256::new();
+    let canonical = canonical_username(username);
+    for value in [provider_id, canonical.as_str()] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    format!("pending:{}", URL_SAFE_NO_PAD.encode(digest.finalize()))
 }
 
 /// A process-wide, precomputed Argon2 hash used when an account is absent or
@@ -2587,6 +2615,7 @@ impl ConfigDb {
             ORDER BY (id)",
             // Backfill `variables` on dashboards created before template-variable support.
             "ALTER TABLE config_dashboards ADD COLUMN IF NOT EXISTS variables String DEFAULT '[]'",
+            "ALTER TABLE config_dashboards ADD COLUMN IF NOT EXISTS defaults String DEFAULT '{}'",
             // ── Widgets ───────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_widgets (
                 id             String,
@@ -5960,6 +5989,28 @@ impl ConfigDb {
         Ok(id)
     }
 
+    /// Create an SSO-managed user before their first login. A verified
+    /// assertion from the named provider must claim this pending identity
+    /// before the account can receive a session.
+    pub async fn create_preprovisioned_sso_user(
+        &self,
+        username: &str,
+        display_name: &str,
+        provider_id: &str,
+        auth_provider: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<String> {
+        let pending_identity = pending_sso_identity_key(provider_id, username);
+        self.create_sso_user(
+            username,
+            display_name,
+            &pending_identity,
+            auth_provider,
+            tenant_id,
+        )
+        .await
+    }
+
     pub async fn update_user_external_identity(
         &self,
         user_id: &str,
@@ -6861,17 +6912,19 @@ impl ConfigDb {
             visibility: String,
             tags: String,
             variables: String,
+            defaults: String,
             created_at: String,
             updated_at: String,
         }
         let rows = self.client
-            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at FROM config_dashboards FINAL WHERE is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) ORDER BY updated_at DESC")
+            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, defaults, created_at, updated_at FROM config_dashboards FINAL WHERE is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) ORDER BY updated_at DESC")
             .bind(user_id).bind(tenant_id)
             .fetch_all::<Row>()
             .await?;
         Ok(rows
             .into_iter()
             .map(|r| crate::models::dashboard::Dashboard {
+                defaults: serde_json::from_str(&r.defaults).unwrap_or_default(),
                 id: r.id,
                 name: r.name,
                 description: r.description,
@@ -6902,16 +6955,18 @@ impl ConfigDb {
             visibility: String,
             tags: String,
             variables: String,
+            defaults: String,
             created_at: String,
             updated_at: String,
         }
         let result = self.client
-            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) LIMIT 1")
+            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, defaults, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) LIMIT 1")
             .bind(id).bind(user_id).bind(tenant_id)
             .fetch_one::<Row>()
             .await;
         match result {
             Ok(r) => Ok(Some(crate::models::dashboard::Dashboard {
+                defaults: serde_json::from_str(&r.defaults).unwrap_or_default(),
                 id: r.id,
                 name: r.name,
                 description: r.description,
@@ -6942,16 +6997,18 @@ impl ConfigDb {
             visibility: String,
             tags: String,
             variables: String,
+            defaults: String,
             created_at: String,
             updated_at: String,
         }
         let result = self.client
-            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, defaults, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
             .fetch_one::<Row>()
             .await;
         match result {
             Ok(r) => Ok(Some(crate::models::dashboard::Dashboard {
+                defaults: serde_json::from_str(&r.defaults).unwrap_or_default(),
                 id: r.id,
                 name: r.name,
                 description: r.description,
@@ -6978,13 +7035,16 @@ impl ConfigDb {
         visibility: &str,
         tags: &str,
         variables: &str,
+        defaults: &crate::models::dashboard::DashboardDefaults,
     ) -> anyhow::Result<()> {
+        defaults.validate().map_err(anyhow::Error::msg)?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, variables, defaults, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(description).bind(tenant_id)
             .bind(owner_id).bind(visibility).bind(tags).bind(variables)
+            .bind(serde_json::to_string(defaults)?)
             .bind(&now).bind(&now).bind(ver)
             .execute()
             .await?;
@@ -7002,6 +7062,7 @@ impl ConfigDb {
         tenant_id: &str,
         user_id: &str,
         user_role: &str,
+        defaults: Option<&crate::models::dashboard::DashboardDefaults>,
     ) -> anyhow::Result<bool> {
         let dash = match self.get_dashboard(id, tenant_id, user_id).await? {
             Some(d) => d,
@@ -7016,12 +7077,15 @@ impl ConfigDb {
         if !can_edit {
             return Ok(false);
         }
+        let defaults = defaults.unwrap_or(&dash.defaults);
+        defaults.validate().map_err(anyhow::Error::msg)?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, variables, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_dashboards (id, name, description, tenant_id, owner_id, visibility, tags, variables, defaults, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(description).bind(&dash.tenant_id)
             .bind(&dash.owner_id).bind(visibility).bind(tags).bind(variables)
+            .bind(serde_json::to_string(defaults)?)
             .bind(&dash.created_at).bind(&now).bind(ver)
             .execute()
             .await?;
@@ -7079,7 +7143,7 @@ impl ConfigDb {
         Ok(Some(serde_json::json!({
             "format_version": "v1",
             "exported_at": Self::now_str(),
-            "dashboard": {"name": dash.name, "description": dash.description, "visibility": dash.visibility, "tags": dash.tags, "variables": dash.variables},
+            "dashboard": {"name": dash.name, "description": dash.description, "visibility": dash.visibility, "tags": dash.tags, "variables": dash.variables, "defaults": dash.defaults},
             "widgets": widget_exports,
         })))
     }
@@ -7112,6 +7176,7 @@ impl ConfigDb {
             visibility,
             &tags_str,
             &vars_str,
+            &import.dashboard.defaults,
         )
         .await?;
         for w in &import.widgets {
