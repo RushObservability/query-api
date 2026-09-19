@@ -1,11 +1,25 @@
 # Dependency security policy
 
-Query API dependency changes are gated by RustSec vulnerability scanning,
-license/source/yank policy, formatting, Clippy, tests, and a release build.
+Pull requests report RustSec vulnerabilities and cargo-deny advisory findings
+without blocking merges. License/source/banned-dependency policy, formatting,
+Clippy, tests, and a release build remain blocking checks.
 The pull-request workflow runs when Rust, Cargo, workflow, Docker, or dependency
 policy files change. A scheduled workflow refreshes the advisory database each
 week, and the tag workflow repeats the security gates before publishing an
-image.
+image. Release and local security checks remain strict.
+
+The advisory scan runs independently of the quality job, saves raw reports for
+30 days, and writes a job summary. After each PR scan, a separate trusted
+`workflow_run` workflow creates or updates one bot comment. The comment shows the
+scanned commit, findings or "Security scan clean", and a link to the run and
+artifacts. Missing or invalid reports show "Security scan incomplete", never
+"clean". Older commits and older rerun attempts cannot replace newer results.
+The PR description is not modified.
+
+The comment publisher supports forked PRs without executing PR code with write
+permissions. Its workflow and reporting scripts must be merged into the default
+branch before GitHub can activate it. If a repository policy prevents comments,
+the job summary and artifacts remain available.
 
 Clippy's correctness and suspicious groups are release-blocking. Existing
 style and complexity findings remain visible as warnings and can be reduced

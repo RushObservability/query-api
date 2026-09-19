@@ -2,7 +2,7 @@ name: Rust security and quality
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened]
     paths:
       - "**/*.rs"
       - "**/*.toml"
@@ -16,6 +16,7 @@ on:
       - "scripts/check-public-errors.sh"
       - "scripts/check-llm-gateway.sh"
       - "scripts/check-security-regressions.sh"
+      - "scripts/*security-report*"
       - "security/**"
       - ".github/workflows/**"
   schedule:
@@ -47,11 +48,6 @@ jobs:
           toolchain: 1.88.0
           components: rustfmt, clippy
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-audit@0.22.2
-
       - name: Install cargo-deny
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
@@ -68,6 +64,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Test security reporting
+        run: node --test scripts/test-security-report.cjs
 
       - name: Enforce container deployment policy
         run: bash scripts/check-container-policy.sh
@@ -93,8 +92,51 @@ jobs:
       - name: Build release targets
         run: cargo build --release --all-features
 
-      - name: Scan RustSec advisories
-        run: cargo audit --ignore RUSTSEC-2023-0071
-
       - name: Enforce dependency policy
-        run: cargo deny check --hide-inclusion-graph advisories bans licenses sources
+        run: cargo deny check --hide-inclusion-graph bans licenses sources
+
+  dependency-report:
+    name: Dependency security report (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, reviewed 2026-08-02
+        with:
+          toolchain: 1.88.0
+
+      - name: Install scanners
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+
+      - name: Scan dependencies without blocking the PR
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          mkdir -p security-report
+          set +e
+          cargo audit --json --ignore RUSTSEC-2023-0071 > security-report/audit.json 2> security-report/audit.log
+          echo "$?" > security-report/audit-exit.txt
+          cargo deny --format json check --hide-inclusion-graph advisories > security-report/deny.stdout 2> security-report/deny.jsonl
+          echo "$?" > security-report/deny-exit.txt
+          exit 0
+
+      - name: Summarize findings
+        if: ${{ !cancelled() }}
+        run: node scripts/security-report.cjs security-report
+
+      - name: Save scan reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-security-report
+          path: security-report/
+          retention-days: 30
+          if-no-files-found: warn
