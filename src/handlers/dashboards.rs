@@ -284,7 +284,14 @@ pub async fn create_widget(
         .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
 
-    let valid_types = ["timeseries", "heatmap", "histogram", "bar", "table", "counter"];
+    let valid_types = [
+        "timeseries",
+        "heatmap",
+        "histogram",
+        "bar",
+        "table",
+        "counter",
+    ];
     if !valid_types.contains(&req.widget_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -347,7 +354,14 @@ pub async fn update_widget(
     Json(req): Json<UpdateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
-    let valid_types = ["timeseries", "heatmap", "histogram", "bar", "table", "counter"];
+    let valid_types = [
+        "timeseries",
+        "heatmap",
+        "histogram",
+        "bar",
+        "table",
+        "counter",
+    ];
     if !valid_types.contains(&req.widget_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
