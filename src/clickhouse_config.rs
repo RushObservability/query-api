@@ -542,6 +542,7 @@ struct AuthSessionRow {
     tenant_id: String,
     auth_method: String,
     provider_id: String,
+    sso_revision: String,
     created_at: String,
     last_seen_at: String,
     expires_at: String,
@@ -710,6 +711,44 @@ fn normalize_slo_incident_events(
 #[cfg(test)]
 mod auth_storage_tests {
     use super::*;
+
+    #[test]
+    fn sso_revisions_fail_closed_and_cover_every_mapping() {
+        let mut rows = vec![
+            SsoRevisionRow {
+                kind: "mapping".into(),
+                id: "a".into(),
+                version: 10,
+            },
+            SsoRevisionRow {
+                kind: "mapping".into(),
+                id: "b".into(),
+                version: 20,
+            },
+            SsoRevisionRow {
+                kind: "provider".into(),
+                id: "p".into(),
+                version: 1000,
+            },
+        ];
+        let original = sso_revision_fingerprint(&rows).unwrap();
+        assert!(sso_revision_matches(&original, &original));
+        assert!(!sso_revision_matches("", &original));
+        assert!(!sso_revision_matches("", ""));
+        // Even a mapping revision below the provider's clock invalidates it.
+        rows[0].version = 11;
+        assert!(!sso_revision_matches(
+            &original,
+            &sso_revision_fingerprint(&rows).unwrap()
+        ));
+        rows.remove(0);
+        assert!(!sso_revision_matches(
+            &original,
+            &sso_revision_fingerprint(&rows).unwrap()
+        ));
+        rows.retain(|row| row.kind != "provider");
+        assert!(sso_revision_fingerprint(&rows).is_err());
+    }
 
     #[test]
     fn kubernetes_cluster_selectors_match_exact_all_and_wildcards() {
@@ -1769,6 +1808,24 @@ pub type SsoProviderRow = (
     String,
 );
 
+#[derive(clickhouse::Row, serde::Deserialize, serde::Serialize)]
+struct SsoRevisionRow {
+    kind: String,
+    id: String,
+    version: u64,
+}
+
+fn sso_revision_fingerprint(rows: &[SsoRevisionRow]) -> anyhow::Result<String> {
+    if !rows.iter().any(|row| row.kind == "provider") {
+        anyhow::bail!("SSO provider does not exist");
+    }
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(serde_json::to_vec(rows)?)))
+}
+
+fn sso_revision_matches(issued: &str, current: &str) -> bool {
+    !issued.is_empty() && !current.is_empty() && issued == current
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SsoActiveProviderReconciliation {
     pub active_provider_id: Option<String>,
@@ -1946,8 +2003,6 @@ pub struct ConfigDb {
     /// Tenant name-or-id → whether ingest requires a scoped key. Tenants with
     /// no explicit row inherit their legacy `auth_required` value.
     ingest_auth_cache: DashMap<String, (bool, Instant)>,
-    /// user_id → (scopes, permissions, tenant_ids).
-    perms_cache: DashMap<String, ((Vec<String>, Vec<String>, Vec<String>), Instant)>,
     /// (tenant_id_or_name, signal) → (enabled, cached_at). Hit on every ingest
     /// request to decide drop-vs-write, so it mirrors the tenant_flags TTL cache.
     /// Defaults (no stored row) are cached too so all-enabled tenants stay cheap.
@@ -2135,7 +2190,6 @@ impl ConfigDb {
             client,
             tenant_cache: DashMap::new(),
             ingest_auth_cache: DashMap::new(),
-            perms_cache: DashMap::new(),
             signal_cache: DashMap::new(),
             api_key_inflight: DashMap::new(),
             username_mutation_lock: tokio::sync::Mutex::new(()),
@@ -2187,7 +2241,6 @@ impl ConfigDb {
     fn invalidate_config_caches(&self) {
         self.tenant_cache.clear();
         self.ingest_auth_cache.clear();
-        self.perms_cache.clear();
         self.signal_cache.clear();
     }
 
@@ -2206,7 +2259,6 @@ impl ConfigDb {
             == 0;
         let cache_full = self.tenant_cache.len() >= MAX_CONFIG_CACHE_ENTRIES
             || self.ingest_auth_cache.len() >= MAX_CONFIG_CACHE_ENTRIES
-            || self.perms_cache.len() >= MAX_CONFIG_CACHE_ENTRIES
             || self.signal_cache.len() >= MAX_CONFIG_CACHE_ENTRIES;
         if !maintenance_due && !cache_full {
             return;
@@ -2215,8 +2267,6 @@ impl ConfigDb {
         self.tenant_cache
             .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
         self.ingest_auth_cache
-            .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
-        self.perms_cache
             .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
         self.signal_cache
             .retain(|_, (_, cached_at)| Self::cache_fresh(*cached_at));
@@ -2282,6 +2332,7 @@ impl ConfigDb {
                 user_version UInt64,
                 auth_method String DEFAULT '',
                 provider_id String DEFAULT '',
+                sso_revision String DEFAULT '',
                 created_at String DEFAULT toString(now()),
                 last_seen_at String,
                 expires_at String,
@@ -2298,6 +2349,9 @@ impl ConfigDb {
             // migration; current local and SSO login paths always set both fields.
             "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS auth_method String DEFAULT '' AFTER user_version",
             "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS provider_id String DEFAULT '' AFTER auth_method",
+            // Empty revisions revoke existing SSO sessions on upgrade. Local
+            // password sessions do not depend on provider configuration.
+            "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS sso_revision String DEFAULT '' AFTER provider_id",
             "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS session_id String DEFAULT '' AFTER token",
             "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS last_seen_at String DEFAULT created_at AFTER created_at",
             "ALTER TABLE config_sessions ADD COLUMN IF NOT EXISTS absolute_expires_at String DEFAULT expires_at AFTER expires_at",
@@ -4099,6 +4153,7 @@ impl ConfigDb {
         user_version: u64,
         auth_method: &str,
         provider_id: &str,
+        sso_revision: &str,
     ) -> anyhow::Result<IssuedSession> {
         let policy = self.effective_session_policy().await?;
         let token: String = {
@@ -4120,13 +4175,14 @@ impl ConfigDb {
         let absolute_expires_at = absolute_expires.format("%Y-%m-%d %H:%M:%S").to_string();
         let stored_token = session_storage_key(&self.session_hmac_secret, &token);
         self.client
-            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, sso_revision, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&stored_token)
             .bind(&session_id)
             .bind(user_id)
             .bind(user_version)
             .bind(auth_method)
             .bind(provider_id)
+            .bind(sso_revision)
             .bind(&created_at)
             .bind(&created_at)
             .bind(&expires_at)
@@ -4147,9 +4203,16 @@ impl ConfigDb {
         user_id: &str,
         auth_method: &str,
         provider_id: &str,
+        authenticated_revision: &str,
     ) -> anyhow::Result<IssuedSession> {
         if !matches!(auth_method, "oidc" | "saml") || provider_id.is_empty() {
             anyhow::bail!("invalid SSO session provenance");
+        }
+        if !sso_revision_matches(
+            authenticated_revision,
+            &self.sso_security_revision(provider_id).await?,
+        ) {
+            anyhow::bail!("SSO configuration changed during authentication; sign in again");
         }
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
@@ -4161,8 +4224,14 @@ impl ConfigDb {
             .bind(user_id)
             .fetch_one::<Row>()
             .await?;
-        self.insert_session(user_id, row.version, auth_method, provider_id)
-            .await
+        self.insert_session(
+            user_id,
+            row.version,
+            auth_method,
+            provider_id,
+            authenticated_revision,
+        )
+        .await
     }
 
     pub async fn create_session_at_version(
@@ -4170,7 +4239,7 @@ impl ConfigDb {
         user_id: &str,
         authenticated_user_version: u64,
     ) -> anyhow::Result<IssuedSession> {
-        self.insert_session(user_id, authenticated_user_version, "local", "")
+        self.insert_session(user_id, authenticated_user_version, "local", "", "")
             .await
     }
 
@@ -4218,13 +4287,14 @@ impl ConfigDb {
             user_id: String,
             auth_method: String,
             provider_id: String,
+            sso_revision: String,
             role: String,
             active_provider_id: String,
             active_provider_present: u8,
         }
         let now = Self::now_str();
         let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id,
-                          s.expires_at, s.user_id, s.auth_method, s.provider_id,
+                          s.expires_at, s.user_id, s.auth_method, s.provider_id, s.sso_revision,
                           ifNull(roles.role, 'viewer') AS role,
                           ifNull(active.provider_id, '') AS active_provider_id,
                           ifNull(active.present, 0) AS active_provider_present
@@ -4301,6 +4371,12 @@ impl ConfigDb {
                 if active_provider_id.as_deref() != Some(row.provider_id.as_str()) {
                     return None;
                 }
+                if !sso_revision_matches(
+                    &row.sso_revision,
+                    &self.sso_security_revision(&row.provider_id).await.ok()?,
+                ) {
+                    return None;
+                }
             }
             // Sessions issued before provenance binding fail closed.
             _ => return None,
@@ -4326,7 +4402,7 @@ impl ConfigDb {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
         let now = Self::now_str();
-        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) AND s.token NOT IN (SELECT token FROM config_session_rotation_grace WHERE grace_expires_at <= ?)";
+        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.sso_revision, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) AND s.token NOT IN (SELECT token FROM config_session_rotation_grace WHERE grace_expires_at <= ?)";
         let base = format!("{base} AND s.last_seen_at > ?");
         let rows = if let Some(user_id) = user_id {
             self.client
@@ -4352,8 +4428,30 @@ impl ConfigDb {
                 .fetch_all::<AuthSessionRow>()
                 .await?
         };
+        let mut valid_rows = Vec::with_capacity(rows.len());
+        let mut revisions = std::collections::HashMap::new();
+        let active = self.effective_active_sso_provider_id().await?;
+        for row in rows {
+            match row.auth_method.as_str() {
+                "local" if row.provider_id.is_empty() => {}
+                "oidc" | "saml" if active.as_deref() == Some(row.provider_id.as_str()) => {
+                    if !revisions.contains_key(&row.provider_id) {
+                        revisions.insert(
+                            row.provider_id.clone(),
+                            self.sso_security_revision(&row.provider_id).await?,
+                        );
+                    }
+                    if !sso_revision_matches(&row.sso_revision, &revisions[&row.provider_id]) {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+            valid_rows.push(row);
+        }
         let mut seen = std::collections::HashSet::new();
-        rows.into_iter()
+        valid_rows
+            .into_iter()
             .filter(|row| seen.insert(row.session_id.clone()))
             .map(|mut row| {
                 let last_seen =
@@ -4378,7 +4476,7 @@ impl ConfigDb {
         uuid::Uuid::parse_str(session_id)
             .map_err(|_| anyhow::anyhow!("invalid session identifier"))?;
         let now = Self::now_str();
-        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id = ? AND s.expires_at > ? AND s.absolute_expires_at > ?";
+        let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.sso_revision, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id = ? AND s.expires_at > ? AND s.absolute_expires_at > ?";
         let row = if let Some(user_id) = user_id {
             self.client
                 .query(&format!("{base} AND s.user_id = ? LIMIT 1"))
@@ -4442,6 +4540,7 @@ impl ConfigDb {
             tenant_id: String,
             auth_method: String,
             provider_id: String,
+            sso_revision: String,
             created_at: String,
             last_seen_at: String,
             last_seen_unix: i64,
@@ -4456,7 +4555,7 @@ impl ConfigDb {
         let stored_token = session_storage_key(&self.session_hmac_secret, token);
         let row = self
             .client
-            .query("SELECT s.session_id, s.user_id, s.user_version, u.username, u.tenant_id, s.auth_method, s.provider_id, s.created_at, s.last_seen_at, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.last_seen_at))) AS last_seen_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.expires_at))) AS expires_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.absolute_expires_at))) AS absolute_expires_unix, s.absolute_expires_at FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1")
+            .query("SELECT s.session_id, s.user_id, s.user_version, u.username, u.tenant_id, s.auth_method, s.provider_id, s.sso_revision, s.created_at, s.last_seen_at, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.last_seen_at))) AS last_seen_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.expires_at))) AS expires_unix, toInt64(toUnixTimestamp(parseDateTimeBestEffort(s.absolute_expires_at))) AS absolute_expires_unix, s.absolute_expires_at FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.token = ? AND s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) LIMIT 1")
             .bind(&stored_token)
             .bind(&now_string)
             .bind(&now_string)
@@ -4475,6 +4574,12 @@ impl ConfigDb {
             "oidc" | "saml" => {
                 let active_provider_id = self.effective_active_sso_provider_id().await?;
                 if active_provider_id.as_deref() != Some(row.provider_id.as_str()) {
+                    return Ok(None);
+                }
+                if !sso_revision_matches(
+                    &row.sso_revision,
+                    &self.sso_security_revision(&row.provider_id).await?,
+                ) {
                     return Ok(None);
                 }
             }
@@ -4521,13 +4626,14 @@ impl ConfigDb {
         // that were already in flight may keep using the old cookie during a
         // short shared grace period, which avoids a logout race across API pods.
         self.client
-            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, sso_revision, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&new_stored_token)
             .bind(&row.session_id)
             .bind(&row.user_id)
             .bind(row.user_version)
             .bind(&row.auth_method)
             .bind(&row.provider_id)
+            .bind(&row.sso_revision)
             .bind(&row.created_at)
             .bind(&now_string)
             .bind(&expires_at)
@@ -4547,13 +4653,14 @@ impl ConfigDb {
         // Extend a bearer that rotated very close to its idle deadline through
         // the full grace period. The grace table rejects every copy afterward.
         if let Err(error) = self.client
-            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, sso_revision, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&stored_token)
             .bind(&row.session_id)
             .bind(&row.user_id)
             .bind(row.user_version)
             .bind(&row.auth_method)
             .bind(&row.provider_id)
+            .bind(&row.sso_revision)
             .bind(&row.created_at)
             .bind(&row.last_seen_at)
             .bind(&grace_expires_at)
@@ -4899,6 +5006,32 @@ impl ConfigDb {
             .execute()
             .await?;
         Ok(())
+    }
+
+    /// Read authorization revisions without a process-local cache. Include
+    /// mapping tombstones so deletion cannot restore an earlier revision.
+    /// Hash each row separately rather than taking max(version), which could
+    /// hide a mapping edit behind another API replica's newer clock.
+    pub async fn sso_security_revision(&self, provider_id: &str) -> anyhow::Result<String> {
+        let rows = self
+            .client
+            .query(
+                "SELECT kind, id, version FROM (
+                SELECT 'provider' AS kind, id, version FROM config_sso_providers FINAL
+                WHERE id = ? AND is_deleted = 0
+                UNION ALL
+                SELECT 'mapping' AS kind, id, version FROM config_idp_group_mappings FINAL
+                WHERE provider_id = ?
+                UNION ALL
+                SELECT 'active' AS kind, slot AS id, version FROM config_sso_active_provider FINAL
+                WHERE slot = 'primary'
+            ) ORDER BY kind, id",
+            )
+            .bind(provider_id)
+            .bind(provider_id)
+            .fetch_all::<SsoRevisionRow>()
+            .await?;
+        sso_revision_fingerprint(&rows)
     }
 
     pub async fn set_user_enabled(&self, user_id: &str, enabled: bool) -> anyhow::Result<bool> {
@@ -5354,12 +5487,9 @@ impl ConfigDb {
         &self,
         user_id: &str,
     ) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
-        if let Some(entry) = self.perms_cache.get(user_id) {
-            let (perms, at) = entry.value();
-            if Self::cache_fresh(*at) {
-                return Ok(perms.clone());
-            }
-        }
+        // Authorization must reflect group changes made by any API replica.
+        // A freshly reauthenticated SSO user must not inherit permissions from
+        // this replica's previous login cache.
 
         let mut all_scopes = std::collections::HashSet::new();
         let mut all_permissions = std::collections::HashSet::new();
@@ -5409,13 +5539,6 @@ impl ConfigDb {
             all_permissions.into_iter().collect::<Vec<_>>(),
             all_tenant_ids.into_iter().collect::<Vec<_>>(),
         );
-        self.maintain_config_caches();
-        if self.perms_cache.len() < MAX_CONFIG_CACHE_ENTRIES
-            || self.perms_cache.contains_key(user_id)
-        {
-            self.perms_cache
-                .insert(user_id.to_string(), (result.clone(), Instant::now()));
-        }
         Ok(result)
     }
 

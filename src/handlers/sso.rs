@@ -357,53 +357,8 @@ async fn find_namespaced_external_user(
         return Ok((existing, identity_key));
     }
 
-    // One-time compatibility migration for identities created before issuer and
-    // provider namespacing was introduced. The migration is performed only
-    // after a fully verified assertion from the currently configured provider.
-    let legacy = state
-        .config_db
-        .find_user_by_external_id(subject, auth_provider)
-        .await
-        .map_err(|error| {
-            public_sso_internal_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "sso_legacy_identity_lookup",
-                error,
-                "SSO authentication could not be completed",
-            )
-        })?;
-    if let Some(user_id) = legacy {
-        state
-            .config_db
-            .update_user_external_identity(&user_id, auth_provider, &identity_key)
-            .await
-            .map_err(|error| {
-                public_sso_internal_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "sso_external_identity_migrate",
-                    error,
-                    "SSO authentication could not be completed",
-                )
-            })?;
-        state
-            .audit
-            .log(
-                crate::audit::AuditEvent::new("sso.identity_namespace_migrate", "system")
-                    .tenant("default".to_string())
-                    .resource("user", user_id.clone())
-                    .outcome("success")
-                    .changes(
-                        serde_json::json!({
-                            "auth_provider": auth_provider,
-                            "provider_id": provider_id,
-                        })
-                        .to_string(),
-                    )
-                    .context(crate::audit::actor_context_from_headers(headers)),
-            )
-            .await;
-        return Ok((Some(user_id), identity_key));
-    }
+    // A raw legacy subject has no issuer/provider provenance. Never claim it
+    // from a new assertion, even if the protocol and subject happen to match.
 
     // An administrator may pre-provision an SSO user for a deny-by-default
     // provider. Bind that account only after a verified assertion supplies the
@@ -457,6 +412,24 @@ async fn find_namespaced_external_user(
         return Ok((Some(user_id), identity_key));
     }
     Ok((None, identity_key))
+}
+
+async fn callback_sso_revision(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    state
+        .config_db
+        .sso_security_revision(provider_id)
+        .await
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sso_security_revision",
+                error,
+                "SSO authentication could not be completed",
+            )
+        })
 }
 
 async fn claim_sso_key_once(
@@ -1246,6 +1219,10 @@ async fn sso_callback_inner(
         ));
     }
 
+    // Capture before reading trust settings or group mappings. A concurrent
+    // configuration edit makes this revision unusable for session creation.
+    let sso_revision = callback_sso_revision(&state, &transaction.provider_id).await?;
+
     // 2. Load the enabled SSO provider
     let provider = state
         .config_db
@@ -1570,7 +1547,7 @@ async fn sso_callback_inner(
     // 10. Create a session (same as local auth)
     let issued = state
         .config_db
-        .create_sso_session(&user_id, "oidc", &provider_id)
+        .create_sso_session(&user_id, "oidc", &provider_id, &sso_revision)
         .await
         .map_err(|error| {
             public_sso_internal_error(
@@ -2263,6 +2240,7 @@ pub async fn save_sso_provider(
         "default_group_id": default_group_id,
         "previous_active_provider_id": previous_active_provider_id,
         "active_provider_id": active_provider_id,
+        "sso_sessions_invalidated": is_update,
     })
     .to_string();
     if let Ok(caller) = &admin_result {
@@ -2469,7 +2447,8 @@ pub async fn create_idp_group_mapping(
                         "action": "create",
                         "idp_group": req.idp_group,
                         "rush_group_id": req.rush_group_id,
-                        "provider_id": provider_id
+                        "provider_id": provider_id,
+                        "sso_sessions_invalidated": true
                     })
                     .to_string(),
                 )
@@ -2515,6 +2494,7 @@ pub async fn update_idp_group_mapping(
             .resource("idp_group_mapping", id.clone())
             .changes(serde_json::json!({
                 "action": "update",
+                "sso_sessions_invalidated": true,
                 "before": { "idp_group": old_idp_group, "rush_group_id": old_rush_group_id },
                 "after": { "idp_group": req.idp_group, "rush_group_id": req.rush_group_id }
             }).to_string())
@@ -2554,7 +2534,10 @@ pub async fn delete_idp_group_mapping(
                     .actor(caller.0.clone(), caller.1.clone())
                     .tenant(caller.3.clone())
                     .resource("idp_group_mapping", id.clone())
-                    .changes(serde_json::json!({ "action": "delete" }).to_string())
+                    .changes(
+                        serde_json::json!({ "action": "delete", "sso_sessions_invalidated": true })
+                            .to_string(),
+                    )
                     .description("idp group mapping deleted")
                     .context(crate::audit::actor_context_from_headers(&headers)),
             )
@@ -2622,6 +2605,7 @@ async fn sso_acs_inner(
             )
         })?;
 
+    let sso_revision = callback_sso_revision(&state, &transaction.provider_id).await?;
     let provider = state
         .config_db
         .get_enabled_sso_provider()
@@ -2898,7 +2882,7 @@ async fn sso_acs_inner(
 
     let issued = state
         .config_db
-        .create_sso_session(&user_id, "saml", &provider_id)
+        .create_sso_session(&user_id, "saml", &provider_id, &sso_revision)
         .await
         .map_err(|error| {
             public_sso_internal_error(
@@ -3817,6 +3801,50 @@ mod tests {
             first,
             external_identity_key("provider-a", "https://idp.example.com", "subject-1")
         );
+    }
+
+    #[test]
+    fn sso_identity_lookup_never_claims_raw_subjects() {
+        let source = include_str!("sso.rs");
+        let lookup = source
+            .split("async fn find_namespaced_external_user(")
+            .nth(1)
+            .unwrap()
+            .split("async fn callback_sso_revision(")
+            .next()
+            .unwrap();
+        assert!(!lookup.contains("find_user_by_external_id(subject"));
+        assert!(lookup.contains("find_user_by_external_id(&identity_key"));
+        assert!(lookup.contains("find_user_by_external_id(&pending_identity"));
+        assert_eq!(lookup.matches("find_user_by_external_id(").count(), 2);
+    }
+
+    #[test]
+    fn sso_callbacks_capture_revision_before_trust_and_preserve_it_at_issuance() {
+        let source = include_str!("sso.rs");
+        for (callback, next, protocol) in [
+            (
+                "async fn sso_callback_inner(",
+                "pub async fn list_sso_providers(",
+                "oidc",
+            ),
+            ("async fn sso_acs_inner(", "pub async fn", "saml"),
+        ] {
+            let body = source
+                .split(callback)
+                .nth(1)
+                .unwrap()
+                .split(next)
+                .next()
+                .unwrap();
+            assert!(
+                body.find("callback_sso_revision(").unwrap()
+                    < body.find("get_enabled_sso_provider()").unwrap()
+            );
+            assert!(body.contains(&format!(
+                "create_sso_session(&user_id, \"{protocol}\", &provider_id, &sso_revision)"
+            )));
+        }
     }
 
     #[test]
