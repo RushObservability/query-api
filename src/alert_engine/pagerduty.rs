@@ -151,15 +151,12 @@ pub async fn send(config: &Value, event: &Value) -> Result<(), String> {
     body.as_object_mut()
         .ok_or("PagerDuty event must be an object")?
         .insert("routing_key".into(), config["routing_key"].clone());
-    let response =
-        crate::outbound::strict_public_https_request(reqwest::Method::POST, endpoint(config)?)
-            .await?
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| {
-                "PagerDuty delivery failed; check connectivity and try again".to_string()
-            })?;
+    let response = super::delivery::request(reqwest::Method::POST, endpoint(config)?, true)
+        .await?
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| "PagerDuty delivery failed; check connectivity and try again".to_string())?;
     check_status(response.status())
 }
 

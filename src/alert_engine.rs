@@ -92,8 +92,8 @@ fn build_slack_payload(
     alert_id: &str,
     runbook_url: &str,
 ) -> serde_json::Value {
-    let is_firing = !matches!(alert_state, "RESOLVED" | "ok" | "TEST");
-    let is_test = alert_state == "TEST";
+    let is_test = alert_state.eq_ignore_ascii_case("test");
+    let is_firing = !is_resolved(alert_state) && !is_test;
 
     let (color, status_emoji, status_label) = if is_test {
         ("#888888", "🔔", "TEST")
@@ -200,8 +200,15 @@ fn build_slack_payload(
     serde_json::json!({ "attachments": [attachment] })
 }
 
+mod delivery;
+#[cfg(test)]
+mod notification_tests;
 pub(crate) mod pagerduty;
 pub(crate) mod rootly;
+
+fn is_resolved(state: &str) -> bool {
+    state.eq_ignore_ascii_case("ok") || state.eq_ignore_ascii_case("resolved")
+}
 
 /// Send a notification to a channel. The caller records the delivery result.
 pub async fn send_channel_notification(
@@ -216,7 +223,7 @@ pub async fn send_channel_notification(
     description: &str,
     alert_id: &str,
     runbook_url: &str,
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
 ) -> Result<(), String> {
@@ -237,29 +244,35 @@ pub async fn send_channel_notification(
 
             let subject = format!("[Rush Alert] {} - {}", alert_name, alert_state,);
 
-            // Send to each recipient
-            for to_addr in recipients
+            // Validate all addresses before sending to avoid partial delivery or silently
+            // substituting another recipient for a malformed address.
+            let recipients: Vec<lettre::message::Mailbox> = recipients
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-            {
+                .map(|s| {
+                    s.parse()
+                        .map_err(|_| "email recipient address is invalid".to_string())
+                })
+                .collect::<Result<_, _>>()?;
+            if recipients.is_empty() {
+                return Err("email channel requires at least one recipient".into());
+            }
+            let from: lettre::message::Mailbox = smtp_config
+                .from
+                .parse()
+                .map_err(|_| "email sender address is invalid".to_string())?;
+            for to_addr in recipients {
                 match Message::builder()
-                    .from(
-                        smtp_config
-                            .from
-                            .parse()
-                            .unwrap_or_else(|_| "wide@localhost".parse().unwrap()),
-                    )
-                    .to(to_addr
-                        .parse()
-                        .unwrap_or_else(|_| "noreply@localhost".parse().unwrap()))
+                    .from(from.clone())
+                    .to(to_addr)
                     .subject(&subject)
                     .header(ContentType::TEXT_PLAIN)
                     .body(message.to_string())
                 {
                     Ok(email) => {
                         if let Err(e) = transport.send(email).await {
-                            return Err(format!("email to {to_addr} failed: {e}"));
+                            return Err(format!("email delivery failed: {e}"));
                         }
                     }
                     Err(e) => {
@@ -287,12 +300,12 @@ pub async fn send_channel_notification(
                 alert_id,
                 runbook_url,
             );
-            crate::outbound::public_https_request(reqwest::Method::POST, url)
-                .await?
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("slack notification failed: {e}"))?;
+            delivery::send_json(
+                delivery::request(reqwest::Method::POST, url, false).await?,
+                &payload,
+                "Slack",
+            )
+            .await?;
             Ok(())
         }
         "webhook" => {
@@ -319,7 +332,7 @@ pub async fn send_channel_notification(
             } else {
                 reqwest::Method::POST
             };
-            let mut req_builder = crate::outbound::public_https_request(method, url).await?;
+            let mut req_builder = delivery::request(method, url, false).await?;
 
             // Apply custom headers
             if let Some(headers) = config.get("headers").and_then(|h| h.as_object()) {
@@ -330,11 +343,7 @@ pub async fn send_channel_notification(
                 }
             }
 
-            req_builder
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("webhook notification failed: {e}"))?;
+            delivery::send_json(req_builder, &payload, "Webhook").await?;
             Ok(())
         }
         "pagerduty" => {
@@ -399,13 +408,32 @@ pub async fn send_channel_notification(
                     .and_then(|u| u.as_str())
                     .unwrap_or("Rush Alerts")
             );
-            http_client
-                .post("https://slack.com/api/chat.postMessage")
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&payload)
-                .send()
+            let mut authorization =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| "Slack App token contains invalid characters".to_string())?;
+            authorization.set_sensitive(true);
+            let response = delivery::send_json(
+                delivery::request(
+                    reqwest::Method::POST,
+                    "https://slack.com/api/chat.postMessage",
+                    true,
+                )
+                .await?
+                .header(reqwest::header::AUTHORIZATION, authorization),
+                &payload,
+                "Slack App",
+            )
+            .await?;
+            let result: serde_json::Value = response
+                .json()
                 .await
-                .map_err(|e| format!("slack_app notification failed: {e}"))?;
+                .map_err(|_| "Slack App returned an invalid response".to_string())?;
+            if result.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Err(
+                    "Slack App rejected the notification; check bot permissions and channel access"
+                        .into(),
+                );
+            }
             Ok(())
         }
         "discord" => {
@@ -413,7 +441,7 @@ pub async fn send_channel_notification(
                 .get("webhook_url")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "discord channel config missing webhook_url".to_string())?;
-            let color: u32 = if alert_state == "RESOLVED" || alert_state == "ok" {
+            let color: u32 = if is_resolved(alert_state) {
                 0x57F287
             } else {
                 0xED4245
@@ -429,12 +457,12 @@ pub async fn send_channel_notification(
                     ],
                 }]
             });
-            crate::outbound::public_https_request(reqwest::Method::POST, url)
-                .await?
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("discord notification failed: {e}"))?;
+            delivery::send_json(
+                delivery::request(reqwest::Method::POST, url, false).await?,
+                &payload,
+                "Discord",
+            )
+            .await?;
             Ok(())
         }
         "alertmanager" => {
@@ -443,11 +471,6 @@ pub async fn send_channel_notification(
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| "alertmanager channel config missing url".to_string())?;
             let api_url = format!("{}/api/v2/alerts", base_url.trim_end_matches('/'));
-            let status = if alert_state == "RESOLVED" || alert_state == "ok" {
-                "resolved"
-            } else {
-                "firing"
-            };
             let extra_labels = config
                 .get("labels")
                 .cloned()
@@ -458,17 +481,20 @@ pub async fn send_channel_notification(
                     lobj.insert(k.clone(), v.clone());
                 }
             }
-            let payload = serde_json::json!([{
+            let mut payload = serde_json::json!([{
                 "labels": labels,
                 "annotations": { "summary": message, "value": value.to_string() },
-                "status": status,
             }]);
-            crate::outbound::public_https_request(reqwest::Method::POST, &api_url)
-                .await?
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("alertmanager notification failed: {e}"))?;
+            // Alertmanager's POST schema uses endsAt for recovery, not status.
+            if is_resolved(alert_state) {
+                payload[0]["endsAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            }
+            delivery::send_json(
+                delivery::request(reqwest::Method::POST, &api_url, false).await?,
+                &payload,
+                "Alertmanager",
+            )
+            .await?;
             Ok(())
         }
         other => Err(format!("unsupported channel type: {other}")),
