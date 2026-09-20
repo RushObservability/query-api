@@ -349,6 +349,11 @@ pub async fn login(
     {
         Ok(authenticated) => authenticated,
         Err(error) => {
+            let reason = if error.is::<crate::clickhouse_config::PasswordWorkBusy>() {
+                "password_capacity_exhausted"
+            } else {
+                "identity_store_unavailable"
+            };
             tracing::error!(operation = "credential_lookup", %error, "authentication request failed");
             state
                 .audit
@@ -356,10 +361,7 @@ pub async fn login(
                     crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
                         .actor_name(req.username.clone())
                         .outcome("failure")
-                        .changes(
-                            serde_json::json!({ "reason": "identity_store_unavailable" })
-                                .to_string(),
-                        )
+                        .changes(serde_json::json!({ "reason": reason }).to_string())
                         .description("authentication unavailable")
                         .context(login_audit_context(&headers, client_ip)),
                 )
@@ -964,19 +966,38 @@ pub async fn admin_revoke_session(
 ///
 /// Default: a hardened `__Host-rush_session` with `Secure` (HTTPS-only) — the
 /// `__Host-` prefix blocks subdomain cookie injection. When `RUSH_INSECURE_COOKIES`
-/// is truthy, emit a plain `rush_session` without `__Host-`/`Secure` so the app
-/// works over plain HTTP (e.g. `kubectl port-forward`, non-TLS internal access),
-/// where browsers refuse to store `Secure`/`__Host-` cookies. `extract_session_cookie`
-/// reads both names.
+/// is enabled in an explicit development environment, emit a plain cookie for
+/// HTTP localhost/port-forward use. Production rejects this override. Cookie
+/// extraction accepts only the name selected by the same policy.
 pub fn session_cookie(token: &str, max_age: i64) -> String {
     session_cookie_with_mode(token, max_age, insecure_cookies_enabled())
 }
 
-fn insecure_cookies_enabled() -> bool {
-    let insecure = std::env::var("RUSH_INSECURE_COOKIES")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    insecure
+fn cookie_security_mode(raw: Option<&str>, production: bool) -> Result<bool, String> {
+    let insecure =
+        raw.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+    if insecure && production {
+        return Err("RUSH_INSECURE_COOKIES is only allowed in explicit development, local, or test environments; production requires HTTPS cookies".into());
+    }
+    Ok(insecure)
+}
+
+pub fn validate_cookie_security() -> Result<(), String> {
+    cookie_security_mode(
+        std::env::var("RUSH_INSECURE_COOKIES").ok().as_deref(),
+        crate::api_key_auth::production_mode(),
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn insecure_cookies_enabled() -> bool {
+    // Startup reports invalid configuration. Library callers and any runtime
+    // environment changes must still fail closed to secure cookies.
+    cookie_security_mode(
+        std::env::var("RUSH_INSECURE_COOKIES").ok().as_deref(),
+        crate::api_key_auth::production_mode(),
+    )
+    .unwrap_or(false)
 }
 
 fn session_cookie_with_mode(token: &str, max_age: i64, insecure: bool) -> String {
@@ -1015,6 +1036,59 @@ fn extract_session_cookie_with_mode(headers: &HeaderMap, insecure: bool) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insecure_cookies_require_explicit_nonproduction_environment() {
+        for environment in [
+            None,
+            Some("production"),
+            Some("prod"),
+            Some("staging"),
+            Some("typo"),
+        ] {
+            let production = crate::api_key_auth::is_production_environment(environment);
+            for value in ["true", "1", " TRUE "] {
+                let mode = cookie_security_mode(Some(value), production);
+                assert!(mode.is_err());
+                // Runtime callers fail closed even if startup validation was skipped.
+                let cookie = session_cookie_with_mode("test", 60, mode.unwrap_or(false));
+                assert!(cookie.starts_with("__Host-rush_session="));
+                assert!(cookie.contains("; Secure;"));
+            }
+        }
+        for environment in ["development", "dev", "local", "test"] {
+            assert_eq!(
+                cookie_security_mode(
+                    Some("true"),
+                    crate::api_key_auth::is_production_environment(Some(environment))
+                ),
+                Ok(true)
+            );
+        }
+        for raw in [None, Some("false"), Some("0")] {
+            assert_eq!(cookie_security_mode(raw, true), Ok(false));
+            assert_eq!(cookie_security_mode(raw, false), Ok(false));
+        }
+    }
+
+    #[test]
+    fn startup_and_sso_use_the_shared_cookie_policy() {
+        let main = include_str!("../main.rs");
+        assert!(main.contains("validate_cookie_security()"));
+        assert!(
+            main.find("validate_cookie_security()").unwrap()
+                < main.find("ConfigDb::open(").unwrap()
+        );
+        let sso = include_str!("sso.rs");
+        let helper = sso
+            .split("fn insecure_cookies_enabled() -> bool {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(helper.contains("crate::handlers::auth::insecure_cookies_enabled()"));
+    }
 
     #[test]
     fn production_session_cookie_is_host_only_and_secure() {

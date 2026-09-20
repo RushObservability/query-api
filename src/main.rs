@@ -1814,6 +1814,8 @@ async fn main() -> anyhow::Result<()> {
     rush_api::edition::validate_startup()?;
     let production = rush_api::api_key_auth::production_mode();
     let api_key_secret = std::env::var("RUSH_API_KEY_SECRET").ok();
+    rush_api::handlers::auth::validate_cookie_security()
+        .map_err(|error| anyhow::anyhow!("invalid cookie security configuration: {error}"))?;
     rush_api::api_key_auth::validate_api_key_secret(api_key_secret.as_deref(), production)
         .map_err(|error| anyhow::anyhow!("invalid API-key security configuration: {error}"))?;
     if rush_api::api_key_auth::api_key_secret_is_strong(api_key_secret.as_deref()) {
