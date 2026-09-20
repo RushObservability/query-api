@@ -6946,7 +6946,10 @@ impl ConfigDb {
         &self,
         tenant_id: &str,
         server: &str,
-    ) -> anyhow::Result<Option<(String, String, String, bool)>> {
+        collector_id: &str,
+    ) -> anyhow::Result<Option<(String, String, String, bool, String)>> {
+        let claim = uuid::Uuid::new_v4().to_string();
+        let claim_hash = crate::handlers::settings::hash_api_key(&claim);
         let row = self.client
             .query("SELECT id, db, query, analyze FROM config_pg_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
             .bind(tenant_id).bind(server)
@@ -6957,11 +6960,11 @@ impl ConfigDb {
             // column left out of the row that replaces the old one reverts to
             // its default and the collector would silently stop analyzing.
             self.client
-                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, analyze, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, 0)")
-                .bind(&r.id).bind(tenant_id).bind(server).bind(&r.db).bind(&r.query).bind(r.analyze).bind(Self::now_str()).bind(Self::next_version())
+                .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, analyze, collector_id, claim_hash, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 0)")
+                .bind(&r.id).bind(tenant_id).bind(server).bind(&r.db).bind(&r.query).bind(r.analyze).bind(collector_id).bind(&claim_hash).bind(Self::now_str()).bind(Self::next_version())
                 .execute().await?;
         }
-        Ok(row.map(|r| (r.id, r.db, r.query, r.analyze != 0)))
+        Ok(row.map(|r| (r.id, r.db, r.query, r.analyze != 0, claim)))
     }
 
     /// Requeue jobs whose collector lease expired. Collector-side EXPLAIN is
@@ -7003,15 +7006,33 @@ impl ConfigDb {
         &self,
         tenant_id: &str,
         id: &str,
+        server: &str,
+        collector_id: &str,
+        claim: &str,
         plan_json: &str,
         error: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        let claim_hash = crate::handlers::settings::hash_api_key(claim);
+        let valid = self.client.query("SELECT count() FROM config_pg_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND server_name = ? AND collector_id = ? AND claim_hash = ? AND status = 'running' AND updated_at >= toString(now() - INTERVAL 2 MINUTE) AND is_deleted = 0")
+            .bind(id).bind(tenant_id).bind(server).bind(collector_id).bind(&claim_hash).fetch_one::<u64>().await?;
+        if valid == 0 {
+            return Ok(false);
+        }
+        if !self
+            .claim_sso_key_once(
+                &format!("explain-result:postgresql:{tenant_id}:{id}:{claim_hash}"),
+                chrono::Utc::now().timestamp() + 120,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         let status = if error.is_empty() { "done" } else { "error" };
         self.client
-            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, status, plan_json, error, updated_at, version, is_deleted) SELECT id, tenant_id, ?, ?, ?, ?, ?, 0 FROM config_pg_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
-            .bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version()).bind(id).bind(tenant_id)
+            .query("INSERT INTO config_pg_explain_jobs (id, tenant_id, server_name, db, query, analyze, status, plan_json, error, updated_at, version, is_deleted) SELECT id, tenant_id, server_name, db, query, analyze, ?, ?, ?, ?, ?, 0 FROM config_pg_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND server_name = ? AND collector_id = ? AND claim_hash = ? AND status = 'running' AND updated_at >= toString(now() - INTERVAL 2 MINUTE) AND is_deleted = 0 LIMIT 1")
+            .bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version()).bind(id).bind(tenant_id).bind(server).bind(collector_id).bind(&claim_hash)
             .execute().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Fetch a job's status/result for the UI.
@@ -7049,19 +7070,22 @@ impl ConfigDb {
         &self,
         tenant_id: &str,
         server: &str,
-    ) -> anyhow::Result<Option<(String, String, String)>> {
+        collector_id: &str,
+    ) -> anyhow::Result<Option<(String, String, String, String)>> {
+        let claim = uuid::Uuid::new_v4().to_string();
+        let claim_hash = crate::handlers::settings::hash_api_key(&claim);
         let row = self.client
-            .query("SELECT id, db, query FROM config_mysql_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
+            .query("SELECT id, db, query, toUInt8(0) AS analyze FROM config_mysql_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'pending' AND is_deleted = 0 ORDER BY created_at ASC LIMIT 1")
             .bind(tenant_id).bind(server)
             .fetch_all::<ExplainClaimRow>().await?
             .into_iter().next();
         if let Some(row) = &row {
             self.client
-                .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, server_name, db, query, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0)")
-                .bind(&row.id).bind(tenant_id).bind(server).bind(&row.db).bind(&row.query).bind(Self::now_str()).bind(Self::next_version())
+                .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, server_name, db, query, collector_id, claim_hash, status, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 0)")
+                .bind(&row.id).bind(tenant_id).bind(server).bind(&row.db).bind(&row.query).bind(collector_id).bind(&claim_hash).bind(Self::now_str()).bind(Self::next_version())
                 .execute().await?;
         }
-        Ok(row.map(|row| (row.id, row.db, row.query)))
+        Ok(row.map(|row| (row.id, row.db, row.query, claim)))
     }
 
     pub async fn requeue_stale_mysql_explain_jobs(
@@ -7070,7 +7094,7 @@ impl ConfigDb {
         server: &str,
     ) -> anyhow::Result<u64> {
         let rows = self.client
-            .query("SELECT id, db, query FROM config_mysql_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'running' AND is_deleted = 0 AND updated_at < toString(now() - INTERVAL 2 MINUTE) LIMIT 20")
+            .query("SELECT id, db, query, toUInt8(0) AS analyze FROM config_mysql_explain_jobs FINAL WHERE tenant_id = ? AND server_name = ? AND status = 'running' AND is_deleted = 0 AND updated_at < toString(now() - INTERVAL 2 MINUTE) LIMIT 20")
             .bind(tenant_id).bind(server)
             .fetch_all::<ExplainClaimRow>().await?;
         let mut count = 0;
@@ -7088,15 +7112,33 @@ impl ConfigDb {
         &self,
         tenant_id: &str,
         id: &str,
+        server: &str,
+        collector_id: &str,
+        claim: &str,
         plan_json: &str,
         error: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        let claim_hash = crate::handlers::settings::hash_api_key(claim);
+        let valid = self.client.query("SELECT count() FROM config_mysql_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND server_name = ? AND collector_id = ? AND claim_hash = ? AND status = 'running' AND updated_at >= toString(now() - INTERVAL 2 MINUTE) AND is_deleted = 0")
+            .bind(id).bind(tenant_id).bind(server).bind(collector_id).bind(&claim_hash).fetch_one::<u64>().await?;
+        if valid == 0 {
+            return Ok(false);
+        }
+        if !self
+            .claim_sso_key_once(
+                &format!("explain-result:mysql:{tenant_id}:{id}:{claim_hash}"),
+                chrono::Utc::now().timestamp() + 120,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         let status = if error.is_empty() { "done" } else { "error" };
         self.client
-            .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, status, plan_json, error, updated_at, version, is_deleted) SELECT id, tenant_id, ?, ?, ?, ?, ?, 0 FROM config_mysql_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
-            .bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version()).bind(id).bind(tenant_id)
+            .query("INSERT INTO config_mysql_explain_jobs (id, tenant_id, server_name, db, query, status, plan_json, error, updated_at, version, is_deleted) SELECT id, tenant_id, server_name, db, query, ?, ?, ?, ?, ?, 0 FROM config_mysql_explain_jobs FINAL WHERE id = ? AND tenant_id = ? AND server_name = ? AND collector_id = ? AND claim_hash = ? AND status = 'running' AND updated_at >= toString(now() - INTERVAL 2 MINUTE) AND is_deleted = 0 LIMIT 1")
+            .bind(status).bind(plan_json).bind(error).bind(Self::now_str()).bind(Self::next_version()).bind(id).bind(tenant_id).bind(server).bind(collector_id).bind(&claim_hash)
             .execute().await?;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn get_mysql_explain_job(

@@ -433,7 +433,7 @@ impl CollectorManager {
 
         let endpoint = std::env::var("RUSH_COLLECTOR_OTLP_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:8080".into());
-        let mut command = Command::new(&binary);
+        let mut command = collector_command(&binary, std::env::vars_os());
         command
             .env(runtime.config_env, &config_path)
             .env("RUSH_OTLP_ENDPOINT", endpoint)
@@ -492,6 +492,57 @@ impl CollectorManager {
             }
         });
     }
+}
+
+/// A collector handles untrusted database responses. Do not give it API signing,
+/// audit, storage, SSO, or integration-encryption credentials.
+fn collector_command(
+    binary: &str,
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Command {
+    const ALLOWED: &[&str] = &[
+        "PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "TZ",
+        "LANG",
+        "LC_ALL",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "RUSH_LICENSE_KEY",
+        "RUSH_LICENSE_PUBKEY",
+        "COLLECTOR_ACTIVITY_INTERVAL_SECS",
+        "COLLECTOR_CONCURRENCY",
+        "COLLECTOR_DATABASES",
+        "COLLECTOR_EXCLUDE_DATABASES",
+        "COLLECTOR_ENVIRONMENT",
+        "COLLECTOR_ERROR_INTERVAL_SECS",
+        "COLLECTOR_EXPLAIN_POLL_SECS",
+        "COLLECTOR_HEALTH_INTERVAL_SECS",
+        "COLLECTOR_INCLUDE_ERROR_TEXT",
+        "COLLECTOR_INCLUDE_LIVE_QUERY_TEXT",
+        "COLLECTOR_METRICS_INTERVAL_SECS",
+        "COLLECTOR_QUERY_INTERVAL_SECS",
+        "COLLECTOR_QUERY_TEXT_CAP",
+        "COLLECTOR_REPLICATION_INTERVAL_SECS",
+        "COLLECTOR_SCHEMA_INTERVAL_SECS",
+        "COLLECTOR_SERVER_NAME",
+        "COLLECTOR_SETTINGS_INTERVAL_SECS",
+        "COLLECTOR_TARGET_REFRESH_SECS",
+        "COLLECTOR_TOP_QUERIES",
+        "COLLECTOR_ALLOW_INSECURE_DB_TLS",
+        "PG_TLS_CA_FILE",
+        "MYSQL_TLS_CA_FILE",
+    ];
+    let mut command = Command::new(binary);
+    command.env_clear().env("RUSH_COLLECTOR_MANAGED", "true");
+    for (key, value) in environment {
+        if key.to_str().is_some_and(|key| ALLOWED.contains(&key)) {
+            command.env(key, value);
+        }
+    }
+    command
 }
 
 fn static_config_fingerprint(path: &Path) -> Result<String> {
@@ -560,6 +611,60 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collector_environment_is_an_allowlist_not_a_copy_of_api_secrets() {
+        let vars = [
+            "PATH",
+            "RUSH_LICENSE_KEY",
+            "COLLECTOR_QUERY_INTERVAL_SECS",
+            "RUSH_INTEGRATION_ENCRYPTION_KEY",
+            "CLICKHOUSE_PASSWORD",
+            "RUSH_AUDIT_HMAC_KEY",
+            "GOOGLE_CLIENT_SECRET",
+            "RUSH_API_KEY",
+            "PG_DSN",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "UNKNOWN_FUTURE_SECRET",
+        ];
+        let mut command = collector_command(
+            "/usr/bin/env",
+            vars.map(|name| (name.into(), "test-value".into())),
+        );
+        let keys: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, _)| key.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "COLLECTOR_QUERY_INTERVAL_SECS",
+                "PATH",
+                "RUSH_COLLECTOR_MANAGED",
+                "RUSH_LICENSE_KEY"
+            ]
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let mut names: Vec<_> = output
+            .lines()
+            .map(|line| line.split_once('=').unwrap().0)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "COLLECTOR_QUERY_INTERVAL_SECS",
+                "PATH",
+                "RUSH_COLLECTOR_MANAGED",
+                "RUSH_LICENSE_KEY"
+            ]
+        );
+    }
 
     const PRIMARY_SECRET: &str = "primary-integration-secret-32-bytes-minimum";
     const ROTATED_SECRET: &str = "rotated-integration-secret-32-bytes-minimum";
