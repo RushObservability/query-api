@@ -720,6 +720,76 @@ fn normalize_slo_incident_events(
 mod auth_storage_tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_work_runs_off_thread_and_preserves_hash_verification() {
+        let runtime_thread = std::thread::current().id();
+        let worker_thread = password_work(|| std::thread::current().id()).await.unwrap();
+        assert_ne!(runtime_thread, worker_thread);
+        let hash = bounded_hash_password("test-only long passphrase")
+            .await
+            .unwrap();
+        assert!(
+            password_work(move || verify_password("test-only long passphrase", &hash))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !password_work(|| verify_password("wrong", dummy_password_hash()))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_work_is_bounded_even_when_request_is_cancelled() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_limit = limit.clone();
+        let request = tokio::spawn(async move {
+            password_work_with_limit(worker_limit, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // A timer still runs on this single-thread runtime while the worker is blocked.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let error = password_work_with_limit(limit.clone(), || ())
+            .await
+            .unwrap_err();
+        assert!(error.is::<PasswordWorkBusy>());
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            limit.available_permits(),
+            0,
+            "cancellation must not free a running job's permit"
+        );
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(1), limit.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(password_work_with_limit(limit, || 42).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn password_worker_panic_releases_capacity() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(
+            password_work_with_limit(limit.clone(), || panic!("test worker failure"))
+                .await
+                .is_err()
+        );
+        assert_eq!(limit.available_permits(), 1);
+    }
+
     #[test]
     fn sso_revisions_fail_closed_and_cover_every_mapping() {
         let mut rows = vec![
@@ -1008,7 +1078,7 @@ mod auth_storage_tests {
                 .next()
                 .unwrap();
             assert!(
-                body.contains("hash_password("),
+                body.contains("bounded_hash_password("),
                 "{function} bypasses policy"
             );
         }
@@ -1582,6 +1652,52 @@ mod slo_event_tests {
 
         assert!(normalize_slo_incident_events(events, 100).is_empty());
     }
+}
+
+const PASSWORD_WORK_CONCURRENCY: usize = 4;
+
+#[derive(Debug, thiserror::Error)]
+#[error("password verification capacity is temporarily exhausted")]
+pub struct PasswordWorkBusy;
+
+async fn password_work_with_limit<T, F>(
+    limit: Arc<tokio::sync::Semaphore>,
+    work: F,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    // Acquire before submitting to Tokio's blocking pool. There is no waiting
+    // request queue, and cancellation cannot release a running job's permit.
+    let permit = limit.try_acquire_owned().map_err(|_| PasswordWorkBusy)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("password worker failed: {error}"))
+}
+
+async fn password_work<T, F>(work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    static LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    password_work_with_limit(
+        LIMIT
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(PASSWORD_WORK_CONCURRENCY)))
+            .clone(),
+        work,
+    )
+    .await
+}
+
+async fn bounded_hash_password(password: &str) -> anyhow::Result<String> {
+    validate_password_policy(password)?;
+    let password = password.to_owned();
+    password_work(move || hash_password(&password)).await?
 }
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
@@ -2227,7 +2343,7 @@ impl ConfigDb {
         db.initialize_sso_claim_store().await?;
         // Do this at startup so the first unknown-user login has no one-time
         // initialization cost that could become a timing signal.
-        let _ = dummy_password_hash();
+        password_work(dummy_password_hash).await?;
         db.validate_unique_usernames().await?;
         Ok(db)
     }
@@ -4027,7 +4143,7 @@ impl ConfigDb {
             })?;
 
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = hash_password(&initial_password)?;
+        let password_hash = bounded_hash_password(&initial_password).await?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
@@ -4083,12 +4199,17 @@ impl ConfigDb {
         // ambiguous identities all verify the same dummy Argon2 hash so their
         // response timing does not reveal account state or provider type.
         let usable_local_identity = rows.len() == 1 && rows[0].auth_provider == "local";
-        let password_hash = if usable_local_identity {
-            rows[0].password_hash.as_str()
-        } else {
-            dummy_password_hash()
-        };
-        let credentials_valid = verify_password(password, password_hash);
+        let password_hash = usable_local_identity.then(|| rows[0].password_hash.clone());
+        let password = password.to_owned();
+        let credentials_valid = password_work(move || {
+            verify_password(
+                &password,
+                password_hash
+                    .as_deref()
+                    .unwrap_or_else(|| dummy_password_hash()),
+            )
+        })
+        .await?;
 
         if rows.len() > 1 {
             anyhow::bail!(
@@ -4852,7 +4973,7 @@ impl ConfigDb {
         let _username_guard = self.username_mutation_lock.lock().await;
         self.ensure_username_available(username).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        let password_hash = hash_password(password)?;
+        let password_hash = bounded_hash_password(password).await?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
@@ -4985,7 +5106,7 @@ impl ConfigDb {
             });
         }
 
-        let password_hash = hash_password(new_password)?;
+        let password_hash = bounded_hash_password(new_password).await?;
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")

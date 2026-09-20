@@ -242,9 +242,7 @@ fn extract_setup_session(headers: &HeaderMap) -> Result<SsoSetupSession, String>
 }
 
 fn insecure_cookies_enabled() -> bool {
-    std::env::var("RUSH_INSECURE_COOKIES")
-        .map(|value| matches!(value.as_str(), "1" | "true"))
-        .unwrap_or(false)
+    crate::handlers::auth::insecure_cookies_enabled()
 }
 
 fn sso_transaction_cookie(value: &str, protocol: &str, max_age: i64) -> Result<String, String> {
@@ -720,21 +718,34 @@ async fn fetch_bounded_oidc_json<T: serde::de::DeserializeOwned>(
 }
 
 async fn parse_bounded_oidc_response<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     label: &str,
 ) -> anyhow::Result<T> {
     if response
         .content_length()
+        .or_else(|| {
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)?
+                .to_str()
+                .ok()?
+                .parse::<u64>()
+                .ok()
+        })
         .is_some_and(|length| length > OIDC_METADATA_MAX_BYTES as u64)
     {
         anyhow::bail!("{label} response is too large");
     }
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| anyhow::anyhow!("{label} response failed: {e}"))?;
-    if bytes.len() > OIDC_METADATA_MAX_BYTES {
-        anyhow::bail!("{label} response is too large");
+        .map_err(|e| anyhow::anyhow!("{label} response failed: {e}"))?
+    {
+        if chunk.len() > OIDC_METADATA_MAX_BYTES - bytes.len() {
+            anyhow::bail!("{label} response is too large");
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("{label} is invalid JSON: {e}"))
 }
@@ -3342,6 +3353,87 @@ pub async fn complete_setup_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn oidc_test_response(chunks: Vec<Result<bytes::Bytes, std::io::Error>>) -> reqwest::Response {
+        reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(
+            futures_util::stream::iter(chunks),
+        )))
+    }
+
+    #[tokio::test]
+    async fn oidc_json_stream_accepts_fragmented_and_exact_limit_bodies() {
+        let response = oidc_test_response(vec![
+            Ok(bytes::Bytes::from_static(b"{\"ok\":")),
+            Ok(bytes::Bytes::from_static(b"true}")),
+        ]);
+        let value: serde_json::Value = parse_bounded_oidc_response(response, "test").await.unwrap();
+        assert_eq!(value["ok"], true);
+        let exact = format!("\"{}\"", "x".repeat(OIDC_METADATA_MAX_BYTES - 2));
+        let value: String =
+            parse_bounded_oidc_response(oidc_test_response(vec![Ok(exact.into())]), "test")
+                .await
+                .unwrap();
+        assert_eq!(value.len(), OIDC_METADATA_MAX_BYTES - 2);
+    }
+
+    #[tokio::test]
+    async fn oidc_json_stream_stops_at_limit_without_waiting_for_eof() {
+        use futures_util::StreamExt;
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = polled.clone();
+        let stream = futures_util::stream::iter(
+            (0..17).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'x'; 65536]))),
+        )
+        .inspect(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .chain(futures_util::stream::pending());
+        let response = reqwest::Response::from(axum::http::Response::new(
+            reqwest::Body::wrap_stream(stream),
+        ));
+        assert_eq!(response.content_length(), None);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            parse_bounded_oidc_response::<serde_json::Value>(response, "test"),
+        )
+        .await
+        .expect("must reject without EOF");
+        assert!(result.unwrap_err().to_string().contains("too large"));
+        assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 17);
+    }
+
+    #[tokio::test]
+    async fn oidc_json_stream_rejects_declared_overflow_bad_json_and_io_errors() {
+        let pending = reqwest::Body::wrap_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header("content-length", OIDC_METADATA_MAX_BYTES + 1)
+                .body(pending)
+                .unwrap(),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            parse_bounded_oidc_response::<serde_json::Value>(response, "test"),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().to_string().contains("too large"));
+        for chunks in [
+            vec![Ok(bytes::Bytes::from_static(b"not json"))],
+            vec![Err(std::io::Error::other("test read failure"))],
+        ] {
+            assert!(
+                parse_bounded_oidc_response::<serde_json::Value>(
+                    oidc_test_response(chunks),
+                    "test"
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn public_sso_errors_do_not_expose_internal_details() {
