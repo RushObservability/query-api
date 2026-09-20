@@ -106,7 +106,7 @@ pub async fn send(config: &Value, payload: &Value) -> Result<(), String> {
     validate_config(config)?;
     let url = config["url"].as_str().unwrap_or(WEBHOOK_URL);
     let token = config["token"].as_str().unwrap_or_default();
-    let response = crate::outbound::strict_public_https_request(reqwest::Method::POST, url)
+    let response = super::delivery::request(reqwest::Method::POST, url, true)
         .await?
         .header(reqwest::header::AUTHORIZATION, auth_header(token)?)
         .json(payload)

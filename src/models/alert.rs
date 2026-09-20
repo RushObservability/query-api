@@ -261,7 +261,9 @@ fn default_empty_array() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_config;
+    use super::{
+        NotificationChannel, NotificationChannelResponse, SECRET_CONFIG_KEYS, redact_config,
+    };
 
     #[test]
     fn notification_response_redacts_credentials_and_endpoints() {
@@ -300,5 +302,44 @@ mod tests {
         assert_eq!(redacted["region"], "eu");
         assert_eq!(redacted["severity"], "error");
         assert!(!redacted.to_string().contains("pd-secret"));
+    }
+
+    #[test]
+    fn every_secret_field_is_redacted_in_channel_api_responses() {
+        for kind in [
+            "slack",
+            "slack_app",
+            "discord",
+            "webhook",
+            "alertmanager",
+            "rootly",
+            "pagerduty",
+            "email",
+        ] {
+            let mut config = serde_json::json!({"channel": "alerts", "region": "eu", "recipients": "oncall@example.invalid"});
+            for key in SECRET_CONFIG_KEYS {
+                config[*key] = serde_json::json!("do-not-expose");
+            }
+            let response = NotificationChannelResponse::from(NotificationChannel {
+                id: "channel-1".into(),
+                tenant_id: "tenant-1".into(),
+                name: "On-call".into(),
+                channel_type: kind.into(),
+                config: config.to_string(),
+                enabled: true,
+                created_at: "".into(),
+            });
+            for key in SECRET_CONFIG_KEYS {
+                assert!(response.config.get(*key).is_none(), "{kind}: {key}");
+                assert_eq!(response.config[format!("{key}_configured")], true);
+            }
+            assert_eq!(response.config["channel"], "alerts");
+            assert_eq!(response.tenant_id, "tenant-1");
+            assert!(
+                !serde_json::to_string(&response)
+                    .unwrap()
+                    .contains("do-not-expose")
+            );
+        }
     }
 }

@@ -738,9 +738,105 @@ async fn validate_channel_config(
 }
 
 #[cfg(test)]
-mod rootly_config_tests {
+mod channel_config_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn all_channel_configs_validate_without_network_access() {
+        let valid = [
+            (
+                "slack",
+                json!({"webhook_url": "https://example.invalid/slack"}),
+            ),
+            ("slack", json!({"url": "https://example.invalid/legacy"})),
+            ("slack_app", json!({"token": "fake-token", "channel": "C1"})),
+            (
+                "discord",
+                json!({"webhook_url": "https://example.invalid/discord"}),
+            ),
+            (
+                "webhook",
+                json!({"url": "https://example.invalid/hook", "method": "PUT"}),
+            ),
+            (
+                "alertmanager",
+                json!({"url": "https://example.invalid/alertmanager"}),
+            ),
+            ("email", json!({"recipients": "oncall@example.invalid"})),
+            ("email", json!({"to": "legacy@example.invalid"})),
+            (
+                "rootly",
+                json!({"url": crate::alert_engine::rootly::WEBHOOK_URL, "token": "fake-secret"}),
+            ),
+            ("pagerduty", json!({"routing_key": "fake-key"})),
+        ];
+        for (kind, config) in valid {
+            assert!(
+                validate_channel_config(kind, &config).await.is_ok(),
+                "{kind}"
+            );
+            for missing in [json!({}), json!(null), json!([])] {
+                assert!(
+                    validate_channel_config(kind, &missing).await.is_err(),
+                    "{kind}"
+                );
+            }
+        }
+        assert!(
+            validate_channel_config("unknown", &json!({"url": "https://example.invalid"}))
+                .await
+                .is_err()
+        );
+        for config in [json!({"token": "fake-token"}), json!({"channel": "C1"})] {
+            assert!(validate_channel_config("slack_app", &config).await.is_err());
+        }
+        for kind in ["slack", "discord", "webhook", "alertmanager"] {
+            for url in [
+                "",
+                "not-a-url",
+                "file:///etc/passwd",
+                "https://user:secret@example.invalid",
+            ] {
+                let config = json!({"url": url, "webhook_url": url});
+                let error = validate_channel_config(kind, &config).await.unwrap_err();
+                assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                assert!(!error.1.contains("user:secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn editing_preserves_omitted_empty_and_null_credentials_but_accepts_rotation() {
+        for key in [
+            "url",
+            "webhook_url",
+            "token",
+            "routing_key",
+            "api_key",
+            "headers",
+        ] {
+            let secret = if key == "headers" {
+                json!({"Authorization": "Bearer fake-secret"})
+            } else {
+                json!("fake-secret")
+            };
+            let existing = json!({key: secret, "channel": "old-channel"});
+            for incoming in [json!({}), json!({key: ""}), json!({key: null})] {
+                assert_eq!(
+                    merge_channel_config(existing.clone(), incoming),
+                    existing,
+                    "{key}"
+                );
+            }
+            let updated = merge_channel_config(
+                existing,
+                json!({key: "replacement", "channel": "new-channel"}),
+            );
+            assert_eq!(updated[key], "replacement");
+            assert_eq!(updated["channel"], "new-channel");
+        }
+    }
 
     #[tokio::test]
     async fn pagerduty_validation_and_secret_preservation() {
