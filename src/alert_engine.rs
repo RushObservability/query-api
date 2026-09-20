@@ -200,8 +200,9 @@ fn build_slack_payload(
     serde_json::json!({ "attachments": [attachment] })
 }
 
-/// Send a notification to a channel and log the result.
-/// Returns Ok(()) on success or Err with the error message.
+pub(crate) mod rootly;
+
+/// Send a notification to a channel. The caller records the delivery result.
 pub async fn send_channel_notification(
     channel: &crate::models::alert::NotificationChannel,
     message: &str,
@@ -376,62 +377,22 @@ pub async fn send_channel_notification(
                 .map_err(|e| format!("pagerduty notification failed: {e}"))?;
             Ok(())
         }
-        "opsgenie" => {
-            let api_key = config
-                .get("api_key")
-                .and_then(|k| k.as_str())
-                .ok_or_else(|| "opsgenie channel config missing api_key".to_string())?;
-
-            if alert_state == "ok" || alert_state == "RESOLVED" {
-                // Close the alert
-                let alias = format!("rush-alert-{}", alert_name.replace(' ', "-").to_lowercase());
-                let close_url = format!("https://api.opsgenie.com/v2/alerts/{}/close", alias);
-                let payload = serde_json::json!({
-                    "source": "rush-observability",
-                    "note": message,
-                });
-                http_client
-                    .post(&close_url)
-                    .header("Authorization", format!("GenieKey {api_key}"))
-                    .query(&[("identifierType", "alias")])
-                    .json(&payload)
-                    .send()
-                    .await
-                    .map_err(|e| format!("opsgenie close failed: {e}"))?;
-            } else {
-                let priority = config
-                    .get("priority_mapping")
-                    .and_then(|m| m.get("critical"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("P1");
-
-                let mut og_payload = serde_json::json!({
-                    "message": message,
-                    "alias": format!("rush-alert-{}", alert_name.replace(' ', "-").to_lowercase()),
-                    "priority": priority,
-                    "source": "rush-observability",
-                    "details": {
-                        "value": value,
-                        "threshold": threshold,
-                    }
-                });
-
-                if let Some(responders) = config.get("responders") {
-                    og_payload["responders"] = responders.clone();
-                }
-                if let Some(tags) = config.get("tags") {
-                    og_payload["tags"] = tags.clone();
-                }
-
-                http_client
-                    .post("https://api.opsgenie.com/v2/alerts")
-                    .header("Authorization", format!("GenieKey {api_key}"))
-                    .json(&og_payload)
-                    .send()
-                    .await
-                    .map_err(|e| format!("opsgenie notification failed: {e}"))?;
-            }
-            Ok(())
+        "rootly" => {
+            rootly::send(
+                &config,
+                &rootly::payload(
+                    channel,
+                    alert_id,
+                    alert_name,
+                    alert_state,
+                    message,
+                    value,
+                    threshold,
+                    signal_type,
+                    runbook_url,
+                ),
+            )
+            .await
         }
         "slack_app" => {
             let token = config

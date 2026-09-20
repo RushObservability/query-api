@@ -278,4 +278,16 @@ mod tests {
         assert!(redacted.get("webhook_url").is_none());
         assert!(redacted.get("token").is_none());
     }
+
+    #[test]
+    fn rootly_response_hides_url_and_bearer_secret() {
+        let redacted = redact_config(
+            r#"{"url":"https://webhooks.rootly.com/webhooks/incoming/generic_webhooks","token":"rootly-source-secret"}"#,
+        );
+        assert_eq!(
+            redacted,
+            serde_json::json!({"url_configured": true, "token_configured": true})
+        );
+        assert!(!redacted.to_string().contains("rootly-source-secret"));
+    }
 }
