@@ -200,6 +200,7 @@ fn build_slack_payload(
     serde_json::json!({ "attachments": [attachment] })
 }
 
+pub(crate) mod pagerduty;
 pub(crate) mod rootly;
 
 /// Send a notification to a channel. The caller records the delivery result.
@@ -337,45 +338,22 @@ pub async fn send_channel_notification(
             Ok(())
         }
         "pagerduty" => {
-            let routing_key = config
-                .get("routing_key")
-                .and_then(|r| r.as_str())
-                .ok_or_else(|| "pagerduty channel config missing routing_key".to_string())?;
-
-            let event_action = if alert_state == "ok" || alert_state == "RESOLVED" {
-                "resolve"
-            } else {
-                "trigger"
-            };
-
-            let pd_severity = config
-                .get("severity_mapping")
-                .and_then(|m| m.get("critical"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("critical");
-
-            let payload = serde_json::json!({
-                "routing_key": routing_key,
-                "event_action": event_action,
-                "dedup_key": format!("rush-alert-{}", alert_name.replace(' ', "-").to_lowercase()),
-                "payload": {
-                    "summary": message,
-                    "severity": pd_severity,
-                    "source": "rush-observability",
-                    "custom_details": {
-                        "value": value,
-                        "threshold": threshold,
-                    }
-                }
-            });
-
-            http_client
-                .post("https://events.pagerduty.com/v2/enqueue")
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("pagerduty notification failed: {e}"))?;
-            Ok(())
+            pagerduty::send(
+                &config,
+                &pagerduty::payload(
+                    channel,
+                    &config,
+                    alert_id,
+                    alert_name,
+                    alert_state,
+                    message,
+                    value,
+                    threshold,
+                    signal_type,
+                    runbook_url,
+                ),
+            )
+            .await
         }
         "rootly" => {
             rootly::send(
