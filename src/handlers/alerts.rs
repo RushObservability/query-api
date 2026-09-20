@@ -552,8 +552,16 @@ pub async fn notify_channel(
 
     let config: serde_json::Value = serde_json::from_str(&channel.config)
         .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
-    if channel.channel_type == "rootly" {
-        let result = crate::alert_engine::rootly::send(&config, &payload).await;
+    if matches!(channel.channel_type.as_str(), "rootly" | "pagerduty") {
+        let result = if channel.channel_type == "pagerduty" {
+            crate::alert_engine::pagerduty::send(
+                &config,
+                &crate::alert_engine::pagerduty::manual_payload(&channel, &config, &payload),
+            )
+            .await
+        } else {
+            crate::alert_engine::rootly::send(&config, &payload).await
+        };
         state
             .audit
             .log(
@@ -668,14 +676,8 @@ async fn validate_channel_config(
                 ));
             }
         }
-        "pagerduty" => {
-            if config.get("routing_key").and_then(|v| v.as_str()).is_none() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "pagerduty channel requires 'routing_key' in config".to_string(),
-                ));
-            }
-        }
+        "pagerduty" => crate::alert_engine::pagerduty::validate_config(config)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
         "rootly" => crate::alert_engine::rootly::validate_config(config)
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
         "slack_app" => {
@@ -739,6 +741,21 @@ async fn validate_channel_config(
 mod rootly_config_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn pagerduty_validation_and_secret_preservation() {
+        let saved = json!({"routing_key": "saved-key", "region": "eu", "severity": "error"});
+        let merged = merge_channel_config(saved.clone(), json!({"routing_key": ""}));
+        assert_eq!(merged, saved);
+        assert!(validate_channel_config("pagerduty", &merged).await.is_ok());
+        let rotated = merge_channel_config(saved, json!({"routing_key": "new-key"}));
+        assert_eq!(rotated["routing_key"], "new-key");
+        assert!(
+            validate_channel_config("pagerduty", &json!({"routing_key": " "}))
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn rootly_validation_and_secret_preservation() {

@@ -290,4 +290,15 @@ mod tests {
         );
         assert!(!redacted.to_string().contains("rootly-source-secret"));
     }
+
+    #[test]
+    fn pagerduty_response_hides_integration_key_but_keeps_region_and_severity() {
+        let redacted =
+            redact_config(r#"{"routing_key":"pd-secret","region":"eu","severity":"error"}"#);
+        assert!(redacted.get("routing_key").is_none());
+        assert_eq!(redacted["routing_key_configured"], true);
+        assert_eq!(redacted["region"], "eu");
+        assert_eq!(redacted["severity"], "error");
+        assert!(!redacted.to_string().contains("pd-secret"));
+    }
 }

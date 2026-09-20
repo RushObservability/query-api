@@ -651,7 +651,8 @@ async fn fire_notifications(
                 continue;
             }
             // A recovery for one monitor group must not resolve another group's alert.
-            let notification_id = if channel.channel_type == "rootly" {
+            let notification_id = if matches!(channel.channel_type.as_str(), "rootly" | "pagerduty")
+            {
                 alert_engine::rootly::monitor_alert_id(&monitor.id, group_key)
             } else {
                 monitor.id.clone()
