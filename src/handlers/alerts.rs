@@ -283,7 +283,7 @@ pub async fn create_channel(
         "slack_app",
         "email",
         "pagerduty",
-        "opsgenie",
+        "rootly",
         "discord",
         "alertmanager",
     ];
@@ -443,7 +443,7 @@ pub async fn test_channel(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let channel = state
         .config_db
         .get_channel(&id, &tenant.tenant_id)
@@ -497,6 +497,19 @@ pub async fn test_channel(
         Err(e) => ("failed", e.clone()),
     };
 
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("notification_channel.test", "user")
+                .actor(caller.0, caller.1)
+                .tenant(tenant.tenant_id.clone())
+                .resource("notification_channel", &id)
+                .outcome(if result.is_ok() { "success" } else { "failure" })
+                .changes(serde_json::json!({"channel_type": channel.channel_type}).to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
     let _ = state
         .config_db
         .create_notification_log(
@@ -529,7 +542,7 @@ pub async fn notify_channel(
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let channel = state
         .config_db
         .get_channel(&id, &tenant.tenant_id)
@@ -539,6 +552,28 @@ pub async fn notify_channel(
 
     let config: serde_json::Value = serde_json::from_str(&channel.config)
         .map_err(|e| crate::api_error::internal_legacy("alerts", e))?;
+    if channel.channel_type == "rootly" {
+        let result = crate::alert_engine::rootly::send(&config, &payload).await;
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("notification_channel.notify", "user")
+                    .actor(caller.0, caller.1)
+                    .tenant(tenant.tenant_id.clone())
+                    .resource("notification_channel", &id)
+                    .outcome(if result.is_ok() { "success" } else { "failure" })
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        result.map_err(|e| {
+            crate::api_error::internal_legacy_with_status(
+                StatusCode::BAD_GATEWAY,
+                "alerts.notify_channel",
+                e,
+            )
+        })?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let url = config
         .get("url")
         .or_else(|| config.get("webhook_url"))
@@ -641,14 +676,8 @@ async fn validate_channel_config(
                 ));
             }
         }
-        "opsgenie" => {
-            if config.get("api_key").and_then(|v| v.as_str()).is_none() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "opsgenie channel requires 'api_key' in config".to_string(),
-                ));
-            }
-        }
+        "rootly" => crate::alert_engine::rootly::validate_config(config)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
         "slack_app" => {
             if config.get("token").and_then(|v| v.as_str()).is_none() {
                 return Err((
@@ -679,7 +708,12 @@ async fn validate_channel_config(
                 ));
             }
         }
-        _ => {}
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "unsupported notification channel type".into(),
+            ));
+        }
     }
     if matches!(
         channel_type,
@@ -699,4 +733,30 @@ async fn validate_channel_config(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rootly_config_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn rootly_validation_and_secret_preservation() {
+        let saved =
+            json!({"url": crate::alert_engine::rootly::WEBHOOK_URL, "token": "saved-secret"});
+        assert!(validate_channel_config("rootly", &saved).await.is_ok());
+        let merged = merge_channel_config(saved.clone(), json!({"url": "", "token": ""}));
+        assert_eq!(merged, saved);
+        assert!(validate_channel_config("rootly", &merged).await.is_ok());
+        assert!(
+            validate_channel_config(
+                "rootly",
+                &json!({"url": crate::alert_engine::rootly::WEBHOOK_URL})
+            )
+            .await
+            .is_err()
+        );
+        let rotated = merge_channel_config(saved, json!({"token": "rotated-secret"}));
+        assert_eq!(rotated["token"], "rotated-secret");
+    }
 }

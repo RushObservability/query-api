@@ -342,6 +342,7 @@ async fn evaluate_monitor(
             fire_notifications(
                 config_db,
                 monitor,
+                group_key,
                 &alert_name,
                 &notification_message,
                 new_state,
@@ -533,6 +534,7 @@ async fn handle_no_data(
             fire_notifications(
                 config_db,
                 monitor,
+                "",
                 &monitor.name,
                 &event_msg,
                 new_state,
@@ -614,6 +616,7 @@ fn resolve_notification_channel_ids(
 async fn fire_notifications(
     config_db: &ConfigDb,
     monitor: &Monitor,
+    group_key: &str,
     alert_name: &str,
     message: &str,
     alert_state: &str,
@@ -647,6 +650,12 @@ async fn fire_notifications(
             if !channel.enabled {
                 continue;
             }
+            // A recovery for one monitor group must not resolve another group's alert.
+            let notification_id = if channel.channel_type == "rootly" {
+                alert_engine::rootly::monitor_alert_id(&monitor.id, group_key)
+            } else {
+                monitor.id.clone()
+            };
             let result = alert_engine::send_channel_notification(
                 &channel,
                 message,
@@ -657,7 +666,7 @@ async fn fire_notifications(
                 "monitors",
                 &monitor.comparator,
                 "",
-                &monitor.id,
+                &notification_id,
                 "",
                 http_client,
                 smtp_config,
@@ -770,6 +779,7 @@ async fn evaluate_composite(
         fire_notifications(
             config_db,
             monitor,
+            "",
             &monitor.name,
             &event_msg,
             new_state,
