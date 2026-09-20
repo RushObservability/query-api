@@ -624,13 +624,17 @@ enum SsoClaimStoreMode {
     Keeper,
 }
 
-fn sso_claim_store_mode(raw: Option<&str>, replicas: usize) -> anyhow::Result<SsoClaimStoreMode> {
+fn sso_claim_store_mode(
+    raw: Option<&str>,
+    replicas: usize,
+    production: bool,
+) -> anyhow::Result<SsoClaimStoreMode> {
     let mode = raw.unwrap_or("auto").trim().to_ascii_lowercase();
     match mode.as_str() {
-        "auto" if replicas > 1 => Ok(SsoClaimStoreMode::Keeper),
+        "auto" if production || replicas > 1 => Ok(SsoClaimStoreMode::Keeper),
         "auto" => Ok(SsoClaimStoreMode::Local),
-        "local" if replicas > 1 => anyhow::bail!(
-            "{SSO_CLAIM_STORE_ENV}=local is unsafe with {QUERY_API_REPLICAS_ENV}={replicas}; use keeper"
+        "local" if production || replicas > 1 => anyhow::bail!(
+            "{SSO_CLAIM_STORE_ENV}=local is only allowed for single-instance development/test; production and multiple replicas require keeper"
         ),
         "local" => Ok(SsoClaimStoreMode::Local),
         "keeper" => Ok(SsoClaimStoreMode::Keeper),
@@ -652,7 +656,11 @@ fn configured_sso_claim_store_mode() -> anyhow::Result<SsoClaimStoreMode> {
         })
         .transpose()?
         .unwrap_or(1);
-    sso_claim_store_mode(std::env::var(SSO_CLAIM_STORE_ENV).ok().as_deref(), replicas)
+    sso_claim_store_mode(
+        std::env::var(SSO_CLAIM_STORE_ENV).ok().as_deref(),
+        replicas,
+        crate::api_key_auth::production_mode(),
+    )
 }
 
 fn sso_claim_storage_key(key: &str) -> String {
@@ -1177,18 +1185,32 @@ mod auth_storage_tests {
     #[test]
     fn sso_claim_store_requires_shared_coordination_for_multiple_replicas() {
         assert_eq!(
-            sso_claim_store_mode(Some("auto"), 1).unwrap(),
+            sso_claim_store_mode(Some("auto"), 1, false).unwrap(),
             SsoClaimStoreMode::Local
         );
         assert_eq!(
-            sso_claim_store_mode(Some("auto"), 2).unwrap(),
+            sso_claim_store_mode(Some("auto"), 2, false).unwrap(),
             SsoClaimStoreMode::Keeper
         );
-        assert!(sso_claim_store_mode(Some("local"), 2).is_err());
+        assert!(sso_claim_store_mode(Some("local"), 2, false).is_err());
         assert_eq!(
-            sso_claim_store_mode(Some("keeper"), 1).unwrap(),
+            sso_claim_store_mode(Some("keeper"), 1, false).unwrap(),
             SsoClaimStoreMode::Keeper
         );
+    }
+
+    #[test]
+    fn production_replay_protection_is_durable_even_for_one_replica() {
+        for replicas in [1, 2, 10] {
+            for mode in [None, Some("auto"), Some("keeper")] {
+                assert_eq!(
+                    sso_claim_store_mode(mode, replicas, true).unwrap(),
+                    SsoClaimStoreMode::Keeper
+                );
+            }
+            assert!(sso_claim_store_mode(Some("local"), replicas, true).is_err());
+        }
+        assert!(sso_claim_store_mode(Some("unknown"), 1, true).is_err());
     }
 
     #[test]
@@ -2016,7 +2038,7 @@ pub struct ConfigDb {
     /// produce a collision.
     username_mutation_lock: tokio::sync::Mutex<()>,
     /// One-time SAML/setup claims. Keeper mode gives every API replica the same
-    /// linearizable keyspace; local mode is accepted only for a single replica.
+    /// linearizable keyspace; local mode is only for single-replica development.
     sso_claim_store_mode: SsoClaimStoreMode,
     local_sso_claims: DashMap<String, i64>,
     sso_claim_cleanup_counter: AtomicU64,
@@ -2212,7 +2234,9 @@ impl ConfigDb {
 
     async fn initialize_sso_claim_store(&self) -> anyhow::Result<()> {
         if self.sso_claim_store_mode == SsoClaimStoreMode::Local {
-            tracing::info!("SSO replay protection uses the single-replica in-process claim store");
+            tracing::warn!(
+                "development SSO replay protection is in-memory and resets on restart; use keeper for durable protection"
+            );
             return Ok(());
         }
 
@@ -2225,7 +2249,7 @@ impl ConfigDb {
         );
         self.client.query(&ddl).execute().await.map_err(|error| {
             anyhow::anyhow!(
-                "shared SSO replay store initialization failed; configure ClickHouse Keeper and keeper_map_path_prefix, or run exactly one query-api replica: {error}"
+                "durable SSO replay store initialization failed; configure ClickHouse Keeper and keeper_map_path_prefix (required in production, including one replica): {error}"
             )
         })?;
         tracing::info!(
@@ -3127,6 +3151,10 @@ impl ConfigDb {
             .client
             .query(&insert)
             .with_option("keeper_map_strict_mode", "1")
+            // Async insertion can batch two claims for the same key into one
+            // KeeperMap write and acknowledge both callers. Every claim needs
+            // its own atomic create, even when the server defaults to async.
+            .with_option("async_insert", "0")
             .bind(&claim_key)
             .bind(expires_at)
             .bind(now)

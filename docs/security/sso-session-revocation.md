@@ -51,6 +51,7 @@ In another terminal:
 
 ```sh
 RUSH_TEST_CLICKHOUSE_URL=http://localhost:18123 \
+RUSH_ENVIRONMENT=test \
 RUSH_SSO_REPLAY_STORE=local \
 RUSH_SESSION_HMAC_SECRET=test-only-session-key-not-for-deployment \
 RUSH_CONFIG_ENCRYPTION_KEY=test-only-encryption-key-not-for-deployment \
