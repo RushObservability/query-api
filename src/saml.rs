@@ -33,6 +33,8 @@ pub struct SamlLoginRequest {
 
 #[derive(Debug, Clone)]
 struct SubjectConfirmation {
+    method: String,
+    not_before_present: bool,
     recipient: String,
     in_response_to: String,
     not_on_or_after: String,
@@ -106,10 +108,66 @@ pub fn verify_signature(xml: &str, idp_cert_pem: &str) -> Result<String, String>
         .join("");
 
     match opensaml::crypto::verify::verify_signature(xml, std::slice::from_ref(&cert_b64)) {
-        Ok((true, Some(verified_content))) => Ok(verified_content),
+        Ok((true, Some(verified_content))) => preserve_signed_namespaces(xml, &verified_content),
         Ok((true, None)) => Err("SAML signature did not cover consumable content".to_string()),
         Ok((false, _)) => Err("SAML signature verification failed".to_string()),
         Err(e) => Err(format!("SAML signature verification error: {e:?}")),
+    }
+}
+
+/// opensaml returns an exact assertion substring, without inherited namespace
+/// declarations. Copy only the bindings in scope at that verified substring;
+/// do not infer namespaces from a familiar prefix such as `saml`.
+fn preserve_signed_namespaces(xml: &str, verified: &str) -> Result<String, String> {
+    use quick_xml::name::PrefixDeclaration;
+    let mut matches = xml.match_indices(verified);
+    let offset = matches
+        .next()
+        .map(|(offset, _)| offset)
+        .ok_or("verified SAML content is not an original subtree")?;
+    if matches.next().is_some() {
+        return Err("ambiguous verified SAML subtree".into());
+    }
+    let mut reader = quick_xml::NsReader::from_str(xml);
+    let mut buf = Vec::new();
+    loop {
+        let start = reader.buffer_position() as usize;
+        let event = reader
+            .read_event_into(&mut buf)
+            .map_err(|_| "invalid signed SAML XML")?;
+        if start == offset {
+            if let Event::Start(element) = event {
+                let declared: Vec<Vec<u8>> = element
+                    .attributes()
+                    .map(|attr| attr.map(|attr| attr.key.as_ref().to_vec()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| "invalid SAML namespace declaration")?;
+                let mut root = element.into_owned();
+                for (prefix, namespace) in reader.resolver().bindings() {
+                    let key = match prefix {
+                        PrefixDeclaration::Default => "xmlns".to_string(),
+                        PrefixDeclaration::Named(prefix) => format!(
+                            "xmlns:{}",
+                            std::str::from_utf8(prefix).map_err(|_| "invalid namespace prefix")?
+                        ),
+                    };
+                    if !declared.iter().any(|name| name == key.as_bytes()) {
+                        root.push_attribute((key.as_bytes(), namespace.as_ref()));
+                    }
+                }
+                let end = reader.buffer_position() as usize - offset;
+                return Ok(format!(
+                    "<{}>{}",
+                    std::str::from_utf8(root.as_ref()).map_err(|_| "invalid assertion text")?,
+                    &verified[end..]
+                ));
+            }
+            return Err("verified SAML content is not an element".into());
+        }
+        if matches!(event, Event::Eof) {
+            return Err("verified SAML subtree not found".into());
+        }
+        buf.clear();
     }
 }
 
@@ -138,11 +196,163 @@ struct ParsedSamlAssertion {
     root_name: String,
     response_in_response_to: String,
     destination: String,
-    conditions_not_before: String,
-    conditions_not_on_or_after: String,
-    audiences: Vec<String>,
-    confirmations: Vec<SubjectConfirmation>,
     assertion_count: usize,
+}
+
+#[derive(Default)]
+struct SamlConstraints {
+    not_before: String,
+    not_on_or_after: String,
+    audience_restrictions: Vec<Vec<String>>,
+    confirmations: Vec<SubjectConfirmation>,
+}
+
+/// Read constraints from their schema positions, keeping each audience
+/// restriction separate. Local-name matches alone must not admit extensions.
+fn parse_saml_constraints(xml: &str) -> Result<SamlConstraints, String> {
+    use quick_xml::name::ResolveResult;
+    const ASSERTION_NS: &[u8] = b"urn:oasis:names:tc:SAML:2.0:assertion";
+    const PROTOCOL_NS: &[u8] = b"urn:oasis:names:tc:SAML:2.0:protocol";
+    let mut reader = quick_xml::NsReader::from_str(xml);
+    let mut path: Vec<String> = Vec::new();
+    let mut result = SamlConstraints::default();
+    let mut conditions_count = 0;
+    let mut method = String::new();
+    let mut confirmation_data_count = 0;
+    let mut audience = String::new();
+    let mut buf = Vec::new();
+    loop {
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buf)
+            .map_err(|error| format!("XML constraint parse error: {error}"))?;
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                let empty = matches!(event, Event::Empty(_));
+                let name = element.name();
+                let local = local_name(name.as_ref());
+                let parent = path.last().map(String::as_str).unwrap_or("");
+                let saml =
+                    matches!(&namespace, ResolveResult::Bound(ns) if ns.as_ref() == ASSERTION_NS);
+                if matches!(
+                    local,
+                    "Conditions" | "AudienceRestriction" | "SubjectConfirmationData"
+                ) {
+                    for attr in element.attributes() {
+                        let attr = attr.map_err(|_| "malformed SAML constraint attribute")?;
+                        if local_name(attr.key.as_ref()) == "type" {
+                            return Err("unsupported SAML constraint type override".into());
+                        }
+                    }
+                }
+                if path.is_empty()
+                    && !((local == "Assertion" && saml)
+                        || (local == "Response"
+                            && matches!(&namespace, ResolveResult::Bound(ns) if ns.as_ref() == PROTOCOL_NS)))
+                {
+                    return Err("unsupported signed SAML root element".into());
+                }
+                if parent == "Conditions" && (!saml || local != "AudienceRestriction") {
+                    return Err("unsupported SAML condition".into());
+                }
+                if parent == "AudienceRestriction" && (!saml || local != "Audience") {
+                    return Err("unsupported SAML audience restriction content".into());
+                }
+                if matches!(parent, "Audience" | "SubjectConfirmationData") {
+                    return Err("unsupported SAML constraint content".into());
+                }
+                match local {
+                    "Assertion" if !saml || !(parent.is_empty() || parent == "Response") => {
+                        return Err("misplaced SAML assertion".into());
+                    }
+                    "Subject" if !saml || parent != "Assertion" => {
+                        return Err("misplaced SAML subject".into());
+                    }
+                    "Conditions" => {
+                        if !saml || parent != "Assertion" || conditions_count != 0 {
+                            return Err(
+                                "SAML must have one assertion-level Conditions element".into()
+                            );
+                        }
+                        conditions_count += 1;
+                        result.not_before =
+                            attribute(element, b"NotBefore", reader.decoder()).unwrap_or_default();
+                        result.not_on_or_after =
+                            attribute(element, b"NotOnOrAfter", reader.decoder())
+                                .unwrap_or_default();
+                    }
+                    "AudienceRestriction" => {
+                        if !saml || parent != "Conditions" {
+                            return Err("misplaced SAML audience restriction".into());
+                        }
+                        result.audience_restrictions.push(Vec::new());
+                    }
+                    "Audience" => {
+                        if !saml || parent != "AudienceRestriction" {
+                            return Err("misplaced SAML audience".into());
+                        }
+                        audience.clear();
+                    }
+                    "SubjectConfirmation" => {
+                        if !saml
+                            || parent != "Subject"
+                            || path.iter().rev().nth(1).map(String::as_str) != Some("Assertion")
+                        {
+                            return Err("misplaced SAML subject confirmation".into());
+                        }
+                        method =
+                            attribute(element, b"Method", reader.decoder()).unwrap_or_default();
+                        confirmation_data_count = 0;
+                    }
+                    "SubjectConfirmationData" => {
+                        if !saml || parent != "SubjectConfirmation" || confirmation_data_count != 0
+                        {
+                            return Err(
+                                "misplaced or duplicate SAML subject confirmation data".into()
+                            );
+                        }
+                        confirmation_data_count += 1;
+                        result.confirmations.push(SubjectConfirmation {
+                            method: method.clone(),
+                            not_before_present: attribute(element, b"NotBefore", reader.decoder())
+                                .is_some(),
+                            recipient: attribute(element, b"Recipient", reader.decoder())
+                                .unwrap_or_default(),
+                            in_response_to: attribute(element, b"InResponseTo", reader.decoder())
+                                .unwrap_or_default(),
+                            not_on_or_after: attribute(element, b"NotOnOrAfter", reader.decoder())
+                                .unwrap_or_default(),
+                        });
+                    }
+                    _ => {}
+                }
+                if !empty {
+                    path.push(local.to_string());
+                }
+            }
+            Event::Text(ref text) if path.last().is_some_and(|name| name == "Audience") => {
+                let decoded = text.decode().map_err(|_| "invalid SAML audience text")?;
+                audience.push_str(
+                    &quick_xml::escape::unescape(&decoded)
+                        .map_err(|_| "invalid SAML audience escape")?,
+                );
+            }
+            Event::End(ref element) => {
+                if local_name(element.name().as_ref()) == "Audience" {
+                    result
+                        .audience_restrictions
+                        .last_mut()
+                        .ok_or("missing SAML audience restriction")?
+                        .push(audience.clone());
+                }
+                path.pop();
+            }
+            Event::DocType(_) => return Err("SAML document types are not supported".into()),
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(result)
 }
 
 fn attribute(
@@ -198,6 +408,7 @@ pub fn validate_signed_assertion(
     const CLOCK_SKEW_SECS: i64 = 120;
 
     let parsed = parse_assertion_xml(signed_xml, groups_claim)?;
+    let constraints = parse_saml_constraints(signed_xml)?;
     if parsed.assertion_count != 1 {
         return Err("SAML response must contain exactly one assertion".to_string());
     }
@@ -210,23 +421,28 @@ pub fn validate_signed_assertion(
     if parsed.assertion.issuer != expected_issuer {
         return Err("SAML assertion issuer does not match the configured IdP".to_string());
     }
-    if parsed.conditions_not_before.is_empty() || parsed.conditions_not_on_or_after.is_empty() {
+    if constraints.not_before.is_empty() || constraints.not_on_or_after.is_empty() {
         return Err(
             "SAML assertion Conditions must include NotBefore and NotOnOrAfter".to_string(),
         );
     }
-    let not_before = parse_saml_time(&parsed.conditions_not_before, "NotBefore")?;
-    let not_on_or_after = parse_saml_time(&parsed.conditions_not_on_or_after, "NotOnOrAfter")?;
+    let not_before = parse_saml_time(&constraints.not_before, "NotBefore")?;
+    let not_on_or_after = parse_saml_time(&constraints.not_on_or_after, "NotOnOrAfter")?;
+    if not_before >= not_on_or_after {
+        return Err("SAML Conditions validity interval is empty".into());
+    }
     if now + CLOCK_SKEW_SECS < not_before {
         return Err("SAML assertion is not yet valid".to_string());
     }
     if now - CLOCK_SKEW_SECS >= not_on_or_after {
         return Err("SAML assertion has expired".to_string());
     }
-    if !parsed
-        .audiences
-        .iter()
-        .any(|audience| audience == expected_audience)
+    if constraints.audience_restrictions.is_empty()
+        || !constraints.audience_restrictions.iter().all(|restriction| {
+            restriction
+                .iter()
+                .any(|audience| audience == expected_audience)
+        })
     {
         return Err("SAML assertion audience does not match this service provider".to_string());
     }
@@ -240,23 +456,28 @@ pub fn validate_signed_assertion(
         }
     }
 
-    let confirmation = parsed.confirmations.iter().find(|confirmation| {
-        confirmation.recipient == expected_recipient
-            && confirmation.in_response_to == expected_request_id
-    });
-    let confirmation = confirmation.ok_or_else(|| {
-        "SAML SubjectConfirmationData does not match the ACS URL and login request".to_string()
-    })?;
-    if confirmation.not_on_or_after.is_empty() {
-        return Err("SAML SubjectConfirmationData is missing NotOnOrAfter".to_string());
-    }
-    let subject_expiry = parse_saml_time(
-        &confirmation.not_on_or_after,
-        "SubjectConfirmationData NotOnOrAfter",
-    )?;
-    if now - CLOCK_SKEW_SECS >= subject_expiry {
-        return Err("SAML subject confirmation has expired".to_string());
-    }
+    // Confirmations are alternatives, but all checks must succeed on the same
+    // bearer confirmation. Web Browser SSO forbids its NotBefore attribute.
+    let subject_expiry = constraints
+        .confirmations
+        .iter()
+        .filter_map(|confirmation| {
+            if confirmation.method != "urn:oasis:names:tc:SAML:2.0:cm:bearer"
+                || confirmation.not_before_present
+                || confirmation.recipient != expected_recipient
+                || confirmation.in_response_to != expected_request_id
+            {
+                return None;
+            }
+            parse_saml_time(
+                &confirmation.not_on_or_after,
+                "SubjectConfirmationData NotOnOrAfter",
+            )
+            .ok()
+            .filter(|expiry| now - CLOCK_SKEW_SECS < *expiry)
+        })
+        .min()
+        .ok_or("SAML has no valid bearer SubjectConfirmationData for this login")?;
 
     let mut assertion = parsed.assertion;
     assertion.expires_at = not_on_or_after.min(subject_expiry);
@@ -278,11 +499,6 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
     let mut in_assertion = false;
     let mut issuer = String::new();
     let mut in_issuer = false;
-    let mut conditions_not_before = String::new();
-    let mut conditions_not_on_or_after = String::new();
-    let mut audiences = Vec::new();
-    let mut in_audience = false;
-    let mut confirmations = Vec::new();
     let mut name_id = String::new();
     let mut attributes: HashMap<String, String> = HashMap::new();
     let mut current_attr_name = String::new();
@@ -324,20 +540,6 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                         }
                     }
                     "Issuer" => in_issuer = true,
-                    "Conditions" => {
-                        conditions_not_before =
-                            attribute(e, b"NotBefore", reader.decoder()).unwrap_or_default();
-                        conditions_not_on_or_after =
-                            attribute(e, b"NotOnOrAfter", reader.decoder()).unwrap_or_default();
-                    }
-                    "Audience" => in_audience = true,
-                    "SubjectConfirmationData" => confirmations.push(SubjectConfirmation {
-                        recipient: attribute(e, b"Recipient", reader.decoder()).unwrap_or_default(),
-                        in_response_to: attribute(e, b"InResponseTo", reader.decoder())
-                            .unwrap_or_default(),
-                        not_on_or_after: attribute(e, b"NotOnOrAfter", reader.decoder())
-                            .unwrap_or_default(),
-                    }),
                     "NameID" => {
                         in_name_id = true;
                     }
@@ -365,7 +567,6 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                     match local {
                         "Assertion" => in_assertion = false,
                         "Issuer" => in_issuer = false,
-                        "Audience" => in_audience = false,
                         "NameID" => in_name_id = false,
                         "StatusMessage" => in_status_message = false,
                         "AttributeValue" => in_attr_value = false,
@@ -386,8 +587,6 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                     .unwrap_or_default();
                 if in_issuer && in_assertion {
                     issuer = text;
-                } else if in_audience {
-                    audiences.push(text);
                 } else if in_name_id {
                     name_id = text;
                 } else if in_status_message {
@@ -407,7 +606,6 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                 match local {
                     "Assertion" => in_assertion = false,
                     "Issuer" => in_issuer = false,
-                    "Audience" => in_audience = false,
                     "NameID" => in_name_id = false,
                     "StatusMessage" => in_status_message = false,
                     "AttributeValue" => in_attr_value = false,
@@ -470,10 +668,6 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
         root_name,
         response_in_response_to,
         destination,
-        conditions_not_before,
-        conditions_not_on_or_after,
-        audiences,
-        confirmations,
         assertion_count,
     })
 }
@@ -706,6 +900,50 @@ mod tests {
         .expect("validated signed SAML assertion");
         assert_eq!(assertion.name_id, "jane@acme.com");
         assert_eq!(assertion.groups, ["operators"]);
+
+        // All malformed examples are signed with the trusted key. Rejection
+        // must come from constraint validation, not a broken signature.
+        let invalid = [
+            ("conflicting restrictions", template.replace("</saml:Conditions>", "<saml:AudienceRestriction><saml:Audience>https://other.example.com</saml:Audience></saml:AudienceRestriction></saml:Conditions>")),
+            ("empty restriction", template.replace("</saml:Conditions>", "<saml:AudienceRestriction/></saml:Conditions>")),
+            ("holder of key", template.replace("cm:bearer", "cm:holder-of-key")),
+            ("missing method", template.replace(" Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\"", "")),
+            ("future confirmation", template.replace("<saml:SubjectConfirmationData ", "<saml:SubjectConfirmationData NotBefore=\"2099-01-01T00:00:00Z\" ")),
+            ("past confirmation NotBefore", template.replace("<saml:SubjectConfirmationData ", "<saml:SubjectConfirmationData NotBefore=\"2000-01-01T00:00:00Z\" ")),
+            ("unknown condition", template.replace("</saml:Conditions>", "<custom:Condition xmlns:custom=\"urn:test\"/></saml:Conditions>")),
+            ("proxy condition", template.replace("</saml:Conditions>", "<saml:ProxyRestriction Count=\"0\"/></saml:Conditions>")),
+            ("wrong namespace", template.replace("<saml:AudienceRestriction>", "<saml:AudienceRestriction xmlns:saml=\"urn:attacker\">")),
+            ("condition type override", template.replace("<saml:AudienceRestriction>", "<saml:AudienceRestriction xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"custom\">")),
+            ("unwrapped confirmation data", template.replace("<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">", "").replace("</saml:SubjectConfirmation>", "")),
+        ];
+        for (case, xml) in invalid {
+            let signed = bergshamra::sign(&context, &xml).expect(case);
+            let verified = verify_signature(&signed, &certificate).expect(case);
+            assert!(
+                validate_signed_assertion(
+                    &verified,
+                    "groups",
+                    "_request-1",
+                    recipient,
+                    audience,
+                    "https://idp.example.com",
+                    now
+                )
+                .is_err(),
+                "accepted {case}"
+            );
+        }
+        // Audience alternatives within a restriction are OR; restrictions are
+        // AND. An unsupported confirmation cannot hide a valid bearer choice.
+        for xml in [
+            template.replace("</saml:AudienceRestriction>", "<saml:Audience>https://other.example.com</saml:Audience></saml:AudienceRestriction>"),
+            template.replace("</saml:Conditions>", &format!("<saml:AudienceRestriction><saml:Audience>{audience}</saml:Audience></saml:AudienceRestriction></saml:Conditions>")),
+            template.replace("<saml:SubjectConfirmation Method=", &format!("<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:holder-of-key\"><saml:SubjectConfirmationData Recipient=\"{recipient}\" InResponseTo=\"_request-1\" NotOnOrAfter=\"2023-11-14T22:18:20Z\"/></saml:SubjectConfirmation><saml:SubjectConfirmation Method=")),
+        ] {
+            let signed = bergshamra::sign(&context, &xml).unwrap();
+            let verified = verify_signature(&signed, &certificate).unwrap();
+            validate_signed_assertion(&verified, "groups", "_request-1", recipient, audience, "https://idp.example.com", now).unwrap();
+        }
 
         let tampered = signed.replace("jane@acme.com", "attacker@example.com");
         assert!(verify_signature(&tampered, &certificate).is_err());
