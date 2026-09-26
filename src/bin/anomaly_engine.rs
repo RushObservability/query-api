@@ -95,15 +95,50 @@ async fn main() -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?,
     );
     rush_api::query_governor::install_global(query_governor);
-    anomaly_engine::run_anomaly_engine(
+
+    // Takes the same lease as the in-process engine, so this deployment and any
+    // API replica can never both evaluate rules.
+    let shutdown = rush_api::shutdown::ShutdownController::new();
+    let election = rush_api::leader::LeaderElection::from_env(
+        config_db.client.clone(),
+        &rush_api::stats_engine::configured_instance_id(),
+        self_metrics.clone(),
+        Some(shutdown.clone()),
+    )
+    .await?;
+    let engine = anomaly_engine::run_anomaly_engine(
         config_db,
         read_ch,
         write_ch,
         smtp_config,
         prom_base_url,
         self_metrics,
-    )
-    .await;
+        election.lease(rush_api::leader::ANOMALIES),
+    );
+    tokio::select! {
+        _ = engine => {}
+        _ = stop_signal() => {
+            // Release the lease so another replica takes over without waiting
+            // out its TTL.
+            shutdown.request();
+            rush_api::leader::wait_for_release(std::time::Duration::from_secs(3)).await;
+        }
+    }
 
     Ok(())
+}
+
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }

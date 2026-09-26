@@ -177,6 +177,8 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `RUSH_EXPECTED_QUERY_API_REPLICAS` | `1` | deployment contract for HA buffering |
 | `RUSH_RUN_REPLAYER` | `true` | set `false` on HA API replicas |
 | `RUSH_DRAIN_WORKER_ONLY` | `false` | run one shared-buffer drain worker |
+| `RUSH_LEADER_ELECTION` | `auto` | `auto`, `local`, or `keeper`; `auto` uses Keeper leases for production or more than one replica, and `local` refuses to start in either |
+| `RUSH_LEADER_LEASE_TTL_SECS` | `15` | background-engine lease lifetime, 6 to 300 seconds; renewed every third of it |
 | `RUSH_SHUTDOWN_TOKEN` | _(empty)_ | optional token for non-loopback shutdown callers |
 | `RUSH_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `RUST_LOG` | _(unset)_ | tracing filter, for example `rush_api=info` |
@@ -318,6 +320,45 @@ watch `rush_ingest_spool_oldest_age_secs`, `rush_ingest_spool_segments`, and
 `rush_ingest_spool_utilization_ratio` until the backlog returns to zero. Do not
 scale drain workers horizontally until the queue has a distributed claim/lease
 protocol.
+
+### Background engines with several replicas
+
+Every replica starts the alert, SLO, anomaly, detection, and retention engines.
+Each engine takes a lease in a ClickHouse KeeperMap table (`config_engine_leases`)
+and only runs its cycles on the replica holding it, so rules are evaluated and
+notifications sent once, however many replicas run. Alert and SLO state stays in
+ClickHouse, so a new leader carries on from where the last one stopped.
+
+Managed collectors (`RUSH_COLLECTOR_MANAGER_ENABLED=true`, licensed builds) take
+a `collectors` lease the same way. Only the holder runs PostgreSQL and MySQL
+collector processes, for every tenant with enabled targets. A replica that loses
+the lease stops its collectors within a second, before another replica can take
+over. Collectors run as child processes, so in a container they also stop when
+query-api dies; outside a container, a query-api killed with SIGKILL leaves its
+collectors running until something else stops them.
+
+A leader renews every third of `RUSH_LEADER_LEASE_TTL_SECS` and stops acting a
+third of a TTL before its lease could expire, so it has stepped down before any
+other replica can take over. A clean shutdown releases the lease at once; after
+a crash, another replica takes over within one TTL. Notifications are
+at-least-once: a leader that dies after sending but before saving the new state
+causes one repeat from the next leader.
+
+`/healthz` reports each lease's holder and epoch under `engines`. On `/metrics`:
+
+| Metric | Meaning |
+|---|---|
+| `rush_engine_leader{engine}` | 1 on the replica holding the lease, 0 elsewhere |
+| `rush_engine_leader_info{engine,holder}` | the same, labelled with this replica's holder id |
+| `rush_engine_lease_epoch{engine}` | increments each time a different replica takes the lease |
+| `rush_engine_lease_last_renewal_timestamp_seconds{engine}` | last successful renewal by this replica as leader |
+| `rush_engine_lease_renew_duration_ms{engine}` | acquire/renew round trips to Keeper |
+| `rush_engine_leader_changes_total{engine}` | times this replica gained or lost the lease |
+| `rush_engine_lease_errors_total{engine}` | failed acquire/renew attempts |
+
+`sum by (engine) (rush_engine_leader) != 1` for more than a TTL means an engine
+has no leader (usually Keeper is unreachable) or, if above 1, a misconfigured
+install running `RUSH_LEADER_ELECTION=local` on several replicas.
 
 ### Kubernetes graceful shutdown
 

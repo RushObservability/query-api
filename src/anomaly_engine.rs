@@ -119,6 +119,7 @@ pub fn spawn_anomaly_engine(
     smtp_config: SmtpConfig,
     prom_base_url: String,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+    lease: Arc<crate::leader::EngineLease>,
 ) {
     tokio::spawn(run_anomaly_engine(
         config_db,
@@ -127,6 +128,7 @@ pub fn spawn_anomaly_engine(
         smtp_config,
         prom_base_url,
         self_metrics,
+        lease,
     ));
 }
 
@@ -138,6 +140,7 @@ pub async fn run_anomaly_engine(
     smtp_config: SmtpConfig,
     prom_base_url: String,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+    lease: Arc<crate::leader::EngineLease>,
 ) {
     let http_client = reqwest::Client::new();
     let smtp_transport = build_smtp_transport(&smtp_config);
@@ -152,8 +155,11 @@ pub async fn run_anomaly_engine(
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
+        if !lease.is_leader() {
+            continue;
+        }
         let start = std::time::Instant::now();
-        let ok = match eval_anomaly_rules(
+        let cycle = eval_anomaly_rules(
             &config_db,
             &read_ch,
             &write_ch,
@@ -161,9 +167,8 @@ pub async fn run_anomaly_engine(
             &smtp_config,
             &smtp_transport,
             &prom_base_url,
-        )
-        .await
-        {
+        );
+        let ok = match crate::leader::fenced(lease.clone(), cycle).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::error!(error = %e, engine = "anomaly", "anomaly engine error");
@@ -388,7 +393,7 @@ async fn eval_anomaly_rules(
     }
 
     // Flush all per-series eval logs in one INSERT (previously one per series).
-    if !eval_log_values.is_empty() {
+    if !eval_log_values.is_empty() && crate::leader::ensure_leader().is_ok() {
         let sql = format!(
             "INSERT INTO logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES {}",
             eval_log_values.join(", ")
@@ -597,6 +602,10 @@ async fn send_notifications(
     message: &str,
     is_anomalous: bool,
 ) {
+    if let Err(error) = crate::leader::ensure_leader() {
+        tracing::info!(engine = "anomaly", rule_id = %rule.id, %error, "notifications skipped");
+        return;
+    }
     let channel_ids: Vec<String> =
         serde_json::from_str(&rule.notification_channel_ids).unwrap_or_default();
     for channel_id in &channel_ids {

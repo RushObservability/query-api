@@ -12,6 +12,7 @@ pub fn spawn_retention_enforcer(
     config: RushConfig,
     config_db: Arc<ConfigDb>,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+    lease: Arc<crate::leader::EngineLease>,
 ) {
     if !config.retention.enforcer.enabled {
         tracing::info!(
@@ -37,24 +38,31 @@ pub fn spawn_retention_enforcer(
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
+            if !lease.is_leader() {
+                continue;
+            }
             let start = std::time::Instant::now();
-            let mut ok = true;
-            // Apply table-level TTLs from the UI-editable global-retention store
-            // (the source of truth; rush.toml only seeds it and was applied at boot).
-            if !dry_run {
-                if let Err(e) = apply_global_retention_ttls(&ch, &config_db).await {
-                    tracing::error!(error = %e, engine = "retention", "applying global retention TTLs failed");
+            let ok = crate::leader::fenced(lease.clone(), async {
+                let mut ok = true;
+                // Apply table-level TTLs from the UI-editable global-retention store
+                // (the source of truth; rush.toml only seeds it and was applied at boot).
+                if !dry_run && crate::leader::ensure_leader().is_ok() {
+                    if let Err(e) = apply_global_retention_ttls(&ch, &config_db).await {
+                        tracing::error!(error = %e, engine = "retention", "applying global retention TTLs failed");
+                        ok = false;
+                    }
+                }
+                if let Err(e) = enforce_retention(&ch, &config).await {
+                    tracing::error!(error = %e, engine = "retention", "global retention enforcement failed");
                     ok = false;
                 }
-            }
-            if let Err(e) = enforce_retention(&ch, &config).await {
-                tracing::error!(error = %e, engine = "retention", "global retention enforcement failed");
-                ok = false;
-            }
-            if let Err(e) = enforce_tenant_retention(&ch, &config, &config_db).await {
-                tracing::error!(error = %e, engine = "retention", "tenant retention enforcement failed");
-                ok = false;
-            }
+                if let Err(e) = enforce_tenant_retention(&ch, &config, &config_db).await {
+                    tracing::error!(error = %e, engine = "retention", "tenant retention enforcement failed");
+                    ok = false;
+                }
+                ok
+            })
+            .await;
             self_metrics.record_engine(
                 "retention_enforcer",
                 start.elapsed().as_millis() as u64,
@@ -183,6 +191,10 @@ async fn execute_or_log(ch: &Client, sql: &str, dry_run: bool) {
             dry_run = true,
             "would execute retention delete"
         );
+        return;
+    }
+    if let Err(error) = crate::leader::ensure_leader() {
+        tracing::info!(engine = "retention", %error, "retention delete not executed");
         return;
     }
     tracing::debug!(engine = "retention", "executing retention delete");

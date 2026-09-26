@@ -2372,18 +2372,30 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn background engines (skipped in drain-worker-only mode)
     //
-    // Each rule-evaluation engine runs in-process by default (single-binary /
-    // local dev) and can be disabled per-replica with RUSH_RUN_<X>_ENGINE=false
-    // so that in HA only one replica evaluates rules — N replicas would mean N×
-    // rule-eval load on ClickHouse and N× duplicate notifications (the
-    // last_eval_at gate is racy across replicas: ReplacingMergeTree is
-    // eventually consistent). Same semantics as RUSH_RUN_ANOMALY_ENGINE below.
+    // Every replica starts every engine, and each engine only runs its cycles
+    // on the replica holding its leader lease (see rush_api::leader), so rules
+    // are evaluated and notifications sent once however many replicas run.
+    // RUSH_RUN_<X>_ENGINE=false still keeps an engine off a given process, for
+    // installs that run engines in a dedicated deployment.
     let engine_enabled = |var: &str| -> bool {
         std::env::var(var)
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
             .unwrap_or(true)
     };
-    if !drain_only {
+    let election = if drain_only {
+        None
+    } else {
+        Some(
+            rush_api::leader::LeaderElection::from_env(
+                config_db.client.clone(),
+                &instance_id,
+                self_metrics.clone(),
+                Some(shutdown_controller.clone()),
+            )
+            .await?,
+        )
+    };
+    if let Some(election) = election.as_ref() {
         // Legacy alert-rules engine retired — Monitors (monitor_engine) is the single
         // alerting system. The alert_engine module is kept only for the shared
         // notification infrastructure (SmtpConfig, send_channel_notification) that
@@ -2394,6 +2406,7 @@ async fn main() -> anyhow::Result<()> {
                 ch.clone(),
                 admin_ch.clone(),
                 self_metrics.clone(),
+                election.lease(rush_api::leader::SLOS),
             );
         } else {
             tracing::info!(
@@ -2405,10 +2418,9 @@ async fn main() -> anyhow::Result<()> {
         // sends notifications. Queries Prometheus-source rules against the API's own
         // /prom endpoint (RUSH_PROM_BASE_URL, defaulting to this server).
         //
-        // Runs in-process by default (single-binary / local dev). In Kubernetes the
-        // chart runs a dedicated `anomaly_engine` Deployment, so it sets
-        // RUSH_RUN_ANOMALY_ENGINE=false on the API to avoid double-evaluating rules
-        // and sending duplicate notifications.
+        // Runs in-process by default. The chart can instead run a dedicated
+        // `anomaly_engine` Deployment and set RUSH_RUN_ANOMALY_ENGINE=false here;
+        // both take the same lease, so running both is also safe.
         let run_anomaly_in_process = std::env::var("RUSH_RUN_ANOMALY_ENGINE")
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
             .unwrap_or(true);
@@ -2422,6 +2434,7 @@ async fn main() -> anyhow::Result<()> {
                 smtp_config.clone(),
                 prom_base_url,
                 self_metrics.clone(),
+                election.lease(rush_api::leader::ANOMALIES),
             );
         } else {
             tracing::info!(
@@ -2433,6 +2446,7 @@ async fn main() -> anyhow::Result<()> {
             wide_config.clone(),
             config_db.clone(),
             self_metrics.clone(),
+            election.lease(rush_api::leader::RETENTION),
         );
         // stats_engine is spawned after the ingest buffer is built (it emits buffer metrics).
 
@@ -2443,6 +2457,7 @@ async fn main() -> anyhow::Result<()> {
                 config_db.clone(),
                 smtp_config,
                 self_metrics.clone(),
+                election.lease(rush_api::leader::MONITORS),
             );
         } else {
             tracing::info!(
@@ -2453,7 +2468,12 @@ async fn main() -> anyhow::Result<()> {
         // Seed built-in SIEM detection rules and spawn the SIEM detection engine
         config_db.ensure_default_detection_rules().await?;
         if engine_enabled("RUSH_RUN_SIEM_ENGINE") {
-            siem_engine::spawn(ch.clone(), config_db.clone(), self_metrics.clone());
+            siem_engine::spawn(
+                ch.clone(),
+                config_db.clone(),
+                self_metrics.clone(),
+                election.lease(rush_api::leader::DETECTIONS),
+            );
         } else {
             tracing::info!(
                 "in-process siem engine disabled (RUSH_RUN_SIEM_ENGINE=false); expecting a dedicated siem-engine deployment"
@@ -2638,10 +2658,14 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // API-managed integration collector supervisor. It is opt-in and feature
-    // gated so the community binary never launches paid collectors.
-    let collectors = std::sync::Arc::new(rush_api::integrations::CollectorManager::new(
-        config_db.clone(),
-    ));
+    // gated so the community binary never launches paid collectors. Only the
+    // replica holding the collectors lease runs them.
+    let mut collector_manager = rush_api::integrations::CollectorManager::new(config_db.clone());
+    if let Some(election) = election.as_ref().filter(|_| collector_manager.enabled()) {
+        collector_manager =
+            collector_manager.with_lease(election.lease(rush_api::leader::COLLECTORS));
+    }
+    let collectors = std::sync::Arc::new(collector_manager);
     collectors.spawn_reconciler();
 
     let state = AppState {
@@ -3425,6 +3449,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal(shutdown_controller.clone()))
     .await?;
+    // Engines stopped acting when shutdown began; make sure Keeper hears it so
+    // another replica takes over now rather than after the lease TTL.
+    rush_api::leader::wait_for_release(Duration::from_secs(3)).await;
     graceful_shutdown_drain(shutdown_writer, shutdown_controller, replayer_handle).await;
 
     Ok(())

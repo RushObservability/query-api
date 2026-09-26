@@ -110,6 +110,7 @@ pub async fn healthz(State(state): State<AppState>) -> Json<Value> {
             "write_failures": audit.write_failures,
         },
         "secure": secure,
+        "engines": crate::leader::status(),
     }))
 }
 

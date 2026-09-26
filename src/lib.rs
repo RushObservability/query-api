@@ -16,6 +16,7 @@ pub mod handlers;
 pub mod ingest_limits;
 pub mod integrations;
 pub mod internal_auth;
+pub mod leader;
 pub mod license;
 pub mod llm_gateway;
 pub mod llm_providers;

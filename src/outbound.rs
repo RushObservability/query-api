@@ -73,6 +73,9 @@ pub fn validate_notification_url(raw_url: &str) -> Result<(), String> {
 /// has no redirects, bounded connect/total timeouts, and pinned DNS
 /// resolution. Private/internal targets require explicit configuration.
 pub async fn public_https_request(method: Method, raw_url: &str) -> Result<RequestBuilder, String> {
+    // A background engine that lost its leader lease must not notify anyone;
+    // the replica that holds the lease now will.
+    crate::leader::ensure_leader().map_err(|error| error.to_string())?;
     guarded_request(method, raw_url, allow_private_notification_urls()).await
 }
 
