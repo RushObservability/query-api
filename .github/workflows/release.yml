@@ -93,6 +93,9 @@ jobs:
       - name: Test advisory scan reporting
         run: python3 scripts/test-summarize-trivy.py
 
+      - name: Test licensed release dispatch configuration
+        run: python3 scripts/test-licensed-dispatch.py
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -114,6 +117,8 @@ jobs:
   build-and-push:
     needs: security-gate
     runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
     permissions:
       contents: write
       packages: write
@@ -284,3 +289,45 @@ jobs:
             release_args+=(--notes-start-tag "$PREVIOUS_TAG")
           fi
           gh release create "${release_args[@]}"
+
+  dispatch-licensed-build:
+    name: Dispatch licensed build
+    needs: [security-gate, build-and-push]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Create licensed-build App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.LICENSE_BUILDER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.LICENSE_BUILDER_APP_PRIVATE_KEY }}
+          owner: RushObservability
+          repositories: query-api-license
+          permission-actions: write
+
+      - name: Dispatch matching licensed release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_VERSION: ${{ needs.security-gate.outputs.version }}
+          RELEASE_TAG: ${{ needs.security-gate.outputs.tag }}
+          QUERY_API_SHA: ${{ github.sha }}
+          PUBLIC_IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "/repos/RushObservability/query-api-license/actions/workflows/release.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[version]=${RELEASE_VERSION}" \
+            -f "inputs[query_api_ref]=${RELEASE_TAG}" \
+            -f "inputs[query_api_sha]=${QUERY_API_SHA}" \
+            -f "inputs[public_image_digest]=${PUBLIC_IMAGE_DIGEST}" \
+            -f "inputs[source_run_url]=${SOURCE_RUN_URL}"
+          echo "Dispatched query-api-license ${RELEASE_TAG}." >> "$GITHUB_STEP_SUMMARY"
