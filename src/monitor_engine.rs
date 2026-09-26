@@ -34,6 +34,7 @@ pub fn spawn(
     config_db: Arc<ConfigDb>,
     smtp_config: alert_engine::SmtpConfig,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+    lease: Arc<crate::leader::EngineLease>,
 ) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
@@ -41,17 +42,21 @@ pub fn spawn(
         let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
 
         loop {
+            if !lease.is_leader() {
+                tokio::time::sleep(crate::leader::FOLLOWER_POLL).await;
+                continue;
+            }
             let start = Instant::now();
             let mut ok = true;
-            let (evaluated, state_changes) = match run_evaluation_cycle(
+            let cycle = run_evaluation_cycle(
                 &ch,
                 &config_db,
                 &http_client,
                 &smtp_config,
                 &smtp_transport,
                 &mut eval_state,
-            )
-            .await
+            );
+            let (evaluated, state_changes) = match crate::leader::fenced(lease.clone(), cycle).await
             {
                 Ok(stats) => stats,
                 Err(e) => {

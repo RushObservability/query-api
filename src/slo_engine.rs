@@ -291,6 +291,9 @@ async fn write_slo_metrics(
     compliant: bool,
     now_nanos: i64,
 ) {
+    if crate::leader::ensure_leader().is_err() {
+        return;
+    }
     let escaped_name = crate::query_builder::escape_string_literal(&slo_name);
     let attrs = format!("{{'slo.id': '{slo_id}', 'slo.name': '{escaped_name}'}}");
     let metrics = [
@@ -331,6 +334,7 @@ pub fn spawn_slo_engine(
     read_ch: Client,
     write_ch: Client,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+    lease: Arc<crate::leader::EngineLease>,
 ) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
@@ -338,16 +342,18 @@ pub fn spawn_slo_engine(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
+            if !lease.is_leader() {
+                continue;
+            }
             let start = std::time::Instant::now();
-            let ok = match eval_slos(
+            let cycle = eval_slos(
                 &config_db,
                 &read_ch,
                 &write_ch,
                 &http_client,
                 &mut eval_state,
-            )
-            .await
-            {
+            );
+            let ok = match crate::leader::fenced(lease.clone(), cycle).await {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!("slo engine error: {e}");

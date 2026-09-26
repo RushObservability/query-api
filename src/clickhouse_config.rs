@@ -8243,6 +8243,7 @@ impl ConfigDb {
         status: &str,
         error: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = Self::now_str();
         self.client
@@ -8876,6 +8877,7 @@ impl ConfigDb {
         last_eval_at: &str,
         last_breached_at: Option<&str>,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let existing = match self.get_slo(id, tenant_id).await? {
             Some(r) => r,
             None => return Ok(()),
@@ -8913,6 +8915,7 @@ impl ConfigDb {
         total_count: f64,
         last_eval_at: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
@@ -8960,6 +8963,7 @@ impl ConfigDb {
         error_budget_remaining: f64,
         message: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let now = Self::now_str();
         self.client
             .query("INSERT INTO config_slo_events (id, slo_id, tenant_id, state, error_count, total_count, error_budget_remaining, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -9222,6 +9226,7 @@ impl ConfigDb {
         last_eval_at: &str,
         last_triggered_at: Option<&str>,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let existing = match self.get_anomaly_rule(id, tenant_id).await? {
             Some(r) => r,
             None => return Ok(()),
@@ -9301,6 +9306,7 @@ impl ConfigDb {
         deviation: f64,
         message: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let now = Self::now_str();
         self.client
             .query("INSERT INTO config_anomaly_events (id, rule_id, tenant_id, state, metric, value, expected, deviation, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -9901,6 +9907,7 @@ impl ConfigDb {
         group_states: &str,
         last_eval_at: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let existing = match self.get_monitor_by_id(id).await? {
             Some(r) => r,
             None => return Ok(()),
@@ -9932,6 +9939,7 @@ impl ConfigDb {
         monitor: &crate::models::monitor::Monitor,
         last_eval_at: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
@@ -9955,6 +9963,7 @@ impl ConfigDb {
         id: &str,
         last_triggered_at: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let existing = match self.get_monitor_by_id(id).await? {
             Some(r) => r,
             None => return Ok(()),
@@ -9989,6 +9998,7 @@ impl ConfigDb {
         threshold: Option<f64>,
         message: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let now = Self::now_str();
         self.client
             .query("INSERT INTO config_monitor_events (id, monitor_id, tenant_id, group_key, prev_state, new_state, value, threshold, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -10375,6 +10385,7 @@ impl ConfigDb {
         last_eval_at: &str,
         last_triggered_at: Option<&str>,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let now = Self::now_str();
         let ver = Self::next_version();
         let triggered =
@@ -10679,6 +10690,7 @@ impl ConfigDb {
         match_count: i64,
         sample_data: &str,
     ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
         let now = Self::now_str();
         self.client
             .query("INSERT INTO config_detection_events (id, rule_id, tenant_id, severity, match_count, sample_data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")

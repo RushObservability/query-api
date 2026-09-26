@@ -14,6 +14,7 @@ pub fn spawn(
     ch: Client,
     config_db: Arc<ConfigDb>,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
+    lease: Arc<crate::leader::EngineLease>,
 ) {
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
@@ -27,9 +28,12 @@ pub fn spawn(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
+            if !lease.is_leader() {
+                continue;
+            }
             let start = std::time::Instant::now();
-            let ok = match run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state).await
-            {
+            let cycle = run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state);
+            let ok = match crate::leader::fenced(lease.clone(), cycle).await {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(error = %e, engine = "siem", "detection cycle failed");

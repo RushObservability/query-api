@@ -227,6 +227,8 @@ pub async fn send_channel_notification(
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
 ) -> Result<(), String> {
+    // Covers email too, which doesn't go through the outbound HTTP guard.
+    crate::leader::ensure_leader().map_err(|error| error.to_string())?;
     let config: serde_json::Value =
         serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
 
