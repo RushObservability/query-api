@@ -411,6 +411,7 @@ pub async fn get_runtime_config(
         })
         .collect::<Vec<_>>();
 
+    let session_default = |secs: i64| Some(secs.to_string());
     let mut runtime = vec![
         config_entry("RUSH_PORT", Some("8080"), false, false),
         config_entry("CLICKHOUSE_URL", Some("http://localhost:8123"), false, true),
@@ -420,16 +421,23 @@ pub async fn get_runtime_config(
         config_entry("SRE_AGENT_URL", Some("http://localhost:8081"), false, true),
         config_entry("RUSH_SPOOL_DIR", Some("./data/spool"), false, false),
         config_entry("RUSH_BUFFER_BACKEND", Some("disk"), false, false),
-        config_entry("RUSH_SESSION_IDLE_TIMEOUT_SECS", Some("1800"), false, false),
+        config_entry(
+            "RUSH_SESSION_IDLE_TIMEOUT_SECS",
+            session_default(crate::clickhouse_config::DEFAULT_SESSION_IDLE_TIMEOUT_SECS).as_deref(),
+            false,
+            false,
+        ),
         config_entry(
             "RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS",
-            Some("86400"),
+            session_default(crate::clickhouse_config::DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECS)
+                .as_deref(),
             false,
             false,
         ),
         config_entry(
             "RUSH_SESSION_RENEWAL_INTERVAL_SECS",
-            Some("300"),
+            session_default(crate::clickhouse_config::DEFAULT_SESSION_RENEWAL_INTERVAL_SECS)
+                .as_deref(),
             false,
             false,
         ),
@@ -440,7 +448,7 @@ pub async fn get_runtime_config(
         config_entry("RUSH_API_KEY_SECRET", None, true, false),
         config_entry("RUSH_SSO_TRANSACTION_SECRET", None, true, false),
         config_entry("RUSH_AUDIT_HMAC_SECRET", None, true, false),
-        config_entry("RUSH_SRE_AGENT_INTERNAL_TOKEN", None, true, false),
+        config_entry("SRE_AGENT_INTERNAL_TOKEN", None, true, false),
         config_entry("RUSH_SMTP_PASS", None, true, false),
         config_entry("RUSH_BUFFER_S3_SECRET_KEY", None, true, false),
     ]);

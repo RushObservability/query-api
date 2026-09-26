@@ -18,6 +18,32 @@ pub struct SmtpConfig {
     pub from: String,
 }
 
+impl SmtpConfig {
+    /// Read `RUSH_SMTP_HOST`, `_PORT`, `_USER`, `_PASS`, and `_FROM`. The older
+    /// unprefixed `SMTP_*` names are still accepted when the `RUSH_` name is unset.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let env_or_legacy = |name: &str, legacy: &str| {
+            lookup(name)
+                .or_else(|| lookup(legacy))
+                .filter(|value| !value.trim().is_empty())
+        };
+        Self {
+            host: env_or_legacy("RUSH_SMTP_HOST", "SMTP_HOST"),
+            port: env_or_legacy("RUSH_SMTP_PORT", "SMTP_PORT")
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(587),
+            user: env_or_legacy("RUSH_SMTP_USER", "SMTP_USER"),
+            pass: env_or_legacy("RUSH_SMTP_PASS", "SMTP_PASS"),
+            from: env_or_legacy("RUSH_SMTP_FROM", "SMTP_FROM")
+                .unwrap_or_else(|| "rush@localhost".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct AlertQueryConfig {
     #[serde(default = "default_time_range")]
@@ -869,5 +895,54 @@ mod slack_payload_tests {
             .collect();
         assert!(labels.contains(&"View Alert"));
         assert!(labels.contains(&"View Query"));
+    }
+}
+
+#[cfg(test)]
+mod smtp_config_tests {
+    use super::SmtpConfig;
+    use std::collections::HashMap;
+
+    fn config(vars: &[(&str, &str)]) -> SmtpConfig {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        SmtpConfig::from_lookup(|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn reads_rush_prefixed_names() {
+        let cfg = config(&[
+            ("RUSH_SMTP_HOST", "smtp.example.com"),
+            ("RUSH_SMTP_PORT", "2525"),
+            ("RUSH_SMTP_USER", "alerts"),
+            ("RUSH_SMTP_PASS", "secret"),
+            ("RUSH_SMTP_FROM", "alerts@example.com"),
+        ]);
+        assert_eq!(cfg.host.as_deref(), Some("smtp.example.com"));
+        assert_eq!(cfg.port, 2525);
+        assert_eq!(cfg.user.as_deref(), Some("alerts"));
+        assert_eq!(cfg.pass.as_deref(), Some("secret"));
+        assert_eq!(cfg.from, "alerts@example.com");
+    }
+
+    #[test]
+    fn falls_back_to_unprefixed_names_and_prefers_rush_ones() {
+        let cfg = config(&[
+            ("SMTP_HOST", "legacy.example.com"),
+            ("SMTP_PORT", "25"),
+            ("RUSH_SMTP_PORT", "587"),
+        ]);
+        assert_eq!(cfg.host.as_deref(), Some("legacy.example.com"));
+        assert_eq!(cfg.port, 587);
+    }
+
+    #[test]
+    fn defaults_when_unset_or_blank() {
+        let cfg = config(&[("RUSH_SMTP_HOST", "  "), ("RUSH_SMTP_PORT", "not-a-port")]);
+        assert_eq!(cfg.host, None);
+        assert_eq!(cfg.port, 587);
+        assert_eq!(cfg.from, "rush@localhost");
     }
 }

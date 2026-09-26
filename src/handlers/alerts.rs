@@ -456,16 +456,7 @@ pub async fn test_channel(
         channel.name,
     );
 
-    let smtp_config = crate::alert_engine::SmtpConfig {
-        host: std::env::var("SMTP_HOST").ok(),
-        port: std::env::var("SMTP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(587),
-        user: std::env::var("SMTP_USER").ok(),
-        pass: std::env::var("SMTP_PASS").ok(),
-        from: std::env::var("SMTP_FROM").unwrap_or_else(|_| "rush@localhost".to_string()),
-    };
+    let smtp_config = crate::alert_engine::SmtpConfig::from_env();
     let smtp_transport = if smtp_config.host.is_some() {
         // Build a simple transport for the test
         None // We won't build a full transport here; email tests require SMTP to be configured at startup

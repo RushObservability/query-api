@@ -2314,16 +2314,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("config db opened");
 
     // SMTP config for email notifications (optional)
-    let smtp_config = alert_engine::SmtpConfig {
-        host: std::env::var("RUSH_SMTP_HOST").ok(),
-        port: std::env::var("RUSH_SMTP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(587),
-        user: std::env::var("RUSH_SMTP_USER").ok(),
-        pass: std::env::var("RUSH_SMTP_PASS").ok(),
-        from: std::env::var("RUSH_SMTP_FROM").unwrap_or_else(|_| "wide@localhost".to_string()),
-    };
+    let smtp_config = alert_engine::SmtpConfig::from_env();
 
     // Ingest-buffer drain controls (Phase 3):
     //  RUSH_DRAIN_WORKER_ONLY=true → run only the buffer drain (no HTTP, no engines).
