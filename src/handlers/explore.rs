@@ -795,7 +795,7 @@ fn span_summary_sql(predicate: &str, interval_secs: u64, group_expr: Option<&str
         "service_name",
         "toString(multiIf(http_status_code >= 500, 500, http_status_code >= 400, 400, 200))",
         "http_method",
-        "status IN ('ERROR', 'STATUS_CODE_ERROR') OR http_status_code >= 500",
+        crate::query_builder::ERROR_SPAN,
         "length(service_name) + length(span_name) + length(http_path) + length(attributes)",
         group_expr,
         true,

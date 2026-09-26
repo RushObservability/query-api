@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::AppState;
 use crate::TenantContext;
+use crate::query_builder::ERROR_SPAN;
 
 #[derive(Debug, Serialize, Deserialize, Row)]
 pub struct ServiceEntry {
@@ -116,7 +117,7 @@ pub async fn service_graph(
         "SELECT \
             service_name, \
             count() as request_count, \
-            countIf(http_status_code >= 500 OR status = 'ERROR') as error_count, \
+            countIf({ERROR_SPAN}) as error_count, \
             avg(duration_ns) / 1000000.0 as avg_duration_ms, \
             quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
             quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
@@ -141,7 +142,7 @@ pub async fn service_graph(
          FROM ( \
             SELECT \
                 trace_id, span_id, service_name AS child_svc, parent_span_id, \
-                (http_status_code >= 500 OR status = 'ERROR') AS child_err, \
+                {ERROR_SPAN} AS child_err, \
                 duration_ns AS child_dur \
             FROM spans \
             PREWHERE tenant_id = '{escaped_tenant}' \
@@ -688,7 +689,7 @@ pub async fn service_endpoints(
     let operation_mode = params.mode == "operation";
 
     // Common RED aggregates; only the grouping key + filter differ by mode.
-    let err_expr = "countIf(http_status_code >= 500 OR status = 'ERROR') AS errors";
+    let err_expr = format!("countIf({ERROR_SPAN}) AS errors");
     let pct = "quantile(0.5)(duration_ns)/1000000.0 AS p50_ms, \
                quantile(0.95)(duration_ns)/1000000.0 AS p95_ms, \
                quantile(0.99)(duration_ns)/1000000.0 AS p99_ms";
@@ -827,7 +828,7 @@ pub async fn service_errors(
                 AND service_name = '{escaped_service}' \
                 AND timestamp >= now() - INTERVAL {minutes} MINUTE \
              WHERE kind = 'SPAN_KIND_SERVER' \
-                AND (status = 'ERROR' OR http_status_code >= 500) \
+                AND {ERROR_SPAN} \
              GROUP BY http_status_code, http_method, http_path \
              ORDER BY count DESC \
              LIMIT 50"

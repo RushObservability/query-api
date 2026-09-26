@@ -13,6 +13,7 @@ use crate::models::query::{
 };
 use crate::models::trace::WideEvent;
 use crate::pagination::{CursorPosition, query_scope};
+use crate::query_builder::ERROR_SPAN;
 use crate::query_builder::{build_where_clause_with_search, resolve_field};
 
 fn invalid_cursor() -> (StatusCode, String) {
@@ -61,7 +62,7 @@ fn latency_heatmap_sql(interval_fn: &str, clauses_sql: &str) -> String {
             toString({interval_fn}) as bucket, \
             toInt32(greatest(-24, least(36, floor(log10(greatest(duration_ns / 1000000.0, 0.000001)) * 4)))) as latency_bin, \
             count() as count, \
-            countIf(http_status_code >= 500 OR status = 'ERROR') as error_count \
+            countIf({ERROR_SPAN}) as error_count \
          FROM spans {clauses_sql} \
          GROUP BY bucket, latency_bin \
          ORDER BY bucket ASC, latency_bin ASC"
@@ -656,7 +657,7 @@ pub async fn count_query(
 
     let sql = format!(
         "SELECT toString({interval_fn}) as bucket, count() as count, \
-         countIf(http_status_code >= 500 OR status = 'ERROR') as error_count \
+         countIf({ERROR_SPAN}) as error_count \
          FROM spans {} \
          GROUP BY bucket \
          ORDER BY bucket ASC",
@@ -791,7 +792,7 @@ pub async fn timeseries_query(
                 toString({interval_fn}) as bucket, \
                 toString({col}) as group_key, \
                 count() as count, \
-                countIf(http_status_code >= 500 OR status = 'ERROR') as error_count, \
+                countIf({ERROR_SPAN}) as error_count, \
                 avg(duration_ns) / 1000000.0 as avg_duration_ms, \
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
@@ -861,7 +862,7 @@ pub async fn timeseries_query(
             "SELECT \
                 toString({interval_fn}) as bucket, \
                 count() as count, \
-                countIf(http_status_code >= 500 OR status = 'ERROR') as error_count, \
+                countIf({ERROR_SPAN}) as error_count, \
                 avg(duration_ns) / 1000000.0 as avg_duration_ms, \
                 quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
                 quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \

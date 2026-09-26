@@ -618,6 +618,196 @@ const SSO_CLAIM_STORE_ENV: &str = "RUSH_SSO_REPLAY_STORE";
 const QUERY_API_REPLICAS_ENV: &str = "RUSH_QUERY_API_REPLICAS";
 const SSO_CLAIM_KEEPER_TABLE: &str = "config_sso_one_time_claims";
 
+/// Built-in detection rules: (name, description, query_sql, severity, interval_secs, window_secs).
+fn default_detection_rules() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    i64,
+    i64,
+)> {
+    vec![
+        (
+            "Failed login brute force",
+            "Detects IPs with 10+ failed login attempts within the detection window.",
+            "SELECT mat_source_ip, count() AS attempt_count \
+             FROM logs \
+             WHERE Timestamp BETWEEN @window_start AND @window_end \
+               AND mat_action = 'login_failed' \
+             GROUP BY mat_source_ip \
+             HAVING attempt_count >= 10",
+            "high",
+            300,
+            300,
+        ),
+        (
+            "Error rate spike per service",
+            "Fires when any service has an error rate above 5% with at least 100 spans.",
+            "SELECT service_name, \
+               countIf(status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500) AS errors, \
+               count() AS total, \
+               errors / total AS error_rate \
+             FROM spans \
+             WHERE timestamp BETWEEN @window_start AND @window_end \
+             GROUP BY service_name \
+             HAVING error_rate > 0.05 AND total > 100",
+            "high",
+            300,
+            300,
+        ),
+        (
+            "P99 latency regression",
+            "Detects server spans where p99 latency exceeds 500ms with sufficient traffic.",
+            "SELECT service_name, span_name, \
+               quantile(0.99)(duration_ns) / 1000000 AS p99_ms, \
+               count() AS total \
+             FROM spans \
+             WHERE timestamp BETWEEN @window_start AND @window_end \
+               AND kind = 'SPAN_KIND_SERVER' \
+             GROUP BY service_name, span_name \
+             HAVING p99_ms > 500 AND total > 50",
+            "high",
+            300,
+            300,
+        ),
+        (
+            "CPU saturation",
+            "Alerts when average CPU utilization exceeds 90% for any host.",
+            "SELECT ServiceName, \
+               Attributes['host.name'] AS host, \
+               avg(Value) AS avg_cpu \
+             FROM metrics_gauge \
+             WHERE TimeUnix BETWEEN @window_start AND @window_end \
+               AND MetricName = 'system.cpu.utilization' \
+             GROUP BY ServiceName, host \
+             HAVING avg_cpu > 0.9",
+            "critical",
+            300,
+            300,
+        ),
+        (
+            "Request rate drop",
+            "Detects services whose request volume falls below 50 requests in the current window.",
+            "SELECT ServiceName, sum(Value) AS current_requests \
+             FROM metrics_sum \
+             WHERE TimeUnix BETWEEN @window_start AND @window_end \
+               AND MetricName = 'http.server.request.count' \
+             GROUP BY ServiceName \
+             HAVING current_requests < 50",
+            "high",
+            300,
+            300,
+        ),
+        (
+            "Error + latency correlation",
+            "Detects services with both elevated error rates and high p99 latency.",
+            "SELECT service_name, \
+               countIf(status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500) AS errors, \
+               count() AS total, \
+               quantile(0.99)(duration_ns) / 1000000 AS p99_ms \
+             FROM spans \
+             WHERE timestamp BETWEEN @window_start AND @window_end \
+               AND kind = 'SPAN_KIND_SERVER' \
+             GROUP BY service_name \
+             HAVING errors / total > 0.05 AND p99_ms > 500 AND total > 50",
+            "critical",
+            300,
+            300,
+        ),
+        (
+            "High severity log volume",
+            "Fires when ERROR/FATAL log volume exceeds 100 entries in the window.",
+            "SELECT ServiceName, SeverityText, count() AS log_count \
+             FROM logs \
+             WHERE Timestamp BETWEEN @window_start AND @window_end \
+               AND SeverityText IN ('ERROR', 'FATAL') \
+             GROUP BY ServiceName, SeverityText \
+             HAVING log_count >= 100",
+            "medium",
+            300,
+            300,
+        ),
+        (
+            "Log errors + trace failures correlation",
+            "Detects services with 5+ ERROR/FATAL logs carrying trace context, providing a safe single-signal correlation point.",
+            "SELECT ServiceName, count() AS correlated_errors \
+             FROM logs \
+             WHERE Timestamp BETWEEN @window_start AND @window_end \
+               AND SeverityText IN ('ERROR', 'FATAL') \
+               AND TraceId != '' \
+             GROUP BY ServiceName \
+             HAVING correlated_errors >= 5",
+            "critical",
+            300,
+            300,
+        ),
+        (
+            "Latency spike + memory pressure",
+            "Detects services with sustained memory utilization above 85%; investigate alongside latency telemetry.",
+            "SELECT ServiceName, max(Value) AS max_memory \
+             FROM metrics_gauge \
+             WHERE TimeUnix BETWEEN @window_start AND @window_end \
+               AND MetricName IN ('process.runtime.jvm.memory.usage', \
+                                  'container.memory.usage', \
+                                  'process.memory.usage') \
+             GROUP BY ServiceName \
+             HAVING max_memory > 0.85",
+            "high",
+            300,
+            300,
+        ),
+        (
+            "Post-deploy error rate increase",
+            "Detects services that report a deploy span and an elevated error rate in the same evaluation window.",
+            "SELECT service_name, \
+               countIf(span_name LIKE '%deploy%') AS deploy_spans, \
+               countIf(status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500) AS errors, \
+               count() AS total \
+             FROM spans \
+             WHERE timestamp BETWEEN @window_start AND @window_end \
+             GROUP BY service_name \
+             HAVING deploy_spans > 0 AND total > 20 AND errors / total > 0.05",
+            "high",
+            300,
+            600,
+        ),
+        (
+            "New error patterns (unseen in past 7 days)",
+            "Identifies repeated ERROR/FATAL message patterns appearing 3+ times in the current window.",
+            "SELECT ServiceName, Body, count() AS occurrences \
+             FROM logs \
+             WHERE Timestamp BETWEEN @window_start AND @window_end \
+               AND SeverityText IN ('ERROR', 'FATAL') \
+             GROUP BY ServiceName, Body \
+             HAVING occurrences >= 3",
+            "medium",
+            300,
+            300,
+        ),
+        (
+            "Cascading service failures (3+ services)",
+            "Detects errors across 3 or more distinct services in the same window, which can indicate a shared dependency incident.",
+            "SELECT uniqIf(service_name, (status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500)) AS failing_services \
+             FROM spans \
+             WHERE timestamp BETWEEN @window_start AND @window_end \
+             HAVING failing_services >= 3",
+            "critical",
+            300,
+            300,
+        ),
+    ]
+}
+
+/// A built-in detection rule as stored, for refreshing its SQL on upgrade.
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct DefaultDetectionRule {
+    id: String,
+    query_sql: String,
+    enabled: u8,
+    channels: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SsoClaimStoreMode {
     Local,
@@ -2122,6 +2312,39 @@ pub struct MonitorRow {
 }
 
 const SLO_INSERT_SQL: &str = "INSERT INTO config_slos (id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)";
+
+#[cfg(test)]
+mod default_detection_rule_tests {
+    use super::default_detection_rules;
+
+    #[test]
+    fn every_built_in_rule_compiles() {
+        for (name, _, sql, _, _, _) in default_detection_rules() {
+            crate::detection_query::validate_template(sql)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn error_rules_match_the_status_ingest_writes() {
+        for (name, _, sql, _, _, _) in default_detection_rules() {
+            assert!(
+                !sql.contains("status = 'ERROR'"),
+                "{name} compares status to 'ERROR', which ingest never writes"
+            );
+            // Every rule that counts errors uses the same definition as the
+            // Services page: a failed span status or HTTP 5xx.
+            if sql.contains("AS errors") || sql.contains("failing_services") {
+                assert!(
+                    sql.contains(
+                        "status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500"
+                    ),
+                    "{name}"
+                );
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod sql_shape_tests {
@@ -10452,194 +10675,19 @@ impl ConfigDb {
         &self,
         name: &str,
         tenant_id: &str,
-    ) -> anyhow::Result<Option<(String, String)>> {
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row {
-            id: String,
-            query_sql: String,
-        }
+    ) -> anyhow::Result<Option<DefaultDetectionRule>> {
         let rows = self.client
-            .query("SELECT id, query_sql FROM config_detection_rules FINAL WHERE name = ? AND tenant_id = ? AND created_by = 'system' AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, query_sql, enabled, channels FROM config_detection_rules FINAL WHERE name = ? AND tenant_id = ? AND created_by = 'system' AND is_deleted = 0 LIMIT 1")
             .bind(name).bind(tenant_id)
-            .fetch_all::<Row>()
+            .fetch_all::<DefaultDetectionRule>()
             .await?;
-        Ok(rows.into_iter().next().map(|r| (r.id, r.query_sql)))
+        Ok(rows.into_iter().next())
     }
 
     pub async fn ensure_default_detection_rules(&self) -> anyhow::Result<()> {
         tracing::info!("SIEM: checking default detection rules");
 
-        // (name, description, query_sql, severity, interval_secs, window_secs)
-        let defaults: Vec<(&str, &str, &str, &str, i64, i64)> = vec![
-            (
-                "Failed login brute force",
-                "Detects IPs with 10+ failed login attempts within the detection window.",
-                "SELECT mat_source_ip, count() AS attempt_count \
-                 FROM logs \
-                 WHERE Timestamp BETWEEN @window_start AND @window_end \
-                   AND mat_action = 'login_failed' \
-                 GROUP BY mat_source_ip \
-                 HAVING attempt_count >= 10",
-                "high",
-                300,
-                300,
-            ),
-            (
-                "Error rate spike per service",
-                "Fires when any service has an error rate above 5% with at least 100 spans.",
-                "SELECT service_name, \
-                   countIf(status = 'ERROR') AS errors, \
-                   count() AS total, \
-                   errors / total AS error_rate \
-                 FROM spans \
-                 WHERE timestamp BETWEEN @window_start AND @window_end \
-                 GROUP BY service_name \
-                 HAVING error_rate > 0.05 AND total > 100",
-                "high",
-                300,
-                300,
-            ),
-            (
-                "P99 latency regression",
-                "Detects server spans where p99 latency exceeds 500ms with sufficient traffic.",
-                "SELECT service_name, span_name, \
-                   quantile(0.99)(duration_ns) / 1000000 AS p99_ms, \
-                   count() AS total \
-                 FROM spans \
-                 WHERE timestamp BETWEEN @window_start AND @window_end \
-                   AND kind = 'SPAN_KIND_SERVER' \
-                 GROUP BY service_name, span_name \
-                 HAVING p99_ms > 500 AND total > 50",
-                "high",
-                300,
-                300,
-            ),
-            (
-                "CPU saturation",
-                "Alerts when average CPU utilization exceeds 90% for any host.",
-                "SELECT ServiceName, \
-                   Attributes['host.name'] AS host, \
-                   avg(Value) AS avg_cpu \
-                 FROM metrics_gauge \
-                 WHERE TimeUnix BETWEEN @window_start AND @window_end \
-                   AND MetricName = 'system.cpu.utilization' \
-                 GROUP BY ServiceName, host \
-                 HAVING avg_cpu > 0.9",
-                "critical",
-                300,
-                300,
-            ),
-            (
-                "Request rate drop",
-                "Detects services whose request volume falls below 50 requests in the current window.",
-                "SELECT ServiceName, sum(Value) AS current_requests \
-                 FROM metrics_sum \
-                 WHERE TimeUnix BETWEEN @window_start AND @window_end \
-                   AND MetricName = 'http.server.request.count' \
-                 GROUP BY ServiceName \
-                 HAVING current_requests < 50",
-                "high",
-                300,
-                300,
-            ),
-            (
-                "Error + latency correlation",
-                "Detects services with both elevated error rates and high p99 latency.",
-                "SELECT service_name, \
-                   countIf(status = 'ERROR') AS errors, \
-                   count() AS total, \
-                   quantile(0.99)(duration_ns) / 1000000 AS p99_ms \
-                 FROM spans \
-                 WHERE timestamp BETWEEN @window_start AND @window_end \
-                   AND kind = 'SPAN_KIND_SERVER' \
-                 GROUP BY service_name \
-                 HAVING errors / total > 0.05 AND p99_ms > 500 AND total > 50",
-                "critical",
-                300,
-                300,
-            ),
-            (
-                "High severity log volume",
-                "Fires when ERROR/FATAL log volume exceeds 100 entries in the window.",
-                "SELECT ServiceName, SeverityText, count() AS log_count \
-                 FROM logs \
-                 WHERE Timestamp BETWEEN @window_start AND @window_end \
-                   AND SeverityText IN ('ERROR', 'FATAL') \
-                 GROUP BY ServiceName, SeverityText \
-                 HAVING log_count >= 100",
-                "medium",
-                300,
-                300,
-            ),
-            (
-                "Log errors + trace failures correlation",
-                "Detects services with 5+ ERROR/FATAL logs carrying trace context, providing a safe single-signal correlation point.",
-                "SELECT ServiceName, count() AS correlated_errors \
-                 FROM logs \
-                 WHERE Timestamp BETWEEN @window_start AND @window_end \
-                   AND SeverityText IN ('ERROR', 'FATAL') \
-                   AND TraceId != '' \
-                 GROUP BY ServiceName \
-                 HAVING correlated_errors >= 5",
-                "critical",
-                300,
-                300,
-            ),
-            (
-                "Latency spike + memory pressure",
-                "Detects services with sustained memory utilization above 85%; investigate alongside latency telemetry.",
-                "SELECT ServiceName, max(Value) AS max_memory \
-                 FROM metrics_gauge \
-                 WHERE TimeUnix BETWEEN @window_start AND @window_end \
-                   AND MetricName IN ('process.runtime.jvm.memory.usage', \
-                                      'container.memory.usage', \
-                                      'process.memory.usage') \
-                 GROUP BY ServiceName \
-                 HAVING max_memory > 0.85",
-                "high",
-                300,
-                300,
-            ),
-            (
-                "Post-deploy error rate increase",
-                "Detects services that report a deploy span and an elevated 5xx rate in the same evaluation window.",
-                "SELECT service_name, \
-                   countIf(span_name LIKE '%deploy%') AS deploy_spans, \
-                   countIf(http_status_code >= 500) AS errors, \
-                   count() AS total \
-                 FROM spans \
-                 WHERE timestamp BETWEEN @window_start AND @window_end \
-                 GROUP BY service_name \
-                 HAVING deploy_spans > 0 AND total > 20 AND errors / total > 0.05",
-                "high",
-                300,
-                600,
-            ),
-            (
-                "New error patterns (unseen in past 7 days)",
-                "Identifies repeated ERROR/FATAL message patterns appearing 3+ times in the current window.",
-                "SELECT ServiceName, Body, count() AS occurrences \
-                 FROM logs \
-                 WHERE Timestamp BETWEEN @window_start AND @window_end \
-                   AND SeverityText IN ('ERROR', 'FATAL') \
-                 GROUP BY ServiceName, Body \
-                 HAVING occurrences >= 3",
-                "medium",
-                300,
-                300,
-            ),
-            (
-                "Cascading service failures (3+ services)",
-                "Detects errors across 3 or more distinct services in the same window, which can indicate a shared dependency incident.",
-                "SELECT uniqIf(service_name, status = 'ERROR' OR http_status_code >= 500) AS failing_services \
-                 FROM spans \
-                 WHERE timestamp BETWEEN @window_start AND @window_end \
-                 HAVING failing_services >= 3",
-                "critical",
-                300,
-                300,
-            ),
-        ];
+        let defaults = default_detection_rules();
 
         let mut seeded = 0u32;
         let mut refreshed = 0u32;
@@ -10648,7 +10696,7 @@ impl ConfigDb {
                 anyhow::anyhow!("invalid built-in detection rule '{name}': {error}")
             })?;
             match self.get_default_detection_rule(name, "default").await? {
-                Some((id, existing_sql)) => {
+                Some(existing) => {
                     // Built-in rule already present. Refresh it in place if its
                     // definition drifted from the current canonical SQL — older
                     // seeds referenced since-renamed tables (otel_traces → spans,
@@ -10656,9 +10704,11 @@ impl ConfigDb {
                     // wide_events → spans) and a malformed any(subquery), which
                     // made every eval fail. This makes the built-ins self-heal on
                     // upgrade without clobbering user-edited rules (created_by != system).
-                    if existing_sql.trim() != query_sql.trim() {
+                    // Whether the rule is enabled and where it notifies are the
+                    // user's choices, so a refresh keeps them.
+                    if existing.query_sql.trim() != query_sql.trim() {
                         self.update_detection_rule(
-                            &id,
+                            &existing.id,
                             name,
                             description,
                             query_sql,
@@ -10666,8 +10716,8 @@ impl ConfigDb {
                             1,
                             severity,
                             *window,
-                            true,
-                            "[]",
+                            existing.enabled != 0,
+                            &existing.channels,
                         )
                         .await?;
                         refreshed += 1;

@@ -141,7 +141,8 @@ pub async fn create_slo(
 
     let id = uuid::Uuid::new_v4().to_string();
 
-    // For trace/availability SLOs with no error_filters, default to http_status_code >= 500.
+    // For trace/availability SLOs with no error_filters, default to failed spans:
+    // a failed status or HTTP 5xx.
     // Without this, error_filters == total_filters == all requests, causing 100% error rate.
     let effective_error_filters = if uses_metric_promql_pair(&req.slo_type, &req.indicator_type) {
         stored_query_config(&req.error_promql)
@@ -149,7 +150,7 @@ pub async fn create_slo(
         && req.indicator_type == "availability"
         && req.error_filters.as_array().map_or(true, |a| a.is_empty())
     {
-        serde_json::json!([{"field": "http_status_code", "op": ">=", "value": 500}])
+        serde_json::json!([{"field": "error", "op": "=", "value": 1}])
     } else {
         req.error_filters.clone()
     };
@@ -321,7 +322,7 @@ pub async fn update_slo(
         && req.indicator_type == "availability"
         && req.error_filters.as_array().map_or(true, |a| a.is_empty())
     {
-        serde_json::json!([{"field": "http_status_code", "op": ">=", "value": 500}])
+        serde_json::json!([{"field": "error", "op": "=", "value": 1}])
     } else {
         req.error_filters.clone()
     };
