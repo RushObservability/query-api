@@ -249,6 +249,170 @@ pub async fn send_channel_notification(
     description: &str,
     alert_id: &str,
     runbook_url: &str,
+    http_client: &reqwest::Client,
+    smtp_config: &SmtpConfig,
+    smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+) -> Result<(), String> {
+    send_channel_notification_with_fields(
+        channel,
+        message,
+        alert_name,
+        alert_state,
+        value,
+        threshold,
+        signal_type,
+        condition_op,
+        description,
+        alert_id,
+        runbook_url,
+        None,
+        http_client,
+        smtp_config,
+        smtp_transport,
+    )
+    .await
+}
+
+/// Delivery clients an engine keeps for its lifetime.
+pub struct Notifier {
+    http_client: reqwest::Client,
+    smtp_config: SmtpConfig,
+    smtp_transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
+}
+
+impl Notifier {
+    pub fn new(smtp_config: SmtpConfig) -> Self {
+        Self {
+            http_client: reqwest::Client::new(),
+            smtp_transport: build_smtp_transport(&smtp_config),
+            smtp_config,
+        }
+    }
+
+    /// See [`notify_channels`].
+    pub async fn notify(
+        &self,
+        config_db: &ConfigDb,
+        tenant_id: &str,
+        channel_ids: &[String],
+        notification: &ChannelNotification<'_>,
+    ) {
+        notify_channels(
+            config_db,
+            tenant_id,
+            channel_ids,
+            notification,
+            &self.http_client,
+            &self.smtp_config,
+            &self.smtp_transport,
+        )
+        .await;
+    }
+}
+
+/// One notification for [`notify_channels`].
+pub struct ChannelNotification<'a> {
+    /// `monitor`, `slo`, `anomaly`, or `detection`; recorded in the notification log.
+    pub source: &'a str,
+    pub signal_type: &'a str,
+    pub alert_name: &'a str,
+    pub message: &'a str,
+    /// `alert`, `warn`, `no_data`, or `ok`. PagerDuty, Rootly, and Alertmanager
+    /// resolve on `ok`.
+    pub alert_state: &'a str,
+    pub value: f64,
+    pub threshold: f64,
+    pub condition_op: &'a str,
+    pub description: &'a str,
+    /// Used for links back to Rush.
+    pub alert_id: &'a str,
+    /// Deduplication key for PagerDuty and Rootly incidents.
+    pub incident_key: &'a str,
+    pub runbook_url: &'a str,
+    /// Merged into generic webhook payloads, overriding the standard fields,
+    /// so each source keeps the fields its webhook receivers already parse.
+    pub webhook_fields: Option<&'a serde_json::Value>,
+}
+
+/// Send one notification to each of a tenant's channels and record every
+/// delivery in the notification log. Channels from other tenants, missing
+/// channels, and disabled channels are skipped.
+pub async fn notify_channels(
+    config_db: &ConfigDb,
+    tenant_id: &str,
+    channel_ids: &[String],
+    notification: &ChannelNotification<'_>,
+    http_client: &reqwest::Client,
+    smtp_config: &SmtpConfig,
+    smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+) {
+    for channel_id in channel_ids {
+        let channel = match config_db.get_channel(channel_id, tenant_id).await {
+            Ok(Some(channel)) if channel.enabled => channel,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(source = notification.source, %channel_id, %error, "failed to load notification channel");
+                continue;
+            }
+        };
+        let notification_id = if matches!(channel.channel_type.as_str(), "rootly" | "pagerduty") {
+            notification.incident_key
+        } else {
+            notification.alert_id
+        };
+        let result = send_channel_notification_with_fields(
+            &channel,
+            notification.message,
+            notification.alert_name,
+            notification.alert_state,
+            notification.value,
+            notification.threshold,
+            notification.signal_type,
+            notification.condition_op,
+            notification.description,
+            notification_id,
+            notification.runbook_url,
+            notification.webhook_fields,
+            http_client,
+            smtp_config,
+            smtp_transport,
+        )
+        .await;
+        let (status, error_msg) = match &result {
+            Ok(()) => ("sent", String::new()),
+            Err(error) => {
+                tracing::warn!(source = notification.source, %channel_id, %error, "notification failed");
+                ("failed", error.clone())
+            }
+        };
+        let _ = config_db
+            .create_notification_log(
+                channel_id,
+                tenant_id,
+                notification.source,
+                notification.alert_name,
+                notification.alert_state,
+                status,
+                &error_msg,
+            )
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_channel_notification_with_fields(
+    channel: &crate::models::alert::NotificationChannel,
+    message: &str,
+    alert_name: &str,
+    alert_state: &str,
+    value: f64,
+    threshold: f64,
+    signal_type: &str,
+    condition_op: &str,
+    description: &str,
+    alert_id: &str,
+    runbook_url: &str,
+    webhook_fields: Option<&serde_json::Value>,
     _http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
@@ -347,13 +511,21 @@ pub async fn send_channel_notification(
                 .and_then(|m| m.as_str())
                 .unwrap_or("POST");
 
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "alert": alert_name,
                 "state": alert_state,
                 "value": value,
                 "threshold": threshold,
                 "message": message,
             });
+            if let (Some(extra), Some(fields)) = (
+                webhook_fields.and_then(|v| v.as_object()),
+                payload.as_object_mut(),
+            ) {
+                for (key, field) in extra {
+                    fields.insert(key.clone(), field.clone());
+                }
+            }
 
             let method = if method.eq_ignore_ascii_case("PUT") {
                 reqwest::Method::PUT

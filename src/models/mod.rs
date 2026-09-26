@@ -7,6 +7,7 @@ pub mod detection;
 pub mod ingest;
 pub mod kubernetes_access;
 pub mod log;
+pub mod maintenance;
 pub mod metrics;
 pub mod monitor;
 pub mod profile;

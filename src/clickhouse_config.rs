@@ -3159,6 +3159,22 @@ impl ConfigDb {
                 is_deleted UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            // Windows belong to one tenant. Rows from before this column existed
+            // were never applied by any engine; they land in the default tenant.
+            "ALTER TABLE config_maintenance_windows ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default' AFTER id",
+            "ALTER TABLE config_maintenance_windows ADD COLUMN IF NOT EXISTS created_by String DEFAULT '' AFTER created_at",
+            // Last notification sent for each monitor group, so the monitor engine
+            // can renotify on schedule and catch up after a maintenance window.
+            // Written only by the replica holding the monitors lease.
+            "CREATE TABLE IF NOT EXISTS config_monitor_notifications (
+                tenant_id   String,
+                monitor_id  String,
+                group_key   String,
+                state       String,
+                notified_at DateTime64(3, 'UTC'),
+                version     UInt64
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, monitor_id, group_key)",
             // ── Metric firewall (ingest-time block / drop-label rules) ────────────
             "CREATE TABLE IF NOT EXISTS config_metric_firewall (
                 id                      String,
@@ -10757,49 +10773,115 @@ impl ConfigDb {
 
     pub async fn create_maintenance_window(
         &self,
-        id: &str,
-        name: &str,
-        scope: &str,
-        starts_at: &str,
-        ends_at: &str,
+        window: &crate::models::maintenance::MaintenanceWindow,
     ) -> anyhow::Result<()> {
-        let now = Self::now_str();
         self.client
-            .query("INSERT INTO config_maintenance_windows (id, name, scope, starts_at, ends_at, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(id).bind(name).bind(scope).bind(starts_at).bind(ends_at).bind(&now)
-            .execute().await?;
+            .query("INSERT INTO config_maintenance_windows (id, tenant_id, name, scope, starts_at, ends_at, created_at, created_by, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .bind(&window.id)
+            .bind(&window.tenant_id)
+            .bind(&window.name)
+            .bind(&window.scope)
+            .bind(&window.starts_at)
+            .bind(&window.ends_at)
+            .bind(&window.created_at)
+            .bind(&window.created_by)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
         Ok(())
     }
 
+    /// Windows for one tenant, newest first.
     pub async fn list_maintenance_windows(
         &self,
-    ) -> anyhow::Result<Vec<(String, String, String, String, String, String)>> {
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row {
-            id: String,
-            name: String,
-            scope: String,
-            starts_at: String,
-            ends_at: String,
-            created_at: String,
-        }
-        let rows = self.client
-            .query("SELECT id, name, scope, starts_at, ends_at, created_at FROM config_maintenance_windows ORDER BY starts_at DESC")
-            .fetch_all::<Row>()
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.id, r.name, r.scope, r.starts_at, r.ends_at, r.created_at))
-            .collect())
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<crate::models::maintenance::MaintenanceWindow>> {
+        Ok(self.client
+            .query("SELECT id, tenant_id, name, scope, starts_at, ends_at, created_at, created_by FROM config_maintenance_windows FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY starts_at DESC")
+            .bind(tenant_id)
+            .fetch_all::<crate::models::maintenance::MaintenanceWindow>()
+            .await?)
     }
 
-    pub async fn delete_maintenance_window(&self, id: &str) -> anyhow::Result<bool> {
-        self.client
-            .query("ALTER TABLE config_maintenance_windows DELETE WHERE id = ?")
+    /// Every tenant's windows that haven't ended, for the monitor engine.
+    /// Times are stored as normalized RFC 3339 UTC strings, so they compare as text.
+    pub async fn list_unfinished_maintenance_windows(
+        &self,
+        now_rfc3339: &str,
+    ) -> anyhow::Result<Vec<crate::models::maintenance::MaintenanceWindow>> {
+        Ok(self.client
+            .query("SELECT id, tenant_id, name, scope, starts_at, ends_at, created_at, created_by FROM config_maintenance_windows FINAL WHERE is_deleted = 0 AND ends_at > ?")
+            .bind(now_rfc3339)
+            .fetch_all::<crate::models::maintenance::MaintenanceWindow>()
+            .await?)
+    }
+
+    /// Soft-delete a tenant's window. Returns the window that was deleted.
+    pub async fn delete_maintenance_window(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<Option<crate::models::maintenance::MaintenanceWindow>> {
+        let existing = self.client
+            .query("SELECT id, tenant_id, name, scope, starts_at, ends_at, created_at, created_by FROM config_maintenance_windows FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
+            .bind(tenant_id)
+            .fetch_optional::<crate::models::maintenance::MaintenanceWindow>()
+            .await?;
+        let Some(window) = existing else {
+            return Ok(None);
+        };
+        self.client
+            .query("INSERT INTO config_maintenance_windows (id, tenant_id, name, scope, starts_at, ends_at, created_at, created_by, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .bind(&window.id)
+            .bind(&window.tenant_id)
+            .bind(&window.name)
+            .bind(&window.scope)
+            .bind(&window.starts_at)
+            .bind(&window.ends_at)
+            .bind(&window.created_at)
+            .bind(&window.created_by)
+            .bind(Self::next_version())
             .execute()
             .await?;
-        Ok(true)
+        Ok(Some(window))
+    }
+
+    // ── Monitor notification state ─────────────────────────────────────────────
+
+    /// Last notification per (tenant, monitor, group), for the monitor engine.
+    pub async fn list_monitor_notifications(
+        &self,
+    ) -> anyhow::Result<Vec<crate::models::maintenance::MonitorNotification>> {
+        Ok(self
+            .client
+            .query(
+                "SELECT tenant_id, monitor_id, group_key, state, toInt64(toUnixTimestamp64Milli(notified_at)) AS notified_at_ms \
+                 FROM config_monitor_notifications FINAL",
+            )
+            .fetch_all::<crate::models::maintenance::MonitorNotification>()
+            .await?)
+    }
+
+    pub async fn record_monitor_notification(
+        &self,
+        record: &crate::models::maintenance::MonitorNotification,
+    ) -> anyhow::Result<()> {
+        crate::leader::ensure_leader()?;
+        self.client
+            .query(
+                "INSERT INTO config_monitor_notifications (tenant_id, monitor_id, group_key, state, notified_at, version) \
+                 VALUES (?, ?, ?, ?, fromUnixTimestamp64Milli(?), ?)",
+            )
+            .bind(&record.tenant_id)
+            .bind(&record.monitor_id)
+            .bind(&record.group_key)
+            .bind(&record.state)
+            .bind(record.notified_at_ms)
+            .bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
     }
 
     /// Returns true if `now_str` (ISO 8601) falls within any active maintenance window

@@ -601,3 +601,50 @@ async fn email_fails_for_missing_smtp_rejections_and_invalid_recipients() {
     }
     assert_eq!(smtp.recipients.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn webhook_fields_extend_and_override_the_generic_payload() {
+    let http = MockHttp::new(200, "ok", Duration::ZERO).await;
+    let channel = crate::models::alert::NotificationChannel {
+        id: "channel-1".into(),
+        tenant_id: "tenant-1".into(),
+        name: "SLO hook".into(),
+        channel_type: "webhook".into(),
+        config: json!({"url": "https://example.invalid/hook"}).to_string(),
+        enabled: true,
+        created_at: "".into(),
+    };
+    let fields = json!({"slo": "Checkout availability", "state": "breaching", "error_count": 42.0});
+    HTTP_MOCK
+        .scope(
+            http.transport.clone(),
+            send_channel_notification_with_fields(
+                &channel,
+                "SLO 'Checkout availability': BREACHING",
+                "Checkout availability",
+                "alert",
+                -12.5,
+                0.0,
+                "slo",
+                "",
+                "",
+                "slo-1",
+                "",
+                Some(&fields),
+                &reqwest::Client::new(),
+                &smtp_config(),
+                &None,
+            ),
+        )
+        .await
+        .unwrap();
+    let body = http.captured.lock().unwrap()[0].body.clone();
+    assert_eq!(body["alert"], "Checkout availability");
+    assert_eq!(body["value"], -12.5);
+    assert_eq!(body["slo"], "Checkout availability");
+    assert_eq!(body["error_count"], 42.0);
+    assert_eq!(
+        body["state"], "breaching",
+        "source fields win, so old receivers keep working"
+    );
+}

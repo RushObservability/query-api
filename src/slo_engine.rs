@@ -335,9 +335,10 @@ pub fn spawn_slo_engine(
     write_ch: Client,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
     lease: Arc<crate::leader::EngineLease>,
+    smtp_config: crate::alert_engine::SmtpConfig,
 ) {
     tokio::spawn(async move {
-        let http_client = reqwest::Client::new();
+        let notifier = crate::alert_engine::Notifier::new(smtp_config);
         let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
@@ -346,13 +347,7 @@ pub fn spawn_slo_engine(
                 continue;
             }
             let start = std::time::Instant::now();
-            let cycle = eval_slos(
-                &config_db,
-                &read_ch,
-                &write_ch,
-                &http_client,
-                &mut eval_state,
-            );
+            let cycle = eval_slos(&config_db, &read_ch, &write_ch, &notifier, &mut eval_state);
             let ok = match crate::leader::fenced(lease.clone(), cycle).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -390,7 +385,7 @@ async fn eval_slos(
     config_db: &ConfigDb,
     read_ch: &Client,
     write_ch: &Client,
-    http_client: &reqwest::Client,
+    notifier: &crate::alert_engine::Notifier,
     eval_state: &mut crate::eval_state::EvalState,
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
@@ -419,7 +414,7 @@ async fn eval_slos(
                     config_db,
                     read_ch,
                     write_ch,
-                    http_client,
+                    notifier,
                     &slo,
                     now,
                     now_str_ref,
@@ -496,7 +491,7 @@ async fn eval_one_slo(
     config_db: &ConfigDb,
     read_ch: &Client,
     write_ch: &Client,
-    _http_client: &reqwest::Client,
+    notifier: &crate::alert_engine::Notifier,
     slo: &crate::models::slo::Slo,
     now: chrono::DateTime<chrono::Utc>,
     now_str: &str,
@@ -773,32 +768,41 @@ async fn eval_one_slo(
         if let Some(message) = &message {
             let channel_ids: Vec<String> =
                 serde_json::from_str(&slo.notification_channel_ids).unwrap_or_default();
-            for channel_id in &channel_ids {
-                if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
-                    let config: serde_json::Value =
-                        serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
-                    if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                        let payload = match channel.channel_type.as_str() {
-                            "slack" => serde_json::json!({ "text": message }),
-                            _ => serde_json::json!({
-                                "slo": slo.name,
-                                "state": new_state,
-                                "error_count": error_count,
-                                "total_count": total_count,
-                                "error_budget_remaining": error_budget_remaining,
-                                "message": message,
-                            }),
-                        };
-                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
-                            tracing::warn!(
-                                "slo {}: notification to {} failed: {e}",
-                                slo.id,
-                                channel.name
-                            );
-                        }
-                    }
-                }
-            }
+            // Webhook receivers written for the old SLO payload keep their fields,
+            // including `state` as breaching/compliant.
+            let webhook_fields = serde_json::json!({
+                "slo": slo.name,
+                "state": new_state,
+                "error_count": error_count,
+                "total_count": total_count,
+                "error_budget_remaining": error_budget_remaining,
+            });
+            notifier
+                .notify(
+                    config_db,
+                    &slo.tenant_id,
+                    &channel_ids,
+                    &crate::alert_engine::ChannelNotification {
+                        source: "slo",
+                        signal_type: "slo",
+                        alert_name: &slo.name,
+                        message,
+                        alert_state: if new_state == "breaching" {
+                            "alert"
+                        } else {
+                            "ok"
+                        },
+                        value: error_budget_remaining * 100.0,
+                        threshold: 0.0,
+                        condition_op: "",
+                        description: "",
+                        alert_id: &slo.id,
+                        incident_key: &format!("slo:{}", slo.id),
+                        runbook_url: "",
+                        webhook_fields: Some(&webhook_fields),
+                    },
+                )
+                .await;
         }
 
         tracing::info!("slo '{}' state: {} -> {}", slo.name, old_state, new_state);

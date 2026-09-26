@@ -432,7 +432,7 @@ pub async fn mute_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let updated = state
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, false)
@@ -441,6 +441,21 @@ pub async fn mute_monitor(
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
     }
+
+    // AUDIT: monitor muted.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("monitor.mute", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("monitor", id.clone())
+                .changes(serde_json::json!({ "enabled": false }).to_string())
+                .description("monitor muted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
     Ok(Json(serde_json::json!({ "ok": true, "enabled": false })))
 }
 
@@ -451,7 +466,7 @@ pub async fn unmute_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let updated = state
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, true)
@@ -460,6 +475,21 @@ pub async fn unmute_monitor(
     if !updated {
         return Err((StatusCode::NOT_FOUND, "monitor not found".to_string()));
     }
+
+    // AUDIT: monitor unmuted.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("monitor.unmute", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("monitor", id.clone())
+                .changes(serde_json::json!({ "enabled": true }).to_string())
+                .description("monitor unmuted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
     Ok(Json(serde_json::json!({ "ok": true, "enabled": true })))
 }
 

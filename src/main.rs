@@ -2398,6 +2398,7 @@ async fn main() -> anyhow::Result<()> {
                 admin_ch.clone(),
                 self_metrics.clone(),
                 election.lease(rush_api::leader::SLOS),
+                smtp_config.clone(),
             );
         } else {
             tracing::info!(
@@ -2446,7 +2447,7 @@ async fn main() -> anyhow::Result<()> {
             monitor_engine::spawn(
                 ch.clone(),
                 config_db.clone(),
-                smtp_config,
+                smtp_config.clone(),
                 self_metrics.clone(),
                 election.lease(rush_api::leader::MONITORS),
             );
@@ -2464,6 +2465,7 @@ async fn main() -> anyhow::Result<()> {
                 config_db.clone(),
                 self_metrics.clone(),
                 election.lease(rush_api::leader::DETECTIONS),
+                smtp_config.clone(),
             );
         } else {
             tracing::info!(
