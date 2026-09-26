@@ -1566,8 +1566,7 @@ async fn query_apm(
     }
 }
 
-const APM_ERROR_CONDITION: &str =
-    "status IN ('ERROR', 'STATUS_CODE_ERROR') OR http_status_code >= 500";
+const APM_ERROR_CONDITION: &str = crate::query_builder::ERROR_SPAN;
 
 fn apm_aggregation(metric: &str, rate_window_secs: i64) -> String {
     match metric {

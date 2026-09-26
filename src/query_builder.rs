@@ -1,5 +1,11 @@
 use crate::models::query::{Filter, FilterOp};
 
+/// SQL condition for a span that failed. OpenTelemetry and Datadog ingest store
+/// the status as `STATUS_CODE_ERROR`; `ERROR` covers rows written by older
+/// versions. HTTP 5xx counts too, for spans that don't set a status.
+pub const ERROR_SPAN: &str =
+    "(status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500)";
+
 /// Sanitize a datetime string for safe embedding in SQL string literals.
 /// Restricts to characters valid in ISO 8601 / ClickHouse datetime formats,
 /// preventing single-quote injection in PREWHERE time-range conditions.
@@ -141,10 +147,14 @@ pub fn resolve_field(field: &str) -> String {
         format!("if({flat} != '', {flat}, {nested})")
     } else {
         match field {
-            // `level` is a logs concept; in spans the equivalent is `status`
-            // (values: "Ok", "Error", "Unset"). Lower-case both sides so that
-            // `level=error`, `level=Error`, etc. all match correctly.
-            "level" => "lower(status)".to_string(),
+            // `level` is a logs concept; in spans the equivalent is `status`,
+            // stored as STATUS_CODE_OK / STATUS_CODE_ERROR / STATUS_CODE_UNSET.
+            // Strip the prefix and lower-case it so `level=error`, `level=Error`,
+            // and rows from older versions that stored plain `ERROR` all match.
+            "level" => "lower(replaceOne(status, 'STATUS_CODE_', ''))".to_string(),
+            // `error = 1` selects failed spans, by the same definition as the
+            // Services page and alerts.
+            "error" => format!("toUInt8{ERROR_SPAN}"),
             _ if is_safe_column_name(field) => field.to_string(),
             _ => "NULL".to_string(),
         }
@@ -1346,5 +1356,45 @@ mod adversarial_search_parser_tests {
                 prop_assert!(!predicate.contains("/*"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod error_span_tests {
+    use super::ERROR_SPAN;
+
+    #[test]
+    fn matches_the_status_ingest_writes_and_http_5xx() {
+        assert!(ERROR_SPAN.contains("'STATUS_CODE_ERROR'"));
+        assert!(ERROR_SPAN.contains("'ERROR'"));
+        assert!(ERROR_SPAN.contains("http_status_code >= 500"));
+        assert!(
+            ERROR_SPAN.starts_with('(') && ERROR_SPAN.ends_with(')'),
+            "safe to embed in larger conditions"
+        );
+    }
+    #[test]
+    fn level_and_error_fields_match_stored_span_status() {
+        assert_eq!(
+            super::resolve_field("level"),
+            "lower(replaceOne(status, 'STATUS_CODE_', ''))"
+        );
+        assert_eq!(
+            super::resolve_field("error"),
+            format!("toUInt8{ERROR_SPAN}")
+        );
+        let filters = vec![crate::models::query::Filter {
+            field: "error".into(),
+            op: crate::models::query::FilterOp::Eq,
+            value: serde_json::json!(1),
+        }];
+        let sql = super::build_where_clause(&filters, "2026-01-01 00:00:00", "2026-01-01 01:00:00")
+            .to_sql();
+        assert!(
+            sql.contains(
+                "toUInt8(status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500) = 1"
+            ),
+            "{sql}"
+        );
     }
 }

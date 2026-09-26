@@ -245,7 +245,7 @@ fn comparison_conditions(
         cohort_parts.push(format!("duration_ns <= {max}"));
     }
     if req.selection_errors_only {
-        cohort_parts.push("(status = 'ERROR' OR http_status_code >= 500)".to_string());
+        cohort_parts.push(crate::query_builder::ERROR_SPAN.to_string());
     }
     let cohort_suffix = if cohort_parts.is_empty() {
         String::new()
@@ -532,7 +532,7 @@ mod tests {
         .unwrap();
         assert!(selection.contains("duration_ns >= 100000000"));
         assert!(selection.contains("duration_ns <= 2000000000"));
-        assert!(selection.contains("status = 'ERROR' OR http_status_code >= 500"));
+        assert!(selection.contains(crate::query_builder::ERROR_SPAN));
         assert!(selection.contains("parseDateTime64BestEffort('sel-from')"));
         assert!(baseline.contains("AND NOT (timestamp >="));
         assert!(baseline.contains(&selection));

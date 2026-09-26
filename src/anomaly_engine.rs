@@ -1,6 +1,7 @@
 use crate::alert_engine::SmtpConfig;
 use crate::clickhouse_config::ConfigDb;
 use crate::models::anomaly::AnomalyRule;
+use crate::query_builder::ERROR_SPAN;
 use clickhouse::Client;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
@@ -419,7 +420,7 @@ async fn fetch_apm_data(
     let sql = format!(
         "SELECT toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL '1' MINUTE)) as bucket, \
          count() as count, \
-         countIf(status = 'error') as error_count, \
+         countIf({ERROR_SPAN}) as error_count, \
          quantile(0.50)(duration_ns) as p50, \
          quantile(0.95)(duration_ns) as p95, \
          quantile(0.99)(duration_ns) as p99 \
