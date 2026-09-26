@@ -2382,15 +2382,20 @@ async fn main() -> anyhow::Result<()> {
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
             .unwrap_or(true)
     };
-    if !drain_only {
-        let election = rush_api::leader::LeaderElection::from_env(
-            config_db.client.clone(),
-            &instance_id,
-            self_metrics.clone(),
-            Some(shutdown_controller.clone()),
+    let election = if drain_only {
+        None
+    } else {
+        Some(
+            rush_api::leader::LeaderElection::from_env(
+                config_db.client.clone(),
+                &instance_id,
+                self_metrics.clone(),
+                Some(shutdown_controller.clone()),
+            )
+            .await?,
         )
-        .await?;
-
+    };
+    if let Some(election) = election.as_ref() {
         // Legacy alert-rules engine retired — Monitors (monitor_engine) is the single
         // alerting system. The alert_engine module is kept only for the shared
         // notification infrastructure (SmtpConfig, send_channel_notification) that
@@ -2653,10 +2658,14 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // API-managed integration collector supervisor. It is opt-in and feature
-    // gated so the community binary never launches paid collectors.
-    let collectors = std::sync::Arc::new(rush_api::integrations::CollectorManager::new(
-        config_db.clone(),
-    ));
+    // gated so the community binary never launches paid collectors. Only the
+    // replica holding the collectors lease runs them.
+    let mut collector_manager = rush_api::integrations::CollectorManager::new(config_db.clone());
+    if let Some(election) = election.as_ref().filter(|_| collector_manager.enabled()) {
+        collector_manager =
+            collector_manager.with_lease(election.lease(rush_api::leader::COLLECTORS));
+    }
+    let collectors = std::sync::Arc::new(collector_manager);
     collectors.spawn_reconciler();
 
     let state = AppState {

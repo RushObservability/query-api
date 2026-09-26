@@ -6559,6 +6559,20 @@ impl ConfigDb {
 
     // ── API-managed integration targets ───────────────────────────────────────
 
+    /// Tenants with at least one enabled integration target, so the collector
+    /// leader supervises every tenant rather than only its configured default.
+    pub async fn list_integration_target_tenants(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .client
+            .query(
+                "SELECT DISTINCT tenant_id FROM config_integration_targets FINAL
+                 WHERE is_deleted = 0 AND enabled = 1
+                 ORDER BY tenant_id",
+            )
+            .fetch_all::<String>()
+            .await?)
+    }
+
     /// Return configured integration targets, decrypting DSNs only inside the
     /// API process. Callers must never serialize this result directly to users.
     pub async fn list_integration_target_secrets(

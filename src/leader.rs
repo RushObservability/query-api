@@ -54,6 +54,7 @@ pub const SLOS: &str = "slos";
 pub const ANOMALIES: &str = "anomalies";
 pub const DETECTIONS: &str = "detections";
 pub const RETENTION: &str = "retention";
+pub const COLLECTORS: &str = "collectors";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseMode {
@@ -377,11 +378,7 @@ impl LeaderElection {
             leases.retain(|existing| existing.name != name);
             leases.push(lease.clone());
         }
-        self.metrics.set_gauge(
-            "rush_engine_leader",
-            &[("engine", name)],
-            lease.is_leader() as u8 as f64,
-        );
+        report_leadership(&self.metrics, &lease, lease.is_leader());
         if self.mode == LeaseMode::Keeper {
             let renewer = Renewer {
                 client: self.client.clone(),
@@ -396,6 +393,19 @@ impl LeaderElection {
         }
         lease
     }
+}
+
+/// `rush_engine_leader{engine}` is 1 on the replica that holds the lease.
+/// `rush_engine_leader_info{engine,holder}` carries this process's holder id,
+/// so "who leads" is answerable even where scrapes lose the pod label.
+fn report_leadership(metrics: &SelfMetrics, lease: &EngineLease, leader: bool) {
+    let value = leader as u8 as f64;
+    metrics.set_gauge("rush_engine_leader", &[("engine", lease.name)], value);
+    metrics.set_gauge(
+        "rush_engine_leader_info",
+        &[("engine", lease.name), ("holder", lease.holder.as_str())],
+        value,
+    );
 }
 
 struct Renewer {
@@ -436,17 +446,31 @@ impl Renewer {
     async fn attempt(&self) {
         let started = Instant::now();
         let token = uuid::Uuid::new_v4().simple().to_string();
-        match self.acquire(&token).await {
+        let result = self.acquire(&token).await;
+        let labels = [("engine", self.lease.name)];
+        self.metrics.observe_histogram(
+            "rush_engine_lease_renew_duration_ms",
+            &labels,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        match result {
             Ok((row, previous)) => {
                 let won = row.holder == self.lease.holder && row.token == token;
                 if let Ok(mut current) = self.lease.current_holder.write() {
                     current.clone_from(&row.holder);
                 }
+                self.lease.epoch.store(row.epoch, Ordering::Release);
+                self.metrics
+                    .set_gauge("rush_engine_lease_epoch", &labels, row.epoch as f64);
                 if won {
-                    self.lease.epoch.store(row.epoch, Ordering::Release);
                     self.lease
                         .act_until_ms
                         .store(to_millis(self.timing.act_until(started)), Ordering::Release);
+                    self.metrics.set_gauge(
+                        "rush_engine_lease_last_renewal_timestamp_seconds",
+                        &labels,
+                        chrono::Utc::now().timestamp_millis() as f64 / 1_000.0,
+                    );
                     if !self.lease.leader.swap(true, Ordering::AcqRel) {
                         self.changed(true, previous);
                     }
@@ -561,11 +585,7 @@ impl Renewer {
     fn changed(&self, acquired: bool, other: Option<String>) {
         let name = self.lease.name;
         let epoch = self.lease.epoch();
-        self.metrics.set_gauge(
-            "rush_engine_leader",
-            &[("engine", name)],
-            acquired as u8 as f64,
-        );
+        report_leadership(&self.metrics, &self.lease, acquired);
         self.metrics
             .inc_counter("rush_engine_leader_changes_total", &[("engine", name)], 1);
         let other_holder = other.as_deref().unwrap_or("none");

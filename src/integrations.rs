@@ -306,10 +306,16 @@ struct ManagedProcess {
 
 /// Supervises locally spawned collectors. A remote/Kubernetes runner can use
 /// the same ConfigDb target methods without needing this process supervisor.
+///
+/// With several query-api replicas, only the replica holding the `collectors`
+/// leader lease runs collectors. The others keep none, and a replica that loses
+/// the lease stops its collectors within a second, before another replica can
+/// take the lease over.
 pub struct CollectorManager {
     config_db: Arc<ConfigDb>,
     processes: Mutex<HashMap<String, ManagedProcess>>,
     enabled: bool,
+    lease: Option<Arc<crate::leader::EngineLease>>,
 }
 
 impl CollectorManager {
@@ -321,15 +327,33 @@ impl CollectorManager {
             config_db,
             processes: Mutex::new(HashMap::new()),
             enabled,
+            lease: None,
         }
+    }
+
+    /// Run collectors only while `lease` is held. Without a lease (a single
+    /// development instance) this process always runs them.
+    pub fn with_lease(mut self, lease: Arc<crate::leader::EngineLease>) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     pub fn enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Reconcile every configured, licensed collector for a tenant.
+    fn is_leader(&self) -> bool {
+        self.lease.as_ref().is_none_or(|lease| lease.is_leader())
+    }
+
+    /// Reconcile every configured, licensed collector for a tenant. On a
+    /// replica without the collectors lease this only makes sure none run; the
+    /// leader picks up the change on its next pass.
     pub async fn reconcile(&self, tenant_id: &str) -> Result<()> {
+        if !self.is_leader() {
+            self.stop_all().await;
+            return Ok(());
+        }
         let mut first_error = None;
         for runtime in runtimes() {
             if let Err(error) = self.reconcile_one(tenant_id, &runtime).await {
@@ -446,6 +470,14 @@ impl CollectorManager {
         if let Ok(key) = std::env::var("RUSH_COLLECTOR_API_KEY") {
             command.env("RUSH_API_KEY", key);
         }
+        // Checked last, with the process table locked: never start a collector
+        // after this replica has lost the lease.
+        if !self.is_leader() {
+            if cleanup_config {
+                let _ = std::fs::remove_file(&config_path);
+            }
+            return Ok(());
+        }
         let child = command
             .spawn()
             .with_context(|| format!("starting {} collector binary {binary}", runtime.name))?;
@@ -475,20 +507,62 @@ impl CollectorManager {
         Ok(())
     }
 
-    /// Start a lightweight reconciliation loop for the configured local tenant.
+    /// Stop every collector this process runs.
+    pub async fn stop_all(&self) {
+        let keys: Vec<String> = self.processes.lock().await.keys().cloned().collect();
+        for key in keys {
+            let _ = self.stop(&key).await;
+        }
+    }
+
+    /// Tenants to supervise: the configured one, every tenant with an enabled
+    /// target, and any tenant this process still runs a collector for, so a
+    /// removed or disabled target gets stopped.
+    async fn tenants(&self, configured: &str) -> Vec<String> {
+        let mut tenants = std::collections::BTreeSet::from([configured.to_string()]);
+        match self.config_db.list_integration_target_tenants().await {
+            Ok(found) => tenants.extend(found),
+            Err(error) => {
+                tracing::warn!(%error, "could not list tenants with collector targets; supervising the configured tenant only");
+            }
+        }
+        for key in self.processes.lock().await.keys() {
+            if let Some((_, tenant)) = key.split_once(':') {
+                tenants.insert(tenant.to_string());
+            }
+        }
+        tenants.into_iter().collect()
+    }
+
+    /// Supervise collectors: reconcile every 30 seconds while this replica
+    /// holds the collectors lease (and as soon as it gains it), and stop them
+    /// within a second of losing it.
     pub fn spawn_reconciler(self: &Arc<Self>) {
         if !self.enabled {
             return;
         }
+        const FULL_PASS: std::time::Duration = std::time::Duration::from_secs(30);
+        const LEASE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
         let manager = Arc::clone(self);
-        let tenant = std::env::var("RUSH_COLLECTOR_TENANT").unwrap_or_else(|_| "default".into());
+        let configured =
+            std::env::var("RUSH_COLLECTOR_TENANT").unwrap_or_else(|_| "default".into());
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut last_pass: Option<std::time::Instant> = None;
             loop {
-                tick.tick().await;
-                if let Err(error) = manager.reconcile(&tenant).await {
-                    tracing::warn!(tenant = %tenant, %error, "collector reconciliation failed");
+                if !manager.is_leader() {
+                    if last_pass.take().is_some() {
+                        tracing::info!("collectors lease lost; stopping managed collectors");
+                    }
+                    manager.stop_all().await;
+                } else if last_pass.is_none_or(|at| at.elapsed() >= FULL_PASS) {
+                    last_pass = Some(std::time::Instant::now());
+                    for tenant in manager.tenants(&configured).await {
+                        if let Err(error) = manager.reconcile(&tenant).await {
+                            tracing::warn!(tenant = %tenant, %error, "collector reconciliation failed");
+                        }
+                    }
                 }
+                tokio::time::sleep(LEASE_POLL).await;
             }
         });
     }
