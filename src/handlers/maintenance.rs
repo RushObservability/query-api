@@ -1,7 +1,9 @@
 use crate::AppState;
+use crate::TenantContext;
 use crate::handlers::users::{require_auth, require_write};
+use crate::models::maintenance::{MaintenanceWindow, Scope, format_time, validate_window};
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -11,7 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 pub struct CreateWindowRequest {
     pub name: String,
+    /// `all` (default), `monitor:<id>`, or `tag:<key>:<value>`.
     pub scope: Option<String>,
+    /// RFC 3339, any offset.
     pub starts_at: String,
     pub ends_at: String,
 }
@@ -24,79 +28,163 @@ pub struct MaintenanceWindowResponse {
     pub starts_at: String,
     pub ends_at: String,
     pub created_at: String,
+    pub created_by: String,
+    /// `scheduled`, `active`, or `ended`.
+    pub status: &'static str,
 }
 
+impl MaintenanceWindowResponse {
+    fn from_window(window: MaintenanceWindow, now: chrono::DateTime<chrono::Utc>) -> Self {
+        let status = window.status(now);
+        Self {
+            id: window.id,
+            name: window.name,
+            scope: window.scope,
+            starts_at: window.starts_at,
+            ends_at: window.ends_at,
+            created_at: window.created_at,
+            created_by: window.created_by,
+            status,
+        }
+    }
+}
+
+/// GET /api/v1/maintenance-windows — this tenant's windows, newest first.
 pub async fn list_windows(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
-    let rows = state
+    let now = chrono::Utc::now();
+    let windows: Vec<MaintenanceWindowResponse> = state
         .config_db
-        .list_maintenance_windows()
+        .list_maintenance_windows(&tenant.tenant_id)
         .await
-        .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?;
-    let windows: Vec<MaintenanceWindowResponse> = rows
+        .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?
         .into_iter()
-        .map(|r| MaintenanceWindowResponse {
-            id: r.0,
-            name: r.1,
-            scope: r.2,
-            starts_at: r.3,
-            ends_at: r.4,
-            created_at: r.5,
-        })
+        .map(|window| MaintenanceWindowResponse::from_window(window, now))
         .collect();
     Ok(Json(serde_json::json!({ "windows": windows })))
 }
 
+/// POST /api/v1/maintenance-windows — silence monitor notifications for a period.
 pub async fn create_window(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateWindowRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
-    if req.name.trim().is_empty() {
+    let caller = require_write(&state, &headers).await?;
+    let name = req.name.trim();
+    if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name required".to_string()));
     }
-    if req.name.len() > 255 {
+    if name.len() > 255 {
         return Err((
             StatusCode::BAD_REQUEST,
             "name must not exceed 255 characters".to_string(),
         ));
     }
-    if req.starts_at.len() < 10 || req.ends_at.len() < 10 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid starts_at or ends_at".to_string(),
-        ));
+    let now = chrono::Utc::now();
+    let (starts_at, ends_at) = validate_window(&req.starts_at, &req.ends_at, now)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let scope = Scope::parse(req.scope.as_deref().unwrap_or("all"))
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    if let Scope::Monitor(monitor_id) = &scope {
+        let exists = state
+            .config_db
+            .get_monitor(monitor_id, &tenant.tenant_id)
+            .await
+            .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?
+            .is_some();
+        if !exists {
+            return Err((StatusCode::BAD_REQUEST, "monitor not found".to_string()));
+        }
     }
-    let id = uuid::Uuid::new_v4().to_string();
-    let scope = req.scope.unwrap_or_else(|| "all".to_string());
+
+    let window = MaintenanceWindow {
+        id: uuid::Uuid::new_v4().to_string(),
+        tenant_id: tenant.tenant_id.clone(),
+        name: name.to_string(),
+        scope: scope.as_stored(),
+        starts_at: format_time(starts_at),
+        ends_at: format_time(ends_at),
+        created_at: format_time(now),
+        created_by: caller.1.clone(),
+    };
     state
         .config_db
-        .create_maintenance_window(&id, &req.name, &scope, &req.starts_at, &req.ends_at)
+        .create_maintenance_window(&window)
         .await
         .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?;
+
+    // AUDIT: maintenance window created.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("maintenance_window.create", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("maintenance_window", window.id.clone())
+                .changes(
+                    serde_json::json!({
+                        "name": window.name,
+                        "scope": window.scope,
+                        "starts_at": window.starts_at,
+                        "ends_at": window.ends_at,
+                    })
+                    .to_string(),
+                )
+                .description("maintenance window created")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({ "id": id, "ok": true })),
+        Json(MaintenanceWindowResponse::from_window(window, now)),
     ))
 }
 
+/// DELETE /api/v1/maintenance-windows/{id} — end or cancel a window.
 pub async fn delete_window(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
-        .delete_maintenance_window(&id)
+        .delete_maintenance_window(&id, &tenant.tenant_id)
         .await
         .map_err(|e| crate::api_error::internal_legacy("maintenance", e))?;
-    if !deleted {
+    let Some(window) = deleted else {
         return Err((StatusCode::NOT_FOUND, "window not found".to_string()));
-    }
+    };
+
+    // AUDIT: maintenance window deleted.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("maintenance_window.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("maintenance_window", window.id.clone())
+                .changes(
+                    serde_json::json!({
+                        "name": window.name,
+                        "scope": window.scope,
+                        "starts_at": window.starts_at,
+                        "ends_at": window.ends_at,
+                    })
+                    .to_string(),
+                )
+                .description("maintenance window deleted")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }

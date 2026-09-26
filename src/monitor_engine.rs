@@ -96,6 +96,196 @@ fn build_smtp_transport(
     Some(builder.build())
 }
 
+/// What to do about notifications for one monitor group this cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Notify {
+    /// Nothing to send or record.
+    No,
+    /// The state differs from the last notification: send it.
+    Change,
+    /// Still in the same problem state past the renotify interval: send again.
+    Renotify,
+    /// No notification on record yet: record the current state without sending,
+    /// so renotify timing and maintenance catch-up have a starting point.
+    Baseline,
+}
+
+/// Decide whether a group notifies. `last` is the (state, epoch ms) of its last
+/// notification, if any.
+fn decide_notification(
+    prev_state: &str,
+    new_state: &str,
+    last: Option<(&str, i64)>,
+    now_ms: i64,
+    silenced: bool,
+    renotify_secs: Option<i64>,
+    notifies: impl Fn(&str) -> bool,
+) -> Notify {
+    let baseline = if last.is_none() {
+        Notify::Baseline
+    } else {
+        Notify::No
+    };
+    let (last_state, last_at) = last.unwrap_or((prev_state, now_ms));
+    if silenced {
+        return baseline;
+    }
+    if new_state != last_state {
+        return if notifies(new_state) {
+            Notify::Change
+        } else {
+            baseline
+        };
+    }
+    let problem = matches!(new_state, "alert" | "warn" | "no_data");
+    let due = renotify_secs
+        .filter(|secs| *secs > 0)
+        .is_some_and(|secs| now_ms.saturating_sub(last_at) >= secs.saturating_mul(1_000));
+    if problem && notifies(new_state) && due {
+        Notify::Renotify
+    } else {
+        baseline
+    }
+}
+
+/// (tenant, monitor, group) → (state, notified at ms).
+type LastNotifications = HashMap<(String, String, String), (String, i64)>;
+
+/// Maintenance windows and last notifications, loaded once per cycle and
+/// shared by every monitor evaluated in it.
+struct NotifyPolicy {
+    now_ms: i64,
+    /// Active windows, with their parsed scope.
+    windows: Vec<(
+        crate::models::maintenance::MaintenanceWindow,
+        crate::models::maintenance::Scope,
+    )>,
+    /// `None` when it couldn't be loaded: then only state changes notify, as before.
+    last: Option<LastNotifications>,
+}
+
+impl NotifyPolicy {
+    async fn load(config_db: &ConfigDb, now: chrono::DateTime<chrono::Utc>) -> Self {
+        let now_text = crate::models::maintenance::format_time(now);
+        let windows = match config_db
+            .list_unfinished_maintenance_windows(&now_text)
+            .await
+        {
+            Ok(windows) => windows
+                .into_iter()
+                .filter(|window| window.is_active(now))
+                .filter_map(|window| {
+                    let scope = crate::models::maintenance::Scope::parse(&window.scope).ok()?;
+                    Some((window, scope))
+                })
+                .collect(),
+            Err(error) => {
+                // Fail open: an unreadable window table must not silence alerts.
+                tracing::warn!(engine = "monitors", %error, "failed to load maintenance windows; notifying normally");
+                Vec::new()
+            }
+        };
+        let last = match config_db.list_monitor_notifications().await {
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            (row.tenant_id, row.monitor_id, row.group_key),
+                            (row.state, row.notified_at_ms),
+                        )
+                    })
+                    .collect(),
+            ),
+            Err(error) => {
+                tracing::warn!(engine = "monitors", %error, "failed to load monitor notification state; renotify skipped this cycle");
+                None
+            }
+        };
+        Self {
+            now_ms: now.timestamp_millis(),
+            windows,
+            last,
+        }
+    }
+
+    /// Name of the active window silencing this monitor, if any.
+    fn silencing_window(&self, monitor: &Monitor) -> Option<&str> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        let tags = monitor_tag_map(&monitor.tags);
+        self.windows
+            .iter()
+            .find(|(window, scope)| {
+                window.tenant_id == monitor.tenant_id && scope.covers(&monitor.id, &tags)
+            })
+            .map(|(window, _)| window.name.as_str())
+    }
+
+    fn decide(
+        &self,
+        monitor: &Monitor,
+        group_key: &str,
+        prev_state: &str,
+        new_state: &str,
+    ) -> Notify {
+        let notifies = |state: &str| state != "no_data" || monitor.no_data_action == "notify";
+        let silenced = self.silencing_window(monitor).is_some();
+        let Some(last) = &self.last else {
+            // Without notification state, behave as before: notify on change.
+            return if !silenced && new_state != prev_state && notifies(new_state) {
+                Notify::Change
+            } else {
+                Notify::No
+            };
+        };
+        let key = (
+            monitor.tenant_id.clone(),
+            monitor.id.clone(),
+            group_key.to_string(),
+        );
+        decide_notification(
+            prev_state,
+            new_state,
+            last.get(&key).map(|(state, at)| (state.as_str(), *at)),
+            self.now_ms,
+            silenced,
+            monitor.renotify_interval,
+            notifies,
+        )
+    }
+
+    /// Record what was sent, or the baseline. Only called when state is tracked.
+    async fn record(
+        &self,
+        config_db: &ConfigDb,
+        monitor: &Monitor,
+        group_key: &str,
+        decision: Notify,
+        prev_state: &str,
+        new_state: &str,
+    ) {
+        if self.last.is_none() || decision == Notify::No {
+            return;
+        }
+        let state = if decision == Notify::Baseline {
+            prev_state
+        } else {
+            new_state
+        };
+        let record = crate::models::maintenance::MonitorNotification {
+            tenant_id: monitor.tenant_id.clone(),
+            monitor_id: monitor.id.clone(),
+            group_key: group_key.to_string(),
+            state: state.to_string(),
+            notified_at_ms: self.now_ms,
+        };
+        if let Err(error) = config_db.record_monitor_notification(&record).await {
+            tracing::warn!(engine = "monitors", monitor_id = %monitor.id, %error, "failed to record monitor notification");
+        }
+    }
+}
+
 /// Run one evaluation cycle across all enabled monitors. Returns (evaluated, state_changes).
 async fn run_evaluation_cycle(
     ch: &Client,
@@ -111,6 +301,8 @@ async fn run_evaluation_cycle(
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let monitors = config_db.list_enabled_monitors().await?;
+    let policy = NotifyPolicy::load(config_db, now).await;
+    let policy_ref = &policy;
 
     // States of every enabled monitor as fetched this cycle — composite monitors
     // resolve their members from this map instead of one SELECT…FINAL per member.
@@ -164,6 +356,7 @@ async fn run_evaluation_cycle(
                     smtp_transport,
                     monitor_states_ref,
                     should_flush,
+                    policy_ref,
                 ),
             )
             .await
@@ -190,6 +383,7 @@ async fn run_evaluation_cycle(
                         smtp_config,
                         smtp_transport,
                         should_flush,
+                        policy_ref,
                     )
                     .await
                 }
@@ -221,6 +415,7 @@ async fn evaluate_monitor(
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
     monitor_states: &HashMap<String, String>,
     should_flush: bool,
+    policy: &NotifyPolicy,
 ) -> anyhow::Result<(u64, bool)> {
     let group_by: Vec<String> = serde_json::from_str(&monitor.group_by).unwrap_or_default();
     let has_groups = !group_by.is_empty();
@@ -240,6 +435,7 @@ async fn evaluate_monitor(
                 smtp_transport,
                 monitor_states,
                 should_flush,
+                policy,
             )
             .await;
         }
@@ -259,6 +455,7 @@ async fn evaluate_monitor(
             smtp_config,
             smtp_transport,
             should_flush,
+            policy,
         )
         .await);
     }
@@ -272,7 +469,9 @@ async fn evaluate_monitor(
         let current_state = group_states
             .get(group_key)
             .map(|s| s.as_str())
-            .unwrap_or(&monitor.state);
+            .unwrap_or(&monitor.state)
+            .to_string();
+        let current_state = current_state.as_str();
 
         let new_state = evaluate_threshold(
             current_state,
@@ -283,10 +482,11 @@ async fn evaluate_monitor(
             monitor.warning_recovery,
             &monitor.comparator,
         );
+        let decision = policy.decide(monitor, group_key, current_state, new_state);
+        let changed = new_state != current_state;
+        let sends = matches!(decision, Notify::Change | Notify::Renotify);
 
-        if new_state != current_state {
-            changes += 1;
-
+        if changed || sends {
             let threshold = match new_state {
                 "alert" => monitor.critical,
                 "warn" => monitor.warning,
@@ -302,71 +502,104 @@ async fn evaluate_monitor(
                 threshold.unwrap_or(0.0),
             );
 
-            let event_msg = format!(
-                "Monitor '{}'{}: {} -> {} (value={:.4}, threshold={:.4})",
-                alert_name,
-                if group_key.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", group_key)
-                },
-                current_state,
-                new_state,
-                value,
-                threshold.unwrap_or(0.0),
-            );
-            let notification_message = if monitor.message.trim().is_empty() {
-                event_msg.clone()
+            let group_label = if group_key.is_empty() {
+                String::new()
             } else {
-                render_monitor_template(
-                    &monitor.message,
-                    &group_by,
+                format!(" [{group_key}]")
+            };
+            let reading = format!(
+                "(value={:.4}, threshold={:.4})",
+                value,
+                threshold.unwrap_or(0.0)
+            );
+            let event_msg = format!(
+                "Monitor '{alert_name}'{group_label}: {current_state} -> {new_state} {reading}"
+            );
+
+            if changed {
+                changes += 1;
+                let event_msg = match policy.silencing_window(monitor) {
+                    Some(window) => format!(
+                        "{event_msg}; notifications silenced by maintenance window '{window}'"
+                    ),
+                    None => event_msg.clone(),
+                };
+                let event_id = uuid::Uuid::new_v4().to_string();
+                let _ = config_db
+                    .create_monitor_event(
+                        &event_id,
+                        &monitor.id,
+                        &monitor.tenant_id,
+                        group_key,
+                        current_state,
+                        new_state,
+                        Some(*value),
+                        threshold,
+                        &event_msg,
+                    )
+                    .await;
+
+                if new_state == "alert" || new_state == "warn" {
+                    let _ = config_db
+                        .update_monitor_triggered(&monitor.id, now_str)
+                        .await;
+                }
+            }
+
+            if sends {
+                let renotify = decision == Notify::Renotify;
+                let message = if !monitor.message.trim().is_empty() {
+                    let rendered = render_monitor_template(
+                        &monitor.message,
+                        &group_by,
+                        group_key,
+                        new_state,
+                        *value,
+                        threshold.unwrap_or(0.0),
+                    );
+                    if renotify {
+                        format!("[Renotify] {rendered}")
+                    } else {
+                        rendered
+                    }
+                } else if changed {
+                    event_msg.clone()
+                } else if renotify {
+                    format!(
+                        "[Renotify] Monitor '{alert_name}'{group_label}: still {new_state} {reading}"
+                    )
+                } else {
+                    // Catching up, e.g. after a maintenance window: report where it is now.
+                    format!("Monitor '{alert_name}'{group_label}: {new_state} {reading}")
+                };
+                fire_notifications(
+                    config_db,
+                    monitor,
                     group_key,
+                    &alert_name,
+                    &message,
                     new_state,
                     *value,
                     threshold.unwrap_or(0.0),
-                )
-            };
-
-            let event_id = uuid::Uuid::new_v4().to_string();
-            let _ = config_db
-                .create_monitor_event(
-                    &event_id,
-                    &monitor.id,
-                    &monitor.tenant_id,
-                    group_key,
-                    current_state,
-                    new_state,
-                    Some(*value),
-                    threshold,
-                    &event_msg,
+                    http_client,
+                    smtp_config,
+                    smtp_transport,
                 )
                 .await;
-
-            // Fire notifications
-            fire_notifications(
-                config_db,
-                monitor,
-                group_key,
-                &alert_name,
-                &notification_message,
-                new_state,
-                *value,
-                threshold.unwrap_or(0.0),
-                http_client,
-                smtp_config,
-                smtp_transport,
-            )
-            .await;
-
-            if new_state == "alert" || new_state == "warn" {
-                let _ = config_db
-                    .update_monitor_triggered(&monitor.id, now_str)
-                    .await;
             }
 
             group_states.insert(group_key.clone(), new_state.to_string());
         }
+        policy
+            .record(
+                config_db,
+                monitor,
+                group_key,
+                decision,
+                current_state,
+                new_state,
+            )
+            .await;
     }
 
     // Determine overall monitor state (worst across groups)
@@ -497,6 +730,7 @@ fn evaluate_threshold(
 
 /// Handle the no-data condition for a monitor. Returns (state_changes, persisted_to_db).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_no_data(
     config_db: &ConfigDb,
     monitor: &Monitor,
@@ -505,8 +739,9 @@ async fn handle_no_data(
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
     should_flush: bool,
+    policy: &NotifyPolicy,
 ) -> (u64, bool) {
-    let old_state = &monitor.state;
+    let old_state = monitor.state.as_str();
     let action = monitor.no_data_action.as_str();
 
     let new_state = match action {
@@ -514,13 +749,21 @@ async fn handle_no_data(
         "resolve" => "ok",
         _ => "no_data", // "show" also sets no_data, but does not notify
     };
+    let decision = policy.decide(monitor, "", old_state, new_state);
+    let changed = new_state != old_state;
+    let event_msg = format!(
+        "Monitor '{}': {} -> {} (no data received)",
+        monitor.name, old_state, new_state,
+    );
 
-    if new_state != old_state.as_str() {
+    if changed {
+        let event_msg = match policy.silencing_window(monitor) {
+            Some(window) => {
+                format!("{event_msg}; notifications silenced by maintenance window '{window}'")
+            }
+            None => event_msg.clone(),
+        };
         let event_id = uuid::Uuid::new_v4().to_string();
-        let event_msg = format!(
-            "Monitor '{}': {} -> {} (no data received)",
-            monitor.name, old_state, new_state,
-        );
         let _ = config_db
             .create_monitor_event(
                 &event_id,
@@ -534,24 +777,34 @@ async fn handle_no_data(
                 &event_msg,
             )
             .await;
+    }
 
-        if action == "notify" {
-            fire_notifications(
-                config_db,
-                monitor,
-                "",
-                &monitor.name,
-                &event_msg,
-                new_state,
-                0.0,
-                0.0,
-                http_client,
-                smtp_config,
-                smtp_transport,
-            )
-            .await;
-        }
+    if matches!(decision, Notify::Change | Notify::Renotify) {
+        let message = if decision == Notify::Renotify {
+            format!("[Renotify] Monitor '{}' still has no data", monitor.name)
+        } else {
+            event_msg.clone()
+        };
+        fire_notifications(
+            config_db,
+            monitor,
+            "",
+            &monitor.name,
+            &message,
+            new_state,
+            0.0,
+            0.0,
+            http_client,
+            smtp_config,
+            smtp_transport,
+        )
+        .await;
+    }
+    policy
+        .record(config_db, monitor, "", decision, old_state, new_state)
+        .await;
 
+    if changed {
         // Transition persists immediately, exactly as before.
         let _ = config_db
             .update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str)
@@ -650,63 +903,31 @@ async fn fire_notifications(
         &routes,
     );
 
-    for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel(channel_id, &monitor.tenant_id).await {
-            if !channel.enabled {
-                continue;
-            }
+    alert_engine::notify_channels(
+        config_db,
+        &monitor.tenant_id,
+        &channel_ids,
+        &alert_engine::ChannelNotification {
+            source: "monitor",
+            signal_type: "monitors",
+            alert_name,
+            message,
+            alert_state,
+            value,
+            threshold,
+            condition_op: &monitor.comparator,
+            description: "",
+            alert_id: &monitor.id,
             // A recovery for one monitor group must not resolve another group's alert.
-            let notification_id = if matches!(channel.channel_type.as_str(), "rootly" | "pagerduty")
-            {
-                alert_engine::rootly::monitor_alert_id(&monitor.id, group_key)
-            } else {
-                monitor.id.clone()
-            };
-            let result = alert_engine::send_channel_notification(
-                &channel,
-                message,
-                alert_name,
-                alert_state,
-                value,
-                threshold,
-                "monitors",
-                &monitor.comparator,
-                "",
-                &notification_id,
-                "",
-                http_client,
-                smtp_config,
-                smtp_transport,
-            )
-            .await;
-
-            let (status, error_msg) = match &result {
-                Ok(()) => ("sent", String::new()),
-                Err(e) => {
-                    tracing::warn!(
-                        engine = "monitors",
-                        monitor_id = %monitor.id,
-                        channel_id = %channel_id,
-                        error = %e,
-                        "notification failed"
-                    );
-                    ("failed", e.clone())
-                }
-            };
-
-            let _ = config_db
-                .create_notification_log(
-                    channel_id,
-                    &monitor.tenant_id,
-                    "monitor",
-                    alert_name,
-                    alert_state,
-                    status,
-                    &error_msg,
-                )
-                .await;
-        }
-    }
+            incident_key: &alert_engine::rootly::monitor_alert_id(&monitor.id, group_key),
+            runbook_url: "",
+            webhook_fields: None,
+        },
+        http_client,
+        smtp_config,
+        smtp_transport,
+    )
+    .await;
 }
 
 /// Evaluate a composite monitor by examining the states of its component monitors.
@@ -721,6 +942,7 @@ async fn evaluate_composite(
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
     monitor_states: &HashMap<String, String>,
     should_flush: bool,
+    policy: &NotifyPolicy,
 ) -> anyhow::Result<(u64, bool)> {
     let monitor_ids: Vec<String> =
         serde_json::from_str(&monitor.composite_monitor_ids).unwrap_or_default();
@@ -759,22 +981,30 @@ async fn evaluate_composite(
     // Evaluate the boolean formula (simple parser for A && B && !C patterns)
     let composite_result = eval_boolean_formula(formula, &letter_states);
     let new_state = if composite_result { "alert" } else { "ok" };
+    let old_state = monitor.state.as_str();
+    let decision = policy.decide(monitor, "", old_state, new_state);
+    let event_msg = format!(
+        "Composite monitor '{}': {} -> {} (formula: {})",
+        monitor.name, old_state, new_state, formula,
+    );
 
     let mut changes: u64 = 0;
-    if new_state != monitor.state.as_str() {
+    if new_state != old_state {
         changes = 1;
+        let event_msg = match policy.silencing_window(monitor) {
+            Some(window) => {
+                format!("{event_msg}; notifications silenced by maintenance window '{window}'")
+            }
+            None => event_msg.clone(),
+        };
         let event_id = uuid::Uuid::new_v4().to_string();
-        let event_msg = format!(
-            "Composite monitor '{}': {} -> {} (formula: {})",
-            monitor.name, monitor.state, new_state, formula,
-        );
         let _ = config_db
             .create_monitor_event(
                 &event_id,
                 &monitor.id,
                 &monitor.tenant_id,
                 "",
-                &monitor.state,
+                old_state,
                 new_state,
                 None,
                 None,
@@ -782,12 +1012,28 @@ async fn evaluate_composite(
             )
             .await;
 
+        if new_state == "alert" {
+            let _ = config_db
+                .update_monitor_triggered(&monitor.id, now_str)
+                .await;
+        }
+    }
+
+    if matches!(decision, Notify::Change | Notify::Renotify) {
+        let message = if decision == Notify::Renotify {
+            format!(
+                "[Renotify] Composite monitor '{}' is still alerting (formula: {formula})",
+                monitor.name
+            )
+        } else {
+            event_msg.clone()
+        };
         fire_notifications(
             config_db,
             monitor,
             "",
             &monitor.name,
-            &event_msg,
+            &message,
             new_state,
             0.0,
             0.0,
@@ -796,13 +1042,10 @@ async fn evaluate_composite(
             smtp_transport,
         )
         .await;
-
-        if new_state == "alert" {
-            let _ = config_db
-                .update_monitor_triggered(&monitor.id, now_str)
-                .await;
-        }
     }
+    policy
+        .record(config_db, monitor, "", decision, old_state, new_state)
+        .await;
 
     if changes > 0 {
         // Transition persists immediately, exactly as before.
@@ -2221,6 +2464,136 @@ mod tests {
                 &["endpoint".to_string(), "http_method".to_string()]
             )
             .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod notify_policy_tests {
+    use super::{Notify, decide_notification};
+
+    const NOW: i64 = 10_000_000;
+    fn all(_: &str) -> bool {
+        true
+    }
+
+    #[test]
+    fn notifies_state_changes() {
+        assert_eq!(
+            decide_notification("ok", "alert", Some(("ok", 0)), NOW, false, None, all),
+            Notify::Change
+        );
+        assert_eq!(
+            decide_notification("alert", "ok", Some(("alert", 0)), NOW, false, None, all),
+            Notify::Change
+        );
+        assert_eq!(
+            decide_notification("ok", "ok", Some(("ok", 0)), NOW, false, None, all),
+            Notify::No
+        );
+    }
+
+    #[test]
+    fn first_sight_records_a_baseline_or_notifies_a_change() {
+        assert_eq!(
+            decide_notification("alert", "alert", None, NOW, false, Some(60), all),
+            Notify::Baseline
+        );
+        assert_eq!(
+            decide_notification("ok", "alert", None, NOW, false, None, all),
+            Notify::Change
+        );
+    }
+
+    #[test]
+    fn maintenance_silences_and_catches_up_afterwards() {
+        // During the window: nothing sent, whatever happens.
+        assert_eq!(
+            decide_notification("ok", "alert", Some(("ok", 0)), NOW, true, None, all),
+            Notify::No
+        );
+        assert_eq!(
+            decide_notification("ok", "alert", None, NOW, true, None, all),
+            Notify::Baseline
+        );
+        // After it: still alerting, last notification said ok, so notify once.
+        assert_eq!(
+            decide_notification("alert", "alert", Some(("ok", 0)), NOW, false, None, all),
+            Notify::Change
+        );
+        // Alerted before the window, recovered inside it: send the recovery.
+        assert_eq!(
+            decide_notification("ok", "ok", Some(("alert", 0)), NOW, false, None, all),
+            Notify::Change
+        );
+        // Flapped inside the window and ended where it started: nothing.
+        assert_eq!(
+            decide_notification("ok", "ok", Some(("ok", 0)), NOW, false, None, all),
+            Notify::No
+        );
+    }
+
+    #[test]
+    fn renotifies_on_schedule_while_in_a_problem_state() {
+        let last = Some(("alert", NOW - 3_600_000));
+        assert_eq!(
+            decide_notification("alert", "alert", last, NOW, false, Some(3_600), all),
+            Notify::Renotify
+        );
+        assert_eq!(
+            decide_notification("alert", "alert", last, NOW, false, Some(7_200), all),
+            Notify::No
+        );
+        assert_eq!(
+            decide_notification("alert", "alert", last, NOW, false, None, all),
+            Notify::No
+        );
+        assert_eq!(
+            decide_notification("alert", "alert", last, NOW, false, Some(0), all),
+            Notify::No
+        );
+        assert_eq!(
+            decide_notification("warn", "warn", Some(("warn", 0)), NOW, false, Some(60), all),
+            Notify::Renotify
+        );
+        assert_eq!(
+            decide_notification("ok", "ok", Some(("ok", 0)), NOW, false, Some(60), all),
+            Notify::No
+        );
+        assert_eq!(
+            decide_notification("alert", "alert", last, NOW, true, Some(60), all),
+            Notify::No,
+            "maintenance wins"
+        );
+    }
+
+    #[test]
+    fn respects_no_data_notify_setting() {
+        let quiet = |state: &str| state != "no_data";
+        assert_eq!(
+            decide_notification("ok", "no_data", Some(("ok", 0)), NOW, false, None, quiet),
+            Notify::No
+        );
+        assert_eq!(
+            decide_notification("ok", "no_data", Some(("ok", 0)), NOW, false, None, all),
+            Notify::Change
+        );
+        assert_eq!(
+            decide_notification(
+                "no_data",
+                "no_data",
+                Some(("no_data", 0)),
+                NOW,
+                false,
+                Some(60),
+                quiet
+            ),
+            Notify::No
+        );
+        // Back from an un-notified no_data to the last notified state: nothing new.
+        assert_eq!(
+            decide_notification("no_data", "ok", Some(("ok", 0)), NOW, false, None, quiet),
+            Notify::No
         );
     }
 }

@@ -2,9 +2,8 @@ use crate::alert_engine::SmtpConfig;
 use crate::clickhouse_config::ConfigDb;
 use crate::models::anomaly::AnomalyRule;
 use clickhouse::Client;
-use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use std::sync::Arc;
 
 #[derive(clickhouse::Row, serde::Deserialize)]
@@ -595,7 +594,7 @@ fn anomaly_log_tuple(
 
 async fn send_notifications(
     config_db: &ConfigDb,
-    _http_client: &reqwest::Client,
+    http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
     rule: &AnomalyRule,
@@ -608,72 +607,34 @@ async fn send_notifications(
     }
     let channel_ids: Vec<String> =
         serde_json::from_str(&rule.notification_channel_ids).unwrap_or_default();
-    for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
-            let config: serde_json::Value =
-                serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
-
-            match channel.channel_type.as_str() {
-                "email" => {
-                    if let Some(to_addr) = config.get("to").and_then(|t| t.as_str()) {
-                        if let Some(transport) = smtp_transport {
-                            let subject = format!(
-                                "[Wide Anomaly] {} - {}",
-                                rule.name,
-                                if is_anomalous {
-                                    "ANOMALOUS"
-                                } else {
-                                    "RESOLVED"
-                                }
-                            );
-                            match Message::builder()
-                                .from(
-                                    smtp_config
-                                        .from
-                                        .parse()
-                                        .unwrap_or_else(|_| "wide@localhost".parse().unwrap()),
-                                )
-                                .to(to_addr
-                                    .parse()
-                                    .unwrap_or_else(|_| "noreply@localhost".parse().unwrap()))
-                                .subject(subject)
-                                .header(ContentType::TEXT_PLAIN)
-                                .body(message.to_string())
-                            {
-                                Ok(email) => {
-                                    if let Err(e) = transport.send(email).await {
-                                        tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "email", "notification failed");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "failed to build email");
-                                }
-                            }
-                        }
-                    }
-                }
-                "slack" => {
-                    if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                        let payload = serde_json::json!({ "text": message });
-                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
-                            tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "slack", "notification failed");
-                        }
-                    }
-                }
-                _ => {
-                    // webhook
-                    if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                        let payload = serde_json::json!({
-                            "anomaly": rule.name,
-                            "state": if is_anomalous { "anomalous" } else { "normal" },
-                            "message": message,
-                        });
-                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
-                            tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, channel = "webhook", "notification failed");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Webhook receivers written for the old anomaly payload keep their fields,
+    // including `state` as anomalous/normal.
+    let webhook_fields = serde_json::json!({
+        "anomaly": rule.name,
+        "state": if is_anomalous { "anomalous" } else { "normal" },
+    });
+    crate::alert_engine::notify_channels(
+        config_db,
+        &rule.tenant_id,
+        &channel_ids,
+        &crate::alert_engine::ChannelNotification {
+            source: "anomaly",
+            signal_type: "anomaly",
+            alert_name: &rule.name,
+            message,
+            alert_state: if is_anomalous { "alert" } else { "ok" },
+            value: 0.0,
+            threshold: 0.0,
+            condition_op: "",
+            description: "",
+            alert_id: &rule.id,
+            incident_key: &format!("anomaly:{}", rule.id),
+            runbook_url: "",
+            webhook_fields: Some(&webhook_fields),
+        },
+        http_client,
+        smtp_config,
+        smtp_transport,
+    )
+    .await;
 }

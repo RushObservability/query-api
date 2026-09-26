@@ -15,9 +15,10 @@ pub fn spawn(
     config_db: Arc<ConfigDb>,
     self_metrics: Arc<crate::self_metrics::SelfMetrics>,
     lease: Arc<crate::leader::EngineLease>,
+    smtp_config: crate::alert_engine::SmtpConfig,
 ) {
     tokio::spawn(async move {
-        let http_client = reqwest::Client::new();
+        let notifier = crate::alert_engine::Notifier::new(smtp_config);
         tracing::info!(
             engine = "siem",
             interval_secs = 60,
@@ -32,7 +33,7 @@ pub fn spawn(
                 continue;
             }
             let start = std::time::Instant::now();
-            let cycle = run_detection_cycle(&ch, &config_db, &http_client, &mut eval_state);
+            let cycle = run_detection_cycle(&ch, &config_db, &notifier, &mut eval_state);
             let ok = match crate::leader::fenced(lease.clone(), cycle).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -48,7 +49,7 @@ pub fn spawn(
 async fn run_detection_cycle(
     ch: &Client,
     config_db: &ConfigDb,
-    http_client: &reqwest::Client,
+    notifier: &crate::alert_engine::Notifier,
     eval_state: &mut crate::eval_state::EvalState,
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
@@ -85,7 +86,7 @@ async fn run_detection_cycle(
                 evaluate_rule(
                     ch,
                     config_db,
-                    http_client,
+                    notifier,
                     &rule,
                     &now,
                     now_str_ref,
@@ -167,7 +168,7 @@ fn is_rule_due(rule: &DetectionRule, now: &chrono::DateTime<chrono::Utc>) -> boo
 async fn evaluate_rule(
     ch: &Client,
     config_db: &ConfigDb,
-    http_client: &reqwest::Client,
+    notifier: &crate::alert_engine::Notifier,
     rule: &DetectionRule,
     now: &chrono::DateTime<chrono::Utc>,
     now_str: &str,
@@ -201,7 +202,7 @@ async fn evaluate_rule(
     if did_fire {
         // Fires persist last_triggered_at immediately, from the rule row we
         // already hold (no SELECT…FINAL re-read).
-        fire_detection(config_db, http_client, rule, match_count, "[]", now_str).await;
+        fire_detection(config_db, notifier, rule, match_count, "[]", now_str).await;
         config_db
             .persist_detection_rule_eval(rule, now_str, Some(now_str))
             .await?;
@@ -222,7 +223,7 @@ async fn evaluate_rule(
 /// Fire a detection: create an event and send notifications.
 async fn fire_detection(
     config_db: &ConfigDb,
-    _http_client: &reqwest::Client,
+    notifier: &crate::alert_engine::Notifier,
     rule: &DetectionRule,
     match_count: i64,
     sample_data: &str,
@@ -264,45 +265,38 @@ async fn fire_detection(
         "[SIEM Detection] Rule '{}' fired (severity={}, match_count={}, tenant={})",
         rule.name, rule.severity, match_count, rule.tenant_id,
     );
-
-    for channel_id in &channel_ids {
-        if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
-            let config: serde_json::Value =
-                serde_json::from_str(&channel.config).unwrap_or(serde_json::json!({}));
-
-            match channel.channel_type.as_str() {
-                "slack" => {
-                    if let Some(url) = config
-                        .get("url")
-                        .or_else(|| config.get("webhook_url"))
-                        .and_then(|u| u.as_str())
-                    {
-                        let payload = serde_json::json!({ "text": message });
-                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
-                            tracing::warn!(error = %e, engine = "siem", rule_name = %rule.name, channel = "slack", "notification failed");
-                        }
-                    }
-                }
-                _ => {
-                    // webhook (default)
-                    if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
-                        let payload = serde_json::json!({
-                            "detection_rule": rule.name,
-                            "severity": rule.severity,
-                            "tenant_id": rule.tenant_id,
-                            "match_count": match_count,
-                            "message": message,
-                            "event_id": event_id,
-                            "fired_at": now_str,
-                        });
-                        if let Err(e) = crate::outbound::post_json(url, &payload).await {
-                            tracing::warn!(error = %e, engine = "siem", rule_name = %rule.name, channel = "webhook", "notification failed");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Webhook receivers written for the old detection payload keep their fields.
+    let webhook_fields = serde_json::json!({
+        "detection_rule": rule.name,
+        "severity": rule.severity,
+        "tenant_id": rule.tenant_id,
+        "match_count": match_count,
+        "event_id": event_id,
+        "fired_at": now_str,
+    });
+    notifier
+        .notify(
+            config_db,
+            &rule.tenant_id,
+            &channel_ids,
+            &crate::alert_engine::ChannelNotification {
+                source: "detection",
+                signal_type: "detection",
+                alert_name: &rule.name,
+                message: &message,
+                alert_state: "alert",
+                value: match_count as f64,
+                threshold: 0.0,
+                condition_op: "",
+                description: "",
+                alert_id: &rule.id,
+                // Each firing is its own incident; detections don't resolve.
+                incident_key: &format!("detection:{event_id}"),
+                runbook_url: "",
+                webhook_fields: Some(&webhook_fields),
+            },
+        )
+        .await;
 }
 
 /// Execute a detection rule query for dry-run / test purposes.
