@@ -67,16 +67,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
     tracing::info!("config db opened");
 
-    let smtp_config = SmtpConfig {
-        host: std::env::var("RUSH_SMTP_HOST").ok(),
-        port: std::env::var("RUSH_SMTP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(587),
-        user: std::env::var("RUSH_SMTP_USER").ok(),
-        pass: std::env::var("RUSH_SMTP_PASS").ok(),
-        from: std::env::var("RUSH_SMTP_FROM").unwrap_or_else(|_| "wide@localhost".to_string()),
-    };
+    let smtp_config = SmtpConfig::from_env();
 
     let prom_base_url =
         std::env::var("RUSH_PROM_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
