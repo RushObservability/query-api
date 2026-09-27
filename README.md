@@ -362,25 +362,17 @@ install running `RUSH_LEADER_ELECTION=local` on several replicas.
 
 ### Kubernetes graceful shutdown
 
-`POST /shutdown` is intended for a pod-local `preStop` hook. It immediately
-marks `/readyz` unavailable and rejects new application requests, then the
-process flushes in-memory batches and waits for the durable spool to reach zero
-before exiting. The endpoint accepts loopback callers without authentication;
-set `RUSH_SHUTDOWN_TOKEN` if a non-loopback management caller must trigger it.
+SIGTERM starts a graceful shutdown. The process marks `/readyz` unavailable and
+rejects new application requests, flushes in-memory batches, and waits for the
+durable spool to reach zero before exiting. It writes a `system.shutdown` audit
+event with the signal that started it. No `preStop` hook is needed.
 
-The published query-api image includes `curl`, so a Deployment can use:
-
-```yaml
-lifecycle:
-  preStop:
-    exec:
-      command:
-        - /bin/sh
-        - -c
-        - >-
-          exec /usr/bin/curl --fail --silent --show-error --max-time 5
-          --request POST http://127.0.0.1:8080/shutdown
-```
+The published image runs on the distroless Chainguard `glibc-dynamic` runtime,
+with no shell or `curl`, so an exec hook that shells out to `curl` fails.
+`POST /shutdown` starts the same drain for a caller outside the pod, such as a
+management sidecar. It accepts loopback callers without authentication; set
+`RUSH_SHUTDOWN_TOKEN` to let a non-loopback caller trigger it with the
+`X-Rush-Shutdown-Token` header.
 
 Give the pod enough `terminationGracePeriodSeconds` for the expected backlog.
 If ClickHouse is unavailable, the process keeps retrying instead of claiming a

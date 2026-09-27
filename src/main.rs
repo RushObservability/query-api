@@ -2550,7 +2550,7 @@ async fn main() -> anyhow::Result<()> {
             backend = effective_backend,
             "RUSH_DRAIN_WORKER_ONLY — draining ingest buffer to ClickHouse; not serving HTTP"
         );
-        shutdown_signal(shutdown_controller.clone()).await;
+        shutdown_signal(shutdown_controller.clone(), audit.clone()).await;
         graceful_shutdown_drain(writer, shutdown_controller, replayer_handle).await;
         return Ok(());
     }
@@ -2661,6 +2661,7 @@ async fn main() -> anyhow::Result<()> {
     let collectors = std::sync::Arc::new(collector_manager);
     collectors.spawn_reconciler();
 
+    let shutdown_audit = audit.clone();
     let state = AppState {
         ch,
         admin_ch,
@@ -3440,7 +3441,7 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_controller.clone()))
+    .with_graceful_shutdown(shutdown_signal(shutdown_controller.clone(), shutdown_audit))
     .await?;
     // Engines stopped acting when shutdown began; make sure Keeper hears it so
     // another replica takes over now rather than after the lease TTL.
@@ -3451,7 +3452,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Resolve when a shutdown signal (Ctrl-C / SIGTERM) is received.
-async fn shutdown_signal(shutdown: rush_api::shutdown::ShutdownController) {
+///
+/// A signal that starts the shutdown is audited here. `POST /shutdown` audits
+/// its own request, so a signal arriving after it adds nothing.
+async fn shutdown_signal(
+    shutdown: rush_api::shutdown::ShutdownController,
+    audit: std::sync::Arc<rush_api::audit::AuditLogger>,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -3468,12 +3475,24 @@ async fn shutdown_signal(shutdown: rush_api::shutdown::ShutdownController) {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-        _ = shutdown.wait_for_request() => {},
+    let signal = tokio::select! {
+        _ = ctrl_c => Some("SIGINT"),
+        _ = terminate => Some("SIGTERM"),
+        _ = shutdown.wait_for_request() => None,
+    };
+    let first_request = shutdown.request();
+    if let (Some(signal), true) = (signal, first_request) {
+        // AUDIT: process shutdown started by a signal.
+        audit
+            .log(
+                rush_api::audit::AuditEvent::new("system.shutdown", "system")
+                    .resource("query_api", "shutdown")
+                    .metadata(
+                        serde_json::json!({ "trigger": "signal", "signal": signal }).to_string(),
+                    ),
+            )
+            .await;
     }
-    shutdown.request();
 }
 
 /// Stop admitting work, flush in-memory batches, then keep retrying the durable
