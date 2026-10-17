@@ -422,9 +422,19 @@ components:
 ```bash
 git clone https://github.com/RushObservability/query-api
 cd query-api
-cargo build --release   # or: make release
+cargo build --release   # or: make build-release
 cargo test              # or: make test
 ```
+
+## Releasing
+
+From an up-to-date `main`, `make release` opens a version-bump PR. It first runs
+the release workflow's dependency gate locally (`cargo audit` and `cargo deny`,
+plus the release script tests), so a known advisory stops the release before any
+branch is created. Install the tools once with
+`cargo install --locked cargo-audit cargo-deny`. Pass `VERSION=x.y.z` to choose
+the version, or `DRY_RUN=1` to run the gate and print the plan without changing
+anything. Merging the PR runs the release workflow, which tags and publishes.
 
 ## License
 

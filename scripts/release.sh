@@ -85,6 +85,24 @@ echo "  New version:     $version"
 echo "  Branch:          $release_branch"
 echo "  Tag after merge: $release_tag"
 
+# Run the release workflow's dependency gate locally (.github/workflows/release.yml,
+# "Security release gate") before any branch exists, so a known advisory fails
+# here instead of after the release PR merges. The gate's fmt, Clippy, and test
+# steps run below, after the version bump.
+for gate_tool in cargo-audit cargo-deny python3; do
+  if ! command -v "$gate_tool" >/dev/null 2>&1; then
+    echo "Required for the release security gate: $gate_tool. Install the cargo tools with: cargo install --locked cargo-audit cargo-deny" >&2
+    exit 1
+  fi
+done
+echo "Release security gate: release workflow script tests"
+python3 scripts/test-summarize-trivy.py
+python3 scripts/test-licensed-dispatch.py
+echo "Release security gate: cargo audit"
+cargo audit --ignore RUSTSEC-2023-0071
+echo "Release security gate: cargo deny"
+cargo deny check --hide-inclusion-graph advisories bans licenses sources
+
 if [[ "$dry_run" == "1" ]]; then
   echo "Dry run complete. No files, branches, commits, or pull requests were changed."
   exit 0
