@@ -2703,6 +2703,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
         .route("/api/v1/explore/search", post(handlers::explore::search))
         .route("/api/v1/settings/log-views", get(handlers::log_views::get).put(handlers::log_views::put))
+        // Saved Explore queries: private to the owner or shared with the tenant
+        .route("/api/v1/saved-queries", get(handlers::saved_queries::list).post(handlers::saved_queries::create))
+        .route(
+            "/api/v1/saved-queries/{id}",
+            get(handlers::saved_queries::get)
+                .put(handlers::saved_queries::update)
+                .delete(handlers::saved_queries::delete),
+        )
         // Export current query + results (CSV/JSON), capped by export_max_rows
         .route("/api/v1/query/export", post(handlers::query::export_query))
         // BubbleUp comparison analysis

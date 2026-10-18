@@ -193,7 +193,7 @@ fn may_save(scope: ViewScope, role: &str) -> bool {
     }
 }
 
-fn ensure_requested_tenant(headers: &HeaderMap, tenant: &str) -> Result<(), ApiError> {
+pub(crate) fn ensure_requested_tenant(headers: &HeaderMap, tenant: &str) -> Result<(), ApiError> {
     if let Some(requested) = headers.get("x-rush-tenant") {
         if requested.to_str().ok().map(str::trim) != Some(tenant) {
             // Tenant middleware can fall back to a session default. Never save a
