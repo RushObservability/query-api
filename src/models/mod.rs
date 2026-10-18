@@ -13,6 +13,7 @@ pub mod monitor;
 pub mod profile;
 pub mod query;
 pub mod rum;
+pub mod saved_query;
 pub mod service_link;
 pub mod slo;
 pub mod trace;

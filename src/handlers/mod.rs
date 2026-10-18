@@ -42,6 +42,7 @@ pub mod remote_write;
 pub mod repository_access;
 pub mod retention;
 pub mod rum;
+pub mod saved_queries;
 pub mod service_links;
 pub mod services;
 pub mod settings;

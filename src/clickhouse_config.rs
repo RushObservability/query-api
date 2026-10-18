@@ -71,6 +71,20 @@ pub struct InvestigationTurn {
     pub created_at: String,
 }
 
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct SavedQueryRow {
+    tenant_id: String,
+    id: String,
+    name: String,
+    description: String,
+    visibility: String,
+    owner_id: String,
+    owner_name: String,
+    query: String,
+    created_at: String,
+    updated_at: String,
+}
+
 impl ConfigDb {
     pub async fn create_investigation_session(
         &self,
@@ -2945,6 +2959,22 @@ impl ConfigDb {
                 is_deleted    UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            // ── Saved Explore queries (private to owner, or shared with the tenant) ──
+            "CREATE TABLE IF NOT EXISTS config_saved_queries (
+                tenant_id   String,
+                id          String,
+                name        String,
+                description String DEFAULT '',
+                visibility  String DEFAULT 'private',
+                owner_id    String,
+                owner_name  String DEFAULT '',
+                query       String DEFAULT '{}',
+                created_at  String DEFAULT toString(now()),
+                updated_at  String DEFAULT toString(now()),
+                version     UInt64,
+                is_deleted  UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (tenant_id, id)",
             // ── Investigation sessions (owned by sre-agent; mutable → ReplacingMergeTree) ──
             "CREATE TABLE IF NOT EXISTS config_investigation_sessions (
                 id                String,
@@ -9800,6 +9830,112 @@ impl ConfigDb {
             .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver)
             .execute().await?;
         Ok(true)
+    }
+
+    // ── Saved query operations ─────────────────────────────────────────────────
+
+    const SAVED_QUERY_COLUMNS: &'static str = "tenant_id, id, name, description, visibility, owner_id, owner_name, query, created_at, updated_at";
+
+    fn saved_query_from_row(r: SavedQueryRow) -> crate::models::saved_query::SavedQuery {
+        crate::models::saved_query::SavedQuery {
+            // A row that fails to decode restores an empty Explore state rather
+            // than hiding the entry from its owner.
+            query: serde_json::from_str(&r.query).unwrap_or_default(),
+            id: r.id,
+            tenant_id: r.tenant_id,
+            name: r.name,
+            description: r.description,
+            visibility: r.visibility,
+            owner_id: r.owner_id,
+            owner_name: r.owner_name,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+
+    /// Saved queries the user can see in a tenant: their own private ones plus
+    /// every query shared with the tenant.
+    pub async fn list_saved_queries(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<crate::models::saved_query::SavedQuery>> {
+        let sql = format!(
+            "SELECT {} FROM config_saved_queries FINAL WHERE is_deleted = 0 AND tenant_id = ? AND (visibility = 'tenant' OR owner_id = ?) ORDER BY updated_at DESC",
+            Self::SAVED_QUERY_COLUMNS
+        );
+        let rows = self
+            .client
+            .query(&sql)
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_all::<SavedQueryRow>()
+            .await?;
+        Ok(rows.into_iter().map(Self::saved_query_from_row).collect())
+    }
+
+    pub async fn get_saved_query(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::models::saved_query::SavedQuery>> {
+        let sql = format!(
+            "SELECT {} FROM config_saved_queries FINAL WHERE is_deleted = 0 AND tenant_id = ? AND id = ? LIMIT 1",
+            Self::SAVED_QUERY_COLUMNS
+        );
+        match self
+            .client
+            .query(&sql)
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_one::<SavedQueryRow>()
+            .await
+        {
+            Ok(r) => Ok(Some(Self::saved_query_from_row(r))),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Counts toward the per-user and per-tenant caps.
+    pub async fn count_saved_queries(
+        &self,
+        tenant_id: &str,
+        visibility: &str,
+        owner_id: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        let mut query = self.client.query(if owner_id.is_some() {
+            "SELECT count() FROM config_saved_queries FINAL WHERE is_deleted = 0 AND tenant_id = ? AND visibility = ? AND owner_id = ?"
+        } else {
+            "SELECT count() FROM config_saved_queries FINAL WHERE is_deleted = 0 AND tenant_id = ? AND visibility = ?"
+        });
+        query = query.bind(tenant_id).bind(visibility);
+        if let Some(owner_id) = owner_id {
+            query = query.bind(owner_id);
+        }
+        Ok(query.fetch_one::<u64>().await?)
+    }
+
+    /// Insert a new version of a saved query. ReplacingMergeTree keeps the row
+    /// with the highest version, so create, update and delete share this path.
+    pub async fn write_saved_query(
+        &self,
+        saved: &crate::models::saved_query::SavedQuery,
+        is_deleted: bool,
+    ) -> anyhow::Result<()> {
+        let query_json = serde_json::to_string(&saved.query)?;
+        self.client
+            .query("INSERT INTO config_saved_queries (tenant_id, id, name, description, visibility, owner_id, owner_name, query, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&saved.tenant_id).bind(&saved.id).bind(&saved.name).bind(&saved.description)
+            .bind(&saved.visibility).bind(&saved.owner_id).bind(&saved.owner_name).bind(&query_json)
+            .bind(&saved.created_at).bind(&saved.updated_at).bind(Self::next_version())
+            .bind(if is_deleted { 1u8 } else { 0u8 })
+            .execute().await?;
+        Ok(())
+    }
+
+    pub fn saved_query_timestamp() -> String {
+        Self::now_str()
     }
 
     // ── Service link operations ────────────────────────────────────────────────
