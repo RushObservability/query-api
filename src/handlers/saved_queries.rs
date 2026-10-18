@@ -10,7 +10,7 @@ use crate::models::saved_query::{
 use crate::{AppState, TenantContext};
 
 use super::log_views::{ensure_requested_tenant, validate_field};
-use super::users::require_auth;
+use super::users::require_principal;
 
 type ApiError = (StatusCode, String);
 /// (user_id, username, display_name, tenant_id, role) from `require_auth`.
@@ -37,7 +37,7 @@ impl Viewer {
 }
 
 async fn require_viewer(state: &AppState, headers: &HeaderMap) -> Result<Viewer, ApiError> {
-    let caller = require_auth(state, headers).await?;
+    let caller = require_principal(state, headers).await?;
     let groups = state
         .config_db
         .get_user_groups(&caller.0)
@@ -244,7 +244,7 @@ pub async fn list(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_requested_tenant(&headers, &tenant.tenant_id)?;
-    let caller = require_auth(&state, &headers).await?;
+    let caller = require_principal(&state, &headers).await?;
     let groups = state
         .config_db
         .list_user_group_refs(&caller.0)

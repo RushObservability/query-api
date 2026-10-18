@@ -7,7 +7,7 @@ use axum::{
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::{require_auth, require_write};
+use crate::handlers::users::{require_principal, require_principal_write};
 use crate::models::monitor::*;
 use crate::monitor_engine;
 
@@ -27,7 +27,7 @@ pub async fn list_monitors(
     headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let monitors = state
         .config_db
         .list_monitors(&tenant.tenant_id)
@@ -44,7 +44,7 @@ pub async fn create_monitor(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -171,7 +171,7 @@ pub async fn get_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let monitor = state
         .config_db
         .get_monitor(&id, &tenant.tenant_id)
@@ -199,7 +199,7 @@ pub async fn update_monitor(
     Path(id): Path<String>,
     Json(req): Json<UpdateMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     // Validate monitor type
     let valid_types = ["metric", "log", "apm", "composite"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
@@ -323,7 +323,7 @@ pub async fn delete_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_monitor(&id, &tenant.tenant_id)
@@ -356,7 +356,7 @@ pub async fn list_monitor_events(
     Path(id): Path<String>,
     Query(params): Query<EventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let events = state
         .config_db
         .list_monitor_events(&id, params.limit)
@@ -372,7 +372,7 @@ pub async fn preview_monitor(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<PreviewMonitorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     if !(60..=604_800).contains(&req.eval_window_secs) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -432,7 +432,7 @@ pub async fn mute_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     let updated = state
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, false)
@@ -466,7 +466,7 @@ pub async fn unmute_monitor(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     let updated = state
         .config_db
         .set_monitor_enabled(&id, &tenant.tenant_id, true)
@@ -742,7 +742,7 @@ pub async fn autocomplete(
     Extension(tenant): Extension<TenantContext>,
     Query(params): Query<AutocompleteQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let prefix = escape_ch(&params.prefix);
     let tenant_id = escape_ch(&tenant.tenant_id);
 
@@ -940,7 +940,7 @@ pub async fn suggest(
     headers: HeaderMap,
     Json(req): Json<SuggestRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let mut suggestions: Vec<Suggestion> = Vec::new();
 
     match req.monitor_type.as_str() {

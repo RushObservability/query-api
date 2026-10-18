@@ -12,12 +12,14 @@ use std::future::Future;
 use std::time::Instant;
 
 use crate::AppState;
-use crate::clickhouse_config::SessionUser;
+use crate::clickhouse_config::{ApiKeyGrant, SessionUser};
 
 #[derive(Default)]
 struct RequestSessionCache {
     /// HMAC-derived storage key; never the raw bearer token.
     entry: Option<(String, Option<SessionUser>)>,
+    /// Query API key that tenant middleware resolved for this request, if any.
+    api_key: Option<ApiKeyGrant>,
 }
 
 tokio::task_local! {
@@ -52,6 +54,21 @@ where
         cache.borrow_mut().entry = Some((key, user.clone()));
     });
     (user, false)
+}
+
+/// Record the query API key that authenticated this request. Tenant middleware
+/// calls this after resolution; it is visible only inside the current request.
+pub fn set_api_key_grant(grant: ApiKeyGrant) {
+    let _ = REQUEST_SESSION_CACHE.try_with(|cache| cache.borrow_mut().api_key = Some(grant));
+}
+
+/// The query API key that authenticated this request. Outside a request scope
+/// (unit tests, background work) this is always `None`.
+pub fn api_key_grant() -> Option<ApiKeyGrant> {
+    REQUEST_SESSION_CACHE
+        .try_with(|cache| cache.borrow().api_key.clone())
+        .ok()
+        .flatten()
 }
 
 /// Resolve the authenticated user once per HTTP request. A missing task-local
@@ -154,6 +171,33 @@ mod tests {
         .await;
         assert!(second.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn grant() -> ApiKeyGrant {
+        ApiKeyGrant {
+            id: "key-1".into(),
+            name: "CI".into(),
+            tenant_id: "default".into(),
+            key_type: "query".into(),
+            role: "viewer".into(),
+            signals: Vec::new(),
+            rate_limit_per_minute: 0,
+            source_cidrs: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_grants_live_only_inside_their_request() {
+        assert!(api_key_grant().is_none());
+        set_api_key_grant(grant());
+        assert!(api_key_grant().is_none(), "no scope, nothing stored");
+        scope(async {
+            assert!(api_key_grant().is_none());
+            set_api_key_grant(grant());
+            assert_eq!(api_key_grant(), Some(grant()));
+        })
+        .await;
+        scope(async { assert!(api_key_grant().is_none()) }).await;
     }
 
     #[tokio::test]

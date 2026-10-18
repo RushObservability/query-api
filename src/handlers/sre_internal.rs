@@ -59,7 +59,12 @@ pub async fn context(
         ContextRequest::ListDeploys { service, from, to } => serde_json::to_value(
             state
                 .config_db
-                .list_deploy_markers(service.as_deref(), from.as_deref(), to.as_deref())
+                .list_deploy_markers(
+                    &tenant.tenant_id,
+                    service.as_deref(),
+                    from.as_deref(),
+                    to.as_deref(),
+                )
                 .await
                 .map_err(internal_error)?,
         ),

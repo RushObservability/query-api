@@ -609,13 +609,57 @@ pub enum PasswordChangeOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiKeyGrant {
     pub id: String,
+    /// Display name chosen by the admin; used as the audit actor name.
+    pub name: String,
     pub tenant_id: String,
     /// `query`, `ingest`, or `legacy` for keys created before QAPI-SEC-04.
     pub key_type: String,
+    /// Stored role for query keys (`viewer` or `write`). Empty for ingest keys
+    /// and for query keys created before roles existed; see [`ApiKeyGrant::query_role`].
+    pub role: String,
     pub signals: Vec<String>,
     pub rate_limit_per_minute: u64,
     pub source_cidrs: Vec<String>,
 }
+
+/// Roles a query API key can hold. Keys never hold `admin`.
+pub const API_KEY_ROLES: &[&str] = &["viewer", "write"];
+
+impl ApiKeyGrant {
+    /// The role this key acts with on principal-aware routes, or `None` for
+    /// ingest keys. Query keys created before roles existed act as `viewer`.
+    pub fn query_role(&self) -> Option<&str> {
+        if self.key_type == "ingest" {
+            return None;
+        }
+        Some(if API_KEY_ROLES.contains(&self.role.as_str()) {
+            self.role.as_str()
+        } else {
+            "viewer"
+        })
+    }
+}
+
+/// One row of `GET /api/v1/api-keys`. Never carries the key or its hash.
+#[derive(Clone, Debug)]
+pub struct ApiKeyRecord {
+    pub id: String,
+    pub name: String,
+    pub prefix: String,
+    pub tenant_id: String,
+    pub key_type: String,
+    pub role: String,
+    pub signals: Vec<String>,
+    pub rate_limit_per_minute: u64,
+    pub source_cidrs: Vec<String>,
+    pub created_at: String,
+}
+
+/// Resolve a key hash to its grant. The hash table drives the lookup; name and
+/// role live only on `config_api_keys`, so they are joined by key id. A missing
+/// row there yields empty strings, which [`ApiKeyGrant::query_role`] treats as
+/// `viewer`.
+const API_KEY_RESOLVE_SQL: &str = "SELECT h.id AS id, h.tenant_id AS tenant_id, h.key_type AS key_type, h.signals AS signals, h.rate_limit_per_minute AS rate_limit_per_minute, h.source_cidrs AS source_cidrs, h.is_deleted AS is_deleted, k.name AS name, k.role AS role FROM config_api_keys_by_hash AS h FINAL LEFT JOIN (SELECT id, name, role FROM config_api_keys FINAL WHERE is_deleted = 0) AS k ON k.id = h.id WHERE h.key_hash = ? LIMIT 1";
 
 /// TTL for the config-plane read caches below. Mutations through this process
 /// clear the caches immediately; mutations from another replica are visible
@@ -1114,8 +1158,14 @@ mod auth_storage_tests {
         assert!(
             source.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS config_api_keys_by_hash_mv")
         );
-        assert!(source.contains("FROM config_api_keys_by_hash FINAL WHERE key_hash = ? LIMIT 1"));
+        assert!(source.contains("FROM config_api_keys_by_hash AS h FINAL"));
+        assert!(source.contains("WHERE h.key_hash = ? LIMIT 1"));
         assert!(source.contains("Ok(row) if row.is_deleted == 0"));
+        // Role and name come from config_api_keys so the materialized view is unchanged.
+        assert!(
+            source
+                .contains("SELECT id, name, role FROM config_api_keys FINAL WHERE is_deleted = 0")
+        );
     }
 
     #[test]
@@ -2878,6 +2928,9 @@ impl ConfigDb {
             "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS signals String DEFAULT '[]' AFTER key_type",
             "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS rate_limit_per_minute UInt64 DEFAULT 0 AFTER signals",
             "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS source_cidrs String DEFAULT '[]' AFTER rate_limit_per_minute",
+            // Role for query keys (viewer|write). Kept off config_api_keys_by_hash so its
+            // materialized view does not change; resolution joins it by key id.
+            "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS role String DEFAULT '' AFTER source_cidrs",
             // Authentication reads by key hash, while the source table stays
             // keyed by id for the admin API. A materialized view keeps this
             // lookup table current for new and old API replicas during rolling
@@ -3335,6 +3388,9 @@ impl ConfigDb {
                 deployed_at  String DEFAULT toString(now())
             ) ENGINE = MergeTree()
             ORDER BY (service_name, deployed_at)",
+            // Deploy markers predate tenancy; existing rows belong to 'default'. Every
+            // read filters on tenant_id (the sort key can't change on MergeTree).
+            "ALTER TABLE config_deploy_markers ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default' FIRST",
             // ── Detection rules ───────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_detection_rules (
                 id                String,
@@ -3757,17 +3813,22 @@ impl ConfigDb {
             rate_limit_per_minute: u64,
             source_cidrs: String,
             is_deleted: u8,
+            name: String,
+            role: String,
         }
-        let result = self.client
-            .query("SELECT id, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, is_deleted FROM config_api_keys_by_hash FINAL WHERE key_hash = ? LIMIT 1")
+        let result = self
+            .client
+            .query(API_KEY_RESOLVE_SQL)
             .bind(key_hash)
             .fetch_one::<Row>()
             .await;
         match result {
             Ok(row) if row.is_deleted == 0 => Ok(Some(ApiKeyGrant {
                 id: row.id,
+                name: row.name,
                 tenant_id: row.tenant_id,
                 key_type: row.key_type,
+                role: row.role,
                 signals: serde_json::from_str(&row.signals).unwrap_or_default(),
                 rate_limit_per_minute: row.rate_limit_per_minute,
                 source_cidrs: serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
@@ -6649,21 +6710,7 @@ impl ConfigDb {
 
     // ── API key operations ─────────────────────────────────────────────────────
 
-    pub async fn list_api_keys(
-        &self,
-    ) -> anyhow::Result<
-        Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<String>,
-            u64,
-            Vec<String>,
-            String,
-        )>,
-    > {
+    pub async fn list_api_keys(&self) -> anyhow::Result<Vec<ApiKeyRecord>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String,
@@ -6671,29 +6718,29 @@ impl ConfigDb {
             prefix: String,
             tenant_id: String,
             key_type: String,
+            role: String,
             signals: String,
             rate_limit_per_minute: u64,
             source_cidrs: String,
             created_at: String,
         }
         let rows = self.client
-            .query("SELECT id, name, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
+            .query("SELECT id, name, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
             .fetch_all::<Row>()
             .await?;
         Ok(rows
             .into_iter()
-            .map(|row| {
-                (
-                    row.id,
-                    row.name,
-                    row.prefix,
-                    row.tenant_id,
-                    row.key_type,
-                    serde_json::from_str(&row.signals).unwrap_or_default(),
-                    row.rate_limit_per_minute,
-                    serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
-                    row.created_at,
-                )
+            .map(|row| ApiKeyRecord {
+                id: row.id,
+                name: row.name,
+                prefix: row.prefix,
+                tenant_id: row.tenant_id,
+                key_type: row.key_type,
+                role: row.role,
+                signals: serde_json::from_str(&row.signals).unwrap_or_default(),
+                rate_limit_per_minute: row.rate_limit_per_minute,
+                source_cidrs: serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
+                created_at: row.created_at,
             })
             .collect())
     }
@@ -6706,6 +6753,7 @@ impl ConfigDb {
         prefix: &str,
         tenant_id: &str,
         key_type: &str,
+        role: &str,
         signals: &[String],
         rate_limit_per_minute: u64,
         source_cidrs: &[String],
@@ -6715,9 +6763,9 @@ impl ConfigDb {
         let signals = serde_json::to_string(signals)?;
         let source_cidrs = serde_json::to_string(source_cidrs)?;
         self.client
-            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(key_hash).bind(prefix).bind(tenant_id)
-            .bind(key_type).bind(&signals).bind(rate_limit_per_minute)
+            .bind(key_type).bind(role).bind(&signals).bind(rate_limit_per_minute)
             .bind(&source_cidrs).bind(&now).bind(ver)
             .execute()
             .await?;
@@ -6750,6 +6798,7 @@ impl ConfigDb {
             prefix,
             "default",
             "ingest",
+            "",
             &signals,
             1_000_000,
             &[],
@@ -6766,13 +6815,14 @@ impl ConfigDb {
             prefix: String,
             tenant_id: String,
             key_type: String,
+            role: String,
             signals: String,
             rate_limit_per_minute: u64,
             source_cidrs: String,
             created_at: String,
         }
         let result = self.client
-            .query("SELECT name, key_hash, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT name, key_hash, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
             .fetch_one::<Row>()
             .await;
@@ -6783,9 +6833,9 @@ impl ConfigDb {
         };
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
             .bind(id).bind(&row.name).bind(&row.key_hash).bind(&row.prefix)
-            .bind(&row.tenant_id).bind(&row.key_type).bind(&row.signals)
+            .bind(&row.tenant_id).bind(&row.key_type).bind(&row.role).bind(&row.signals)
             .bind(row.rate_limit_per_minute).bind(&row.source_cidrs)
             .bind(&row.created_at).bind(ver)
             .execute()
@@ -8870,6 +8920,7 @@ impl ConfigDb {
 
     pub async fn create_deploy_marker(
         &self,
+        tenant_id: &str,
         id: &str,
         service_name: &str,
         version: &str,
@@ -8880,14 +8931,15 @@ impl ConfigDb {
     ) -> anyhow::Result<()> {
         let now = Self::now_str();
         self.client
-            .query("INSERT INTO config_deploy_markers (id, service_name, version, commit_sha, description, environment, deployed_by, deployed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(id).bind(service_name).bind(version).bind(commit_sha).bind(description).bind(environment).bind(deployed_by).bind(&now)
+            .query("INSERT INTO config_deploy_markers (tenant_id, id, service_name, version, commit_sha, description, environment, deployed_by, deployed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(tenant_id).bind(id).bind(service_name).bind(version).bind(commit_sha).bind(description).bind(environment).bind(deployed_by).bind(&now)
             .execute().await?;
         Ok(())
     }
 
     pub async fn list_deploy_markers(
         &self,
+        tenant_id: &str,
         service_name: Option<&str>,
         from: Option<&str>,
         to: Option<&str>,
@@ -8905,7 +8957,7 @@ impl ConfigDb {
         }
         // Build query dynamically; ClickHouse doesn't support optional parameters so we build different SQL
         let sql = {
-            let mut s = "SELECT id, service_name, version, commit_sha, description, environment, deployed_by, deployed_at FROM config_deploy_markers WHERE 1=1".to_string();
+            let mut s = "SELECT id, service_name, version, commit_sha, description, environment, deployed_by, deployed_at FROM config_deploy_markers WHERE tenant_id = ?".to_string();
             if service_name.is_some() {
                 s.push_str(" AND service_name = ?");
             }
@@ -8926,7 +8978,7 @@ impl ConfigDb {
             s.push_str(" ORDER BY deployed_at DESC LIMIT 100");
             s
         };
-        let mut q = self.client.query(&sql);
+        let mut q = self.client.query(&sql).bind(tenant_id);
         if let Some(sn) = service_name {
             q = q.bind(sn);
         }

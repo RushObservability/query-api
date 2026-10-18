@@ -8,7 +8,7 @@ use axum::{
 use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::auth::extract_session_cookie;
-use crate::handlers::users::{require_auth, require_write};
+use crate::handlers::users::{api_key_principal, require_principal, require_principal_write};
 use crate::models::dashboard::*;
 
 const WIDGET_TYPES: &[&str] = &[
@@ -45,7 +45,7 @@ mod widget_type_tests {
     }
 }
 
-/// Extract the calling user from the session cookie.
+/// Extract the calling user from the request's API key or session cookie.
 /// Returns (user_id, username, display_name, tenant_id, role).
 /// Falls back to anonymous/default context when no session exists (backward compat).
 async fn resolve_caller(
@@ -53,6 +53,11 @@ async fn resolve_caller(
     headers: &HeaderMap,
     tenant: &TenantContext,
 ) -> (String, String, String, String, String) {
+    if let Some(principal) =
+        crate::request_auth::api_key_grant().and_then(|grant| api_key_principal(&grant))
+    {
+        return principal;
+    }
     if let Some(token) = extract_session_cookie(headers) {
         if let Some(info) = crate::request_auth::resolve_session_user(state, &token).await {
             return info;
@@ -73,7 +78,7 @@ pub async fn list_dashboards(
     Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let dashboards = state
         .config_db
@@ -89,7 +94,7 @@ pub async fn create_dashboard(
     headers: HeaderMap,
     Json(req): Json<CreateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     req.defaults
         .validate()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -183,7 +188,7 @@ pub async fn get_dashboard(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let dashboard = state
         .config_db
@@ -211,7 +216,7 @@ pub async fn update_dashboard(
     Path(id): Path<String>,
     Json(req): Json<UpdateDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     if let Some(defaults) = &req.defaults {
         defaults
             .validate()
@@ -281,7 +286,7 @@ pub async fn delete_dashboard(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
     let deleted = state
         .config_db
@@ -317,7 +322,7 @@ pub async fn create_widget(
     Path(dashboard_id): Path<String>,
     Json(req): Json<CreateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     // Verify dashboard exists and user has visibility
@@ -389,7 +394,7 @@ pub async fn update_widget(
     Path((dashboard_id, widget_id)): Path<(String, String)>,
     Json(req): Json<UpdateWidgetRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     if !WIDGET_TYPES.contains(&req.widget_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -455,7 +460,7 @@ pub async fn delete_widget(
     headers: HeaderMap,
     Path((dashboard_id, widget_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_widget(&widget_id, &dashboard_id)
@@ -487,7 +492,7 @@ pub async fn export_dashboard(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
     let export = state
         .config_db
@@ -504,7 +509,7 @@ pub async fn import_dashboard(
     headers: HeaderMap,
     Json(req): Json<ImportDashboardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
     let dashboard = state
         .config_db
@@ -535,7 +540,7 @@ pub async fn list_dashboard_templates(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let templates = state
         .config_db
         .list_dashboard_templates()
@@ -551,7 +556,7 @@ pub async fn create_from_template(
     Path(template_id): Path<String>,
     Json(req): Json<CreateFromTemplateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    require_principal_write(&state, &headers).await?;
     let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
 
     let template = state

@@ -7,7 +7,7 @@ use axum::{
 use regex::Regex;
 
 use crate::AppState;
-use crate::handlers::users::require_write;
+use crate::handlers::users::{require_principal, require_write};
 use crate::models::custom_skills::{
     CreateCustomSkillRequest, CustomSkill, UpdateCustomSkillRequest,
 };
@@ -121,9 +121,13 @@ fn validate_skill_fields(
     Ok(())
 }
 
+// Skills are instance-wide (the SRE agent loads them for every tenant), so
+// reading them needs an authenticated caller, never anonymous tenant access.
 pub async fn list_custom_skills(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_principal(&state, &headers).await?;
     let skills = state.config_db.list_custom_skills().await.map_err(|e| {
         tracing::error!(error = %e, "internal error");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
@@ -133,8 +137,10 @@ pub async fn list_custom_skills(
 
 pub async fn get_custom_skill(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_principal(&state, &headers).await?;
     let skill = state
         .config_db
         .get_custom_skill(&id)

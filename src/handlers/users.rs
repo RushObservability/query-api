@@ -82,6 +82,59 @@ pub(crate) async fn require_write(
     Ok(caller)
 }
 
+/// Resolve the caller as a browser-session user or a query API key, for routes
+/// that service accounts (such as the MCP server) may use. Returns the same
+/// `(id, name, display_name, tenant_id, role)` shape as [`require_auth`].
+///
+/// A key acts as `apikey:<key id>` with the key's name and its role (`viewer`
+/// or `write`, never `admin`). Use this only on routes deliberately opened to
+/// keys; account, session and admin routes keep [`require_auth`] and
+/// [`require_admin`], which reject keys.
+pub(crate) async fn require_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String, String, String, String), (StatusCode, String)> {
+    if let Some(grant) = crate::request_auth::api_key_grant() {
+        return api_key_principal(&grant).ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "API key cannot use this route".into(),
+            )
+        });
+    }
+    require_auth(state, headers).await
+}
+
+/// [`require_principal`] plus the write role (admin or write users, write keys).
+pub(crate) async fn require_principal_write(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String, String, String, String), (StatusCode, String)> {
+    let caller = require_principal(state, headers).await?;
+    if !role_allows_write(&caller.4) {
+        return Err((StatusCode::FORBIDDEN, "write role required".to_string()));
+    }
+    Ok(caller)
+}
+
+pub(crate) fn api_key_principal(
+    grant: &crate::clickhouse_config::ApiKeyGrant,
+) -> Option<(String, String, String, String, String)> {
+    let role = grant.query_role()?;
+    let name = if grant.name.is_empty() {
+        "API key".to_string()
+    } else {
+        grant.name.clone()
+    };
+    Some((
+        format!("{}{}", crate::audit::API_KEY_ACTOR_PREFIX, grant.id),
+        name.clone(),
+        name,
+        grant.tenant_id.clone(),
+        role.to_string(),
+    ))
+}
+
 fn role_allows_admin(role: &str) -> bool {
     role == "admin"
 }
@@ -825,5 +878,56 @@ mod authorization_tests {
         assert!(!role_allows_write("Admin"));
         assert!(!role_allows_write(""));
         assert!(!role_allows_write("unknown"));
+    }
+
+    fn grant(key_type: &str, role: &str) -> crate::clickhouse_config::ApiKeyGrant {
+        crate::clickhouse_config::ApiKeyGrant {
+            id: "k1".into(),
+            name: "MCP server".into(),
+            tenant_id: "prod".into(),
+            key_type: key_type.into(),
+            role: role.into(),
+            signals: Vec::new(),
+            rate_limit_per_minute: 0,
+            source_cidrs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn api_keys_act_as_prefixed_principals_with_their_role_and_never_admin() {
+        let viewer = super::api_key_principal(&grant("query", "viewer")).unwrap();
+        assert_eq!(viewer.0, "apikey:k1");
+        assert_eq!(viewer.1, "MCP server");
+        assert_eq!(viewer.3, "prod");
+        assert_eq!(viewer.4, "viewer");
+        assert!(!role_allows_write(&viewer.4));
+
+        let writer = super::api_key_principal(&grant("query", "write")).unwrap();
+        assert!(role_allows_write(&writer.4));
+        assert!(!role_allows_admin(&writer.4));
+
+        // A tampered or legacy role value falls back to viewer, never admin.
+        for role in ["", "admin", "legacy"] {
+            assert_eq!(
+                super::api_key_principal(&grant("query", role)).unwrap().4,
+                "viewer"
+            );
+            assert_eq!(
+                super::api_key_principal(&grant("legacy", role)).unwrap().4,
+                "viewer"
+            );
+        }
+        // Ingest keys never become principals.
+        assert!(super::api_key_principal(&grant("ingest", "write")).is_none());
+    }
+
+    #[tokio::test]
+    async fn principal_resolution_prefers_the_request_api_key() {
+        crate::request_auth::scope(async {
+            crate::request_auth::set_api_key_grant(grant("query", "write"));
+            let grant = crate::request_auth::api_key_grant().unwrap();
+            assert_eq!(super::api_key_principal(&grant).unwrap().0, "apikey:k1");
+        })
+        .await;
     }
 }

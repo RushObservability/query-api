@@ -74,6 +74,11 @@ pub struct AuditHealth {
     pub write_failures: u64,
 }
 
+/// Actor-id prefix for API keys acting as principals (`apikey:<key id>`).
+/// [`AuditEvent::actor`] records such actors as `api_key`, so handlers that
+/// build events with `"user"` stay correct when a service account calls them.
+pub const API_KEY_ACTOR_PREFIX: &str = "apikey:";
+
 /// One audit event to record. All fields are `String`; use `Default` +
 /// struct-update syntax or [`AuditEvent::new`] + setters to build one.
 ///
@@ -122,6 +127,9 @@ impl AuditEvent {
     pub fn actor(mut self, id: impl Into<String>, name: impl Into<String>) -> Self {
         self.actor_id = id.into();
         self.actor_name = name.into();
+        if self.actor_type == "user" && self.actor_id.starts_with(API_KEY_ACTOR_PREFIX) {
+            self.actor_type = "api_key".to_string();
+        }
         self
     }
     pub fn actor_name(mut self, v: impl Into<String>) -> Self {
@@ -840,6 +848,18 @@ pub fn actor_context_from_headers(headers: &HeaderMap) -> (String, String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_principals_are_recorded_as_api_key_actors() {
+        let event = AuditEvent::new("monitor.mute", "user").actor("apikey:k1", "MCP server");
+        assert_eq!(event.actor_type, "api_key");
+        assert_eq!(event.actor_id, "apikey:k1");
+        let user = AuditEvent::new("monitor.mute", "user").actor("u1", "alice");
+        assert_eq!(user.actor_type, "user");
+        // Explicit non-user actor types are never rewritten.
+        let system = AuditEvent::new("x", "system").actor("apikey:k1", "n");
+        assert_eq!(system.actor_type, "system");
+    }
 
     fn sample_row(seq: u64, prev: &str) -> AuditRow {
         AuditRow {

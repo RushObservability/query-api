@@ -7,7 +7,7 @@ use axum::{
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::{require_auth, require_write};
+use crate::handlers::users::{require_principal, require_principal_write};
 use crate::models::slo::*;
 
 const VALID_WINDOWS: [&str; 4] = ["rolling_1h", "rolling_24h", "rolling_7d", "rolling_30d"];
@@ -55,7 +55,7 @@ pub async fn list_slos(
     Extension(tenant): Extension<TenantContext>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let slos = state
         .config_db
         .list_slos(&tenant.tenant_id)
@@ -71,7 +71,7 @@ pub async fn create_slo(
     headers: HeaderMap,
     Json(req): Json<CreateSloRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -224,7 +224,7 @@ pub async fn get_slo(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let slo = state
         .config_db
         .get_slo(&id, &tenant.tenant_id)
@@ -250,7 +250,7 @@ pub async fn update_slo(
     Path(id): Path<String>,
     Json(req): Json<UpdateSloRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     if !VALID_SLO_TYPES.contains(&req.slo_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -399,7 +399,7 @@ pub async fn delete_slo(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_slo(&id, &tenant.tenant_id)
@@ -431,7 +431,7 @@ pub async fn list_slo_events(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let events = state
         .config_db
         .list_slo_events(&id, &tenant.tenant_id, 100)

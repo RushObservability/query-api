@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::{require_auth, require_write};
+use crate::handlers::users::{require_principal, require_principal_write, require_write};
 use crate::llm_gateway::{LlmCaller, LlmOperation, MAX_ANOMALY_ADDITIONAL_CONTEXT_BYTES};
 use crate::models::anomaly::*;
 
@@ -19,6 +19,7 @@ pub async fn analyze_anomaly_event(
     Path(event_id): Path<String>,
     Json(req): Json<AnalyzeAnomalyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // LLM analysis stays session-only: API keys use the SRE agent handoff instead.
     let caller = require_write(&state, &headers).await?;
     if req.additional_context.len() > MAX_ANOMALY_ADDITIONAL_CONTEXT_BYTES {
         return Err((
@@ -235,7 +236,7 @@ pub async fn list_anomaly_rules(
     headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let rules = state
         .config_db
         .list_anomaly_rules(&tenant.tenant_id)
@@ -252,7 +253,7 @@ pub async fn create_anomaly_rule(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<CreateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((
@@ -322,7 +323,7 @@ pub async fn get_anomaly_rule(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let rule = state
         .config_db
         .get_anomaly_rule(&id, &tenant.tenant_id)
@@ -348,7 +349,7 @@ pub async fn update_anomaly_rule(
     Path(id): Path<String>,
     Json(req): Json<UpdateAnomalyRuleRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     let valid_sources = ["prometheus", "apm"];
     if !valid_sources.contains(&req.source.as_str()) {
         return Err((
@@ -420,7 +421,7 @@ pub async fn delete_anomaly_rule(
     Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_principal_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_anomaly_rule(&id, &tenant.tenant_id)
@@ -451,7 +452,7 @@ pub async fn list_all_anomaly_events(
     headers: HeaderMap,
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let events = state
         .config_db
         .list_all_anomaly_events(&tenant.tenant_id, 200)
@@ -466,7 +467,7 @@ pub async fn get_anomaly_event(
     Extension(tenant): Extension<TenantContext>,
     Path(event_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let event = state
         .config_db
         .get_anomaly_event(&event_id, &tenant.tenant_id)
@@ -482,7 +483,7 @@ pub async fn get_event_correlations(
     Extension(tenant): Extension<TenantContext>,
     Path(event_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers).await?;
+    require_principal(&state, &headers).await?;
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     // 1. Look up the event
