@@ -5,7 +5,7 @@ use axum::{
 };
 
 use crate::models::saved_query::{
-    SavedQuery, SavedQueryRequest, VISIBILITY_PRIVATE, VISIBILITY_TENANT,
+    SavedQuery, SavedQueryRequest, VISIBILITY_GROUP, VISIBILITY_PRIVATE, VISIBILITY_TENANT,
 };
 use crate::{AppState, TenantContext};
 
@@ -15,6 +15,36 @@ use super::users::require_auth;
 type ApiError = (StatusCode, String);
 /// (user_id, username, display_name, tenant_id, role) from `require_auth`.
 type Caller = (String, String, String, String, String);
+
+/// The signed-in user plus the groups they belong to.
+struct Viewer {
+    caller: Caller,
+    groups: Vec<String>,
+}
+
+impl Viewer {
+    fn id(&self) -> &str {
+        &self.caller.0
+    }
+
+    fn role(&self) -> &str {
+        &self.caller.4
+    }
+
+    fn in_group(&self, group_id: &str) -> bool {
+        self.groups.iter().any(|g| g == group_id)
+    }
+}
+
+async fn require_viewer(state: &AppState, headers: &HeaderMap) -> Result<Viewer, ApiError> {
+    let caller = require_auth(state, headers).await?;
+    let groups = state
+        .config_db
+        .get_user_groups(&caller.0)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("saved_queries.groups", e))?;
+    Ok(Viewer { caller, groups })
+}
 
 const MAX_PRIVATE_PER_USER: u64 = 200;
 const MAX_SHARED_PER_TENANT: u64 = 500;
@@ -29,21 +59,34 @@ fn not_found() -> ApiError {
     (StatusCode::NOT_FOUND, "saved query not found".into())
 }
 
-/// Sharing with the whole tenant requires write access; anyone signed in can
-/// keep private queries.
+/// Sharing requires write access; anyone signed in can keep private queries.
 fn may_share(role: &str) -> bool {
     matches!(role, "admin" | "write")
 }
 
-fn is_visible(caller: &Caller, saved: &SavedQuery) -> bool {
-    saved.visibility == VISIBILITY_TENANT || saved.owner_id == caller.0
+/// Whether the viewer may publish a query at this visibility. Group sharing is
+/// limited to the viewer's own groups, admins included, so nobody can push
+/// queries into a group they cannot see.
+fn may_publish(viewer: &Viewer, visibility: &str, group_id: &str) -> bool {
+    match visibility {
+        VISIBILITY_TENANT => may_share(viewer.role()),
+        VISIBILITY_GROUP => may_share(viewer.role()) && viewer.in_group(group_id),
+        _ => true,
+    }
 }
 
-fn may_modify(caller: &Caller, saved: &SavedQuery) -> bool {
-    if saved.visibility == VISIBILITY_TENANT {
-        caller.4 == "admin" || (saved.owner_id == caller.0 && may_share(&caller.4))
+fn is_visible(viewer: &Viewer, saved: &SavedQuery) -> bool {
+    saved.owner_id == viewer.id()
+        || saved.visibility == VISIBILITY_TENANT
+        || (saved.visibility == VISIBILITY_GROUP && viewer.in_group(&saved.group_id))
+}
+
+fn may_modify(viewer: &Viewer, saved: &SavedQuery) -> bool {
+    if saved.visibility == VISIBILITY_PRIVATE {
+        saved.owner_id == viewer.id()
     } else {
-        saved.owner_id == caller.0
+        // Group queries reach this check only for members (see `is_visible`).
+        viewer.role() == "admin" || (saved.owner_id == viewer.id() && may_share(viewer.role()))
     }
 }
 
@@ -59,11 +102,15 @@ fn normalize(req: &mut SavedQueryRequest) -> Result<(), ApiError> {
     if req.description.chars().count() > 1000 {
         return Err(bad_request("Description must not exceed 1000 characters"));
     }
-    if !matches!(
-        req.visibility.as_str(),
-        VISIBILITY_PRIVATE | VISIBILITY_TENANT
-    ) {
-        return Err(bad_request("Visibility must be private or tenant"));
+    req.group_id = req.group_id.trim().into();
+    match req.visibility.as_str() {
+        VISIBILITY_GROUP => {
+            if req.group_id.is_empty() || req.group_id.len() > 128 {
+                return Err(bad_request("Choose a group to share with"));
+            }
+        }
+        VISIBILITY_PRIVATE | VISIBILITY_TENANT => req.group_id.clear(),
+        _ => return Err(bad_request("Visibility must be private, group or tenant")),
     }
     let query = &mut req.query;
     if query.filters.len() > MAX_FILTERS {
@@ -104,6 +151,7 @@ fn audit_summary(saved: &SavedQuery) -> serde_json::Value {
     serde_json::json!({
         "name": saved.name,
         "visibility": saved.visibility,
+        "group_id": saved.group_id,
         "owner_id": saved.owner_id,
         "filter_count": saved.query.filters.len(),
         "has_search": !saved.query.search.is_empty(),
@@ -146,11 +194,11 @@ async fn enforce_cap(
     visibility: &str,
     owner_id: &str,
 ) -> Result<(), ApiError> {
-    let (owner, limit, message) = if visibility == VISIBILITY_TENANT {
+    let (owner, limit, message) = if visibility != VISIBILITY_PRIVATE {
         (
             None,
             MAX_SHARED_PER_TENANT,
-            "This tenant has reached the limit of 500 shared queries",
+            "This tenant has reached the limit of 500 shared queries at this visibility",
         )
     } else {
         (
@@ -172,7 +220,7 @@ async fn enforce_cap(
 
 async fn load_visible(
     state: &AppState,
-    caller: &Caller,
+    viewer: &Viewer,
     tenant_id: &str,
     id: &str,
 ) -> Result<SavedQuery, ApiError> {
@@ -182,9 +230,9 @@ async fn load_visible(
         .await
         .map_err(|e| crate::api_error::internal_legacy("saved_queries.get", e))?
         .ok_or_else(not_found)?;
-    // Someone else's private query is reported as missing, not forbidden, so
+    // A query the viewer cannot see is reported as missing, not forbidden, so
     // IDs do not reveal that it exists.
-    if !is_visible(caller, &saved) {
+    if !is_visible(viewer, &saved) {
         return Err(not_found());
     }
     Ok(saved)
@@ -197,13 +245,21 @@ pub async fn list(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_requested_tenant(&headers, &tenant.tenant_id)?;
     let caller = require_auth(&state, &headers).await?;
+    let groups = state
+        .config_db
+        .list_user_group_refs(&caller.0)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("saved_queries.groups", e))?;
+    let group_ids: Vec<String> = groups.iter().map(|g| g.id.clone()).collect();
     let saved = state
         .config_db
-        .list_saved_queries(&tenant.tenant_id, &caller.0)
+        .list_saved_queries(&tenant.tenant_id, &caller.0, &group_ids)
         .await
         .map_err(|e| crate::api_error::internal_legacy("saved_queries.list", e))?;
     Ok(Json(serde_json::json!({
         "saved_queries": saved,
+        // Sharing targets for the save form, and names for group badges.
+        "groups": groups,
         "tenant_id": tenant.tenant_id,
     })))
 }
@@ -215,9 +271,9 @@ pub async fn get(
     headers: HeaderMap,
 ) -> Result<Json<SavedQuery>, ApiError> {
     ensure_requested_tenant(&headers, &tenant.tenant_id)?;
-    let caller = require_auth(&state, &headers).await?;
+    let viewer = require_viewer(&state, &headers).await?;
     Ok(Json(
-        load_visible(&state, &caller, &tenant.tenant_id, &id).await?,
+        load_visible(&state, &viewer, &tenant.tenant_id, &id).await?,
     ))
 }
 
@@ -228,26 +284,27 @@ pub async fn create(
     Json(mut req): Json<SavedQueryRequest>,
 ) -> Result<(StatusCode, Json<SavedQuery>), ApiError> {
     ensure_requested_tenant(&headers, &tenant.tenant_id)?;
-    let caller = require_auth(&state, &headers).await?;
+    let viewer = require_viewer(&state, &headers).await?;
+    let caller = &viewer.caller;
     let audit = AuditCtx {
         state: &state,
         headers: &headers,
-        caller: &caller,
+        caller,
         tenant_id: &tenant.tenant_id,
     };
     normalize(&mut req)?;
-    if req.visibility == VISIBILITY_TENANT && !may_share(&caller.4) {
+    if !may_publish(&viewer, &req.visibility, &req.group_id) {
         audit
             .log(
                 "saved_query.create",
                 "",
                 "failure",
-                serde_json::json!({"visibility": req.visibility, "reason": "share_not_allowed"}),
+                serde_json::json!({"visibility": req.visibility, "group_id": req.group_id, "reason": "share_not_allowed"}),
             )
             .await;
         return Err((
             StatusCode::FORBIDDEN,
-            "Write access is required to share queries with the tenant".into(),
+            "Sharing needs write access, and you can only share with groups you belong to".into(),
         ));
     }
     enforce_cap(&state, &tenant.tenant_id, &req.visibility, &caller.0).await?;
@@ -259,6 +316,7 @@ pub async fn create(
         name: req.name,
         description: req.description,
         visibility: req.visibility,
+        group_id: req.group_id,
         owner_id: caller.0.clone(),
         owner_name: if caller.2.trim().is_empty() {
             caller.1.clone()
@@ -293,24 +351,25 @@ pub async fn update(
     Json(mut req): Json<SavedQueryRequest>,
 ) -> Result<Json<SavedQuery>, ApiError> {
     ensure_requested_tenant(&headers, &tenant.tenant_id)?;
-    let caller = require_auth(&state, &headers).await?;
+    let viewer = require_viewer(&state, &headers).await?;
+    let caller = &viewer.caller;
     let audit = AuditCtx {
         state: &state,
         headers: &headers,
-        caller: &caller,
+        caller,
         tenant_id: &tenant.tenant_id,
     };
     normalize(&mut req)?;
-    let existing = load_visible(&state, &caller, &tenant.tenant_id, &id).await?;
-    let changes_visibility = req.visibility != existing.visibility;
-    // Only the owner may move a query between private and shared, so an admin
-    // can never make someone else's query vanish from the tenant into a
-    // private list they cannot reach.
-    let denied = if !may_modify(&caller, &existing) {
+    let existing = load_visible(&state, &viewer, &tenant.tenant_id, &id).await?;
+    let changes_visibility =
+        req.visibility != existing.visibility || req.group_id != existing.group_id;
+    // Only the owner may change who can see a query, so an admin can never make
+    // someone else's query vanish from the people it was shared with.
+    let denied = if !may_modify(&viewer, &existing) {
         Some("not_owner")
     } else if changes_visibility && existing.owner_id != caller.0 {
         Some("visibility_owner_only")
-    } else if req.visibility == VISIBILITY_TENANT && !may_share(&caller.4) {
+    } else if changes_visibility && !may_publish(&viewer, &req.visibility, &req.group_id) {
         Some("share_not_allowed")
     } else {
         None
@@ -343,6 +402,7 @@ pub async fn update(
         name: req.name,
         description: req.description,
         visibility: req.visibility,
+        group_id: req.group_id,
         query: req.query,
         updated_at: crate::clickhouse_config::ConfigDb::saved_query_timestamp(),
         ..existing.clone()
@@ -370,15 +430,16 @@ pub async fn delete(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     ensure_requested_tenant(&headers, &tenant.tenant_id)?;
-    let caller = require_auth(&state, &headers).await?;
+    let viewer = require_viewer(&state, &headers).await?;
+    let caller = &viewer.caller;
     let audit = AuditCtx {
         state: &state,
         headers: &headers,
-        caller: &caller,
+        caller,
         tenant_id: &tenant.tenant_id,
     };
-    let existing = load_visible(&state, &caller, &tenant.tenant_id, &id).await?;
-    if !may_modify(&caller, &existing) {
+    let existing = load_visible(&state, &viewer, &tenant.tenant_id, &id).await?;
+    if !may_modify(&viewer, &existing) {
         audit
             .log(
                 "saved_query.delete",
@@ -417,14 +478,17 @@ mod tests {
     use super::*;
     use crate::models::saved_query::{SavedQueryBody, SavedQueryFilter};
 
-    fn caller(id: &str, role: &str) -> Caller {
-        (
-            id.into(),
-            id.into(),
-            String::new(),
-            "default".into(),
-            role.into(),
-        )
+    fn viewer(id: &str, role: &str, groups: &[&str]) -> Viewer {
+        Viewer {
+            caller: (
+                id.into(),
+                id.into(),
+                String::new(),
+                "default".into(),
+                role.into(),
+            ),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+        }
     }
 
     fn saved(owner: &str, visibility: &str) -> SavedQuery {
@@ -434,6 +498,11 @@ mod tests {
             name: "Errors".into(),
             description: String::new(),
             visibility: visibility.into(),
+            group_id: if visibility == VISIBILITY_GROUP {
+                "sre".into()
+            } else {
+                String::new()
+            },
             owner_id: owner.into(),
             owner_name: owner.into(),
             query: SavedQueryBody::default(),
@@ -449,28 +518,73 @@ mod tests {
     #[test]
     fn private_queries_are_visible_only_to_their_owner() {
         let private = saved("alice", VISIBILITY_PRIVATE);
-        assert!(is_visible(&caller("alice", "viewer"), &private));
-        assert!(!is_visible(&caller("bob", "admin"), &private));
-        assert!(!may_modify(&caller("bob", "admin"), &private));
-        assert!(may_modify(&caller("alice", "viewer"), &private));
+        assert!(is_visible(&viewer("alice", "viewer", &[]), &private));
+        assert!(!is_visible(&viewer("bob", "admin", &[]), &private));
+        assert!(!may_modify(&viewer("bob", "admin", &[]), &private));
+        assert!(may_modify(&viewer("alice", "viewer", &[]), &private));
     }
 
     #[test]
-    fn shared_queries_are_visible_to_all_but_editable_by_writer_owner_or_admin() {
+    fn tenant_queries_are_visible_to_all_but_editable_by_writer_owner_or_admin() {
         let shared = saved("alice", VISIBILITY_TENANT);
-        assert!(is_visible(&caller("bob", "viewer"), &shared));
-        assert!(!may_modify(&caller("bob", "write"), &shared));
-        assert!(may_modify(&caller("bob", "admin"), &shared));
-        assert!(may_modify(&caller("alice", "write"), &shared));
+        assert!(is_visible(&viewer("bob", "viewer", &[]), &shared));
+        assert!(!may_modify(&viewer("bob", "write", &[]), &shared));
+        assert!(may_modify(&viewer("bob", "admin", &[]), &shared));
+        assert!(may_modify(&viewer("alice", "write", &[]), &shared));
         // An owner later demoted to viewer can no longer change what the tenant sees.
-        assert!(!may_modify(&caller("alice", "viewer"), &shared));
+        assert!(!may_modify(&viewer("alice", "viewer", &[]), &shared));
     }
 
     #[test]
-    fn only_writers_may_share() {
+    fn group_queries_are_visible_only_to_members_and_the_owner() {
+        let group = saved("alice", VISIBILITY_GROUP);
+        assert!(is_visible(&viewer("bob", "viewer", &["sre"]), &group));
+        assert!(!is_visible(&viewer("carol", "admin", &["admins"]), &group));
+        // The owner keeps access even after leaving the group.
+        assert!(is_visible(&viewer("alice", "write", &[]), &group));
+        assert!(may_modify(&viewer("alice", "write", &[]), &group));
+        assert!(!may_modify(&viewer("bob", "write", &["sre"]), &group));
+        assert!(may_modify(&viewer("dave", "admin", &["sre"]), &group));
+    }
+
+    #[test]
+    fn sharing_needs_write_access_and_group_membership() {
+        assert!(may_publish(
+            &viewer("a", "viewer", &[]),
+            VISIBILITY_PRIVATE,
+            ""
+        ));
+        assert!(!may_publish(
+            &viewer("a", "viewer", &[]),
+            VISIBILITY_TENANT,
+            ""
+        ));
+        assert!(may_publish(
+            &viewer("a", "write", &[]),
+            VISIBILITY_TENANT,
+            ""
+        ));
+        assert!(may_publish(
+            &viewer("a", "write", &["sre"]),
+            VISIBILITY_GROUP,
+            "sre"
+        ));
+        assert!(!may_publish(
+            &viewer("a", "viewer", &["sre"]),
+            VISIBILITY_GROUP,
+            "sre"
+        ));
+        assert!(!may_publish(
+            &viewer("a", "write", &["sre"]),
+            VISIBILITY_GROUP,
+            "dba"
+        ));
+        assert!(!may_publish(
+            &viewer("a", "admin", &["admins"]),
+            VISIBILITY_GROUP,
+            "sre"
+        ));
         assert!(may_share("admin"));
-        assert!(may_share("write"));
-        assert!(!may_share("viewer"));
         assert!(!may_share(""));
     }
 
@@ -478,11 +592,16 @@ mod tests {
     fn normalize_trims_and_defaults_to_private() {
         let mut req = request(serde_json::json!({
             "name": "  Checkout errors ",
+            "description": "  Used during the Oct 12 incident ",
+            "group_id": "ignored",
             "query": {"filters": [{"field": " service.name ", "op": " = ", "value": "checkout"}], "view_mode": "logs"}
         }));
         normalize(&mut req).unwrap();
         assert_eq!(req.name, "Checkout errors");
+        assert_eq!(req.description, "Used during the Oct 12 incident");
         assert_eq!(req.visibility, VISIBILITY_PRIVATE);
+        // A group only applies to group visibility.
+        assert_eq!(req.group_id, "");
         assert_eq!(
             req.query.filters[0],
             SavedQueryFilter {
@@ -491,6 +610,11 @@ mod tests {
                 value: "checkout".into()
             }
         );
+        let mut group = request(
+            serde_json::json!({"name": "x", "visibility": "group", "group_id": " sre ", "query": {}}),
+        );
+        normalize(&mut group).unwrap();
+        assert_eq!(group.group_id, "sre");
     }
 
     #[test]
@@ -498,6 +622,8 @@ mod tests {
         let cases = [
             serde_json::json!({"name": "  ", "query": {}}),
             serde_json::json!({"name": "x", "visibility": "global", "query": {}}),
+            serde_json::json!({"name": "x", "visibility": "group", "query": {}}),
+            serde_json::json!({"name": "x", "description": "d".repeat(1001), "query": {}}),
             serde_json::json!({"name": "x", "query": {"view_mode": "metrics"}}),
             serde_json::json!({"name": "x", "query": {"time_preset": 600_000}}),
             serde_json::json!({"name": "x", "query": {"filters": [{"field": "", "op": "=", "value": "v"}]}}),
@@ -532,16 +658,18 @@ mod tests {
 
     #[test]
     fn audit_summary_omits_filter_values_and_search_text() {
-        let mut query = saved("alice", VISIBILITY_TENANT);
+        let mut query = saved("alice", VISIBILITY_GROUP);
         query.query.filters.push(SavedQueryFilter {
             field: "user.email".into(),
             op: "=".into(),
             value: "secret@example.com".into(),
         });
         query.query.search = "token=abc123".into();
+        query.description = "why: incident 42".into();
         let summary = audit_summary(&query).to_string();
         assert!(!summary.contains("secret@example.com"));
         assert!(!summary.contains("abc123"));
         assert!(summary.contains("\"filter_count\":1"));
+        assert!(summary.contains("\"group_id\":\"sre\""));
     }
 }

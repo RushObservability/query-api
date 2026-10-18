@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const VISIBILITY_PRIVATE: &str = "private";
+pub const VISIBILITY_GROUP: &str = "group";
 pub const VISIBILITY_TENANT: &str = "tenant";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -35,6 +36,8 @@ pub struct SavedQuery {
     pub name: String,
     pub description: String,
     pub visibility: String,
+    /// The group the query is shared with when `visibility` is `group`, else empty.
+    pub group_id: String,
     pub owner_id: String,
     pub owner_name: String,
     pub query: SavedQueryBody,
@@ -50,7 +53,16 @@ pub struct SavedQueryRequest {
     pub description: String,
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    #[serde(default)]
+    pub group_id: String,
     pub query: SavedQueryBody,
+}
+
+/// A group the caller belongs to, offered as a sharing target.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SavedQueryGroup {
+    pub id: String,
+    pub name: String,
 }
 
 fn default_visibility() -> String {

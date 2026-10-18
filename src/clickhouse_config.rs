@@ -78,6 +78,7 @@ struct SavedQueryRow {
     name: String,
     description: String,
     visibility: String,
+    group_id: String,
     owner_id: String,
     owner_name: String,
     query: String,
@@ -2966,6 +2967,7 @@ impl ConfigDb {
                 name        String,
                 description String DEFAULT '',
                 visibility  String DEFAULT 'private',
+                group_id    String DEFAULT '',
                 owner_id    String,
                 owner_name  String DEFAULT '',
                 query       String DEFAULT '{}',
@@ -2975,6 +2977,7 @@ impl ConfigDb {
                 is_deleted  UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (tenant_id, id)",
+            "ALTER TABLE config_saved_queries ADD COLUMN IF NOT EXISTS group_id String DEFAULT '' AFTER visibility",
             // ── Investigation sessions (owned by sre-agent; mutable → ReplacingMergeTree) ──
             "CREATE TABLE IF NOT EXISTS config_investigation_sessions (
                 id                String,
@@ -9834,7 +9837,7 @@ impl ConfigDb {
 
     // ── Saved query operations ─────────────────────────────────────────────────
 
-    const SAVED_QUERY_COLUMNS: &'static str = "tenant_id, id, name, description, visibility, owner_id, owner_name, query, created_at, updated_at";
+    const SAVED_QUERY_COLUMNS: &'static str = "tenant_id, id, name, description, visibility, group_id, owner_id, owner_name, query, created_at, updated_at";
 
     fn saved_query_from_row(r: SavedQueryRow) -> crate::models::saved_query::SavedQuery {
         crate::models::saved_query::SavedQuery {
@@ -9846,6 +9849,7 @@ impl ConfigDb {
             name: r.name,
             description: r.description,
             visibility: r.visibility,
+            group_id: r.group_id,
             owner_id: r.owner_id,
             owner_name: r.owner_name,
             created_at: r.created_at,
@@ -9853,15 +9857,16 @@ impl ConfigDb {
         }
     }
 
-    /// Saved queries the user can see in a tenant: their own private ones plus
-    /// every query shared with the tenant.
+    /// Saved queries the user can see in a tenant: their own, every query
+    /// shared with the tenant, and those shared with one of their groups.
     pub async fn list_saved_queries(
         &self,
         tenant_id: &str,
         user_id: &str,
+        group_ids: &[String],
     ) -> anyhow::Result<Vec<crate::models::saved_query::SavedQuery>> {
         let sql = format!(
-            "SELECT {} FROM config_saved_queries FINAL WHERE is_deleted = 0 AND tenant_id = ? AND (visibility = 'tenant' OR owner_id = ?) ORDER BY updated_at DESC",
+            "SELECT {} FROM config_saved_queries FINAL WHERE is_deleted = 0 AND tenant_id = ? AND (visibility = 'tenant' OR owner_id = ? OR (visibility = 'group' AND has(?, group_id))) ORDER BY updated_at DESC",
             Self::SAVED_QUERY_COLUMNS
         );
         let rows = self
@@ -9869,6 +9874,7 @@ impl ConfigDb {
             .query(&sql)
             .bind(tenant_id)
             .bind(user_id)
+            .bind(group_ids)
             .fetch_all::<SavedQueryRow>()
             .await?;
         Ok(rows.into_iter().map(Self::saved_query_from_row).collect())
@@ -9925,13 +9931,35 @@ impl ConfigDb {
     ) -> anyhow::Result<()> {
         let query_json = serde_json::to_string(&saved.query)?;
         self.client
-            .query("INSERT INTO config_saved_queries (tenant_id, id, name, description, visibility, owner_id, owner_name, query, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .query("INSERT INTO config_saved_queries (tenant_id, id, name, description, visibility, group_id, owner_id, owner_name, query, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&saved.tenant_id).bind(&saved.id).bind(&saved.name).bind(&saved.description)
-            .bind(&saved.visibility).bind(&saved.owner_id).bind(&saved.owner_name).bind(&query_json)
+            .bind(&saved.visibility).bind(&saved.group_id).bind(&saved.owner_id).bind(&saved.owner_name).bind(&query_json)
             .bind(&saved.created_at).bind(&saved.updated_at).bind(Self::next_version())
             .bind(if is_deleted { 1u8 } else { 0u8 })
             .execute().await?;
         Ok(())
+    }
+
+    /// Groups the user belongs to (skipping deleted groups), with their names.
+    pub async fn list_user_group_refs(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<crate::models::saved_query::SavedQueryGroup>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            name: String,
+        }
+        let rows = self
+            .client
+            .query("SELECT id, name FROM config_groups FINAL WHERE is_deleted = 0 AND id IN (SELECT group_id FROM config_user_groups FINAL WHERE user_id = ? AND is_deleted = 0) ORDER BY name ASC")
+            .bind(user_id)
+            .fetch_all::<Row>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::models::saved_query::SavedQueryGroup { id: r.id, name: r.name })
+            .collect())
     }
 
     pub fn saved_query_timestamp() -> String {
