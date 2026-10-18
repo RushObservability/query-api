@@ -9958,7 +9958,10 @@ impl ConfigDb {
             .await?;
         Ok(rows
             .into_iter()
-            .map(|r| crate::models::saved_query::SavedQueryGroup { id: r.id, name: r.name })
+            .map(|r| crate::models::saved_query::SavedQueryGroup {
+                id: r.id,
+                name: r.name,
+            })
             .collect())
     }
 
