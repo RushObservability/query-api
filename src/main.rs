@@ -71,6 +71,31 @@ enum CredentialKind {
     QueryKey,
     IngestKey,
     InternalSre,
+    /// A `rush_`-format key that matched no live key (unknown, deleted, or
+    /// for another deployment). Rejected with 401 instead of falling through
+    /// to session or anonymous access. Carries only the public 12-char prefix.
+    RejectedKey {
+        prefix: String,
+    },
+    /// The key store could not be reached while checking a `rush_` key.
+    KeyCheckUnavailable,
+}
+
+/// Rush API keys look like `rush_qry_…` / `rush_ing_…`. Only these are rejected
+/// outright when unknown; other bearer tokens keep the historical fallthrough.
+fn looks_like_rush_api_key(key: &str) -> bool {
+    key.starts_with("rush_")
+}
+
+/// The same 12-character public prefix stored with each key.
+fn api_key_public_prefix(key: &str) -> String {
+    key.chars().take(12).collect()
+}
+
+enum KeyLookup {
+    Found(Box<TenantResolution>),
+    NotFound,
+    Unavailable,
 }
 
 impl TenantResolution {
@@ -88,6 +113,26 @@ impl TenantResolution {
             tenant_id: tenant_id.into(),
             authenticated: true,
             credential: CredentialKind::Session,
+            api_key: None,
+        }
+    }
+
+    fn rejected_key(key: &str) -> Self {
+        Self {
+            tenant_id: "default".to_string(),
+            authenticated: false,
+            credential: CredentialKind::RejectedKey {
+                prefix: api_key_public_prefix(key),
+            },
+            api_key: None,
+        }
+    }
+
+    fn key_check_unavailable() -> Self {
+        Self {
+            tenant_id: "default".to_string(),
+            authenticated: false,
+            credential: CredentialKind::KeyCheckUnavailable,
             api_key: None,
         }
     }
@@ -556,7 +601,11 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
             tenant_id: resolution.tenant_id.clone(),
             authenticated: true,
             actor_id: grant.id.clone(),
-            actor_name: "API key".to_string(),
+            actor_name: if grant.name.is_empty() {
+                "API key".to_string()
+            } else {
+                grant.name.clone()
+            },
             actor_type: "api_key".to_string(),
             credential_type: "query_key".to_string(),
         },
@@ -577,6 +626,12 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
             credential_type: "anonymous".to_string(),
         },
     };
+    if resolution.credential == CredentialKind::QueryKey {
+        if let Some(grant) = resolution.api_key.clone() {
+            // Lets principal-aware handlers act as this key (see users::require_principal).
+            rush_api::request_auth::set_api_key_grant(grant);
+        }
+    }
     req.extensions_mut().insert(TenantContext {
         tenant_id: resolution.tenant_id.clone(),
     });
@@ -1181,6 +1236,32 @@ fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
     }
 }
 
+/// Collectors with a revoked key retry constantly. Record one audit event per
+/// key prefix per minute so the append-only audit chain isn't flooded.
+fn should_audit_rejected_key(prefix: &str) -> bool {
+    static LAST_AUDITED: std::sync::LazyLock<dashmap::DashMap<String, std::time::Instant>> =
+        std::sync::LazyLock::new(dashmap::DashMap::new);
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+    let now = std::time::Instant::now();
+    if LAST_AUDITED.len() > 10_000 {
+        LAST_AUDITED.retain(|_, at| now.duration_since(*at) < WINDOW);
+    }
+    let mut due = false;
+    LAST_AUDITED
+        .entry(prefix.to_string())
+        .and_modify(|at| {
+            if now.duration_since(*at) >= WINDOW {
+                *at = now;
+                due = true;
+            }
+        })
+        .or_insert_with(|| {
+            due = true;
+            now
+        });
+    due
+}
+
 fn should_audit_route_denial(signal: Option<&str>) -> bool {
     // Collector execution/control is security-sensitive, not telemetry ingest.
     // Keep query/configuration access denials, but leave ingest failures in logs.
@@ -1209,6 +1290,9 @@ async fn audit_api_key_denial(
         CredentialKind::Session => ("ingest.auth_denied", "user"),
         CredentialKind::Anonymous => ("ingest.auth_denied", "anonymous"),
         CredentialKind::InternalSre => ("sre_agent.scope_denied", "system"),
+        CredentialKind::RejectedKey { .. } | CredentialKind::KeyCheckUnavailable => {
+            ("apikey.auth_failure", "anonymous")
+        }
     };
     let mut event = rush_api::audit::AuditEvent::new(action, actor_type)
         .tenant(resolution.tenant_id.clone())
@@ -1304,6 +1388,36 @@ async fn enforce_tenant_auth_middleware(
     // the config store is temporarily unavailable.
     if allows_unauthenticated_tenant_request(&method, &path) {
         return next.run(req).await;
+    }
+
+    match &resolution.credential {
+        CredentialKind::RejectedKey { prefix } => {
+            if should_audit_rejected_key(prefix) {
+                state
+                    .audit
+                    .log(
+                        rush_api::audit::AuditEvent::new("apikey.auth_failure", "anonymous")
+                            .tenant(tenant_id.clone())
+                            .resource("api_key_prefix", prefix.clone())
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({
+                                    "reason": "unknown_or_revoked_key",
+                                    "prefix": prefix,
+                                    "path": path,
+                                })
+                                .to_string(),
+                            )
+                            .context(rush_api::audit::actor_context_from_headers(req.headers())),
+                    )
+                    .await;
+            }
+            return (StatusCode::UNAUTHORIZED, "API key is invalid or revoked").into_response();
+        }
+        CredentialKind::KeyCheckUnavailable => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "API key check unavailable").into_response();
+        }
+        _ => {}
     }
 
     if should_reject_interactive_llm(&method, &path, &resolution.credential) {
@@ -1575,9 +1689,9 @@ async fn resolve_tenant_from_headers(
     resolved
 }
 
-async fn resolve_api_key_credential(state: &AppState, key: &str) -> Option<TenantResolution> {
+async fn resolve_api_key_credential(state: &AppState, key: &str) -> KeyLookup {
     if key.is_empty() {
-        return None;
+        return KeyLookup::NotFound;
     }
     let key_hash = handlers::settings::hash_api_key(key);
     let started = std::time::Instant::now();
@@ -1593,12 +1707,31 @@ async fn resolve_api_key_credential(state: &AppState, key: &str) -> Option<Tenan
         },
     );
     match result {
-        Ok(Some(grant)) => Some(TenantResolution::api_key(grant)),
-        Ok(None) => None,
+        Ok(Some(grant)) => KeyLookup::Found(Box::new(TenantResolution::api_key(grant))),
+        Ok(None) => KeyLookup::NotFound,
         Err(error) => {
             tracing::warn!(%error, "API key resolution failed");
-            None
+            KeyLookup::Unavailable
         }
+    }
+}
+
+/// Resolution for a presented key: a live key, a rejection for unknown or
+/// uncheckable `rush_` keys, or `None` to continue with the next credential.
+async fn resolve_presented_key(state: &AppState, key: &str) -> Option<TenantResolution> {
+    presented_key_resolution(resolve_api_key_credential(state, key).await, key)
+}
+
+fn presented_key_resolution(lookup: KeyLookup, key: &str) -> Option<TenantResolution> {
+    match lookup {
+        KeyLookup::Found(resolution) => Some(*resolution),
+        KeyLookup::NotFound if looks_like_rush_api_key(key) => {
+            Some(TenantResolution::rejected_key(key))
+        }
+        KeyLookup::Unavailable if looks_like_rush_api_key(key) => {
+            Some(TenantResolution::key_check_unavailable())
+        }
+        KeyLookup::NotFound | KeyLookup::Unavailable => None,
     }
 }
 
@@ -1614,7 +1747,7 @@ async fn resolve_tenant_inner(
     if let Some(val) = auth_header {
         if val.len() > 7 && val[..7].eq_ignore_ascii_case("bearer ") {
             let key = val[7..].trim();
-            if let Some(resolution) = resolve_api_key_credential(state, key).await {
+            if let Some(resolution) = resolve_presented_key(state, key).await {
                 return resolution;
             }
             tracing::debug!(method = "api_key", "API key not found");
@@ -1627,7 +1760,7 @@ async fn resolve_tenant_inner(
     if let Some(dd_key_val) = dd_key {
         let key = dd_key_val.trim();
         if !key.is_empty() {
-            if let Some(resolution) = resolve_api_key_credential(state, key).await {
+            if let Some(resolution) = resolve_presented_key(state, key).await {
                 return resolution;
             }
             tracing::debug!(method = "agent_api_key", "API key not found");
@@ -2703,6 +2836,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
         .route("/api/v1/explore/search", post(handlers::explore::search))
         .route("/api/v1/settings/log-views", get(handlers::log_views::get).put(handlers::log_views::put))
+        // Identity behind the current credential (session or API key)
+        .route("/api/v1/whoami", get(handlers::whoami::whoami))
         // Saved Explore queries: private to the owner or shared with the tenant
         .route("/api/v1/saved-queries", get(handlers::saved_queries::list).post(handlers::saved_queries::create))
         .route(
@@ -3541,11 +3676,12 @@ async fn graceful_shutdown_drain(
 #[cfg(test)]
 mod tenant_auth_tests {
     use super::{
-        CredentialKind, TenantResolution, allows_unauthenticated_tenant_request,
-        credential_route_denial, effective_route_ingest_auth_required, explicit_ingest_tenant,
-        ingest_signal_for_route, internal_sre_route_allowed, is_explain_collector_route,
-        is_state_changing_method, query_workload_for_request, request_log_path,
-        request_origin_allowed_with_policy, requires_csrf_origin, should_audit_route_denial,
+        CredentialKind, KeyLookup, TenantResolution, allows_unauthenticated_tenant_request,
+        api_key_public_prefix, credential_route_denial, effective_route_ingest_auth_required,
+        explicit_ingest_tenant, ingest_signal_for_route, internal_sre_route_allowed,
+        is_explain_collector_route, is_state_changing_method, presented_key_resolution,
+        query_workload_for_request, request_log_path, request_origin_allowed_with_policy,
+        requires_csrf_origin, should_audit_rejected_key, should_audit_route_denial,
         should_reject_for_tenant_auth, should_reject_interactive_llm,
         trust_forwarded_origin_headers, validate_request_time_range,
     };
@@ -4227,11 +4363,48 @@ mod tenant_auth_tests {
     }
 
     #[test]
+    fn unknown_rush_keys_are_rejected_instead_of_falling_through() {
+        let key = "rush_qry_0123456789abcdef";
+        assert_eq!(
+            presented_key_resolution(KeyLookup::NotFound, key)
+                .unwrap()
+                .credential,
+            CredentialKind::RejectedKey {
+                prefix: "rush_qry_012".to_string()
+            }
+        );
+        assert_eq!(
+            presented_key_resolution(KeyLookup::Unavailable, key)
+                .unwrap()
+                .credential,
+            CredentialKind::KeyCheckUnavailable
+        );
+        let rejected = presented_key_resolution(KeyLookup::NotFound, key).unwrap();
+        assert!(!rejected.authenticated);
+        assert!(rejected.api_key.is_none());
+        // Other bearer tokens keep falling through to session/anonymous resolution.
+        assert!(presented_key_resolution(KeyLookup::NotFound, "some-other-token").is_none());
+        assert!(presented_key_resolution(KeyLookup::Unavailable, "eyJhbGciOi").is_none());
+        // The stored prefix never exposes more than 12 characters of the presented key.
+        assert_eq!(api_key_public_prefix(key).len(), 12);
+    }
+
+    #[test]
+    fn rejected_key_audits_are_throttled_per_prefix() {
+        let prefix = format!("rush_qry_t{}", std::process::id() % 100);
+        assert!(should_audit_rejected_key(&prefix));
+        assert!(!should_audit_rejected_key(&prefix));
+        assert!(should_audit_rejected_key(&format!("{prefix}x")));
+    }
+
+    #[test]
     fn only_explicit_ingest_keys_receive_ingest_credentials() {
         let grant = |key_type: &str| ApiKeyGrant {
             id: "key-id".to_string(),
+            name: "CI".to_string(),
             tenant_id: "default".to_string(),
             key_type: key_type.to_string(),
+            role: String::new(),
             signals: vec!["logs".to_string()],
             rate_limit_per_minute: 100,
             source_cidrs: Vec::new(),

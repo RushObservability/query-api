@@ -59,3 +59,4 @@ pub mod traces;
 pub mod usage;
 pub mod usage_metering;
 pub mod users;
+pub mod whoami;

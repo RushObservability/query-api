@@ -22,6 +22,8 @@ pub struct ApiKeyListEntry {
     pub prefix: String,
     pub tenant_id: String,
     pub key_type: String,
+    /// `viewer` or `write` for query keys; empty for ingest keys.
+    pub role: String,
     pub signals: Vec<String>,
     pub rate_limit_per_minute: u64,
     pub source_cidrs: Vec<String>,
@@ -36,6 +38,7 @@ pub struct ApiKeyCreated {
     pub prefix: String,
     pub tenant_id: String,
     pub key_type: String,
+    pub role: String,
     pub signals: Vec<String>,
     pub rate_limit_per_minute: u64,
     pub source_cidrs: Vec<String>,
@@ -47,6 +50,9 @@ pub struct CreateApiKeyRequest {
     pub name: String,
     #[serde(default = "default_api_key_type")]
     pub key_type: String,
+    /// Query keys only: `viewer` (default) or `write`.
+    #[serde(default)]
+    pub role: Option<String>,
     #[serde(default)]
     pub signals: Vec<String>,
     #[serde(default)]
@@ -57,6 +63,26 @@ pub struct CreateApiKeyRequest {
 
 fn default_api_key_type() -> String {
     "query".to_string()
+}
+
+/// Validate the requested role for a new key. Query keys default to `viewer`;
+/// ingest keys carry no role.
+fn api_key_role(key_type: &str, requested: Option<&str>) -> Result<String, String> {
+    let requested = requested.map(|role| role.trim().to_ascii_lowercase());
+    if key_type == "ingest" {
+        return match requested.as_deref() {
+            None | Some("") => Ok(String::new()),
+            Some(_) => Err("role applies only to query keys".to_string()),
+        };
+    }
+    let role = requested
+        .filter(|role| !role.is_empty())
+        .unwrap_or_else(|| "viewer".into());
+    if crate::clickhouse_config::API_KEY_ROLES.contains(&role.as_str()) {
+        Ok(role)
+    } else {
+        Err("role must be 'viewer' or 'write'".to_string())
+    }
 }
 
 fn generate_api_key(key_type: &str) -> String {
@@ -109,29 +135,25 @@ pub async fn list_api_keys(
     })?;
     let keys: Vec<ApiKeyListEntry> = rows
         .into_iter()
-        .map(
-            |(
-                id,
-                name,
-                prefix,
-                tenant_id,
-                key_type,
-                signals,
-                rate_limit_per_minute,
-                source_cidrs,
-                created_at,
-            )| ApiKeyListEntry {
-                id,
-                name,
-                prefix,
-                tenant_id,
-                key_type,
-                signals,
-                rate_limit_per_minute,
-                source_cidrs,
-                created_at,
+        .map(|row| ApiKeyListEntry {
+            id: row.id,
+            name: row.name,
+            prefix: row.prefix,
+            tenant_id: row.tenant_id,
+            // Keys created before roles existed act as viewers.
+            role: if row.key_type == "ingest" {
+                String::new()
+            } else if crate::clickhouse_config::API_KEY_ROLES.contains(&row.role.as_str()) {
+                row.role
+            } else {
+                "viewer".to_string()
             },
-        )
+            key_type: row.key_type,
+            signals: row.signals,
+            rate_limit_per_minute: row.rate_limit_per_minute,
+            source_cidrs: row.source_cidrs,
+            created_at: row.created_at,
+        })
         .collect();
     Ok(Json(serde_json::json!({ "keys": keys })))
 }
@@ -157,6 +179,8 @@ pub async fn create_api_key(
             "key_type must be 'query' or 'ingest'".to_string(),
         ));
     }
+    let role = api_key_role(&key_type, req.role.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let signals = if key_type == "ingest" {
         crate::api_key_auth::normalize_signals(&req.signals)
             .map_err(|message| (StatusCode::BAD_REQUEST, message))?
@@ -197,6 +221,7 @@ pub async fn create_api_key(
             &prefix,
             &tenant.tenant_id,
             &key_type,
+            &role,
             &signals,
             rate_limit_per_minute,
             &source_cidrs,
@@ -230,6 +255,7 @@ pub async fn create_api_key(
                         "prefix": prefix,
                         "tenant": tenant.tenant_id,
                         "key_type": key_type,
+                        "role": role,
                         "signals": signals,
                         "rate_limit_per_minute": rate_limit_per_minute,
                         "source_restricted": !source_cidrs.is_empty(),
@@ -249,6 +275,7 @@ pub async fn create_api_key(
         prefix,
         tenant_id: tenant.tenant_id,
         key_type,
+        role,
         signals,
         rate_limit_per_minute,
         source_cidrs,
@@ -1036,6 +1063,27 @@ pub async fn set_session_policy(
             .context(crate::audit::actor_context_from_headers(&headers)),
     ).await;
     Ok(Json(session_policy_response(policy)))
+}
+
+#[cfg(test)]
+mod api_key_role_tests {
+    use super::api_key_role;
+
+    #[test]
+    fn query_keys_default_to_viewer_and_accept_only_known_roles() {
+        assert_eq!(api_key_role("query", None).unwrap(), "viewer");
+        assert_eq!(api_key_role("query", Some("")).unwrap(), "viewer");
+        assert_eq!(api_key_role("query", Some(" Write ")).unwrap(), "write");
+        for role in ["admin", "owner", "agent", "viewer,write"] {
+            assert!(api_key_role("query", Some(role)).is_err(), "{role}");
+        }
+    }
+
+    #[test]
+    fn ingest_keys_carry_no_role() {
+        assert_eq!(api_key_role("ingest", None).unwrap(), "");
+        assert!(api_key_role("ingest", Some("write")).is_err());
+    }
 }
 
 #[cfg(test)]
