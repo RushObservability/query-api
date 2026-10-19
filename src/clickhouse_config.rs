@@ -3991,6 +3991,60 @@ impl ConfigDb {
             .map(|(id, ..)| id))
     }
 
+    /// Resolve a session's tenant with the same authorization checks for an
+    /// explicit selection and its saved default. An explicit denial must never
+    /// silently select another tenant. Stored tenant values may be names or IDs.
+    pub async fn resolve_session_tenant(
+        &self,
+        user_id: &str,
+        role: &str,
+        default_tenant: &str,
+        requested: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        let mut accessible = if role == "admin" {
+            Vec::new()
+        } else {
+            self.resolve_user_permissions(user_id).await?.2
+        };
+        let allowed = |id: &str, name: &str, enabled: bool| {
+            enabled
+                && !id.eq_ignore_ascii_case(crate::audit::AUDIT_TENANT)
+                && !name.eq_ignore_ascii_case(crate::audit::AUDIT_TENANT)
+                && (role == "admin" || accessible.iter().any(|value| value == id))
+        };
+        let preferred = requested.unwrap_or(default_tenant);
+        if let Some((id, name, enabled, _)) = self.tenant_flags(preferred).await? {
+            if allowed(&id, &name, enabled) {
+                return Ok(Some(name));
+            }
+        }
+        if requested.is_some() {
+            return Ok(None);
+        }
+        // A user's default can outlive a group grant or a disabled tenant.
+        // Choose a deterministic enabled grant for the initial page load.
+        if role == "admin" {
+            return Ok(self
+                .list_tenants()
+                .await?
+                .into_iter()
+                .find(|(id, name, enabled, _, _)| allowed(id, name, *enabled))
+                .map(|(_, name, ..)| name));
+        }
+        accessible.sort();
+        for id in accessible {
+            if let Some((_, name, true, _)) = self.tenant_flags(&id).await? {
+                if !id.eq_ignore_ascii_case(crate::audit::AUDIT_TENANT)
+                    && !name.eq_ignore_ascii_case(crate::audit::AUDIT_TENANT)
+                {
+                    return Ok(Some(name));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn set_tenant_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<bool> {
         self.invalidate_config_caches();
         let existing = self.get_tenant(id).await?;
@@ -11908,5 +11962,154 @@ impl ConfigDb {
             total_bytes: row.total_bytes,
             redaction_count: row.redaction_count,
         })
+    }
+}
+
+#[cfg(test)]
+mod session_tenant_regressions {
+    use super::*;
+    use clickhouse::test::{Mock, handlers};
+
+    fn config(mock: &Mock) -> ConfigDb {
+        ConfigDb {
+            client: Client::default()
+                .with_url(mock.url())
+                .with_compression(clickhouse::Compression::None),
+            tenant_cache: DashMap::new(),
+            ingest_auth_cache: DashMap::new(),
+            signal_cache: DashMap::new(),
+            api_key_inflight: DashMap::new(),
+            username_mutation_lock: tokio::sync::Mutex::new(()),
+            sso_claim_store_mode: SsoClaimStoreMode::Local,
+            local_sso_claims: DashMap::new(),
+            sso_claim_cleanup_counter: AtomicU64::new(0),
+            config_cache_maintenance_counter: AtomicU64::new(0),
+            session_policy: SessionPolicy::new(3600, 86400, 300).unwrap(),
+            session_policy_cache: tokio::sync::Mutex::new(None),
+            session_hmac_secret: vec![42; 32],
+        }
+    }
+
+    fn grants(mock: &Mock, tenant_ids: &[&str]) {
+        mock.add(handlers::provide([("[\"all\"]", "[\"read\"]")]));
+        mock.add(handlers::provide(tenant_ids.iter().map(|id| (*id,))));
+    }
+
+    #[tokio::test]
+    async fn inaccessible_or_disabled_default_selects_an_enabled_grant() {
+        for enabled in [0_u8, 1] {
+            let mock = Mock::new();
+            let db = config(&mock);
+            grants(&mock, &["tenant-a-id"]);
+            mock.add(handlers::provide([("default", "default", enabled, 0_u8)]));
+            mock.add(handlers::provide([("tenant-a-id", "tenant-a", 1_u8, 1_u8)]));
+            assert_eq!(
+                db.resolve_session_tenant("u1", "viewer", "default", None)
+                    .await
+                    .unwrap(),
+                Some("tenant-a".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_unauthorized_selection_never_falls_back() {
+        for requested in ["default", "tenant-b"] {
+            let mock = Mock::new();
+            let db = config(&mock);
+            grants(&mock, &["tenant-a-id"]);
+            mock.add(handlers::provide([(requested, requested, 1_u8, 0_u8)]));
+            assert_eq!(
+                db.resolve_session_tenant("u1", "viewer", "tenant-a", Some(requested))
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_ids_and_names_resolve_to_the_same_allowed_scope() {
+        for requested in ["tenant-a-id", "tenant-a"] {
+            let mock = Mock::new();
+            let db = config(&mock);
+            grants(&mock, &["tenant-a-id"]);
+            mock.add(handlers::provide([("tenant-a-id", "tenant-a", 1_u8, 1_u8)]));
+            assert_eq!(
+                db.resolve_session_tenant("u1", "viewer", "default", Some(requested))
+                    .await
+                    .unwrap(),
+                Some("tenant-a".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_or_reserved_tenant_is_rejected_even_for_admin() {
+        for (id, name, enabled) in [
+            ("tenant-a-id", "tenant-a", 0_u8),
+            ("_audit", "_audit", 1_u8),
+            ("audit-id", "_AUDIT", 1_u8),
+        ] {
+            let mock = Mock::new();
+            let db = config(&mock);
+            mock.add(handlers::provide([(id, name, enabled, 1_u8)]));
+            assert_eq!(
+                db.resolve_session_tenant("admin", "admin", "default", Some(name))
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_grants_does_not_become_anonymous_access_to_default() {
+        let mock = Mock::new();
+        let db = config(&mock);
+        grants(&mock, &[]);
+        mock.add(handlers::provide([("default", "default", 1_u8, 0_u8)]));
+        assert_eq!(
+            db.resolve_session_tenant("u1", "viewer", "default", None)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_and_tenant_lookup_failures_are_propagated() {
+        for fail_permissions in [true, false] {
+            let mock = Mock::new();
+            let db = config(&mock);
+            if !fail_permissions {
+                grants(&mock, &["tenant-a-id"]);
+            }
+            mock.add(handlers::failure(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ));
+            assert!(
+                db.resolve_session_tenant("u1", "viewer", "default", None)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_with_disabled_default_can_choose_an_enabled_tenant() {
+        let mock = Mock::new();
+        let db = config(&mock);
+        mock.add(handlers::provide([("default", "default", 0_u8, 0_u8)]));
+        mock.add(handlers::provide([
+            ("_audit", "_audit", 1_u8, 1_u8, "2026-01-01"),
+            ("tenant-a-id", "tenant-a", 1_u8, 1_u8, "2026-01-02"),
+        ]));
+        assert_eq!(
+            db.resolve_session_tenant("admin", "admin", "default", None)
+                .await
+                .unwrap(),
+            Some("tenant-a".into())
+        );
     }
 }

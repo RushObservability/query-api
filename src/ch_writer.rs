@@ -32,7 +32,7 @@ use crate::spool::{IngestBuffer, SpoolFull};
 
 #[derive(Debug)]
 pub enum WriteError {
-    /// The spool is full — caller should return HTTP 429.
+    /// The accumulator is busy or its durable spool is full. Return HTTP 429.
     Backpressure,
     /// A serialisation or other non-CH error occurred.
     Fatal(String),
@@ -41,7 +41,7 @@ pub enum WriteError {
 impl std::fmt::Display for WriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteError::Backpressure => write!(f, "backpressure: spool full"),
+            WriteError::Backpressure => write!(f, "backpressure: ingest buffer unavailable"),
             WriteError::Fatal(s) => write!(f, "fatal write error: {s}"),
         }
     }
@@ -239,34 +239,39 @@ fn decode_spool(payload: &[u8]) -> anyhow::Result<SpoolBatch> {
     }
 }
 
+fn batch_serialized_size(batch: &SpoolBatch) -> Result<usize, WriteError> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Counter(0);
+    serde_json::to_writer(&mut count, batch)
+        .map_err(|error| WriteError::Fatal(error.to_string()))?;
+    Ok(count.0)
+}
+
 // ─── Cross-request insert batching ─────────────────────────────────────────────
 //
 // Each ingest HTTP request previously triggered an immediate typed insert (and a
 // metrics request fired up to 5 — one per metric type). Under high request rates
 // that means many tiny inserts, which ClickHouse dislikes (each insert is a part).
 //
-// `BatchAccumulator` coalesces rows from multiple requests into per-table buffers
-// and a background flush task drains each table's buffer when EITHER it reaches
-// `max_rows` OR `max_age` has elapsed since its first buffered row — whichever
-// comes first. Flushing goes through the SAME `write_now` (try_insert → spool on
-// failure) path as before, so durability is preserved: a flush that can't reach
-// ClickHouse spools the coalesced batch, and 429 backpressure surfaces when the
-// spool fills on that flush.
+// `BatchAccumulator` coalesces requests into bounded per-table buffers. Before
+// admitting rows that reach a row/byte limit, the writer flushes the previously
+// accepted buffer. Failed flushes retain those rows and reject new requests
+// without retaining them. The same slot lock covers admission and delivery.
 //
-// DURABILITY / BACKPRESSURE TRADEOFF (documented intentionally):
-//   With batching enabled, `ChWriter::write` returns to the HTTP caller as soon
-//   as the rows are buffered in memory — BEFORE the flush actually hits CH. So
-//   backpressure becomes ASYNCHRONOUS: a caller no longer receives a synchronous
-//   429 when ClickHouse is down. Instead the buffered rows are flushed by the
-//   background task, which spools them on CH failure; the spool absorbs the
-//   outage and a 429 surfaces (on the flush path, logged) only once the spool
-//   fills. Buffered-but-not-yet-flushed rows live in memory and are lost on a
-//   hard crash (they were never acked durably) — this is the cost of batching.
-//   On graceful shutdown `flush_all` drains every buffer first.
-//
-//   Operators who require today's synchronous 429 / zero in-memory buffering can
-//   set RUSH_INGEST_BATCH_ROWS=1 or RUSH_INGEST_BATCH_MS=0, which makes `write`
-//   flush immediately (identical to the pre-batching behavior, synchronous 429).
+// With batching enabled, success can still mean an in-memory acknowledgment;
+// a hard process crash can lose rows that have not reached the durable spool.
+// Graceful shutdown retries buffered writes. Set RUSH_INGEST_BATCH_ROWS=1 or
+// RUSH_INGEST_BATCH_MS=0 to use synchronous insert/spool acknowledgment instead.
+// No in-memory byte accounting changes that durability tradeoff.
 
 #[derive(Clone, Copy, Debug)]
 pub struct BatchConfig {
@@ -274,11 +279,14 @@ pub struct BatchConfig {
     pub max_rows: usize,
     /// Flush a table's buffer once this long has elapsed since its first row.
     pub max_age: Duration,
+    /// Maximum serialized bytes retained per table. Oversized requests bypass
+    /// the accumulator and receive synchronous insert/spool backpressure.
+    pub max_bytes: usize,
 }
 
 impl BatchConfig {
-    /// Read config from env: `RUSH_INGEST_BATCH_ROWS` (default 5000) and
-    /// `RUSH_INGEST_BATCH_MS` (default 500). `rows <= 1` or `ms == 0` disables
+    /// Read `RUSH_INGEST_BATCH_ROWS` (5000), `RUSH_INGEST_BATCH_MS` (500), and
+    /// `RUSH_INGEST_BATCH_BYTES` (8 MiB per table). Zero bytes, `rows <= 1`, or `ms == 0` disables
     /// batching (every `write` flushes immediately — today's behavior).
     pub fn from_env() -> Self {
         let max_rows = std::env::var("RUSH_INGEST_BATCH_ROWS")
@@ -292,12 +300,16 @@ impl BatchConfig {
         BatchConfig {
             max_rows,
             max_age: Duration::from_millis(max_ms),
+            max_bytes: std::env::var("RUSH_INGEST_BATCH_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8 * 1024 * 1024),
         }
     }
 
     /// True when batching is effectively disabled (flush every write inline).
     fn disabled(&self) -> bool {
-        self.max_rows <= 1 || self.max_age.is_zero()
+        self.max_rows <= 1 || self.max_age.is_zero() || self.max_bytes == 0
     }
 }
 
@@ -306,6 +318,7 @@ impl Default for BatchConfig {
         BatchConfig {
             max_rows: 5_000,
             max_age: Duration::from_millis(500),
+            max_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -316,6 +329,10 @@ impl Default for BatchConfig {
 struct TableBuffer {
     batch: Option<SpoolBatch>,
     first_row_at: Option<Instant>,
+    bytes: usize,
+    /// Set before an attempted flush, including one cancelled by its caller.
+    /// New writes cannot enter the slot until these acknowledged rows drain.
+    needs_flush: bool,
 }
 
 /// The in-process batching layer: one buffer per ClickHouse table, each behind
@@ -334,74 +351,13 @@ impl BatchAccumulator {
         }
     }
 
-    /// Enqueue an (already firewall-applied) batch into its table slot. Returns
-    /// the batch to flush NOW if enqueuing pushed the slot to/over `max_rows`
-    /// (so the caller flushes inline, bounding latency + memory); otherwise the
-    /// rows stay buffered for the background flusher / age trigger.
-    async fn enqueue(&self, batch: SpoolBatch) -> Option<SpoolBatch> {
-        let slot = batch.slot();
-        let mut g = self.slots[slot].lock().await;
-        match g.batch.as_mut() {
-            Some(existing) => existing.extend_from(batch),
-            None => {
-                g.first_row_at = Some(Instant::now());
-                g.batch = Some(batch);
-            }
-        }
-        let len = g.batch.as_ref().map(|b| b.len()).unwrap_or(0);
-        if len >= self.cfg.max_rows {
-            g.first_row_at = None;
-            g.batch.take()
-        } else {
-            None
-        }
-    }
-
-    /// Take any slot whose buffer is due to flush by the age trigger. Returns the
-    /// drained batch (caller flushes it). Called repeatedly by the flush task.
-    async fn take_aged(&self, slot: usize, now: Instant) -> Option<SpoolBatch> {
-        let mut g = self.slots[slot].lock().await;
-        let due = matches!(g.first_row_at, Some(t) if now.duration_since(t) >= self.cfg.max_age);
-        if due {
-            g.first_row_at = None;
-            g.batch.take()
-        } else {
-            None
-        }
-    }
-
-    /// Drain every non-empty slot unconditionally (used by graceful shutdown).
-    async fn drain_all(&self) -> Vec<SpoolBatch> {
-        let mut out = Vec::new();
-        for slot in &self.slots {
-            let mut g = slot.lock().await;
-            g.first_row_at = None;
-            if let Some(b) = g.batch.take() {
-                out.push(b);
-            }
-        }
-        out
-    }
-
-    /// Put a failed graceful-shutdown flush back into memory. This is needed
-    /// when the durable spool is full: dropping the batch would violate the
-    /// shutdown no-loss contract.
-    async fn restore(&self, batch: SpoolBatch) {
-        let slot = batch.slot();
-        let mut g = self.slots[slot].lock().await;
-        match g.batch.as_mut() {
-            Some(existing) => existing.extend_from(batch),
-            None => {
-                g.first_row_at = Some(Instant::now());
-                g.batch = Some(batch);
-            }
-        }
-    }
-
     async fn is_empty(&self) -> bool {
         for slot in &self.slots {
-            if slot.lock().await.batch.is_some() {
-                return false;
+            match slot.try_lock() {
+                Ok(buffer) if buffer.batch.is_none() => {}
+                // A write in flight must also prevent shutdown from treating
+                // the accumulator as drained, without blocking on its network I/O.
+                _ => return false,
             }
         }
         true
@@ -476,16 +432,12 @@ impl ChWriter {
 
     /// Write a batch to ClickHouse.
     ///
-    /// With batching enabled (the default), the firewall is applied here and the
-    /// rows are buffered for cross-request coalescing; this returns `Ok(())` as
-    /// soon as the rows are buffered. If buffering pushes the table's buffer to
-    /// the row threshold, the coalesced batch is flushed inline (so a single
-    /// large request still inserts promptly). See `BatchAccumulator` for the
-    /// asynchronous-backpressure tradeoff.
-    ///
-    /// With batching disabled (`RUSH_INGEST_BATCH_ROWS=1` / `RUSH_INGEST_BATCH_MS=0`)
-    /// this behaves exactly as before: a synchronous insert with synchronous
-    /// 429 backpressure on spool-full.
+    /// Batching accepts rows into a bounded per-table accumulator. Reaching a
+    /// limit flushes previously accepted rows before admitting this request;
+    /// a failed flush rejects it without adding its rows to the queue. Requests
+    /// exceeding either limit are written synchronously. The age flusher and
+    /// shutdown share the same lock and preserve accepted rows across failures.
+    /// Disabling batching makes every request use synchronous insert/spool.
     pub async fn write(&self, mut batch: SpoolBatch) -> Result<(), WriteError> {
         // Metric firewall runs once here over the request's rows so the firewall
         // semantics are unchanged whether or not batching coalesces afterward
@@ -498,36 +450,63 @@ impl ChWriter {
 
         if self.batcher.cfg.disabled() {
             // Batching off: preserve today's synchronous insert→spool→429 path.
-            return self.write_now(batch).await.map_err(|(error, _batch)| error);
+            return self.write_now(&batch).await;
         }
 
-        // Buffer the rows; flush inline only if this enqueue crossed the row
-        // threshold. Otherwise the background flusher / age trigger drains it.
-        if let Some(due) = self.batcher.enqueue(batch).await {
-            match self.write_now(due).await {
-                Ok(()) => Ok(()),
-                Err((error, batch)) => {
-                    self.batcher.restore(batch).await;
-                    Err(error)
-                }
-            }
-        } else {
-            Ok(())
+        // Keep the slot locked through delivery. Background and inline flushes
+        // must not detach a batch while another request fills the same slot.
+        let bytes = batch_serialized_size(&batch)?;
+        // Do not turn pending mutex waiters into an unbounded second queue of
+        // request bodies while ClickHouse is slow or unresponsive.
+        let mut slot = self.batcher.slots[batch.slot()]
+            .try_lock()
+            .map_err(|_| WriteError::Backpressure)?;
+        let rows = slot.batch.as_ref().map_or(0, SpoolBatch::len);
+        if slot.needs_flush
+            || rows.saturating_add(batch.len()) >= self.batcher.cfg.max_rows
+            || slot.bytes.saturating_add(bytes) >= self.batcher.cfg.max_bytes
+        {
+            // Only previously accepted rows are retained on failure. The current
+            // request has not entered the accumulator and is safe to retry.
+            self.flush_slot(&mut slot).await?;
         }
+        if batch.len() >= self.batcher.cfg.max_rows || bytes >= self.batcher.cfg.max_bytes {
+            return self.write_now(&batch).await;
+        }
+        match slot.batch.as_mut() {
+            Some(existing) => existing.extend_from(batch),
+            None => {
+                slot.first_row_at = Some(Instant::now());
+                slot.batch = Some(batch);
+            }
+        }
+        slot.bytes = slot.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Borrow the queued batch across delivery so cancellation or failure leaves
+    /// acknowledged rows in place. Clearing it requires a successful write.
+    async fn flush_slot(&self, slot: &mut TableBuffer) -> Result<(), WriteError> {
+        if let Some(batch) = &slot.batch {
+            slot.needs_flush = true;
+            self.write_now(batch).await?;
+        }
+        *slot = TableBuffer::default();
+        Ok(())
     }
 
     /// Perform the actual insert for a (firewall-already-applied) batch, spooling
     /// on CH failure. This is the single durable write path shared by the inline
     /// `write` (batching-disabled), the row-threshold inline flush, the
     /// background flusher, and graceful shutdown.
-    async fn write_now(&self, batch: SpoolBatch) -> Result<(), (WriteError, SpoolBatch)> {
+    async fn write_now(&self, batch: &SpoolBatch) -> Result<(), WriteError> {
         if batch.is_empty() {
             return Ok(());
         }
         let row_count = batch.len();
         let table = batch.table();
 
-        match try_insert(&self.ch, &batch).await {
+        match try_insert(&self.ch, batch).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(
@@ -538,14 +517,11 @@ impl ChWriter {
                 );
 
                 // Serialise for the spool (zstd-compressed MessagePack).
-                let payload = match encode_spool(&batch) {
-                    Ok(payload) => payload,
-                    Err(error) => return Err((error, batch)),
-                };
+                let payload = encode_spool(batch)?;
 
                 match self.buffer.append(table, payload).await {
                     Ok(()) => Ok(()),
-                    Err(SpoolFull) => Err((WriteError::Backpressure, batch)),
+                    Err(SpoolFull) => Err(WriteError::Backpressure),
                 }
             }
         }
@@ -554,13 +530,11 @@ impl ChWriter {
     /// Flush every buffered table batch to ClickHouse (spooling on failure).
     /// Called on graceful shutdown so no buffered rows are silently dropped.
     pub async fn flush_all(&self) {
-        stream::iter(self.batcher.drain_all().await)
-            .for_each_concurrent(4, |batch| async move {
-                let table = batch.table();
-                let rows = batch.len();
-                if let Err((e, batch)) = self.write_now(batch).await {
-                    self.batcher.restore(batch).await;
-                    tracing::warn!(error = %e, table = table, rows = rows, "flush_all: write failed (spool full?)");
+        stream::iter(0..SpoolBatch::SLOTS)
+            .for_each_concurrent(4, |index| async move {
+                let mut slot = self.batcher.slots[index].lock().await;
+                if let Err(error) = self.flush_slot(&mut slot).await {
+                    tracing::warn!(%error, index, "flush_all: buffered rows retained");
                 }
             })
             .await;
@@ -594,21 +568,15 @@ impl ChWriter {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let mut aged = Vec::new();
-                for slot in 0..SpoolBatch::SLOTS {
-                    if let Some(batch) = me.batcher.take_aged(slot, now).await {
-                        aged.push(batch);
-                    }
-                }
-                stream::iter(aged)
-                    .for_each_concurrent(4, |batch| {
+                stream::iter(0..SpoolBatch::SLOTS)
+                    .for_each_concurrent(4, |index| {
                         let me = &me;
                         async move {
-                            let table = batch.table();
-                            let rows = batch.len();
-                            if let Err((e, batch)) = me.write_now(batch).await {
-                                me.batcher.restore(batch).await;
-                                tracing::warn!(error = %e, table = table, rows = rows, "batch flush failed (spool full?)");
+                            let mut slot = me.batcher.slots[index].lock().await;
+                            if slot.first_row_at.is_some_and(|at| now.saturating_duration_since(at) >= me.batcher.cfg.max_age) {
+                                if let Err(error) = me.flush_slot(&mut slot).await {
+                                    tracing::warn!(%error, index, "batch flush failed; buffered rows retained");
+                                }
                             }
                         }
                     })
@@ -849,128 +817,35 @@ mod batch_tests {
         assert!(
             BatchConfig {
                 max_rows: 1,
-                max_age: Duration::from_millis(500)
+                max_age: Duration::from_millis(500),
+                ..BatchConfig::default()
             }
             .disabled()
         );
         assert!(
             BatchConfig {
                 max_rows: 5000,
-                max_age: Duration::ZERO
+                max_age: Duration::ZERO,
+                ..BatchConfig::default()
             }
             .disabled()
         );
         assert!(
             BatchConfig {
                 max_rows: 0,
-                max_age: Duration::from_millis(500)
+                max_age: Duration::from_millis(500),
+                ..BatchConfig::default()
             }
             .disabled()
         );
         assert!(
             !BatchConfig {
                 max_rows: 5000,
-                max_age: Duration::from_millis(500)
+                max_age: Duration::from_millis(500),
+                ..BatchConfig::default()
             }
             .disabled()
         );
-    }
-
-    #[tokio::test]
-    async fn row_count_threshold_triggers_inline_flush() {
-        let acc = BatchAccumulator::new(BatchConfig {
-            max_rows: 10,
-            max_age: Duration::from_secs(60),
-        });
-        // Under threshold: buffered, nothing returned.
-        assert!(acc.enqueue(gauge(4)).await.is_none());
-        assert!(acc.enqueue(gauge(3)).await.is_none());
-        // Crossing the threshold returns the coalesced batch (4+3+5 = 12 >= 10).
-        let due = acc
-            .enqueue(gauge(5))
-            .await
-            .expect("should flush at threshold");
-        assert_eq!(due.len(), 12, "all buffered rows coalesce into one flush");
-        // Slot is now empty again.
-        assert!(acc.enqueue(gauge(1)).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn time_threshold_triggers_aged_flush() {
-        let acc = BatchAccumulator::new(BatchConfig {
-            max_rows: 1_000_000,
-            max_age: Duration::from_millis(20),
-        });
-        assert!(
-            acc.enqueue(gauge(3)).await.is_none(),
-            "below row threshold → buffered"
-        );
-        let slot = gauge(1).slot();
-        // Not yet aged.
-        assert!(acc.take_aged(slot, Instant::now()).await.is_none());
-        // After max_age elapses, the buffer is due.
-        let later = Instant::now() + Duration::from_millis(25);
-        let aged = acc
-            .take_aged(slot, later)
-            .await
-            .expect("should be due after max_age");
-        assert_eq!(aged.len(), 3);
-        // Drained: no longer due.
-        assert!(
-            acc.take_aged(slot, later + Duration::from_secs(1))
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn separate_tables_buffer_independently() {
-        let acc = BatchAccumulator::new(BatchConfig {
-            max_rows: 5,
-            max_age: Duration::from_secs(60),
-        });
-        assert!(acc.enqueue(gauge(3)).await.is_none());
-        // Sum rows go to a different slot; gauge's 3 rows don't trip the sum slot.
-        let sums = SpoolBatch::Sum(Vec::new());
-        // (empty Sum batch just exercises slot independence; 3 gauge rows stay put)
-        let _ = sums.slot();
-        assert!(
-            acc.enqueue(gauge(1)).await.is_none(),
-            "gauge still at 4 < 5"
-        );
-        let due = acc.enqueue(gauge(1)).await.expect("gauge reaches 5");
-        assert_eq!(due.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn drain_all_empties_every_slot() {
-        let acc = BatchAccumulator::new(BatchConfig {
-            max_rows: 1_000_000,
-            max_age: Duration::from_secs(60),
-        });
-        acc.enqueue(gauge(2)).await;
-        acc.enqueue(SpoolBatch::Logs(Vec::new())).await; // empty, still creates a slot entry
-        acc.enqueue(gauge(3)).await; // coalesces with first gauge → 5
-        let drained = acc.drain_all().await;
-        let total: usize = drained.iter().map(|b| b.len()).sum();
-        assert_eq!(total, 5, "all buffered rows drained exactly once");
-        // Second drain is empty.
-        assert!(acc.drain_all().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_flush_restore_preserves_the_exact_batch_without_cloning() {
-        let acc = BatchAccumulator::new(BatchConfig {
-            max_rows: 5,
-            max_age: Duration::from_secs(60),
-        });
-        let due = acc.enqueue(gauge(5)).await.expect("threshold batch");
-        assert!(acc.is_empty().await);
-        acc.restore(due).await;
-        let restored = acc.drain_all().await;
-        assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].len(), 5);
-        assert!(acc.is_empty().await);
     }
 
     // ── Spool payload codec ──
@@ -1024,5 +899,196 @@ mod batch_tests {
         // mistakable for legacy JSON.
         let encoded = encode_spool(&gauge(1)).expect("encode");
         assert!(serde_json::from_slice::<serde_json::Value>(&encoded).is_err());
+    }
+    struct TestWriter(ChWriter, std::path::PathBuf);
+    impl TestWriter {
+        fn new(url: &str, cfg: BatchConfig) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("rush-ingest-test-{}", uuid::Uuid::new_v4()));
+            let spool = crate::spool::Spool::open(&dir, 0).unwrap();
+            Self(
+                ChWriter::with_batch_config(
+                    Client::default()
+                        .with_url(url)
+                        .with_compression(clickhouse::Compression::None),
+                    Arc::new(IngestBuffer::Disk(spool)),
+                    cfg,
+                ),
+                dir,
+            )
+        }
+    }
+    impl Drop for TestWriter {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_retries_do_not_enter_the_buffer() {
+        let test = TestWriter::new(
+            "http://127.0.0.1:9",
+            BatchConfig {
+                max_rows: 2,
+                ..BatchConfig::default()
+            },
+        );
+        let accepted = gauge(1);
+        test.0.write(accepted.clone()).await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let writer = test.0.clone();
+            tasks.push(tokio::spawn(async move { writer.write(gauge(1)).await }));
+        }
+        for task in tasks {
+            assert!(matches!(task.await.unwrap(), Err(WriteError::Backpressure)));
+        }
+        let slot = test.0.batcher.slots[accepted.slot()].lock().await;
+        assert!(same_batch(slot.batch.as_ref().unwrap(), &accepted));
+        assert!(slot.needs_flush);
+    }
+
+    #[tokio::test]
+    async fn failed_background_flush_blocks_even_small_new_writes() {
+        let test = TestWriter::new("http://127.0.0.1:9", BatchConfig::default());
+        test.0.write(gauge(1)).await.unwrap();
+        test.0.flush_all().await;
+        assert!(matches!(
+            test.0.write(gauge(1)).await,
+            Err(WriteError::Backpressure)
+        ));
+        let slot = test.0.batcher.slots[gauge(1).slot()].lock().await;
+        assert_eq!(slot.batch.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_applies_before_row_threshold() {
+        let one = batch_serialized_size(&gauge(1)).unwrap();
+        let test = TestWriter::new(
+            "http://127.0.0.1:9",
+            BatchConfig {
+                max_rows: 1000,
+                max_bytes: one + 1,
+                ..BatchConfig::default()
+            },
+        );
+        test.0.write(gauge(1)).await.unwrap();
+        assert!(matches!(
+            test.0.write(gauge(1)).await,
+            Err(WriteError::Backpressure)
+        ));
+        let slot = test.0.batcher.slots[gauge(1).slot()].lock().await;
+        assert_eq!(slot.bytes, one);
+        assert_eq!(slot.batch.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_rejected_request_is_never_retained() {
+        let test = TestWriter::new(
+            "http://127.0.0.1:9",
+            BatchConfig {
+                max_bytes: 1,
+                ..BatchConfig::default()
+            },
+        );
+        assert!(matches!(
+            test.0.write(gauge(1)).await,
+            Err(WriteError::Backpressure)
+        ));
+        assert!(!test.0.has_pending_batches().await);
+    }
+
+    #[tokio::test]
+    async fn recovery_delivers_accepted_rows_once_and_allows_new_writes() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let test = TestWriter::new(
+            mock.url(),
+            BatchConfig {
+                max_rows: 3,
+                ..BatchConfig::default()
+            },
+        );
+        test.0.write(gauge(2)).await.unwrap();
+        mock.add(handlers::failure(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+        assert!(matches!(
+            test.0.write(gauge(1)).await,
+            Err(WriteError::Backpressure)
+        ));
+        let old = mock.add(handlers::record::<GaugeRow>());
+        test.0.write(gauge(1)).await.unwrap();
+        assert_eq!(old.collect::<Vec<_>>().await.len(), 2);
+        let new = mock.add(handlers::record::<GaugeRow>());
+        test.0.flush_all().await;
+        assert_eq!(new.collect::<Vec<_>>().await.len(), 1);
+        assert!(!test.0.has_pending_batches().await);
+        assert_eq!(test.0.spool_segments(), 0);
+    }
+
+    #[tokio::test]
+    async fn aged_buffer_flushes_and_shutdown_does_not_send_it_twice() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let test = TestWriter::new(
+            mock.url(),
+            BatchConfig {
+                max_age: Duration::from_millis(10),
+                ..BatchConfig::default()
+            },
+        );
+        let received = mock.add(handlers::record::<GaugeRow>());
+        test.0.write(gauge(2)).await.unwrap();
+        test.0.spawn_flusher();
+        let rows = tokio::time::timeout(Duration::from_secs(2), received.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        test.0.flush_all().await;
+        assert!(!test.0.has_pending_batches().await);
+    }
+
+    #[tokio::test]
+    async fn stalled_flush_rejects_new_writes_and_cancellation_preserves_accepted_rows() {
+        use axum::{Router, routing::any};
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let signal = reached.clone();
+        let router = Router::new().route(
+            "/",
+            any(move || {
+                let signal = signal.clone();
+                async move {
+                    signal.notify_one();
+                    std::future::pending::<()>().await;
+                    ""
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let test = TestWriter::new(&url, BatchConfig::default());
+        test.0.write(gauge(1)).await.unwrap();
+        let writer = test.0.clone();
+        let flush = tokio::spawn(async move {
+            writer.flush_all().await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), reached.notified())
+            .await
+            .unwrap();
+        assert!(test.0.has_pending_batches().await);
+        let rejected = tokio::time::timeout(Duration::from_millis(50), test.0.write(gauge(1)))
+            .await
+            .unwrap();
+        assert!(matches!(rejected, Err(WriteError::Backpressure)));
+        flush.abort();
+        assert!(flush.await.unwrap_err().is_cancelled());
+        let slot = test.0.batcher.slots[gauge(1).slot()].lock().await;
+        assert_eq!(slot.batch.as_ref().unwrap().len(), 1);
+        assert!(slot.needs_flush);
+        server.abort();
     }
 }

@@ -79,6 +79,8 @@ enum CredentialKind {
     },
     /// The key store could not be reached while checking a `rush_` key.
     KeyCheckUnavailable,
+    TenantDenied,
+    TenantCheckUnavailable,
 }
 
 /// Rush API keys look like `rush_qry_…` / `rush_ing_…`. Only these are rejected
@@ -133,6 +135,19 @@ impl TenantResolution {
             tenant_id: "default".to_string(),
             authenticated: false,
             credential: CredentialKind::KeyCheckUnavailable,
+            api_key: None,
+        }
+    }
+
+    fn tenant_denied(tenant_id: impl Into<String>, unavailable: bool) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            authenticated: false,
+            credential: if unavailable {
+                CredentialKind::TenantCheckUnavailable
+            } else {
+                CredentialKind::TenantDenied
+            },
             api_key: None,
         }
     }
@@ -1292,7 +1307,9 @@ async fn audit_api_key_denial(
     let (action, actor_type) = match resolution.credential {
         CredentialKind::QueryKey | CredentialKind::IngestKey => ("apikey.scope_denied", "api_key"),
         CredentialKind::Session => ("ingest.auth_denied", "user"),
-        CredentialKind::Anonymous => ("ingest.auth_denied", "anonymous"),
+        CredentialKind::Anonymous
+        | CredentialKind::TenantDenied
+        | CredentialKind::TenantCheckUnavailable => ("ingest.auth_denied", "anonymous"),
         CredentialKind::InternalSre => ("sre_agent.scope_denied", "system"),
         CredentialKind::RejectedKey { .. } | CredentialKind::KeyCheckUnavailable => {
             ("apikey.auth_failure", "anonymous")
@@ -1331,6 +1348,13 @@ async fn same_tenant(state: &AppState, key_tenant: &str, requested: &str) -> boo
             Ok(Some(id)) if id == requested
         ),
     }
+}
+
+/// These handlers authenticate independently of a telemetry tenant. In
+/// particular, an admin must still be able to re-enable the last disabled one.
+fn tenant_discovery_or_recovery_route(method: &Method, path: &str, admin: bool) -> bool {
+    (method == Method::GET && matches!(path, "/api/v1/auth/me" | "/api/v1/tenants"))
+        || (admin && (path == "/api/v1/tenants" || path.starts_with("/api/v1/tenants/")))
 }
 
 /// Enforce independent query and ingest authentication after tenant resolution
@@ -1420,6 +1444,41 @@ async fn enforce_tenant_auth_middleware(
         }
         CredentialKind::KeyCheckUnavailable => {
             return (StatusCode::SERVICE_UNAVAILABLE, "API key check unavailable").into_response();
+        }
+        CredentialKind::TenantDenied | CredentialKind::TenantCheckUnavailable => {
+            // These endpoints authenticate independently and let a user inspect
+            // their session and permitted tenants even after losing all grants.
+            let caller = if let Some(token) = handlers::auth::extract_session_cookie(req.headers())
+            {
+                rush_api::request_auth::resolve_session_user(&state, &token).await
+            } else {
+                None
+            };
+            if tenant_discovery_or_recovery_route(
+                &method,
+                &path,
+                caller.as_ref().is_some_and(|user| user.4 == "admin"),
+            ) {
+                return next.run(req).await;
+            }
+            if resolution.credential == CredentialKind::TenantCheckUnavailable {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tenant authorization unavailable",
+                )
+                    .into_response();
+            }
+            let mut event = rush_api::audit::AuditEvent::new("tenant.access_denied", "anonymous")
+                .tenant(tenant_id.clone())
+                .resource("tenant", tenant_id.clone())
+                .outcome("failure")
+                .context(rush_api::audit::actor_context_from_headers(req.headers()));
+            if let Some((id, name, _, _, _)) = caller {
+                event.actor_type = "user".into();
+                event = event.actor(id, name);
+            }
+            state.audit.log(event).await;
+            return (StatusCode::FORBIDDEN, "tenant access denied").into_response();
         }
         _ => {}
     }
@@ -1682,17 +1741,13 @@ async fn resolve_tenant_from_headers(
 ) -> TenantResolution {
     let resolved =
         resolve_tenant_inner(state, auth_header, dd_key, rush_tenant, session_token).await;
-    // FINAL LOCKDOWN SAFETY NET: under no circumstances may the public request
-    // path resolve to the reserved `_audit` tenant. Even though every individual
-    // resolution branch already excludes it (header branch rejects it; API keys
-    // are bound to `default`; sessions resolve to a real user tenant), collapse
-    // any `_audit` here to `default` so audit data can never be read or written
-    // via the normal telemetry tenant scoping.
+    // No credential may authorize the reserved audit tenant through the normal
+    // telemetry routes. Preserve the denial instead of falling back to default.
     if resolved
         .tenant_id
         .eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT)
     {
-        return TenantResolution::anonymous("default");
+        return TenantResolution::tenant_denied(rush_api::audit::AUDIT_TENANT, false);
     }
     resolved
 }
@@ -1775,112 +1830,43 @@ async fn resolve_tenant_inner(
         }
     }
 
-    // ── Priority 2: X-Rush-Tenant header ──
-    // The frontend tenant switcher sends this. It takes priority over the
-    // session's default tenant so users can switch between tenants they
-    // have access to.
-    //
-    // If the tenant has auth_required=true (locked), the X-Rush-Tenant header
-    // alone is NOT enough — the request must also have been authenticated via
-    // Bearer token, DD-API-KEY, or session cookie (priorities 1/1b above).
-    // This prevents unauthenticated ingest into locked tenants.
-    if let Some(tenant_header) = rush_tenant {
-        let tenant = tenant_header.trim().to_string();
-        // LOCKDOWN: `_audit` is the reserved tamper-evident-audit tenant. It must
-        // NEVER be selectable via the public API (X-Rush-Tenant header or
-        // /t/{tenant} URL prefix), for ingest OR query. Treat any attempt to
-        // select it as "not allowed" and fall through to the normal resolution
-        // chain (which ends at "default"). Case-insensitive. (The tenant is also
-        // seeded disabled, so is_tenant_enabled would reject it anyway — this is
-        // an explicit belt-and-suspenders guard with a clear audit trail.)
-        if tenant.eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT) {
-            tracing::warn!(
-                method = "header",
-                "attempt to select reserved '_audit' tenant via public API — rejected"
-            );
-        } else if !tenant.is_empty() {
-            let tenant_started = std::time::Instant::now();
-            let tenant_enabled = state.config_db.is_tenant_enabled(&tenant).await;
-            state.self_metrics.record_auth_lookup(
-                "tenant_policy",
-                tenant_started.elapsed().as_secs_f64() * 1_000.0,
-                u64::from(tenant_enabled),
-                if tenant_enabled { "ok" } else { "not_found" },
-            );
-            if tenant_enabled {
-                // If the request carries a session cookie, validate the user has
-                // group-based access to the requested tenant.
-                if let Some(token) = &session_token {
-                    if let Some((user_id, _username, _display_name, _tid, role)) =
-                        rush_api::request_auth::resolve_session_user(state, token).await
-                    {
-                        if role == "admin" {
-                            // Admins can access any enabled tenant
-                            return TenantResolution::session(tenant);
-                        }
-                        // Non-admins: resolve accessible tenant IDs and check
-                        let permissions_started = std::time::Instant::now();
-                        let permissions = state.config_db.resolve_user_permissions(&user_id).await;
-                        state.self_metrics.record_auth_lookup(
-                            "user_permissions",
-                            permissions_started.elapsed().as_secs_f64() * 1_000.0,
-                            permissions
-                                .as_ref()
-                                .map(|(scopes, permissions, tenants)| {
-                                    (scopes.len() + permissions.len() + tenants.len()) as u64
-                                })
-                                .unwrap_or(0),
-                            if permissions.is_ok() { "ok" } else { "error" },
-                        );
-                        if let Ok((_, _, accessible_ids)) = permissions {
-                            // accessible_ids are UUIDs; resolve the requested
-                            // tenant name to an ID for comparison
-                            if let Ok(Some(tenant_id)) =
-                                state.config_db.get_tenant_id_by_name(&tenant).await
-                            {
-                                if accessible_ids.contains(&tenant_id) {
-                                    return TenantResolution::session(tenant);
-                                }
-                            }
-                        }
-                        tracing::debug!(
-                            tenant = %tenant,
-                            "X-Rush-Tenant rejected: user lacks group access"
-                        );
-                        // Fall through to session default tenant
-                    }
-                } else if !state.config_db.is_tenant_auth_required(&tenant).await
-                    || !state
-                        .config_db
-                        .is_tenant_ingest_auth_required(&tenant)
-                        .await
-                {
-                    // An anonymous header may select a tenant that has either
-                    // open queries or open ingestion. The route-specific inner
-                    // policy still rejects access to the other surface.
-                    return TenantResolution::anonymous(tenant);
-                } else {
-                    tracing::debug!(
-                        tenant_id = %tenant,
-                        method = "header",
-                        "tenant requires auth — X-Rush-Tenant header rejected without valid session/API key"
-                    );
+    // Sessions must authorize every tenant selection, including the saved
+    // default. Never downgrade a valid but unauthorized session to anonymous.
+    if let Some(token) = &session_token {
+        if let Some((user_id, _, _, default_tenant, role)) =
+            rush_api::request_auth::resolve_session_user(state, token).await
+        {
+            let requested = rush_tenant.as_deref();
+            return match state
+                .config_db
+                .resolve_session_tenant(&user_id, &role, &default_tenant, requested)
+                .await
+            {
+                Ok(Some(tenant)) => TenantResolution::session(tenant),
+                Ok(None) => {
+                    TenantResolution::tenant_denied(requested.unwrap_or(&default_tenant), false)
                 }
-            } else {
-                tracing::debug!(tenant_id = %tenant, method = "header", "tenant disabled or missing, falling through");
-            }
+                Err(error) => {
+                    tracing::error!(%error, "session tenant authorization unavailable");
+                    TenantResolution::tenant_denied(requested.unwrap_or(&default_tenant), true)
+                }
+            };
         }
     }
 
-    // ── Priority 3: Session cookie → user's default tenant ──
-    // Fallback when no explicit tenant header is sent (e.g., first page load
-    // before the tenant switcher initializes).
-    if let Some(token) = session_token {
-        if let Some((_user_id, _username, _display_name, tenant_id, _role)) =
-            rush_api::request_auth::resolve_session_user(state, &token).await
+    // Anonymous selection is still governed by the route-specific query and
+    // ingest policies below. An invalid explicit tenant must not select default.
+    if let Some(tenant) = rush_tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if tenant.eq_ignore_ascii_case(rush_api::audit::AUDIT_TENANT)
+            || !state.config_db.is_tenant_enabled(tenant).await
         {
-            return TenantResolution::session(tenant_id);
+            return TenantResolution::tenant_denied(tenant, false);
         }
+        return TenantResolution::anonymous(tenant);
     }
 
     // ── Priority 4: default ──
@@ -2670,6 +2656,7 @@ async fn main() -> anyhow::Result<()> {
         writer.spawn_flusher();
         tracing::info!(
             batch_rows = bc.max_rows,
+            batch_bytes = bc.max_bytes,
             batch_ms = bc.max_age.as_millis() as u64,
             "ingest insert batching configured"
         );
@@ -4687,6 +4674,28 @@ mod tenant_auth_tests {
             ),
         ] {
             assert!(!allows_unauthenticated_tenant_request(method, path));
+        }
+    }
+    #[test]
+    fn tenant_recovery_routes_do_not_authorize_telemetry_access() {
+        use super::tenant_discovery_or_recovery_route as allowed;
+        assert!(allowed(&Method::GET, "/api/v1/auth/me", false));
+        assert!(allowed(&Method::GET, "/api/v1/tenants", false));
+        assert!(allowed(
+            &Method::PUT,
+            "/api/v1/tenants/default/toggle",
+            true
+        ));
+        assert!(!allowed(
+            &Method::PUT,
+            "/api/v1/tenants/default/toggle",
+            false
+        ));
+        assert!(!allowed(&Method::GET, "/api/v1/tenants-extra", true));
+        for admin in [true, false] {
+            assert!(!allowed(&Method::POST, "/api/v1/query", admin));
+            assert!(!allowed(&Method::POST, "/api/v1/logs", admin));
+            assert!(!allowed(&Method::POST, "/v1/traces", admin));
         }
     }
 }

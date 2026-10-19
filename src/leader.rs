@@ -23,9 +23,8 @@
 //! state writes. Outside a fenced scope (API handlers, tests) the check passes.
 //!
 //! Lease changes are reported through logs, `rush_engine_leader*` metrics, and
-//! `/healthz`, not the audit log. Every replica changes leases on each start
-//! and stop, and the audit chain's sequence is assigned per process, so
-//! concurrent audit writes from several replicas collide.
+//! `/healthz`. Lease renewals are coordination traffic rather than user changes;
+//! application mutations continue to write audit events.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
