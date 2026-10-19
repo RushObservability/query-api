@@ -767,7 +767,7 @@ fn build_log_plan(
         &req.time_range.to,
         req.search.as_deref(),
         tenant_id,
-    );
+    )?;
     let predicate = clauses.to_sql();
     let rows_sql = format!(
         "SELECT {} FROM logs {predicate} ORDER BY Timestamp DESC, ServiceName DESC, TraceId DESC, SpanId DESC, hex(SHA256(Body)) DESC LIMIT {limit}",

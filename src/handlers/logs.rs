@@ -11,10 +11,46 @@ use crate::models::log::{LogListRecord, LogRecord};
 use crate::models::query::{CountBucket, CountQueryRequest, Filter, FilterOp, TimeRange};
 use crate::query_builder::{QueryClauses, build_log_search_sql, format_value, sanitize_datetime};
 
+/// HTTP response status for a log row. Logs have no status column (spans keep it
+/// in `http_status_code`); OpenTelemetry HTTP semantic conventions put it in a log
+/// attribute: `http.response.status_code` (current) or `http.status_code` (legacy).
+/// A plain `status_code` attribute is the last fallback so queries that relied on
+/// the old unqualified-key lookup keep matching. The result is a String; numeric
+/// comparisons go through `toFloat64OrNull` in [`log_filter_condition`].
+const LOG_HTTP_STATUS_EXPR: &str = "multiIf(\
+    LogAttributes['http.response.status_code'] != '', LogAttributes['http.response.status_code'], \
+    LogAttributes['http.status_code'] != '', LogAttributes['http.status_code'], \
+    LogAttributes['status_code'])";
+
+/// Span-table columns that have no log counterpart. Without this check they fell
+/// through to an attribute lookup and, with the numeric values the span UI sends
+/// (e.g. `duration_ns >= 500000000`), produced a ClickHouse type error → HTTP 500.
+/// A log attribute with one of these names is still reachable as `log.<name>`.
+const SPAN_ONLY_FIELDS: &[&str] = &["duration_ns", "span_name", "span_kind", "parent_span_id"];
+
+/// Reject span-only structured fields with a 400 instead of building SQL for them.
+fn validate_log_filter_field(field: &str) -> Result<(), (StatusCode, String)> {
+    if SPAN_ONLY_FIELDS.contains(&field) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{field}' is a span field and does not exist on logs; \
+                 query it in traces mode, or use 'log.{field}' for a log attribute"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a log field name to a ClickHouse column expression.
 /// Uses materialized columns for common resource attributes (avoids Map lookups).
 pub(crate) fn resolve_log_field(field: &str) -> String {
     match field {
+        // Span-style status names (the natural-language parser and span facets
+        // emit these) resolve to the OTel HTTP status log attribute.
+        "status_code" | "http_status_code" | "http.status_code" | "http.response.status_code" => {
+            LOG_HTTP_STATUS_EXPR.to_string()
+        }
         "time" | "timestamp" | "Timestamp" => "Timestamp".to_string(),
         "service_name" | "ServiceName" => "ServiceName".to_string(),
         // `level` is the cross-signal name the Explore search bar and the
@@ -73,7 +109,7 @@ pub(crate) fn build_log_where(
     to: &str,
     search: Option<&str>,
     tenant_id: &str,
-) -> QueryClauses {
+) -> Result<QueryClauses, (StatusCode, String)> {
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
@@ -91,30 +127,11 @@ pub(crate) fn build_log_where(
     let mut conditions = Vec::new();
 
     for filter in filters {
+        validate_log_filter_field(&filter.field)?;
         let field = resolve_log_field(&filter.field);
-        if let Some(condition) = crate::query_builder::log_severity_condition(&field, filter) {
-            conditions.push(condition);
-            continue;
-        }
-        let condition = match &filter.op {
-            FilterOp::Eq => format!("{field} = {}", format_value(&filter.value)),
-            FilterOp::Ne => format!("{field} != {}", format_value(&filter.value)),
-            FilterOp::Gt => format!("{field} > {}", format_value(&filter.value)),
-            FilterOp::Gte => format!("{field} >= {}", format_value(&filter.value)),
-            FilterOp::Lt => format!("{field} < {}", format_value(&filter.value)),
-            FilterOp::Lte => format!("{field} <= {}", format_value(&filter.value)),
-            FilterOp::Like => format!("{field} LIKE {}", format_value(&filter.value)),
-            FilterOp::NotLike => format!("{field} NOT LIKE {}", format_value(&filter.value)),
-            FilterOp::In => format!(
-                "{field} IN {}",
-                crate::query_builder::format_array_value(&filter.value)
-            ),
-            FilterOp::NotIn => format!(
-                "{field} NOT IN {}",
-                crate::query_builder::format_array_value(&filter.value)
-            ),
-        };
-        conditions.push(condition);
+        conditions.push(escape_bind_placeholders(&log_filter_condition(
+            &field, filter,
+        )));
     }
 
     let mut has_search = false;
@@ -137,16 +154,104 @@ pub(crate) fn build_log_where(
         let mut all = Vec::with_capacity(conditions.len() + 1);
         all.push(time_tenant);
         all.extend(conditions);
-        QueryClauses {
+        Ok(QueryClauses {
             prewhere: String::new(),
             where_clause: all.join(" AND "),
-        }
+        })
     } else {
-        QueryClauses {
+        Ok(QueryClauses {
             prewhere: time_tenant,
             where_clause: conditions.join(" AND "),
-        }
+        })
     }
+}
+
+/// Build one log filter predicate for an already-resolved column expression.
+///
+/// Every log field except `Timestamp` and `SeverityNumber` is String-typed (native
+/// string columns, `LogAttributes[...]`/`ResourceAttributes[...]` map lookups,
+/// `JSON_VALUE`). ClickHouse has no common type for String and a number, so a
+/// numeric value such as `status_code >= 500` — which the Explore UI sends for any
+/// numeric-looking input — failed with NO_COMMON_TYPE and surfaced as HTTP 500.
+/// For String expressions, range operators compare numerically through
+/// `toFloat64OrNull` (non-numeric/missing values never match), and every other
+/// operator compares the value's text form.
+fn log_filter_condition(field: &str, filter: &Filter) -> String {
+    let string_typed = !matches!(field, "Timestamp" | "SeverityNumber");
+    let range_op = match filter.op {
+        FilterOp::Gt => Some(">"),
+        FilterOp::Gte => Some(">="),
+        FilterOp::Lt => Some("<"),
+        FilterOp::Lte => Some("<="),
+        _ => None,
+    };
+    if let (true, Some(op), Some(number)) = (string_typed, range_op, numeric_value(&filter.value)) {
+        return format!("toFloat64OrNull({field}) {op} {number}");
+    }
+
+    let text_filter;
+    let filter = if string_typed {
+        text_filter = Filter {
+            value: text_value(&filter.value),
+            ..filter.clone()
+        };
+        &text_filter
+    } else {
+        filter
+    };
+    if let Some(condition) = crate::query_builder::log_severity_condition(field, filter) {
+        return condition;
+    }
+    match &filter.op {
+        FilterOp::Eq => format!("{field} = {}", format_value(&filter.value)),
+        FilterOp::Ne => format!("{field} != {}", format_value(&filter.value)),
+        FilterOp::Gt => format!("{field} > {}", format_value(&filter.value)),
+        FilterOp::Gte => format!("{field} >= {}", format_value(&filter.value)),
+        FilterOp::Lt => format!("{field} < {}", format_value(&filter.value)),
+        FilterOp::Lte => format!("{field} <= {}", format_value(&filter.value)),
+        FilterOp::Like => format!("{field} LIKE {}", format_value(&filter.value)),
+        FilterOp::NotLike => format!("{field} NOT LIKE {}", format_value(&filter.value)),
+        FilterOp::In => format!(
+            "{field} IN {}",
+            crate::query_builder::format_array_value(&filter.value)
+        ),
+        FilterOp::NotIn => format!(
+            "{field} NOT IN {}",
+            crate::query_builder::format_array_value(&filter.value)
+        ),
+    }
+}
+
+/// A finite number from a JSON number or a numeric-looking string, rendered as a
+/// SQL numeric literal (Rust's float formatting emits only digits, `.` and `-`).
+fn numeric_value(value: &serde_json::Value) -> Option<String> {
+    let number = match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }?;
+    number.is_finite().then(|| number.to_string())
+}
+
+/// Text form of a scalar (or array of scalars) for comparison against a String
+/// column: attribute maps store numbers and booleans as their text.
+fn text_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(n) => serde_json::Value::String(n.to_string()),
+        serde_json::Value::Bool(b) => serde_json::Value::String(b.to_string()),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(text_value).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The `clickhouse` crate treats every `?` in query text as a bind placeholder
+/// ("unbound query argument" → HTTP 500), including one inside a user-supplied
+/// field name or value. Filter predicates only contain `?` inside string
+/// literals, where ClickHouse's `\x3F` escape decodes to the same character.
+fn escape_bind_placeholders(condition: &str) -> String {
+    condition.replace('?', "\\x3F")
 }
 
 /// Log query request.
@@ -337,7 +442,7 @@ pub async fn query_logs(
         &req.time_range.to,
         req.search.as_deref(),
         tenant_id,
-    );
+    )?;
 
     let scope = crate::pagination::query_scope(
         tenant_id,
@@ -390,7 +495,7 @@ pub async fn query_logs(
                 narrow_to,
                 req.search.as_deref(),
                 tenant_id,
-            );
+            )?;
             let narrow_sql = format!(
                 "SELECT {select_cols} FROM logs {} \
                  ORDER BY {LOG_ORDER} LIMIT {fetch_limit}",
@@ -739,7 +844,7 @@ pub async fn get_log_context(
         &req.time_range.to,
         req.search.as_deref(),
         &tenant.tenant_id,
-    );
+    )?;
     let tuple = "(Timestamp, ServiceName, TraceId, SpanId, hex(SHA256(Body)))";
     let newer = clauses.with_where_extra(&format!("{tuple} > {anchor}"));
     let older = clauses.with_where_extra(&format!("{tuple} <= {anchor}"));
@@ -856,7 +961,7 @@ pub async fn export_logs(
         &req.time_range.to,
         req.search.as_deref(),
         tenant_id,
-    );
+    )?;
     let sql = format!(
         "SELECT {select_cols} FROM logs {} \
          ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT {limit}",
@@ -1135,7 +1240,7 @@ pub async fn count_logs(
         &req.time_range.to,
         req.search.as_deref(),
         tenant_id,
-    );
+    )?;
 
     // The interval is client-supplied: clamp so (range / interval) <= 2000 buckets
     // (a 1s interval over 30d would otherwise be ~2.6M GROUP BY buckets).
@@ -1221,7 +1326,7 @@ pub async fn log_histogram(
         &req.time_range.to,
         req.search.as_deref(),
         tenant_id,
-    );
+    )?;
 
     // Parse from/to (RFC3339, tolerating a missing 'Z' like query_logs does) to
     // size the bucket. Fall back to a 1s bucket if the range can't be parsed.
@@ -1314,7 +1419,7 @@ pub async fn group_logs(
         &req.time_range.to,
         req.search.as_deref(),
         tenant_id,
-    );
+    )?;
 
     let sql = format!(
         "SELECT toString({col}) as group_0, count() as count \
@@ -1392,7 +1497,8 @@ mod tests {
             "2026-01-01T01:00:00Z",
             None,
             "default",
-        );
+        )
+        .unwrap();
         assert!(
             clauses
                 .where_clause
@@ -1423,7 +1529,8 @@ mod tests {
             "2026-01-01T01:00:00Z",
             None,
             "default",
-        );
+        )
+        .unwrap();
         assert!(
             clauses
                 .where_clause
@@ -1452,13 +1559,133 @@ mod tests {
             "2026-01-01T01:00:00Z",
             None,
             "default",
-        );
+        )
+        .unwrap();
         assert!(
             clauses
                 .where_clause
                 .contains("LogAttributes['level'] = 'error'")
         );
         assert!(clauses.where_clause.contains("SeverityText LIKE '%ERR%'"));
+    }
+
+    fn where_for(filters: &[Filter]) -> Result<String, (StatusCode, String)> {
+        build_log_where(
+            filters,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00Z",
+            None,
+            "default",
+        )
+        .map(|clauses| clauses.where_clause)
+    }
+
+    #[test]
+    fn status_code_aliases_resolve_to_the_otel_http_status_attribute() {
+        for alias in [
+            "status_code",
+            "http_status_code",
+            "http.status_code",
+            "http.response.status_code",
+        ] {
+            let expr = resolve_log_field(alias);
+            assert_eq!(expr, LOG_HTTP_STATUS_EXPR, "alias {alias}");
+            assert!(expr.contains("LogAttributes['http.response.status_code']"));
+            assert!(expr.contains("LogAttributes['http.status_code']"));
+        }
+        // An explicit attribute path is left alone.
+        assert_eq!(
+            resolve_log_field("log.status_code"),
+            "LogAttributes['status_code']"
+        );
+    }
+
+    // Regression: the logs NL parser sent `status_code >= 500` / `= 503`, which
+    // compared a String map lookup with a number (NO_COMMON_TYPE → HTTP 500).
+    #[test]
+    fn numeric_status_filters_never_compare_a_string_with_a_number() {
+        let sql = where_for(&[
+            filter("status_code", FilterOp::Gte, serde_json::json!(500)),
+            filter("http_status_code", FilterOp::Lt, serde_json::json!("600")),
+        ])
+        .unwrap();
+        assert!(sql.contains(&format!("toFloat64OrNull({LOG_HTTP_STATUS_EXPR}) >= 500")));
+        assert!(sql.contains(&format!("toFloat64OrNull({LOG_HTTP_STATUS_EXPR}) < 600")));
+
+        let sql =
+            where_for(&[filter("status_code", FilterOp::Eq, serde_json::json!(503))]).unwrap();
+        assert!(sql.contains(&format!("{LOG_HTTP_STATUS_EXPR} = '503'")));
+
+        let sql = where_for(&[filter(
+            "status_code",
+            FilterOp::In,
+            serde_json::json!([500, 503]),
+        )])
+        .unwrap();
+        assert!(sql.contains(&format!("{LOG_HTTP_STATUS_EXPR} IN ('500', '503')")));
+    }
+
+    #[test]
+    fn numeric_values_on_string_columns_are_compared_as_text_or_numbers() {
+        let sql = where_for(&[
+            filter("user_id", FilterOp::Eq, serde_json::json!(123)),
+            filter("log.retry", FilterOp::Ne, serde_json::json!(true)),
+            filter("body", FilterOp::Eq, serde_json::json!(5)),
+            filter("level", FilterOp::Eq, serde_json::json!(5)),
+            filter("log.latency_ms", FilterOp::Gt, serde_json::json!(1.5)),
+        ])
+        .unwrap();
+        assert!(sql.contains(
+            "if(LogAttributes['user_id'] != '', LogAttributes['user_id'], ResourceAttributes['user_id']) = '123'"
+        ));
+        assert!(sql.contains("LogAttributes['retry'] != 'true'"));
+        assert!(sql.contains("Body = '5'"));
+        assert!(sql.contains("upper(SeverityText) = '5'"));
+        assert!(sql.contains("toFloat64OrNull(LogAttributes['latency_ms']) > 1.5"));
+
+        // Non-numeric range values keep the existing string comparison, and the
+        // genuinely numeric columns are not wrapped.
+        let sql = where_for(&[
+            filter("log.version", FilterOp::Gte, serde_json::json!("v2")),
+            filter("severity_number", FilterOp::Gte, serde_json::json!(17)),
+        ])
+        .unwrap();
+        assert!(sql.contains("LogAttributes['version'] >= 'v2'"));
+        assert!(sql.contains("SeverityNumber >= 17"));
+        assert!(!sql.contains("toFloat64OrNull(SeverityNumber)"));
+    }
+
+    #[test]
+    fn span_only_fields_are_a_bad_request() {
+        for field in SPAN_ONLY_FIELDS {
+            let err =
+                where_for(&[filter(field, FilterOp::Gte, serde_json::json!(1))]).expect_err(field);
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(err.1.contains(field), "{}", err.1);
+            assert!(err.1.contains("log."), "{}", err.1);
+        }
+        // The same name as an explicit log attribute is allowed.
+        assert!(
+            where_for(&[filter(
+                "log.duration_ns",
+                FilterOp::Gte,
+                serde_json::json!(1)
+            )])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn filter_predicates_contain_no_bind_placeholders() {
+        let sql = where_for(&[
+            filter("what?", FilterOp::Eq, serde_json::json!("a?b")),
+            filter("log.q", FilterOp::Like, serde_json::json!("%?%")),
+            filter("body.a?b", FilterOp::In, serde_json::json!(["x?", "y"])),
+        ])
+        .unwrap();
+        assert!(!sql.contains('?'), "{sql}");
+        assert!(sql.contains("LogAttributes['what\\x3F']"), "{sql}");
+        assert!(sql.contains("= 'a\\x3Fb'"), "{sql}");
     }
 
     #[test]

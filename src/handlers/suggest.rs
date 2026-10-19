@@ -55,7 +55,7 @@ fn log_suggest_sql(req: &LogSuggestRequest, tenant: &str) -> Result<String, (Sta
         &req.time_range.to,
         None,
         tenant,
-    );
+    )?;
     let field = super::logs::resolve_log_field(&req.field);
     let prefix = crate::query_builder::escape_string_literal(&req.prefix);
     // Bound distinct-value work to recent matching rows. The inner predicate
