@@ -745,7 +745,9 @@ pub async fn service_endpoints(
 // ═══ Top Errors (error grouping) ═══
 // What's actually failing for a service, grouped two ways:
 //   mode=endpoint (default): errored SERVER spans grouped by (status, method, path)
-//     — "503 POST /articles ×80". Always available from trace data.
+//     — "503 POST /articles ×80". Always available from trace data. When the
+//     service has no errored SERVER spans, falls back to errored spans of every
+//     kind (the same scope as the service error rate).
 //   mode=message: ERROR/WARN/FATAL logs grouped by a normalized message template
 //     (UUIDs → UUID, digits → N) so "DB pool exhausted: 0/20" and "…2/20" collapse
 //     into one group — the classic error-grouping / issues view.
@@ -784,6 +786,95 @@ pub struct ErrorsResponse {
     pub mode: String,
 }
 
+/// Endpoint-mode error grouping over errored spans ({ERROR_SPAN}, the same
+/// definition the service error rate uses), grouped by (status, method, path).
+/// `server_only` restricts to the service's own SERVER spans; otherwise every
+/// span kind is included, matching the error-rate scope. CLIENT spans often
+/// carry the method only in span_name ("GET"), so the key derives it from there
+/// while the `method` column stays the raw http_method for Explore drill-down.
+fn endpoint_errors_sql(
+    escaped_tenant: &str,
+    escaped_service: &str,
+    minutes: u64,
+    server_only: bool,
+) -> String {
+    let kind_filter = if server_only {
+        "kind = 'SPAN_KIND_SERVER' AND "
+    } else {
+        ""
+    };
+    format!(
+        "WITH if(http_method != '', http_method, \
+                extract(span_name, '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)(?: |$)')) AS method_label \
+         SELECT arrayStringConcat(arrayFilter(x -> x != '', \
+                [if(http_status_code > 0, toString(http_status_code), ''), method_label, http_path]), ' ') AS key, \
+            http_status_code AS status_code, http_method AS method, http_path AS path, \
+            '' AS severity, '' AS example, \
+            count() AS count, \
+            toString(max(timestamp)) AS last_seen \
+         FROM spans \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+            AND service_name = '{escaped_service}' \
+            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+         WHERE {kind_filter}{ERROR_SPAN} \
+         GROUP BY http_status_code, http_method, method_label, http_path \
+         ORDER BY count DESC \
+         LIMIT 50"
+    )
+}
+
+#[cfg(test)]
+mod service_errors_tests {
+    use super::endpoint_errors_sql;
+    use crate::query_builder::ERROR_SPAN;
+
+    #[test]
+    fn server_scope_filters_to_errored_server_spans() {
+        let sql = endpoint_errors_sql("default", "gateway", 60, true);
+        assert!(sql.contains(&format!("WHERE kind = 'SPAN_KIND_SERVER' AND {ERROR_SPAN}")));
+        assert!(sql.contains("service_name = 'gateway'"));
+        assert!(sql.contains("INTERVAL 60 MINUTE"));
+    }
+
+    #[test]
+    fn fallback_scope_matches_error_rate_across_all_span_kinds() {
+        // The service error rate is countIf({ERROR_SPAN}) over every span kind;
+        // the fallback grouping must use exactly that predicate and no kind filter,
+        // so a gateway whose errors are all CLIENT/INTERNAL spans still gets groups.
+        let sql = endpoint_errors_sql("default", "gateway", 60, false);
+        assert!(sql.contains(&format!("WHERE {ERROR_SPAN} ")));
+        assert!(!sql.contains("SPAN_KIND"));
+    }
+
+    #[test]
+    fn key_derives_method_from_span_name_but_keeps_raw_columns() {
+        let sql = endpoint_errors_sql("default", "gateway", 60, false);
+        // CLIENT spans named "POST" with empty http_method still key as "502 POST /notify".
+        assert!(
+            sql.contains("extract(span_name, '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)(?: |$)')")
+        );
+        assert!(sql.contains("http_method AS method, http_path AS path"));
+        // Column order must stay aligned with the ErrorGroup row struct.
+        let cols = [
+            "AS key",
+            "AS status_code",
+            "AS method",
+            "AS path",
+            "AS severity",
+            "AS example",
+            "AS count",
+            "AS last_seen",
+        ];
+        let mut pos = 0;
+        for c in cols {
+            let at = sql[pos..]
+                .find(c)
+                .unwrap_or_else(|| panic!("{c} out of order"));
+            pos += at + c.len();
+        }
+    }
+}
+
 pub async fn service_errors(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -817,31 +908,39 @@ pub async fn service_errors(
              LIMIT 50"
         )
     } else {
-        format!(
-            "SELECT concat(toString(http_status_code), ' ', http_method, ' ', http_path) AS key, \
-                http_status_code AS status_code, http_method AS method, http_path AS path, \
-                '' AS severity, '' AS example, \
-                count() AS count, \
-                toString(max(timestamp)) AS last_seen \
-             FROM spans \
-             PREWHERE tenant_id = '{escaped_tenant}' \
-                AND service_name = '{escaped_service}' \
-                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
-             WHERE kind = 'SPAN_KIND_SERVER' \
-                AND {ERROR_SPAN} \
-             GROUP BY http_status_code, http_method, http_path \
-             ORDER BY count DESC \
-             LIMIT 50"
-        )
+        endpoint_errors_sql(&escaped_tenant, &escaped_service, minutes, true)
     };
 
-    let groups = crate::tenant_query(&state.ch, &sql, tenant_id)
-        .fetch_all::<ErrorGroup>()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, handler = "service_errors", "query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-        })?;
+    let ch = &state.ch;
+    let fetch = |sql: String| async move {
+        crate::tenant_query(ch, &sql, tenant_id)
+            .fetch_all::<ErrorGroup>()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, handler = "service_errors", "query failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "query failed".to_string(),
+                )
+            })
+    };
+
+    let mut groups = fetch(sql).await?;
+
+    // A service whose failures are all on CLIENT/INTERNAL spans (e.g. a gateway
+    // whose downstream calls fail while its own SERVER spans succeed) still has a
+    // non-zero error rate, because that rate counts {ERROR_SPAN} across every
+    // span kind. Fall back to that same scope so "top error" never reads
+    // "No errors" next to a non-zero error rate.
+    if !message_mode && groups.is_empty() {
+        groups = fetch(endpoint_errors_sql(
+            &escaped_tenant,
+            &escaped_service,
+            minutes,
+            false,
+        ))
+        .await?;
+    }
 
     Ok(Json(ErrorsResponse {
         groups,
