@@ -161,6 +161,51 @@ pub fn resolve_field(field: &str) -> String {
     }
 }
 
+/// SQL condition for an `=`, `!=`, `IN` or `NOT IN` filter on span `status`.
+///
+/// Ingest stores `STATUS_CODE_OK` / `STATUS_CODE_ERROR` / `STATUS_CODE_UNSET`;
+/// rows from older versions hold the bare `OK` / `ERROR` / `UNSET`. Each value
+/// is matched against both spellings, case-insensitively, so `status=ERROR`,
+/// `status=error` and `status=STATUS_CODE_ERROR` select the same spans.
+/// Returns `None` for other fields, operators and non-string values.
+pub fn span_status_condition(filter: &Filter) -> Option<String> {
+    if filter.field != "status" {
+        return None;
+    }
+    let negate = match filter.op {
+        FilterOp::Eq | FilterOp::In => false,
+        FilterOp::Ne | FilterOp::NotIn => true,
+        _ => return None,
+    };
+    let raw: Vec<&str> = match (&filter.op, &filter.value) {
+        (FilterOp::Eq | FilterOp::Ne, serde_json::Value::String(s)) => vec![s.as_str()],
+        (FilterOp::In | FilterOp::NotIn, serde_json::Value::String(s)) => s.split(',').collect(),
+        (FilterOp::In | FilterOp::NotIn, serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str())
+            .collect::<Option<Vec<_>>>()?,
+        _ => return None,
+    };
+    let mut values: Vec<String> = Vec::with_capacity(raw.len() * 2);
+    for value in raw {
+        let upper = value.trim().to_ascii_uppercase();
+        let bare = upper.strip_prefix("STATUS_CODE_").unwrap_or(&upper);
+        let spellings = if bare.is_empty() {
+            vec![upper.clone()]
+        } else {
+            vec![format!("STATUS_CODE_{bare}"), bare.to_string()]
+        };
+        for spelling in spellings {
+            let literal = format_value(&serde_json::Value::String(spelling));
+            if !values.contains(&literal) {
+                values.push(literal);
+            }
+        }
+    }
+    let op = if negate { "NOT IN" } else { "IN" };
+    Some(format!("status {op} ({})", values.join(", ")))
+}
+
 /// Build query clauses from filters, time range, and optional free-text search.
 /// Time range goes into PREWHERE for efficient granule skipping; filters go into WHERE.
 pub fn build_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
@@ -193,6 +238,10 @@ pub fn build_where_clause_with_search(
     let mut conditions = Vec::new();
 
     for filter in filters {
+        if let Some(condition) = span_status_condition(filter) {
+            conditions.push(condition);
+            continue;
+        }
         let field = resolve_field(&filter.field);
         let condition = match &filter.op {
             FilterOp::Eq => format!("{field} = {}", format_value(&filter.value)),
@@ -1396,5 +1445,75 @@ mod error_span_tests {
             ),
             "{sql}"
         );
+    }
+}
+
+#[cfg(test)]
+mod span_status_filter_tests {
+    use super::{build_where_clause, span_status_condition};
+    use crate::models::query::{Filter, FilterOp};
+    use serde_json::json;
+
+    fn status(op: FilterOp, value: serde_json::Value) -> Filter {
+        Filter {
+            field: "status".into(),
+            op,
+            value,
+        }
+    }
+
+    fn where_sql(filter: Filter) -> String {
+        build_where_clause(&[filter], "2026-01-01 00:00:00", "2026-01-01 01:00:00").to_sql()
+    }
+
+    // Regression: Explore's "Errors only" facet sends status=ERROR, but ingest
+    // stores STATUS_CODE_ERROR, so the filter matched no spans.
+    #[test]
+    fn bare_and_prefixed_status_values_match_both_stored_spellings() {
+        let expected = "status IN ('STATUS_CODE_ERROR', 'ERROR')";
+        for value in ["ERROR", "error", "STATUS_CODE_ERROR", " Status_Code_Error "] {
+            let sql = where_sql(status(FilterOp::Eq, json!(value)));
+            assert!(sql.contains(expected), "{value}: {sql}");
+            assert!(!sql.contains("status = "), "{value}: {sql}");
+        }
+    }
+
+    #[test]
+    fn negated_and_list_status_filters_are_normalized() {
+        assert_eq!(
+            span_status_condition(&status(FilterOp::Ne, json!("ok"))).as_deref(),
+            Some("status NOT IN ('STATUS_CODE_OK', 'OK')")
+        );
+        assert_eq!(
+            span_status_condition(&status(FilterOp::In, json!("ERROR,STATUS_CODE_UNSET")))
+                .as_deref(),
+            Some("status IN ('STATUS_CODE_ERROR', 'ERROR', 'STATUS_CODE_UNSET', 'UNSET')")
+        );
+        assert_eq!(
+            span_status_condition(&status(FilterOp::NotIn, json!(["error", "ERROR"]))).as_deref(),
+            Some("status NOT IN ('STATUS_CODE_ERROR', 'ERROR')")
+        );
+    }
+
+    #[test]
+    fn status_values_are_escaped() {
+        let sql = span_status_condition(&status(FilterOp::Eq, json!("x' OR 1=1 --"))).unwrap();
+        assert_eq!(
+            sql,
+            "status IN ('STATUS_CODE_X'' OR 1=1 --', 'X'' OR 1=1 --')"
+        );
+    }
+
+    #[test]
+    fn other_fields_ops_and_values_keep_default_handling() {
+        let other_field = Filter {
+            field: "http_status_code".into(),
+            op: FilterOp::Eq,
+            value: json!("ERROR"),
+        };
+        assert!(span_status_condition(&other_field).is_none());
+        assert!(span_status_condition(&status(FilterOp::Like, json!("%ERR%"))).is_none());
+        assert!(span_status_condition(&status(FilterOp::Eq, json!(2))).is_none());
+        assert!(where_sql(status(FilterOp::Like, json!("%ERR%"))).contains("status LIKE '%ERR%'"));
     }
 }
