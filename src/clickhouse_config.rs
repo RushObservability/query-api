@@ -617,6 +617,9 @@ pub struct ApiKeyGrant {
     /// Stored role for query keys (`viewer` or `write`). Empty for ingest keys
     /// and for query keys created before roles existed; see [`ApiKeyGrant::query_role`].
     pub role: String,
+    /// Query keys only: may start SRE-agent investigations and use LLM-backed
+    /// natural-language parsing. Off unless an admin turns it on.
+    pub agent: bool,
     pub signals: Vec<String>,
     pub rate_limit_per_minute: u64,
     pub source_cidrs: Vec<String>,
@@ -638,6 +641,12 @@ impl ApiKeyGrant {
             "viewer"
         })
     }
+
+    /// Whether this key may use the SRE agent and LLM-backed parsing. Requires
+    /// an explicit grant on a query key; ingest keys never qualify.
+    pub fn allows_agent(&self) -> bool {
+        self.agent && self.query_role().is_some()
+    }
 }
 
 /// One row of `GET /api/v1/api-keys`. Never carries the key or its hash.
@@ -649,6 +658,7 @@ pub struct ApiKeyRecord {
     pub tenant_id: String,
     pub key_type: String,
     pub role: String,
+    pub agent: bool,
     pub signals: Vec<String>,
     pub rate_limit_per_minute: u64,
     pub source_cidrs: Vec<String>,
@@ -659,7 +669,7 @@ pub struct ApiKeyRecord {
 /// role live only on `config_api_keys`, so they are joined by key id. A missing
 /// row there yields empty strings, which [`ApiKeyGrant::query_role`] treats as
 /// `viewer`.
-const API_KEY_RESOLVE_SQL: &str = "SELECT h.id AS id, h.tenant_id AS tenant_id, h.key_type AS key_type, h.signals AS signals, h.rate_limit_per_minute AS rate_limit_per_minute, h.source_cidrs AS source_cidrs, h.is_deleted AS is_deleted, k.name AS name, k.role AS role FROM config_api_keys_by_hash AS h FINAL LEFT JOIN (SELECT id, name, role FROM config_api_keys FINAL WHERE is_deleted = 0) AS k ON k.id = h.id WHERE h.key_hash = ? LIMIT 1";
+const API_KEY_RESOLVE_SQL: &str = "SELECT h.id AS id, h.tenant_id AS tenant_id, h.key_type AS key_type, h.signals AS signals, h.rate_limit_per_minute AS rate_limit_per_minute, h.source_cidrs AS source_cidrs, h.is_deleted AS is_deleted, k.name AS name, k.role AS role, k.agent AS agent FROM config_api_keys_by_hash AS h FINAL LEFT JOIN (SELECT id, name, role, agent FROM config_api_keys FINAL WHERE is_deleted = 0) AS k ON k.id = h.id WHERE h.key_hash = ? LIMIT 1";
 
 /// TTL for the config-plane read caches below. Mutations through this process
 /// clear the caches immediately; mutations from another replica are visible
@@ -1162,10 +1172,9 @@ mod auth_storage_tests {
         assert!(source.contains("WHERE h.key_hash = ? LIMIT 1"));
         assert!(source.contains("Ok(row) if row.is_deleted == 0"));
         // Role and name come from config_api_keys so the materialized view is unchanged.
-        assert!(
-            source
-                .contains("SELECT id, name, role FROM config_api_keys FINAL WHERE is_deleted = 0")
-        );
+        assert!(source.contains(
+            "SELECT id, name, role, agent FROM config_api_keys FINAL WHERE is_deleted = 0"
+        ));
     }
 
     #[test]
@@ -2931,6 +2940,7 @@ impl ConfigDb {
             // Role for query keys (viewer|write). Kept off config_api_keys_by_hash so its
             // materialized view does not change; resolution joins it by key id.
             "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS role String DEFAULT '' AFTER source_cidrs",
+            "ALTER TABLE config_api_keys ADD COLUMN IF NOT EXISTS agent UInt8 DEFAULT 0 AFTER role",
             // Authentication reads by key hash, while the source table stays
             // keyed by id for the admin API. A materialized view keeps this
             // lookup table current for new and old API replicas during rolling
@@ -3815,6 +3825,7 @@ impl ConfigDb {
             is_deleted: u8,
             name: String,
             role: String,
+            agent: u8,
         }
         let result = self
             .client
@@ -3829,6 +3840,7 @@ impl ConfigDb {
                 tenant_id: row.tenant_id,
                 key_type: row.key_type,
                 role: row.role,
+                agent: row.agent != 0,
                 signals: serde_json::from_str(&row.signals).unwrap_or_default(),
                 rate_limit_per_minute: row.rate_limit_per_minute,
                 source_cidrs: serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
@@ -6719,13 +6731,14 @@ impl ConfigDb {
             tenant_id: String,
             key_type: String,
             role: String,
+            agent: u8,
             signals: String,
             rate_limit_per_minute: u64,
             source_cidrs: String,
             created_at: String,
         }
         let rows = self.client
-            .query("SELECT id, name, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
+            .query("SELECT id, name, prefix, tenant_id, key_type, role, agent, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE is_deleted = 0 ORDER BY created_at DESC")
             .fetch_all::<Row>()
             .await?;
         Ok(rows
@@ -6737,6 +6750,7 @@ impl ConfigDb {
                 tenant_id: row.tenant_id,
                 key_type: row.key_type,
                 role: row.role,
+                agent: row.agent != 0,
                 signals: serde_json::from_str(&row.signals).unwrap_or_default(),
                 rate_limit_per_minute: row.rate_limit_per_minute,
                 source_cidrs: serde_json::from_str(&row.source_cidrs).unwrap_or_default(),
@@ -6754,6 +6768,7 @@ impl ConfigDb {
         tenant_id: &str,
         key_type: &str,
         role: &str,
+        agent: bool,
         signals: &[String],
         rate_limit_per_minute: u64,
         source_cidrs: &[String],
@@ -6763,9 +6778,9 @@ impl ConfigDb {
         let signals = serde_json::to_string(signals)?;
         let source_cidrs = serde_json::to_string(source_cidrs)?;
         self.client
-            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, role, agent, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(name).bind(key_hash).bind(prefix).bind(tenant_id)
-            .bind(key_type).bind(role).bind(&signals).bind(rate_limit_per_minute)
+            .bind(key_type).bind(role).bind(u8::from(agent)).bind(&signals).bind(rate_limit_per_minute)
             .bind(&source_cidrs).bind(&now).bind(ver)
             .execute()
             .await?;
@@ -6799,6 +6814,7 @@ impl ConfigDb {
             "default",
             "ingest",
             "",
+            false,
             &signals,
             1_000_000,
             &[],
@@ -6816,13 +6832,14 @@ impl ConfigDb {
             tenant_id: String,
             key_type: String,
             role: String,
+            agent: u8,
             signals: String,
             rate_limit_per_minute: u64,
             source_cidrs: String,
             created_at: String,
         }
         let result = self.client
-            .query("SELECT name, key_hash, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT name, key_hash, prefix, tenant_id, key_type, role, agent, signals, rate_limit_per_minute, source_cidrs, created_at FROM config_api_keys FINAL WHERE id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
             .fetch_one::<Row>()
             .await;
@@ -6833,9 +6850,9 @@ impl ConfigDb {
         };
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, role, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .query("INSERT INTO config_api_keys (id, name, key_hash, prefix, tenant_id, key_type, role, agent, signals, rate_limit_per_minute, source_cidrs, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
             .bind(id).bind(&row.name).bind(&row.key_hash).bind(&row.prefix)
-            .bind(&row.tenant_id).bind(&row.key_type).bind(&row.role).bind(&row.signals)
+            .bind(&row.tenant_id).bind(&row.key_type).bind(&row.role).bind(row.agent).bind(&row.signals)
             .bind(row.rate_limit_per_minute).bind(&row.source_cidrs)
             .bind(&row.created_at).bind(ver)
             .execute()

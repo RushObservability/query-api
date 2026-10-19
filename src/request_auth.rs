@@ -180,6 +180,7 @@ mod tests {
             tenant_id: "default".into(),
             key_type: "query".into(),
             role: "viewer".into(),
+            agent: false,
             signals: Vec::new(),
             rate_limit_per_minute: 0,
             source_cidrs: Vec::new(),
