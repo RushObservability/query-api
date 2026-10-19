@@ -15,8 +15,8 @@ if matches=$(rg -n 'OPENAI_(?:BASE_URL|API_KEY)|reqwest::Client' "${llm_handlers
 fi
 
 for parser in src/handlers/parse_query.rs src/handlers/parse_promql.rs; do
-  if ! rg -q 'require_auth\(&state, &headers\)' "$parser"; then
-    printf '%s must require an interactive authenticated session\n' "$parser" >&2
+  if ! rg -q 'require_agent_principal\(&state, &headers\)' "$parser"; then
+    printf '%s must require a session or an agent-enabled API key\n' "$parser" >&2
     failures=1
   fi
 done

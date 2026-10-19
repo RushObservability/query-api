@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::AppState;
 use crate::handlers::settings::{SreAgentAccessDecision, sre_agent_access_decision};
-use crate::handlers::users::{require_auth, require_write};
+use crate::handlers::users::{require_agent_principal, require_agent_principal_write};
 
 type AuthenticatedCaller = (String, String, String, String, String);
 
@@ -29,9 +29,9 @@ async fn require_agent_access(
     write: bool,
 ) -> Result<AuthenticatedCaller, (StatusCode, String)> {
     let caller = if write {
-        require_write(state, headers).await?
+        require_agent_principal_write(state, headers).await?
     } else {
-        require_auth(state, headers).await?
+        require_agent_principal(state, headers).await?
     };
     match sre_agent_access_decision(state, &caller.3).await {
         SreAgentAccessDecision::Allowed => Ok(caller),

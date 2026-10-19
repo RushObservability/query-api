@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 
 use crate::AppState;
 use crate::handlers::settings::{SreAgentAccessDecision, sre_agent_access_decision};
-use crate::handlers::users::require_auth;
+use crate::handlers::users::{is_api_key_principal, require_agent_principal};
 
 /// Shared HTTP client. No total timeout — `/investigate` streams for minutes;
 /// a short connect timeout still fails fast when the agent is down.
@@ -59,6 +59,16 @@ fn sre_internal_token() -> Result<String, (StatusCode, String)> {
 
 fn with_internal_token(request: reqwest::RequestBuilder, token: String) -> reqwest::RequestBuilder {
     request.header("x-rush-internal-token", token)
+}
+
+/// Tool scopes forwarded to the agent. API keys get telemetry tools only:
+/// repository contents and cluster access stay with interactive users.
+fn scopes_for_caller(caller: &AuthenticatedCaller) -> serde_json::Value {
+    if is_api_key_principal(&caller.0) {
+        serde_json::json!(["all"])
+    } else {
+        scopes_for_role(&caller.4)
+    }
 }
 
 fn scopes_for_role(role: &str) -> serde_json::Value {
@@ -114,13 +124,41 @@ async fn enforce_agent_access(
     Err((StatusCode::FORBIDDEN, message.to_string()))
 }
 
+/// Resolve the investigation caller, auditing an API key turned away for
+/// lacking agent access so attempted use of a key is visible to admins.
+async fn require_investigation_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedCaller, (StatusCode, String)> {
+    let result = require_agent_principal(state, headers).await;
+    if let (Err(err), Some(grant)) = (&result, crate::request_auth::api_key_grant()) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sre_agent.investigation_denied", "api_key")
+                    .actor(
+                        format!("{}{}", crate::audit::API_KEY_ACTOR_PREFIX, grant.id),
+                        grant.name.clone(),
+                    )
+                    .tenant(grant.tenant_id.clone())
+                    .resource("sre_agent", "investigation")
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "api_key_not_agent" }).to_string())
+                    .description(err.1.clone())
+                    .context(crate::audit::actor_context_from_headers(headers)),
+            )
+            .await;
+    }
+    result
+}
+
 /// `POST /api/v1/investigate` — SSE passthrough with tenant/scope injection.
 pub async fn investigate(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers).await?;
+    let caller = require_investigation_caller(&state, &headers).await?;
     enforce_agent_access(&state, &headers, &caller, true).await?;
     let tenant = caller.3.clone();
 
@@ -131,7 +169,7 @@ pub async fn investigate(
         obj.insert("tenant_id".into(), serde_json::json!(tenant));
         // Code is a separate sensitive-read scope. Existing `all` access means
         // all telemetry/infrastructure tools, not repository contents.
-        obj.insert("scopes".into(), scopes_for_role(&caller.4));
+        obj.insert("scopes".into(), scopes_for_caller(&caller));
     }
 
     let url = format!("{}/api/v1/investigate", sre_base());
@@ -206,14 +244,14 @@ pub async fn list_investigation_templates(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers).await?;
+    let caller = require_agent_principal(&state, &headers).await?;
     enforce_agent_access(&state, &headers, &caller, false).await?;
     forward_get(format!("{}/api/v1/investigation-templates", sre_base())).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{scopes_for_role, with_internal_token};
+    use super::{scopes_for_caller, scopes_for_role, with_internal_token};
 
     #[test]
     fn proxy_attaches_the_internal_agent_credential() {
@@ -239,6 +277,27 @@ mod tests {
         assert_eq!(
             scopes_for_role("admin"),
             serde_json::json!(["all", "code", "kube_cluster"])
+        );
+    }
+
+    #[test]
+    fn api_keys_never_receive_code_or_cluster_scopes() {
+        let caller = |id: &str, role: &str| {
+            (
+                id.to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "t".to_string(),
+                role.to_string(),
+            )
+        };
+        assert_eq!(
+            scopes_for_caller(&caller("apikey:k1", "write")),
+            serde_json::json!(["all"])
+        );
+        assert_eq!(
+            scopes_for_caller(&caller("user-1", "write")),
+            serde_json::json!(["all", "code"])
         );
     }
 }

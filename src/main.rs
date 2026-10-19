@@ -711,16 +711,20 @@ fn allows_unauthenticated_tenant_request(method: &axum::http::Method, path: &str
 }
 
 /// Natural-language parsing can create metered provider cost, so a tenant's
-/// open-query policy must never authorize it. Only an interactive browser
-/// session is accepted; query API keys and anonymous tenant selection are not.
+/// open-query policy must never authorize it. An interactive browser session
+/// is accepted, as is a query API key an admin granted agent access (its LLM
+/// use is bounded by its own per-principal quota). Other keys and anonymous
+/// tenant selection are not.
 fn should_reject_interactive_llm(
     method: &axum::http::Method,
     path: &str,
     credential: &CredentialKind,
+    agent_key: bool,
 ) -> bool {
     *method == axum::http::Method::POST
         && matches!(path, "/api/v1/parse-query" | "/api/v1/parse-promql")
         && *credential != CredentialKind::Session
+        && !(*credential == CredentialKind::QueryKey && agent_key)
 }
 
 /// Once shutdown starts, readiness is already false and this gate prevents new
@@ -1420,7 +1424,11 @@ async fn enforce_tenant_auth_middleware(
         _ => {}
     }
 
-    if should_reject_interactive_llm(&method, &path, &resolution.credential) {
+    let agent_key = resolution
+        .api_key
+        .as_ref()
+        .is_some_and(|grant| grant.allows_agent());
+    if should_reject_interactive_llm(&method, &path, &resolution.credential, agent_key) {
         tracing::warn!(
             event = "llm.auth_denied",
             tenant_id = %tenant_id,
@@ -4315,17 +4323,35 @@ mod tenant_auth_tests {
                 &Method::POST,
                 path,
                 &CredentialKind::Anonymous,
+                false,
             ));
             assert!(should_reject_interactive_llm(
                 &Method::POST,
                 path,
                 &CredentialKind::QueryKey,
+                false,
             ));
             assert!(!should_reject_interactive_llm(
                 &Method::POST,
                 path,
                 &CredentialKind::Session,
+                false,
             ));
+            // Agent access is honored only on a query key.
+            assert!(!should_reject_interactive_llm(
+                &Method::POST,
+                path,
+                &CredentialKind::QueryKey,
+                true,
+            ));
+            for credential in [CredentialKind::Anonymous, CredentialKind::IngestKey] {
+                assert!(should_reject_interactive_llm(
+                    &Method::POST,
+                    path,
+                    &credential,
+                    true,
+                ));
+            }
         }
     }
 
@@ -4405,6 +4431,7 @@ mod tenant_auth_tests {
             tenant_id: "default".to_string(),
             key_type: key_type.to_string(),
             role: String::new(),
+            agent: false,
             signals: vec!["logs".to_string()],
             rate_limit_per_minute: 100,
             source_cidrs: Vec::new(),
