@@ -163,17 +163,84 @@ pub fn resolve_field(field: &str) -> String {
 
 /// Build query clauses from filters, time range, and optional free-text search.
 /// Time range goes into PREWHERE for efficient granule skipping; filters go into WHERE.
+///
+/// Every filter applies to the span row itself (alerts and SLOs count spans). The
+/// Explore traces-only rewrite is only done by [`build_where_clause_with_search`].
 pub fn build_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
-    build_where_clause_with_search(filters, from, to, None)
+    build_span_clauses(filters, from, to, None, false)
 }
 
 /// Build query clauses with optional free-text search across multiple columns.
 /// Time range goes into PREWHERE for efficient granule skipping; filters+search go into WHERE.
+///
+/// Used by the tenant-scoped Explore/query handlers. In traces-only mode
+/// (a `parent_span_id = ''` filter) a failure filter selects traces that contain
+/// a failed span; see [`trace_outcome_filters_apply`].
 pub fn build_where_clause_with_search(
     filters: &[Filter],
     from: &str,
     to: &str,
     search: Option<&str>,
+) -> QueryClauses {
+    build_span_clauses(filters, from, to, search, true)
+}
+
+/// Fields that describe a span's outcome rather than which request it is.
+fn is_outcome_field(field: &str) -> bool {
+    matches!(field, "status" | "level" | "error" | "http_status_code")
+}
+
+/// Whether a filter selects failed spans: an error status/level, `error = 1`, or
+/// an HTTP status floor of 400 or higher.
+fn selects_failures(filter: &Filter) -> bool {
+    let number = |value: &serde_json::Value| match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    let mentions_error = |value: &serde_json::Value| match value {
+        serde_json::Value::String(s) => s.to_ascii_lowercase().contains("error"),
+        serde_json::Value::Array(items) => items.iter().any(|v| {
+            v.as_str()
+                .is_some_and(|s| s.to_ascii_lowercase().contains("error"))
+        }),
+        _ => false,
+    };
+    match (filter.field.as_str(), &filter.op) {
+        ("status" | "level", FilterOp::Eq | FilterOp::Like | FilterOp::In) => {
+            mentions_error(&filter.value)
+        }
+        ("error", FilterOp::Eq) => {
+            filter.value == serde_json::json!(true) || number(&filter.value) == Some(1.0)
+        }
+        ("http_status_code", FilterOp::Eq | FilterOp::Gte) => {
+            number(&filter.value).is_some_and(|n| n >= 400.0)
+        }
+        ("http_status_code", FilterOp::Gt) => number(&filter.value).is_some_and(|n| n >= 399.0),
+        _ => false,
+    }
+}
+
+/// Explore's "Traces only" mode adds `parent_span_id = ''` so each trace is listed
+/// once, by its root span. A root span usually succeeds while the 5xx/ERROR is on a
+/// child (a downstream call or an internal route), so requiring the root itself to
+/// match a failure filter hides nearly every failed trace. When the request is in
+/// traces-only mode and filters for failures, ALL outcome filters
+/// ([`is_outcome_field`]) are evaluated over the whole trace instead; the other
+/// filters (service, method, path, duration, search) still describe the root span.
+fn trace_outcome_filters_apply(filters: &[Filter]) -> bool {
+    let traces_only = filters.iter().any(|f| {
+        f.field == "parent_span_id" && matches!(f.op, FilterOp::Eq) && f.value.as_str() == Some("")
+    });
+    traces_only && filters.iter().any(selects_failures)
+}
+
+fn build_span_clauses(
+    filters: &[Filter],
+    from: &str,
+    to: &str,
+    search: Option<&str>,
+    traces_mode: bool,
 ) -> QueryClauses {
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
@@ -191,6 +258,8 @@ pub fn build_where_clause_with_search(
     // `timestamp` (leading PK column) is the efficient path.
     let mut uses_index_predicate = false;
     let mut conditions = Vec::new();
+    let trace_scoped = traces_mode && trace_outcome_filters_apply(filters);
+    let mut trace_conditions = Vec::new();
 
     for filter in filters {
         let field = resolve_field(&filter.field);
@@ -209,7 +278,24 @@ pub fn build_where_clause_with_search(
         if matches!(filter.op, FilterOp::Like | FilterOp::NotLike) {
             uses_index_predicate = true;
         }
+        if trace_scoped && is_outcome_field(&filter.field) {
+            trace_conditions.push(condition);
+            continue;
+        }
         conditions.push(condition);
+    }
+
+    if !trace_conditions.is_empty() {
+        // Root spans of traces that contain a matching span, in the same window.
+        // The subquery is tenant-scoped by the spans `tenant_isolation` row policy
+        // (all callers run through `tenant_query`). Matching the set on `trace_id`
+        // (sort key column + bloom_filter index) prunes granules, so the time
+        // range stays in WHERE like other index-backed predicates.
+        conditions.push(format!(
+            "trace_id IN (SELECT trace_id FROM spans WHERE {time_range} AND {})",
+            trace_conditions.join(" AND ")
+        ));
+        uses_index_predicate = true;
     }
 
     // Free-text search with AND/OR boolean logic
@@ -1396,5 +1482,157 @@ mod error_span_tests {
             ),
             "{sql}"
         );
+    }
+}
+
+#[cfg(test)]
+mod traces_only_tests {
+    use super::{build_where_clause, build_where_clause_with_search};
+    use crate::models::query::{Filter, FilterOp};
+    use serde_json::json;
+
+    const FROM: &str = "2026-10-18T10:00:00Z";
+    const TO: &str = "2026-10-18T11:00:00Z";
+
+    fn f(field: &str, op: FilterOp, value: serde_json::Value) -> Filter {
+        Filter {
+            field: field.into(),
+            op,
+            value,
+        }
+    }
+
+    fn root() -> Filter {
+        f("parent_span_id", FilterOp::Eq, json!(""))
+    }
+
+    fn sql(filters: &[Filter]) -> String {
+        build_where_clause_with_search(filters, FROM, TO, None)
+            .with_prewhere_prefix("tenant_id = 't'")
+            .to_sql()
+    }
+
+    fn parses(predicate: &str) {
+        let full = format!("SELECT trace_id FROM spans {predicate}");
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, &full)
+            .unwrap_or_else(|e| panic!("generated SQL did not parse: {e}\n{full}"));
+    }
+
+    /// Regression: Explore defaults to "Traces only". Service = gateway plus
+    /// Status = Server Error returned 0 traces because the 5xx statuses are on
+    /// child spans while gateway roots return 2xx. The failure filter must select
+    /// traces that contain a 5xx span and still list each trace's root span.
+    #[test]
+    fn server_error_filter_matches_traces_containing_a_failed_span() {
+        let filters = [
+            f("service_name", FilterOp::Eq, json!("gateway")),
+            f("http_status_code", FilterOp::Gte, json!(500)),
+            root(),
+        ];
+        let sql = sql(&filters);
+        let (outer, inner) = sql
+            .split_once("trace_id IN (SELECT trace_id FROM spans WHERE ")
+            .unwrap_or_else(|| panic!("expected a trace_id subquery: {sql}"));
+        assert!(outer.contains("tenant_id = 't'"), "{sql}");
+        assert!(outer.contains("service_name = 'gateway'"), "{sql}");
+        assert!(outer.contains("parent_span_id = ''"), "{sql}");
+        assert!(
+            !outer.contains("http_status_code"),
+            "root must not need a 5xx: {sql}"
+        );
+        assert!(
+            !outer.starts_with("PREWHERE"),
+            "keep the index-backed IN out of PREWHERE: {sql}"
+        );
+        assert!(inner.contains("http_status_code >= 500"), "{sql}");
+        assert!(inner.contains("timestamp >= parseDateTimeBestEffort('2026-10-18T10:00:00Z')"));
+        assert!(
+            !inner.contains("parent_span_id"),
+            "any span in the trace may match: {sql}"
+        );
+        assert!(!inner.contains("service_name"), "{sql}");
+        parses(&sql);
+    }
+
+    #[test]
+    fn error_status_and_error_flag_are_trace_wide_in_traces_only_mode() {
+        for failure in [
+            f("status", FilterOp::Eq, json!("ERROR")),
+            f("status", FilterOp::Eq, json!("STATUS_CODE_ERROR")),
+            f(
+                "status",
+                FilterOp::In,
+                json!(["STATUS_CODE_ERROR", "ERROR"]),
+            ),
+            f("level", FilterOp::Eq, json!("error")),
+            f("error", FilterOp::Eq, json!(1)),
+            f("http_status_code", FilterOp::Eq, json!(503)),
+            f("http_status_code", FilterOp::Gte, json!("500")),
+        ] {
+            let sql = sql(&[failure.clone(), root()]);
+            assert!(
+                sql.contains("trace_id IN (SELECT trace_id FROM spans WHERE "),
+                "{failure:?}: {sql}"
+            );
+            parses(&sql);
+        }
+    }
+
+    #[test]
+    fn status_range_moves_together_into_the_trace_subquery() {
+        // The 4xx quick filter is a pair; both bounds must apply to the same span.
+        let sql = sql(&[
+            f("http_status_code", FilterOp::Gte, json!(400)),
+            f("http_status_code", FilterOp::Lt, json!(500)),
+            root(),
+        ]);
+        let (outer, inner) = sql.split_once("trace_id IN (SELECT").expect("subquery");
+        assert!(!outer.contains("http_status_code"), "{sql}");
+        assert!(
+            inner.contains("http_status_code >= 400 AND http_status_code < 500"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn success_and_non_outcome_filters_still_describe_the_root_span() {
+        // 2xx in traces-only mode means "requests that succeeded", i.e. the root.
+        let sql = sql(&[
+            f("http_status_code", FilterOp::Gte, json!(200)),
+            f("http_status_code", FilterOp::Lt, json!(300)),
+            f("duration_ns", FilterOp::Gte, json!(500_000_000)),
+            root(),
+        ]);
+        assert!(!sql.contains("trace_id IN"), "{sql}");
+        assert!(sql.contains("http_status_code >= 200"), "{sql}");
+        assert!(sql.contains("duration_ns >= 500000000"), "{sql}");
+    }
+
+    #[test]
+    fn span_mode_failure_filters_are_unchanged() {
+        let sql = sql(&[
+            f("service_name", FilterOp::Eq, json!("gateway")),
+            f("http_status_code", FilterOp::Gte, json!(500)),
+        ]);
+        assert!(!sql.contains("trace_id IN"), "{sql}");
+        assert!(sql.contains("http_status_code >= 500"), "{sql}");
+    }
+
+    #[test]
+    fn alert_and_slo_builder_keeps_span_level_semantics() {
+        let filters = [f("status", FilterOp::Eq, json!("ERROR")), root()];
+        let sql = build_where_clause(&filters, FROM, TO).to_sql();
+        assert!(!sql.contains("trace_id IN"), "{sql}");
+        assert!(sql.contains("status = 'ERROR'"), "{sql}");
+    }
+
+    #[test]
+    fn subquery_values_stay_escaped() {
+        let sql = sql(&[
+            f("status", FilterOp::Eq, json!("ERROR') OR 1=1 --")),
+            root(),
+        ]);
+        assert!(sql.contains("status = 'ERROR'') OR 1=1 --'"), "{sql}");
+        parses(&sql);
     }
 }
