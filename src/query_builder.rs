@@ -21,13 +21,31 @@ pub(crate) fn sanitize_datetime(s: &str) -> String {
 /// then uses SQL-standard quote doubling (`'` → `''`) which ClickHouse supports
 /// unconditionally regardless of that setting.
 ///
+/// Finally, every `?` is written as `\x3F` (see [`escape_bind_placeholders`]),
+/// so user text such as a `*why?*` search never reaches the `clickhouse` crate as
+/// a bind placeholder.
+///
 /// Callers should still wrap the result in single quotes:
 ///   `format!("col = '{}'", escape_string_literal(value))`
+/// The result is only valid inside a ClickHouse quoted literal (SQL text or an
+/// `INSERT ... VALUES` row); never pass it to `.bind()`, which escapes on its own.
 /// Prefer parameterized queries via `.bind()` where the clickhouse driver supports
 /// it; use this helper only for dynamic values that cannot be bound.
 pub(crate) fn escape_string_literal(s: &str) -> String {
-    // Backslash must be escaped first to avoid double-escaping the apostrophe step.
-    s.replace('\\', "\\\\").replace('\'', "''")
+    // Backslash must be escaped first to avoid double-escaping the apostrophe step,
+    // and before the `?` step so the `\x3F` escape's own backslash stays single.
+    escape_bind_placeholders(&s.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// The `clickhouse` crate treats every `?` in query text as a bind placeholder
+/// ("unbound query argument" → HTTP 500), including one inside a quoted string
+/// literal. ClickHouse decodes the `\x3F` escape back to `?` inside quoted
+/// literals (and `INSERT ... VALUES` rows), so the value the server sees is
+/// unchanged; LIKE/ILIKE/multiSearchAny still match a literal `?`.
+///
+/// Only apply this to SQL whose `?` characters all sit inside quoted literals.
+pub(crate) fn escape_bind_placeholders(sql: &str) -> String {
+    sql.replace('?', "\\x3F")
 }
 
 /// Return true if `s` is a safe SQL column identifier (letter/underscore start,
@@ -1426,6 +1444,106 @@ mod search_tests {
         let sql = build_log_search_sql("a1b2c3d4e5f60718").unwrap();
         assert_eq!(sql, "SpanId = 'a1b2c3d4e5f60718'");
     }
+
+    // The `clickhouse` crate reads every `?` in query text as a bind placeholder
+    // ("unbound query argument" → HTTP 500). A literal `?` must be written as the
+    // `\x3F` escape, which ClickHouse decodes back to `?` inside quoted literals.
+    #[test]
+    fn escape_string_literal_encodes_bind_placeholders() {
+        assert_eq!(escape_string_literal("why?"), "why\\x3F");
+        // Backslash and quote escaping still apply, and the `\x3F` escape's own
+        // backslash is not doubled.
+        assert_eq!(escape_string_literal("a\\?'b"), "a\\\\\\x3F''b");
+    }
+
+    const QUESTION_MARK_SEARCHES: [&str; 6] = [
+        "why?",
+        "*why?*",
+        "\"a?b\" OR c",
+        "key=val?ue",
+        "key?=val*ue?",
+        "*a?b* OR *c?d*",
+    ];
+
+    #[test]
+    fn log_search_sql_contains_no_bind_placeholders() {
+        for search in QUESTION_MARK_SEARCHES {
+            let sql = build_log_search_sql(search).unwrap();
+            assert!(!sql.contains('?'), "{search} → {sql}");
+        }
+    }
+
+    #[test]
+    fn span_search_sql_contains_no_bind_placeholders() {
+        for search in QUESTION_MARK_SEARCHES {
+            let sql = build_span_search_sql(search).unwrap();
+            assert!(!sql.contains('?'), "{search} → {sql}");
+        }
+    }
+
+    // Each predicate keeps matching a literal `?`: the needle/pattern only swaps
+    // the character for its `\x3F` escape (verified on ClickHouse 26.6:
+    // `SELECT 'why?' LIKE '%why\x3F%'` → 1, `multiSearchAny('why?', ['why\x3F'])` → 1).
+    #[test]
+    fn question_mark_search_semantics_are_preserved() {
+        // Bare `why?` tokenizes like the index (`?` is a separator) → hasToken.
+        assert_eq!(
+            build_log_search_sql("why?").unwrap(),
+            "hasToken(lower(Body), 'why')"
+        );
+        assert_eq!(
+            build_log_search_sql("*why?*").unwrap(),
+            "lower(Body) LIKE '%%why\\x3F%%'"
+        );
+        assert_eq!(
+            build_log_search_sql("*a?b* OR *c?d*").unwrap(),
+            "multiSearchAny(lower(Body), ['a\\x3Fb', 'c\\x3Fd'])"
+        );
+        assert_eq!(
+            build_log_search_sql("key=val?ue").unwrap(),
+            "(LogAttributes['key'] = 'val\\x3Fue' OR ResourceAttributes['key'] = 'val\\x3Fue')"
+        );
+        assert_eq!(
+            build_log_search_sql("key=val?ue*").unwrap(),
+            "(LogAttributes['key'] ILIKE 'val\\x3Fue%' OR ResourceAttributes['key'] ILIKE 'val\\x3Fue%')"
+        );
+        assert_eq!(
+            build_span_search_sql("why?").unwrap(),
+            "(span_name ILIKE '%why\\x3F%' OR service_name ILIKE '%why\\x3F%')"
+        );
+        assert_eq!(
+            build_span_search_sql("*why?*").unwrap(),
+            "(span_name ILIKE '%%why\\x3F%%' OR service_name ILIKE '%%why\\x3F%%')"
+        );
+        assert_eq!(
+            build_span_search_sql("\"a?b\" OR c").unwrap(),
+            "((span_name ILIKE '%a\\x3Fb%' OR service_name ILIKE '%a\\x3Fb%') OR \
+             (span_name ILIKE '%c%' OR service_name ILIKE '%c%'))"
+        );
+        assert_eq!(
+            build_span_search_sql("key=val?ue").unwrap(),
+            "JSONExtractString(attributes, 'key') = 'val\\x3Fue'"
+        );
+    }
+
+    // Span filters reach SQL through the same literal escaping.
+    #[test]
+    fn span_filter_values_contain_no_bind_placeholders() {
+        let filters = vec![Filter {
+            field: "attributes.what?".into(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("a?b"),
+        }];
+        let clauses = build_where_clause_with_search(
+            &filters,
+            "2026-01-01 00:00:00",
+            "2026-01-01 01:00:00",
+            Some("*why?*"),
+        );
+        let sql = clauses.to_sql();
+        assert!(!sql.contains('?'), "{sql}");
+        assert!(sql.contains("'a\\x3Fb'"), "{sql}");
+    }
 }
 
 #[cfg(test)]
@@ -1526,6 +1644,8 @@ mod adversarial_search_parser_tests {
                 // parser expansion.
                 prop_assert!(sql.len() <= input.len().saturating_mul(48).saturating_add(1024));
                 prop_assert!(!sql.contains('\0'));
+                // A bare `?` is a `clickhouse` crate bind placeholder → HTTP 500.
+                prop_assert!(!sql.contains('?'));
             }
         }
 

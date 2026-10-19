@@ -129,9 +129,9 @@ pub(crate) fn build_log_where(
     for filter in filters {
         validate_log_filter_field(&filter.field)?;
         let field = resolve_log_field(&filter.field);
-        conditions.push(escape_bind_placeholders(&log_filter_condition(
-            &field, filter,
-        )));
+        // `?` in field names/values is encoded by `escape_string_literal`, so the
+        // predicate never carries a bare `clickhouse` crate bind placeholder.
+        conditions.push(log_filter_condition(&field, filter));
     }
 
     let mut has_search = false;
@@ -244,14 +244,6 @@ fn text_value(value: &serde_json::Value) -> serde_json::Value {
         }
         other => other.clone(),
     }
-}
-
-/// The `clickhouse` crate treats every `?` in query text as a bind placeholder
-/// ("unbound query argument" → HTTP 500), including one inside a user-supplied
-/// field name or value. Filter predicates only contain `?` inside string
-/// literals, where ClickHouse's `\x3F` escape decodes to the same character.
-fn escape_bind_placeholders(condition: &str) -> String {
-    condition.replace('?', "\\x3F")
 }
 
 /// Log query request.
