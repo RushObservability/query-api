@@ -851,7 +851,7 @@ fn resolve_log_field(field: &str) -> String {
     } else {
         match field {
             "service_name" | "ServiceName" => "ServiceName".to_string(),
-            "severity" | "SeverityText" => "SeverityText".to_string(),
+            "level" | "severity" | "severity_text" | "SeverityText" => "SeverityText".to_string(),
             "body" | "Body" => "Body".to_string(),
             _ => {
                 if is_safe_column_name(field) {
@@ -861,6 +861,43 @@ fn resolve_log_field(field: &str) -> String {
                 }
             }
         }
+    }
+}
+
+/// Case-insensitive equality/membership predicate for the logs `SeverityText`
+/// column. Ingest sources and users disagree on casing (`ERROR` vs `error`), so
+/// `level=error` must match rows stored as `ERROR`. Returns `None` for other
+/// columns and for operators where case folding does not apply.
+pub(crate) fn log_severity_condition(field_expr: &str, filter: &Filter) -> Option<String> {
+    if field_expr != "SeverityText" {
+        return None;
+    }
+    let upper = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => serde_json::Value::String(s.to_uppercase()),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|i| match i {
+                    serde_json::Value::String(s) => serde_json::Value::String(s.to_uppercase()),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    };
+    let col = "upper(SeverityText)";
+    match filter.op {
+        FilterOp::Eq => Some(format!("{col} = {}", format_value(&upper(&filter.value)))),
+        FilterOp::Ne => Some(format!("{col} != {}", format_value(&upper(&filter.value)))),
+        FilterOp::In => Some(format!(
+            "{col} IN {}",
+            format_array_value(&upper(&filter.value))
+        )),
+        FilterOp::NotIn => Some(format!(
+            "{col} NOT IN {}",
+            format_array_value(&upper(&filter.value))
+        )),
+        _ => None,
     }
 }
 
@@ -877,6 +914,10 @@ pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> Quer
 
     for filter in filters {
         let field = resolve_log_field(&filter.field);
+        if let Some(condition) = log_severity_condition(&field, filter) {
+            conditions.push(condition);
+            continue;
+        }
         let condition = match &filter.op {
             FilterOp::Eq => format!("{field} = {}", format_value(&filter.value)),
             FilterOp::Ne => format!("{field} != {}", format_value(&filter.value)),
@@ -1515,5 +1556,45 @@ mod span_status_filter_tests {
         assert!(span_status_condition(&status(FilterOp::Like, json!("%ERR%"))).is_none());
         assert!(span_status_condition(&status(FilterOp::Eq, json!(2))).is_none());
         assert!(where_sql(status(FilterOp::Like, json!("%ERR%"))).contains("status LIKE '%ERR%'"));
+    }
+}
+
+#[cfg(test)]
+mod log_severity_tests {
+    use super::*;
+
+    #[test]
+    fn alert_log_filters_resolve_level_case_insensitively() {
+        let filters = vec![Filter {
+            field: "level".to_string(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("error"),
+        }];
+        let clauses =
+            build_logs_where_clause(&filters, "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z");
+        assert_eq!(clauses.where_clause, "upper(SeverityText) = 'ERROR'");
+    }
+
+    #[test]
+    fn severity_condition_only_applies_to_severity_text() {
+        let f = Filter {
+            field: "body".to_string(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("error"),
+        };
+        assert!(log_severity_condition("Body", &f).is_none());
+    }
+
+    #[test]
+    fn severity_condition_escapes_values() {
+        let f = Filter {
+            field: "level".to_string(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("err'or"),
+        };
+        assert_eq!(
+            log_severity_condition("SeverityText", &f).as_deref(),
+            Some("upper(SeverityText) = 'ERR''OR'")
+        );
     }
 }

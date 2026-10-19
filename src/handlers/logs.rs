@@ -17,7 +17,9 @@ pub(crate) fn resolve_log_field(field: &str) -> String {
     match field {
         "time" | "timestamp" | "Timestamp" => "Timestamp".to_string(),
         "service_name" | "ServiceName" => "ServiceName".to_string(),
-        "severity" | "severity_text" | "SeverityText" => "SeverityText".to_string(),
+        // `level` is the cross-signal name the Explore search bar and the
+        // natural-language parser emit; for logs it means the severity column.
+        "level" | "severity" | "severity_text" | "SeverityText" => "SeverityText".to_string(),
         "severity_number" | "SeverityNumber" => "SeverityNumber".to_string(),
         "body" | "Body" => "Body".to_string(),
         "trace_id" | "TraceId" => "TraceId".to_string(),
@@ -90,6 +92,10 @@ pub(crate) fn build_log_where(
 
     for filter in filters {
         let field = resolve_log_field(&filter.field);
+        if let Some(condition) = crate::query_builder::log_severity_condition(&field, filter) {
+            conditions.push(condition);
+            continue;
+        }
         let condition = match &filter.op {
             FilterOp::Eq => format!("{field} = {}", format_value(&filter.value)),
             FilterOp::Ne => format!("{field} != {}", format_value(&filter.value)),
@@ -1354,6 +1360,105 @@ mod tests {
         assert_eq!(current, legacy);
         assert!(current.contains("mat_environment"));
         assert!(current.contains("deployment.environment.name"));
+    }
+
+    fn filter(field: &str, op: FilterOp, value: serde_json::Value) -> Filter {
+        Filter {
+            field: field.to_string(),
+            op,
+            value,
+        }
+    }
+
+    #[test]
+    fn level_and_severity_aliases_resolve_to_severity_text() {
+        for alias in ["level", "severity", "severity_text", "SeverityText"] {
+            assert_eq!(resolve_log_field(alias), "SeverityText", "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn level_filter_compares_severity_case_insensitively() {
+        let clauses = build_log_where(
+            &[
+                filter(
+                    "service_name",
+                    FilterOp::Eq,
+                    serde_json::json!("notifications"),
+                ),
+                filter("level", FilterOp::Eq, serde_json::json!("error")),
+            ],
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00Z",
+            None,
+            "default",
+        );
+        assert!(
+            clauses
+                .where_clause
+                .contains("ServiceName = 'notifications'")
+        );
+        assert!(
+            clauses
+                .where_clause
+                .contains("upper(SeverityText) = 'ERROR'")
+        );
+        assert!(!clauses.where_clause.contains("LogAttributes['level']"));
+
+        let clauses = build_log_where(
+            &[
+                filter("severity", FilterOp::Ne, serde_json::json!("Debug")),
+                filter(
+                    "severity_text",
+                    FilterOp::In,
+                    serde_json::json!("error,fatal"),
+                ),
+                filter(
+                    "level",
+                    FilterOp::NotIn,
+                    serde_json::json!(["info", "Warn"]),
+                ),
+            ],
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00Z",
+            None,
+            "default",
+        );
+        assert!(
+            clauses
+                .where_clause
+                .contains("upper(SeverityText) != 'DEBUG'")
+        );
+        assert!(
+            clauses
+                .where_clause
+                .contains("upper(SeverityText) IN ('ERROR', 'FATAL')")
+        );
+        assert!(
+            clauses
+                .where_clause
+                .contains("upper(SeverityText) NOT IN ('INFO', 'WARN')")
+        );
+    }
+
+    #[test]
+    fn severity_case_folding_does_not_touch_other_columns_or_ops() {
+        let clauses = build_log_where(
+            &[
+                filter("log.level", FilterOp::Eq, serde_json::json!("error")),
+                filter("level", FilterOp::Like, serde_json::json!("%ERR%")),
+            ],
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00Z",
+            None,
+            "default",
+        );
+        assert!(
+            clauses
+                .where_clause
+                .contains("LogAttributes['level'] = 'error'")
+        );
+        assert!(clauses.where_clause.contains("SeverityText LIKE '%ERR%'"));
     }
 
     #[test]

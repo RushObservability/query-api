@@ -14,6 +14,10 @@ use crate::llm_gateway::{LlmCaller, LlmOperation, MAX_NATURAL_LANGUAGE_QUERY_BYT
 #[derive(Debug, Deserialize)]
 pub struct ParseQueryRequest {
     pub query: String,
+    /// Explore view the filters are for: `"logs"` or `"spans"` (APM). Optional
+    /// so older clients keep the previous, mode-agnostic behavior.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -90,13 +94,20 @@ Output: {"filters":[],"search":"database connection timeout","confidence":0.6}
 Input: "show me warnings from the api-gateway on pod web-1"
 Output: {"filters":[{"field":"service_name","op":"=","value":"api-gateway"},{"field":"level","op":"=","value":"warn"},{"field":"host","op":"=","value":"web-1"}],"search":"","confidence":0.9}"#;
 
+    let spans_mode = req.mode.as_deref() == Some("spans");
+    let system_prompt = if spans_mode {
+        format!("{system_prompt}\n\n{SPANS_MODE_PROMPT}")
+    } else {
+        system_prompt.to_string()
+    };
+
     let content = state
         .llm_gateway
         .chat(
             LlmOperation::ParseQuery,
             &LlmCaller::new(caller.0, tenant.tenant_id),
             "gpt-4o-mini",
-            system_prompt,
+            &system_prompt,
             &req.query,
             400,
             Some(0.1),
@@ -118,5 +129,175 @@ Output: {"filters":[{"field":"service_name","op":"=","value":"api-gateway"},{"fi
             confidence: 0.0,
         });
 
+    let parsed = if spans_mode {
+        normalize_for_spans(parsed)
+    } else {
+        parsed
+    };
+
     Ok(Json(parsed))
+}
+
+const SPANS_MODE_PROMPT: &str = r#"The user is searching APM spans, not logs. Spans have no log level:
+- Never emit a "level" filter.
+- "errors", "failures", "5xx" or "server errors" → {"field":"http_status_code","op":">=","value":500}
+- "4xx" or "client errors" → {"field":"http_status_code","op":">=","value":400}
+- Use "http_status_code" (not "status_code") for HTTP status codes.
+- Do not leave words such as "server" or "client" from those phrases in "search"."#;
+
+/// Words that only qualify an error phrase ("server errors", "client errors").
+/// When one is all that is left of the search after the phrase became a
+/// status-code filter, it carries no meaning and as free text would match
+/// almost nothing.
+const STRAY_ERROR_QUALIFIERS: &[&str] = &["server", "client"];
+
+/// Rewrite LLM output into filters that exist on spans, in case the model
+/// ignored the spans-mode instructions: `level=error` becomes
+/// `http_status_code>=500`, other `level` filters are dropped, `status_code`
+/// is renamed to the span column `http_status_code`, and a free-text part made
+/// only of stray error-phrase qualifiers is dropped.
+fn normalize_for_spans(resp: ParseQueryResponse) -> ParseQueryResponse {
+    let server_errors = || ParsedFilter {
+        field: "http_status_code".to_string(),
+        op: ">=".to_string(),
+        value: serde_json::json!(500),
+    };
+    let mut filters: Vec<ParsedFilter> = Vec::with_capacity(resp.filters.len());
+    for f in resp.filters {
+        let mapped = match f.field.as_str() {
+            "level" | "severity" => {
+                let is_error = f.op == "="
+                    && f.value
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case("error"));
+                if !is_error {
+                    continue;
+                }
+                server_errors()
+            }
+            "status_code" => ParsedFilter {
+                field: "http_status_code".to_string(),
+                ..f
+            },
+            _ => f,
+        };
+        let duplicate = filters
+            .iter()
+            .any(|e| e.field == mapped.field && e.op == mapped.op && e.value == mapped.value);
+        if !duplicate {
+            filters.push(mapped);
+        }
+    }
+    let has_status = filters.iter().any(|f| f.field == "http_status_code");
+    let only_qualifiers = resp
+        .search
+        .split_whitespace()
+        .all(|w| STRAY_ERROR_QUALIFIERS.contains(&w.to_ascii_lowercase().as_str()));
+    let search = if has_status && only_qualifiers {
+        String::new()
+    } else {
+        resp.search
+    };
+    ParseQueryResponse {
+        filters,
+        search,
+        confidence: resp.confidence,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filter(field: &str, op: &str, value: serde_json::Value) -> ParsedFilter {
+        ParsedFilter {
+            field: field.to_string(),
+            op: op.to_string(),
+            value,
+        }
+    }
+
+    fn fields(resp: &ParseQueryResponse) -> Vec<(String, String, serde_json::Value)> {
+        resp.filters
+            .iter()
+            .map(|f| (f.field.clone(), f.op.clone(), f.value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn spans_mode_turns_error_level_into_server_error_status() {
+        let resp = normalize_for_spans(ParseQueryResponse {
+            filters: vec![
+                filter("service_name", "=", serde_json::json!("gateway")),
+                filter("level", "=", serde_json::json!("error")),
+            ],
+            search: "server".to_string(),
+            confidence: 0.9,
+        });
+        assert_eq!(
+            fields(&resp),
+            vec![
+                (
+                    "service_name".into(),
+                    "=".into(),
+                    serde_json::json!("gateway")
+                ),
+                (
+                    "http_status_code".into(),
+                    ">=".into(),
+                    serde_json::json!(500)
+                ),
+            ]
+        );
+        assert_eq!(resp.search, "");
+    }
+
+    #[test]
+    fn spans_mode_dedupes_and_renames_status_code() {
+        let resp = normalize_for_spans(ParseQueryResponse {
+            filters: vec![
+                filter("level", "=", serde_json::json!("ERROR")),
+                filter("status_code", ">=", serde_json::json!(500)),
+                filter("level", "=", serde_json::json!("warn")),
+            ],
+            search: "Server".to_string(),
+            confidence: 0.9,
+        });
+        assert_eq!(
+            fields(&resp),
+            vec![(
+                "http_status_code".into(),
+                ">=".into(),
+                serde_json::json!(500)
+            )]
+        );
+        assert_eq!(resp.search, "");
+    }
+
+    #[test]
+    fn spans_mode_keeps_meaningful_search_words() {
+        let resp = normalize_for_spans(ParseQueryResponse {
+            filters: vec![],
+            search: "server".to_string(),
+            confidence: 0.6,
+        });
+        assert!(resp.filters.is_empty());
+        assert_eq!(resp.search, "server");
+
+        let resp = normalize_for_spans(ParseQueryResponse {
+            filters: vec![filter("level", "=", serde_json::json!("error"))],
+            search: "server restart".to_string(),
+            confidence: 0.8,
+        });
+        assert_eq!(resp.search, "server restart");
+    }
+
+    #[test]
+    fn mode_is_optional_in_request() {
+        let req: ParseQueryRequest = serde_json::from_str(r#"{"query":"errors"}"#).unwrap();
+        assert!(req.mode.is_none());
+        let req: ParseQueryRequest =
+            serde_json::from_str(r#"{"query":"errors","mode":"spans"}"#).unwrap();
+        assert_eq!(req.mode.as_deref(), Some("spans"));
+    }
 }
