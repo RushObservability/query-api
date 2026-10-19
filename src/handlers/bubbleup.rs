@@ -19,6 +19,10 @@ pub struct BubbleUpRequest {
     /// Optional filters to apply to both windows (same as explore filters).
     #[serde(default)]
     pub filters: Vec<Filter>,
+    /// Optional free-text search (same syntax as the explore search box),
+    /// applied to both windows so the cohorts match the explore result set.
+    #[serde(default)]
+    pub search: Option<String>,
     /// Max number of values to return per dimension (default 10).
     pub top_k: Option<u32>,
     /// Optional span-duration bounds defining the selected cohort. These make
@@ -177,6 +181,19 @@ fn build_filter_conditions(filters: &[Filter], signal: &str) -> String {
     parts.join(" ")
 }
 
+/// Build the free-text search condition shared by both windows, using the same
+/// span/log search compilers as the explore query so the cohorts cover exactly
+/// the spans or logs the user is looking at.
+fn build_search_condition(search: Option<&str>, signal: &str) -> Option<String> {
+    let term = search.map(str::trim).filter(|t| !t.is_empty())?;
+    let sql = if signal == "logs" {
+        crate::query_builder::build_log_search_sql(term)
+    } else {
+        crate::query_builder::build_span_search_sql(term)
+    }?;
+    Some(format!("AND ({sql})"))
+}
+
 /// Resolve a log filter field to its ClickHouse column (mirrors logs handler).
 fn resolve_log_filter_field(field: &str) -> String {
     match field {
@@ -266,6 +283,52 @@ fn comparison_conditions(
     Ok((selection, baseline))
 }
 
+/// Build the FROM-scope clause shared by the selection (cohort A) and baseline
+/// (cohort B): tenant + spanning time range + the explore filters and free-text
+/// search. Both cohorts are `countIf`s over this one scan, so anything that
+/// narrows the explore result set must be applied here.
+fn build_scan_clause(
+    req: &BubbleUpRequest,
+    escaped_tenant: &str,
+    ts_col: &str,
+    earliest: &str,
+    latest: &str,
+) -> String {
+    let mut additional_filters = build_filter_conditions(&req.filters, &req.signal);
+    let search_condition = build_search_condition(req.search.as_deref(), &req.signal);
+    if let Some(cond) = &search_condition {
+        if !additional_filters.is_empty() {
+            additional_filters.push(' ');
+        }
+        additional_filters.push_str(cond);
+    }
+
+    // A user `Body LIKE` filter (logs signal) or a free-text search is backed by a
+    // text/skip index, which an explicit PREWHERE on tenant/time would defeat (CH reads
+    // the whole index instead of pruning granules). When such a predicate is present,
+    // fold the scope into a single WHERE and let `optimize_move_to_prewhere` re-derive
+    // the prewhere. Pure-PK filters keep the explicit PREWHERE (the efficient path).
+    let uses_index_predicate = search_condition.is_some()
+        || req
+            .filters
+            .iter()
+            .any(|f| matches!(f.op, FilterOp::Like | FilterOp::NotLike));
+    if uses_index_predicate {
+        format!(
+            "WHERE tenant_id = '{escaped_tenant}' \
+               AND {ts_col} >= parseDateTime64BestEffort('{earliest}') \
+               AND {ts_col} <= parseDateTime64BestEffort('{latest}') {additional_filters}"
+        )
+    } else {
+        format!(
+            "PREWHERE tenant_id = '{escaped_tenant}' \
+               AND {ts_col} >= parseDateTime64BestEffort('{earliest}') \
+               AND {ts_col} <= parseDateTime64BestEffort('{latest}') \
+             WHERE TRUE {additional_filters}"
+        )
+    }
+}
+
 // ── Handler ──
 
 /// BubbleUp comparison analysis: compare the distribution of every dimension
@@ -300,34 +363,10 @@ pub async fn bubbleup(
     };
     let latest = if sel_to > base_to { &sel_to } else { &base_to };
 
-    let additional_filters = build_filter_conditions(&req.filters, &req.signal);
-
     let (selection_condition, baseline_condition) =
         comparison_conditions(&req, ts_col, &sel_from, &sel_to, &base_from, &base_to)?;
 
-    // A user `Body LIKE` filter (logs signal) is backed by the `idx_body_text` text
-    // index, which an explicit PREWHERE on tenant/time would defeat (CH reads the whole
-    // index instead of pruning granules). When such a filter is present, fold the scope
-    // into a single WHERE and let `optimize_move_to_prewhere` re-derive the prewhere.
-    // Pure-PK filters keep the explicit PREWHERE (the efficient granule-skipping path).
-    let has_like = req
-        .filters
-        .iter()
-        .any(|f| matches!(f.op, FilterOp::Like | FilterOp::NotLike));
-    let scan_clause = if has_like {
-        format!(
-            "WHERE tenant_id = '{escaped_tenant}' \
-               AND {ts_col} >= parseDateTime64BestEffort('{earliest}') \
-               AND {ts_col} <= parseDateTime64BestEffort('{latest}') {additional_filters}"
-        )
-    } else {
-        format!(
-            "PREWHERE tenant_id = '{escaped_tenant}' \
-               AND {ts_col} >= parseDateTime64BestEffort('{earliest}') \
-               AND {ts_col} <= parseDateTime64BestEffort('{latest}') \
-             WHERE TRUE {additional_filters}"
-        )
-    };
+    let scan_clause = build_scan_clause(&req, &escaped_tenant, ts_col, earliest, latest);
 
     // ── Total counts query ──
     let totals_sql = format!(
@@ -506,6 +545,7 @@ mod tests {
             },
             signal: signal.into(),
             filters: vec![],
+            search: None,
             top_k: None,
             selection_min_duration_ns: None,
             selection_max_duration_ns: None,
@@ -552,6 +592,61 @@ mod tests {
         .unwrap();
         assert!(!baseline.contains("NOT"));
         assert!(baseline.contains("base-from"));
+    }
+
+    // Regression: a free-text explore search must scope BOTH cohorts. Previously
+    // `search` was not part of the request, so "Slowest 5%" vs "Everything else"
+    // ran over every span in the time range instead of the matching spans.
+    #[test]
+    fn span_search_scopes_shared_scan_for_both_cohorts() {
+        let mut req: BubbleUpRequest = serde_json::from_value(serde_json::json!({
+            "selection": { "from": "2026-01-01T00:00:00Z", "to": "2026-01-01T01:00:00Z" },
+            "baseline": { "from": "2026-01-01T00:00:00Z", "to": "2026-01-01T01:00:00Z" },
+            "signal": "spans",
+            "filters": [{ "field": "service_name", "op": "=", "value": "payments" }],
+            "search": "charge",
+            "selection_min_duration_ns": 50_000_000u64,
+            "exclude_selection_from_baseline": true,
+        }))
+        .unwrap();
+        assert_eq!(req.search.as_deref(), Some("charge"));
+
+        let scan = build_scan_clause(&req, "default", "timestamp", "a", "b");
+        let search_sql = crate::query_builder::build_span_search_sql("charge").unwrap();
+        assert!(scan.contains(&format!("AND ({search_sql})")), "{scan}");
+        assert!(scan.contains("service_name = 'payments'"), "{scan}");
+        // Text-index predicate: scope must be folded into WHERE, not PREWHERE.
+        assert!(scan.starts_with("WHERE tenant_id = 'default'"), "{scan}");
+        assert!(!scan.contains("PREWHERE"), "{scan}");
+
+        // Blank search leaves the scan unchanged (and keeps the PREWHERE path).
+        req.search = Some("   ".into());
+        let scan = build_scan_clause(&req, "default", "timestamp", "a", "b");
+        assert!(scan.starts_with("PREWHERE"), "{scan}");
+        assert!(!scan.contains(&search_sql), "{scan}");
+    }
+
+    #[test]
+    fn log_search_uses_log_search_compiler() {
+        let mut req = request("logs");
+        req.search = Some("timeout".into());
+        let scan = build_scan_clause(&req, "default", "Timestamp", "a", "b");
+        let log_sql = crate::query_builder::build_log_search_sql("timeout").unwrap();
+        assert!(scan.contains(&format!("AND ({log_sql})")), "{scan}");
+        assert!(!scan.contains("PREWHERE"), "{scan}");
+    }
+
+    #[test]
+    fn search_is_optional_in_request_body() {
+        let req: BubbleUpRequest = serde_json::from_value(serde_json::json!({
+            "selection": { "from": "a", "to": "b" },
+            "baseline": { "from": "a", "to": "b" },
+            "signal": "spans",
+        }))
+        .unwrap();
+        assert!(req.search.is_none());
+        let scan = build_scan_clause(&req, "default", "timestamp", "a", "b");
+        assert!(scan.starts_with("PREWHERE"), "{scan}");
     }
 
     #[test]
