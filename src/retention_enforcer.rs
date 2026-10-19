@@ -295,8 +295,8 @@ async fn enforce_tenant_retention(
             continue;
         }
 
-        // Escape single quotes in tenant_id to prevent SQL injection
-        let safe_tenant_id = tenant_id.replace('\'', "''");
+        // Escape tenant_id for a quoted SQL literal (quotes, backslashes, and `?`).
+        let safe_tenant_id = crate::query_builder::escape_string_literal(tenant_id);
 
         match signal.as_str() {
             "metrics" => {

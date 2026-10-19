@@ -724,9 +724,10 @@ fn parse_group_by(group_by: &serde_json::Value) -> Result<Vec<String>, (StatusCo
 
 // ── Autocomplete ──
 
-/// Escape a string value for safe use in a ClickHouse SQL LIKE pattern / literal.
+/// Escape a string value for safe use in a ClickHouse SQL LIKE pattern / literal
+/// (delegates to the shared escaper, which also encodes `?`).
 fn escape_ch(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    crate::query_builder::escape_string_literal(s)
 }
 
 #[derive(clickhouse::Row, serde::Deserialize)]

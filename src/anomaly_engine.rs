@@ -428,7 +428,7 @@ async fn fetch_apm_data(
          WHERE tenant_id = '{}' AND service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp <= parseDateTimeBestEffort('{}') \
          GROUP BY bucket ORDER BY bucket",
         escaped_tenant,
-        rule.service_name.replace('\'', "''"),
+        crate::query_builder::escape_string_literal(&rule.service_name),
         from,
         now_str,
     );

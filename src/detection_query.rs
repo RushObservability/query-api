@@ -261,7 +261,7 @@ fn placeholder_at(rest: &str, placeholder: &str) -> bool {
 }
 
 fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", crate::query_builder::escape_string_literal(value))
 }
 
 fn validate_query(query: &Query) -> Result<(), DetectionQueryError> {
@@ -577,6 +577,11 @@ fn inject_tenant_predicate(query: &mut Query, tenant_id: &str) -> Result<(), Det
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_string_literal_escapes_quotes_backslashes_and_question_marks() {
+        assert_eq!(sql_string_literal("a'b\\c?"), "'a''b\\\\c\\x3F'");
+    }
 
     fn compile(sql: &str) -> Result<CompiledDetectionQuery, DetectionQueryError> {
         compile_count_query(

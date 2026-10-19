@@ -1086,9 +1086,11 @@ fn eval_boolean_formula(formula: &str, states: &HashMap<char, bool>) -> bool {
 
 // ── ClickHouse query builders ──
 
-/// Escape a string value for safe use in a ClickHouse SQL literal.
+/// Escape a string value for safe use in a ClickHouse SQL literal (delegates to the
+/// shared escaper, which also encodes `?` so the clickhouse crate can't mistake it
+/// for a bind placeholder).
 fn escape_ch(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    crate::query_builder::escape_string_literal(s)
 }
 
 pub(crate) fn apm_match_condition(column: &str, value: &str) -> Option<String> {

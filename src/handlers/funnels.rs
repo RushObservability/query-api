@@ -72,11 +72,13 @@ fn step_clauses(step: &FunnelStep, from: &str, to: &str, tenant_id: &str) -> Que
     );
     let mut conditions = Vec::new();
     if let Some(svc) = &step.service_name {
-        let safe = svc.replace('\'', "''");
+        let safe = crate::query_builder::escape_string_literal(svc);
         conditions.push(format!("service_name = '{safe}'"));
     }
     if let Some(prefix) = &step.http_path_prefix {
-        let safe = prefix.replace('\'', "''").replace('%', "\\%");
+        let safe = crate::query_builder::escape_string_literal(prefix)
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         conditions.push(format!("http_path LIKE '{safe}%'"));
     }
     if let Some(min) = step.min_status_code {
@@ -256,4 +258,32 @@ pub async fn run_funnel(
         funnel_id: id,
         steps: result_steps,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_clauses_escape_quotes_question_marks_and_like_wildcards() {
+        let step = FunnelStep {
+            label: "checkout".into(),
+            service_name: Some("svc'?".into()),
+            http_path_prefix: Some("/a_b%?'".into()),
+            min_status_code: None,
+            max_status_code: None,
+        };
+        let c = step_clauses(&step, "2026-01-01 00:00:00", "2026-01-01 01:00:00", "t?'");
+        let sql = format!("{} {}", c.prewhere, c.where_clause);
+        assert!(
+            !sql.contains('?'),
+            "raw ? would be a bind placeholder: {sql}"
+        );
+        assert!(c.prewhere.contains("tenant_id = 't\\x3F'''"));
+        assert!(c.where_clause.contains("service_name = 'svc''\\x3F'"));
+        assert!(
+            c.where_clause
+                .contains("http_path LIKE '/a\\_b\\%\\x3F''%'")
+        );
+    }
 }

@@ -637,7 +637,7 @@ fn labels_to_ch_map(labels: &[(&'static str, String)]) -> String {
 /// string literal. Self-metric names/labels are internal/finite, but escaping keeps the
 /// raw INSERT robust.
 fn escape_sql(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+    crate::query_builder::escape_string_literal(s)
 }
 
 async fn query_count(ch: &Client, sql: &str) -> u64 {
@@ -679,9 +679,11 @@ mod tests {
 
     #[test]
     fn sql_escape() {
-        assert_eq!(escape_sql("a'b"), "a\\'b");
+        assert_eq!(escape_sql("a'b"), "a''b");
         assert_eq!(escape_sql("a\\b"), "a\\\\b");
         assert_eq!(escape_sql("plain"), "plain");
+        // `?` would be taken as a clickhouse-crate bind placeholder.
+        assert_eq!(escape_sql("a?b"), "a\\x3Fb");
     }
 
     #[test]
