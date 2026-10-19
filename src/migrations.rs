@@ -1062,7 +1062,7 @@ pub async fn run(
 
     // Audit log table. Built separately from the static MIGRATIONS list because
     // its TTL is env-driven (RUSH_AUDIT_RETENTION_DAYS) and must be format!ed in.
-    if let Err(e) = create_audit_table(&client).await {
+    if let Err(e) = create_audit_table(&client.clone().with_database("observability")).await {
         tracing::error!("audit_events migration failed: {e}");
         return Err(e);
     }
@@ -1086,20 +1086,22 @@ pub async fn run(
 ///
 /// `observability.audit_events` is an **immutable** `MergeTree` (NOT
 /// ReplacingMergeTree) — rows are never updated or merged-away by key, so the
-/// hash chain stays intact. It is ORDER BY `seq` (the monotonic chain index)
-/// and partitioned monthly. Retention is its OWN long TTL (default 730 days,
+/// hash chains stay intact. The existing `seq` sort key is preserved; writer
+/// identity is checked with `chain_id`. The table is partitioned monthly.
+/// Retention is its own long TTL (default 730 days,
 /// overridable via `RUSH_AUDIT_RETENTION_DAYS`) and is deliberately exempt from
 /// the per-tenant retention enforcer (see `retention_enforcer.rs`).
-async fn create_audit_table(client: &Client) -> anyhow::Result<()> {
+pub(crate) async fn create_audit_table(client: &Client) -> anyhow::Result<()> {
     let retention_days: u64 = std::env::var("RUSH_AUDIT_RETENTION_DAYS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(730);
 
     let ddl = format!(
-        "CREATE TABLE IF NOT EXISTS observability.audit_events (
+        "CREATE TABLE IF NOT EXISTS audit_events (
   id String,
   seq UInt64,
+  chain_id String DEFAULT '',
   timestamp DateTime64(9),
   tenant_id String DEFAULT '_audit',
   actor_id String, actor_name String, actor_type String,
@@ -1125,14 +1127,32 @@ SETTINGS index_granularity = 8192"
     // Additive migration for QAPI-SEC-11. Empty identifiers preserve the
     // canonical format and verification behavior of pre-rotation rows.
     client
-        .query("ALTER TABLE observability.audit_events ADD COLUMN IF NOT EXISTS key_id String DEFAULT '' AFTER metadata")
+        .query("ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS key_id String DEFAULT '' AFTER metadata")
         .execute()
         .await?;
     client
-        .query("ALTER TABLE observability.audit_events ADD COLUMN IF NOT EXISTS segment_id String DEFAULT '' AFTER key_id")
+        .query("ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS segment_id String DEFAULT '' AFTER key_id")
         .execute()
         .await?;
     Ok(())
+}
+
+/// Upgrade an existing audit table when its writer starts. The caller records
+/// the schema change as soon as the upgraded audit logger is available.
+pub(crate) async fn upgrade_audit_writer_chains(client: &Client) -> anyhow::Result<bool> {
+    let present = client
+        .query("SELECT count() FROM system.columns WHERE database = currentDatabase() AND table = 'audit_events' AND name = 'chain_id'")
+        .fetch_one::<u64>()
+        .await?;
+    if present != 0 {
+        return Ok(false);
+    }
+    // Empty chain_id preserves the old global chain and its signed bytes.
+    client
+        .query("ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS chain_id String DEFAULT '' AFTER seq")
+        .execute()
+        .await?;
+    Ok(true)
 }
 
 /// Number of distinct (table, source, interval) rollup backfills.

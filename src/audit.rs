@@ -1,7 +1,8 @@
 //! Tamper-evident audit log.
 //!
 //! Audit events are written to the append-only `observability.audit_events`
-//! table as a hash-chained sequence: each row carries a monotonic `seq`, the
+//! table as hash-chained sequences: each process owns a unique `chain_id`.
+//! Within that chain each row carries a monotonic `seq`, the
 //! `prev_hash` of the row before it, and its own `hash`, where
 //! `hash = HMAC_SHA256(secret, canonical(seq, prev_hash, fields))`.
 //!
@@ -10,8 +11,9 @@
 //! `hash` from that point forward — making tampering detectable by
 //! [`AuditLogger`]-side verification (see `verify` in `handlers::audit`).
 //!
-//! Writes are **serialized** through a single async mutex so `seq` and the
-//! chain link are assigned atomically. Before delivery, every row is fsynced to
+//! Writes within a process are serialized through an async mutex. An advisory
+//! file lock also coordinates processes sharing an outbox directory. Before
+//! delivery, every row is fsynced to
 //! a local ordered outbox. ClickHouse outages therefore retain events for later
 //! replay while readiness and metrics expose the degraded state.
 
@@ -42,6 +44,7 @@ pub const AUDIT_TENANT: &str = "_audit";
 
 /// In-memory tail of the hash chain, guarded by a mutex so each `log` call
 /// reads + advances it atomically.
+#[derive(Default)]
 struct ChainState {
     last_seq: u64,
     last_hash: String,
@@ -53,6 +56,9 @@ struct ChainState {
 /// via `Arc` (it lives on `AppState`).
 pub struct AuditLogger {
     ch: Client,
+    /// Unique per process lifetime. Restarts replay old chains before writing
+    /// a new one; no two replicas allocate sequences in the same chain.
+    chain_id: String,
     current_key_id: String,
     keys: HashMap<String, Vec<u8>>,
     spool_dir: PathBuf,
@@ -173,6 +179,9 @@ impl AuditEvent {
 pub struct AuditRow {
     pub id: String,
     pub seq: u64,
+    /// Empty for the historical global chain. Default also reads old outboxes.
+    #[serde(default)]
+    pub chain_id: String,
     /// Nanosecond unix timestamp (DateTime64(9) is encoded as i64 ns by the driver).
     pub timestamp: i64,
     pub tenant_id: String,
@@ -257,6 +266,11 @@ fn canonical(row: &AuditRow) -> String {
     if !row.key_id.is_empty() || !row.segment_id.is_empty() {
         out.push_str(&format!("\nkey_id={}", esc(&row.key_id)));
         out.push_str(&format!("\nsegment_id={}", esc(&row.segment_id)));
+    }
+    // Keep legacy hashes byte-for-byte stable. New rows bind their writer's
+    // identity so they cannot be moved between chains without detection.
+    if !row.chain_id.is_empty() {
+        out.push_str(&format!("\nchain_id={}", esc(&row.chain_id)));
     }
     out
 }
@@ -429,10 +443,37 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Each call opens a separate descriptor, so flock also excludes other logger
+/// instances in this process. Closing the descriptor releases it on error or
+/// cancellation. Never unlink the lock file, which would create a second lock.
+async fn lock_spool_directory(path: &Path) -> anyhow::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path.join(".lock"))?;
+        loop {
+            // SAFETY: file owns a live descriptor for the duration of the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(file);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(error.into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("audit outbox locking requires a Unix platform")
+}
+
 impl AuditLogger {
-    /// Build the logger and recover its ordered durable outbox. A real empty
-    /// table is a fresh chain; every other tail-read error fails startup so the
-    /// process can never silently create a second sequence-zero chain.
+    /// Validate existing signing keys and recover the durable outbox before
+    /// starting this process's independent chain. Recovery errors fail startup;
+    /// an unreadable previous tail is never treated as an empty chain.
     pub async fn new(ch: Client, metrics: Arc<SelfMetrics>) -> anyhow::Result<Self> {
         let (current_key_id, keys) = load_key_config()?;
         let spool_dir = PathBuf::from(
@@ -448,9 +489,28 @@ impl AuditLogger {
         if spool_max_bytes < 1024 * 1024 {
             anyhow::bail!("RUSH_AUDIT_SPOOL_MAX_BYTES must be at least 1048576");
         }
-        create_private_directory(&spool_dir)?;
+        Self::open(
+            ch,
+            metrics,
+            current_key_id,
+            keys,
+            spool_dir,
+            spool_max_bytes,
+        )
+        .await
+    }
 
-        let tail = Self::load_chain_tail(&ch).await?;
+    async fn open(
+        ch: Client,
+        metrics: Arc<SelfMetrics>,
+        current_key_id: String,
+        keys: HashMap<String, Vec<u8>>,
+        spool_dir: PathBuf,
+        spool_max_bytes: u64,
+    ) -> anyhow::Result<Self> {
+        create_private_directory(&spool_dir)?;
+        let _spool_lock = lock_spool_directory(&spool_dir).await?;
+        let migrated = crate::migrations::upgrade_audit_writer_chains(&ch).await?;
         let required_key_ids = Self::load_required_key_ids(&ch).await?;
         for key_id in &required_key_ids {
             if key_for_id(&keys, &current_key_id, key_id).is_none() {
@@ -465,6 +525,7 @@ impl AuditLogger {
         let (pending_events, pending_bytes) = spool_usage(&spool_dir)?;
         let logger = AuditLogger {
             ch,
+            chain_id: uuid::Uuid::new_v4().to_string(),
             current_key_id,
             keys,
             spool_dir,
@@ -474,17 +535,34 @@ impl AuditLogger {
             pending_bytes: AtomicU64::new(pending_bytes),
             write_failures: AtomicU64::new(0),
             metrics,
-            state: Mutex::new(tail),
+            state: Mutex::new(ChainState::default()),
         };
         logger.publish_metrics();
         logger.recover_spool().await?;
-        if let Err(error) = logger.retry_pending().await {
+        if let Err(error) = logger.flush_spool_locked().await {
             tracing::error!(%error, "audit outbox replay deferred; readiness is degraded");
+        }
+        drop(_spool_lock);
+        if migrated {
+            logger
+                .log(
+                    AuditEvent::new("schema.migrate", "system")
+                        .resource("table", "audit_events")
+                        .changes(
+                            serde_json::json!({
+                                "migration": "audit_writer_chains",
+                                "added_column": "chain_id",
+                                "legacy_default": ""
+                            })
+                            .to_string(),
+                        ),
+                )
+                .await;
         }
         Ok(logger)
     }
 
-    async fn load_chain_tail(ch: &Client) -> anyhow::Result<ChainState> {
+    async fn load_chain_tail(ch: &Client, chain_id: &str) -> anyhow::Result<ChainState> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Tail {
             seq: u64,
@@ -494,8 +572,9 @@ impl AuditLogger {
         }
         match ch
             .query(
-                "SELECT seq, hash, key_id, segment_id FROM audit_events ORDER BY seq DESC LIMIT 1",
+                "SELECT seq, hash, key_id, segment_id FROM audit_events WHERE chain_id = ? ORDER BY seq DESC LIMIT 1",
             )
+            .bind(chain_id)
             .fetch_one::<Tail>()
             .await
         {
@@ -539,7 +618,7 @@ impl AuditLogger {
         current_key_id: &str,
         required_key_ids: &[String],
     ) -> anyhow::Result<()> {
-        const SELECT_ROW: &str = "SELECT id, seq, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events WHERE key_id = ?) ORDER BY seq DESC LIMIT 1";
+        const SELECT_ROW: &str = "SELECT id, seq, chain_id, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events WHERE key_id = ?) ORDER BY seq DESC LIMIT 1";
         for key_id in required_key_ids {
             let row = ch
                 .query(SELECT_ROW)
@@ -563,18 +642,25 @@ impl AuditLogger {
 
     async fn recover_spool(&self) -> anyhow::Result<()> {
         let files = pending_files(&self.spool_dir)?;
-        let mut state = self.state.lock().await;
-        let mut previous_pending = false;
+        let mut tails = HashMap::<String, ChainState>::new();
         for path in files {
             let (row, bytes) = read_spool_row(&path)?;
-            if row.seq <= state.last_seq && !previous_pending {
+            if !tails.contains_key(&row.chain_id) {
+                tails.insert(
+                    row.chain_id.clone(),
+                    Self::load_chain_tail(&self.ch, &row.chain_id).await?,
+                );
+            }
+            let state = tails.get_mut(&row.chain_id).expect("chain tail loaded");
+            if row.seq <= state.last_seq {
                 #[derive(clickhouse::Row, serde::Deserialize)]
                 struct Existing {
                     hash: String,
                 }
                 let existing = self
                     .ch
-                    .query("SELECT hash FROM audit_events WHERE seq = ? LIMIT 1")
+                    .query("SELECT hash FROM audit_events WHERE chain_id = ? AND seq = ? LIMIT 1")
+                    .bind(&row.chain_id)
                     .bind(row.seq)
                     .fetch_optional::<Existing>()
                     .await?;
@@ -589,7 +675,6 @@ impl AuditLogger {
                     ),
                 }
             }
-            previous_pending = true;
             if row.seq != state.last_seq + 1 || row.prev_hash != state.last_hash {
                 anyhow::bail!("audit outbox ordering/link failure at sequence {}", row.seq);
             }
@@ -614,6 +699,14 @@ impl AuditLogger {
     /// their operation because the audit write failed.
     pub async fn log(&self, ev: AuditEvent) {
         let mut state = self.state.lock().await;
+        let _spool_lock = match lock_spool_directory(&self.spool_dir).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.mark_failure();
+                tracing::error!(%error, "audit outbox lock failed");
+                return;
+            }
+        };
         let seq = state.last_seq + 1;
         let prev_hash = state.last_hash.clone();
         if state.segment_id.is_empty() || state.key_id != self.current_key_id {
@@ -625,6 +718,7 @@ impl AuditLogger {
         let mut row = AuditRow {
             id: uuid::Uuid::new_v4().to_string(),
             seq,
+            chain_id: self.chain_id.clone(),
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             tenant_id: ev.tenant_id,
             actor_id: ev.actor_id,
@@ -669,10 +763,9 @@ impl AuditLogger {
 
     fn persist_spool_row(&self, row: &AuditRow) -> anyhow::Result<()> {
         let payload = serde_json::to_vec(row)?;
-        let projected = self
-            .pending_bytes
-            .load(Ordering::Relaxed)
-            .saturating_add(payload.len() as u64);
+        // A different process may have delivered files in a shared directory.
+        let (pending_events, pending_bytes) = spool_usage(&self.spool_dir)?;
+        let projected = pending_bytes.saturating_add(payload.len() as u64);
         if projected > self.spool_max_bytes {
             anyhow::bail!(
                 "audit outbox capacity exhausted ({projected} > {})",
@@ -694,9 +787,9 @@ impl AuditLogger {
         file.sync_all()?;
         fs::rename(&temp_path, &final_path)?;
         sync_directory(&self.spool_dir)?;
-        self.pending_events.fetch_add(1, Ordering::Relaxed);
-        self.pending_bytes
-            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        self.pending_events
+            .store(pending_events + 1, Ordering::Relaxed);
+        self.pending_bytes.store(projected, Ordering::Relaxed);
         self.degraded.store(true, Ordering::Relaxed);
         self.publish_metrics();
         Ok(())
@@ -705,13 +798,20 @@ impl AuditLogger {
     async fn flush_spool_locked(&self) -> anyhow::Result<()> {
         for path in pending_files(&self.spool_dir)? {
             let (row, bytes) = read_spool_row(&path)?;
+            let secret = self
+                .secret_for_key(&row.key_id)
+                .ok_or_else(|| anyhow::anyhow!("missing audit key '{}'", row.key_id))?;
+            if compute_hash(secret, &row) != row.hash {
+                anyhow::bail!("audit outbox integrity failure at sequence {}", row.seq);
+            }
             #[derive(clickhouse::Row, serde::Deserialize)]
             struct Existing {
                 hash: String,
             }
             if let Some(existing) = self
                 .ch
-                .query("SELECT hash FROM audit_events WHERE seq = ? LIMIT 1")
+                .query("SELECT hash FROM audit_events WHERE chain_id = ? AND seq = ? LIMIT 1")
+                .bind(&row.chain_id)
                 .bind(row.seq)
                 .fetch_optional::<Existing>()
                 .await?
@@ -723,27 +823,39 @@ impl AuditLogger {
                 continue;
             }
 
-            let mut insert = self.ch.insert("audit_events")?;
+            // Never inherit fire-and-forget ingestion settings. end() must mean
+            // durable storage before we remove the only local copy.
+            let durable = self
+                .ch
+                .clone()
+                .with_option("async_insert", "0")
+                .with_option("wait_for_async_insert", "1");
+            let mut insert = durable.insert("audit_events")?;
             insert.write(&row).await?;
             insert.end().await?;
             self.remove_spool_file(&path, bytes)?;
         }
+        // Another process can drain a shared outbox between our attempts.
+        self.pending_events.store(0, Ordering::Relaxed);
+        self.pending_bytes.store(0, Ordering::Relaxed);
         self.degraded.store(false, Ordering::Relaxed);
         self.publish_metrics();
         Ok(())
     }
 
-    fn remove_spool_file(&self, path: &Path, bytes: u64) -> anyhow::Result<()> {
+    fn remove_spool_file(&self, path: &Path, _bytes: u64) -> anyhow::Result<()> {
         fs::remove_file(path)?;
         sync_directory(&self.spool_dir)?;
-        self.pending_events.fetch_sub(1, Ordering::Relaxed);
-        self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        let (events, bytes) = spool_usage(&self.spool_dir)?;
+        self.pending_events.store(events, Ordering::Relaxed);
+        self.pending_bytes.store(bytes, Ordering::Relaxed);
         self.publish_metrics();
         Ok(())
     }
 
     async fn retry_pending(&self) -> anyhow::Result<()> {
         let _state = self.state.lock().await;
+        let _spool_lock = lock_spool_directory(&self.spool_dir).await?;
         self.flush_spool_locked().await
     }
 
@@ -865,6 +977,7 @@ mod tests {
         AuditRow {
             id: "id-1".into(),
             seq,
+            chain_id: String::new(),
             timestamp: 1_700_000_000_000_000_000,
             tenant_id: "default".into(),
             actor_id: "u1".into(),
@@ -978,6 +1091,7 @@ mod tests {
         let mut keys = HashMap::new();
         keys.insert("primary".to_string(), secret.clone());
         let logger = AuditLogger {
+            chain_id: uuid::Uuid::new_v4().to_string(),
             ch: Client::default(),
             current_key_id: "primary".into(),
             keys,
@@ -1036,6 +1150,7 @@ mod tests {
         let mut keys = HashMap::new();
         keys.insert("primary".to_string(), secret);
         let logger = AuditLogger {
+            chain_id: uuid::Uuid::new_v4().to_string(),
             ch: Client::default().with_url("http://127.0.0.1:9"),
             current_key_id: "primary".into(),
             keys,
@@ -1076,6 +1191,7 @@ mod tests {
         let mut keys = HashMap::new();
         keys.insert("primary".to_string(), secret);
         let logger = AuditLogger {
+            chain_id: uuid::Uuid::new_v4().to_string(),
             ch: Client::default(),
             current_key_id: "primary".into(),
             keys,
@@ -1110,5 +1226,247 @@ mod tests {
         assert!(validate_current_secret("short", true).is_err());
         assert!(validate_current_secret("short", false).is_ok());
         assert!(validate_current_secret("01234567890123456789012345678901", true).is_ok());
+    }
+    const TEST_SECRET: &[u8] = b"0123456789012345678901234567890123456789";
+
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("rush-audit-regression-{}", uuid::Uuid::new_v4()));
+            create_private_directory(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_logger(ch: Client, spool_dir: PathBuf) -> AuditLogger {
+        create_private_directory(&spool_dir).unwrap();
+        AuditLogger {
+            ch,
+            chain_id: uuid::Uuid::new_v4().to_string(),
+            current_key_id: "primary".into(),
+            keys: HashMap::from([("primary".into(), TEST_SECRET.to_vec())]),
+            spool_dir,
+            spool_max_bytes: 1024 * 1024,
+            degraded: AtomicBool::new(false),
+            pending_events: AtomicU64::new(0),
+            pending_bytes: AtomicU64::new(0),
+            write_failures: AtomicU64::new(0),
+            metrics: Arc::new(SelfMetrics::new()),
+            state: Mutex::new(ChainState::default()),
+        }
+    }
+
+    async fn open_test_logger(ch: Client, path: PathBuf) -> anyhow::Result<AuditLogger> {
+        AuditLogger::open(
+            ch,
+            Arc::new(SelfMetrics::new()),
+            "primary".into(),
+            HashMap::from([("primary".into(), TEST_SECRET.to_vec())]),
+            path,
+            1024 * 1024,
+        )
+        .await
+    }
+
+    #[test]
+    fn writer_identity_is_signed_and_old_outboxes_still_deserialize() {
+        let mut row = sample_row(1, "");
+        let legacy_hash = compute_hash(TEST_SECRET, &row);
+        let mut json = serde_json::to_value(&row).unwrap();
+        json.as_object_mut().unwrap().remove("chain_id");
+        let old: AuditRow = serde_json::from_value(json).unwrap();
+        assert_eq!(compute_hash(TEST_SECRET, &old), legacy_hash);
+        row.chain_id = "writer-a".into();
+        let first = compute_hash(TEST_SECRET, &row);
+        assert_ne!(first, legacy_hash);
+        row.chain_id = "writer-b".into();
+        assert_ne!(first, compute_hash(TEST_SECRET, &row));
+    }
+
+    #[tokio::test]
+    async fn concurrent_writers_use_independent_verifiable_chains() {
+        let dir = TestDirectory::new();
+        let client = Client::default().with_url("http://127.0.0.1:9");
+        let a = test_logger(client.clone(), dir.0.join("a"));
+        let b = test_logger(client, dir.0.join("b"));
+        for _ in 0..3 {
+            tokio::join!(
+                a.log(AuditEvent::new("a.update", "system")),
+                b.log(AuditEvent::new("b.update", "system"))
+            );
+        }
+        let mut rows = Vec::new();
+        for path in [&a.spool_dir, &b.spool_dir] {
+            rows.extend(
+                pending_files(path)
+                    .unwrap()
+                    .into_iter()
+                    .map(|file| read_spool_row(&file).unwrap().0),
+            );
+        }
+        assert_ne!(a.chain_id, b.chain_id);
+        let result = crate::handlers::audit::verify_rows(&rows, |_| Some(TEST_SECRET));
+        assert_eq!(result["intact"], true);
+        assert_eq!(result["checked"], 6);
+        rows[1].actor_name = "changed".into();
+        let result = crate::handlers::audit::verify_rows(&rows, |_| Some(TEST_SECRET));
+        assert_eq!(result["intact"], false);
+        assert_eq!(result["first_broken_chain_id"], a.chain_id);
+    }
+
+    #[tokio::test]
+    async fn durable_insert_failure_keeps_outbox_until_success() {
+        use axum::{
+            Router,
+            extract::State,
+            http::{StatusCode, Uri},
+            routing::any,
+        };
+        #[derive(Default)]
+        struct Fixture {
+            queries: Mutex<Vec<String>>,
+            fail_insert: AtomicBool,
+        }
+        async fn respond(State(f): State<Arc<Fixture>>, uri: Uri) -> (StatusCode, &'static str) {
+            let query = uri.query().unwrap_or_default().to_string();
+            let is_insert = query.contains("INSERT");
+            f.queries.lock().await.push(query);
+            if is_insert && f.fail_insert.load(Ordering::Relaxed) {
+                (StatusCode::SERVICE_UNAVAILABLE, "disk unavailable")
+            } else {
+                (StatusCode::OK, "")
+            }
+        }
+        let fixture = Arc::new(Fixture::default());
+        fixture.fail_insert.store(true, Ordering::Relaxed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new()
+            .route("/", any(respond))
+            .with_state(fixture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let dir = TestDirectory::new();
+        let logger = test_logger(
+            Client::default()
+                .with_url(url)
+                .with_option("async_insert", "1")
+                .with_option("wait_for_async_insert", "0"),
+            dir.0.clone(),
+        );
+        logger.log(AuditEvent::new("settings.update", "user")).await;
+        assert_eq!(pending_files(&dir.0).unwrap().len(), 1);
+        assert!(!logger.health().ready);
+        fixture.fail_insert.store(false, Ordering::Relaxed);
+        logger.retry_pending().await.unwrap();
+        assert!(pending_files(&dir.0).unwrap().is_empty());
+        assert!(logger.health().ready);
+        let queries = fixture.queries.lock().await;
+        let inserts: Vec<_> = queries.iter().filter(|q| q.contains("INSERT")).collect();
+        assert_eq!(inserts.len(), 2);
+        for insert in inserts {
+            let params: HashMap<_, _> = url::form_urlencoded::parse(insert.as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(params.get("async_insert").map(String::as_str), Some("0"));
+            assert_eq!(
+                params.get("wait_for_async_insert").map(String::as_str),
+                Some("1")
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_outbox_lock_excludes_other_writers_and_releases_on_drop() {
+        let dir = TestDirectory::new();
+        let first = lock_spool_directory(&dir.0).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), lock_spool_directory(&dir.0))
+                .await
+                .is_err()
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), lock_spool_directory(&dir.0))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ClickHouse at RUSH_TEST_CLICKHOUSE_URL"]
+    async fn audit_migration_concurrency_and_restart_recovery() -> anyhow::Result<()> {
+        let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
+        let admin = Client::default().with_url(&url);
+        let database = format!("audit_test_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let ch = admin
+            .clone()
+            .with_database(&database)
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0");
+        let result: anyhow::Result<()> = async {
+            crate::migrations::create_audit_table(&ch).await?;
+            let mut legacy = sample_row(1, "");
+            legacy.timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+            legacy.hash = compute_hash(TEST_SECRET, &legacy);
+            let durable = ch.clone().with_option("async_insert", "0");
+            let mut insert = durable.insert("audit_events")?;
+            insert.write(&legacy).await?;
+            insert.end().await?;
+            ch.query("ALTER TABLE audit_events DROP COLUMN chain_id").execute().await?;
+            // Migration upgrades an existing table without rewriting its hashes.
+            crate::migrations::create_audit_table(&ch).await?;
+            crate::migrations::create_audit_table(&ch).await?;
+            let root = TestDirectory::new();
+            let a = open_test_logger(ch.clone(), root.0.join("a")).await?;
+            let b = open_test_logger(ch.clone(), root.0.join("b")).await?;
+            for _ in 0..5 {
+                tokio::join!(a.log(AuditEvent::new("a.update", "user")), b.log(AuditEvent::new("b.update", "user")));
+            }
+            assert!(a.health().ready && b.health().ready);
+            // Exercise the shared-volume overlap used by rolling deployments.
+            let shared = root.0.join("shared");
+            let c = open_test_logger(ch.clone(), shared.clone()).await?;
+            let d = open_test_logger(ch.clone(), shared).await?;
+            for _ in 0..3 {
+                tokio::join!(c.log(AuditEvent::new("c.update", "user")), d.log(AuditEvent::new("d.update", "user")));
+            }
+            c.retry_pending().await?;
+            assert!(c.health().ready && d.health().ready);
+            // Replay a chain left by a process that could not reach ClickHouse.
+            let offline = test_logger(Client::default().with_url("http://127.0.0.1:9"), root.0.join("offline"));
+            offline.log(AuditEvent::new("offline.update", "user")).await;
+            offline.log(AuditEvent::new("offline.update", "user")).await;
+            let restarted = open_test_logger(ch.clone(), offline.spool_dir.clone()).await?;
+            assert_ne!(offline.chain_id, restarted.chain_id);
+            assert!(restarted.health().ready);
+            restarted.log(AuditEvent::new("restarted.update", "user")).await;
+            let rows = ch.query("SELECT id, seq, chain_id, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id, seq")
+                .fetch_all::<AuditRow>().await?;
+            assert_eq!(rows.len(), 21);
+            assert_eq!(rows.iter().filter(|row| row.action == "schema.migrate").count(), 1);
+            assert_eq!(crate::handlers::audit::verify_rows(&rows, |_| Some(TEST_SECRET))["intact"], true);
+            // Match the list endpoint's cross-chain chronological order SQL.
+            let newest = ch.query("SELECT id, seq, chain_id, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY ts DESC, id DESC LIMIT 1")
+                .fetch_one::<AuditRow>().await?;
+            assert_eq!(newest.action, "restarted.update");
+            Ok(())
+        }.await;
+        admin
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await?;
+        result
     }
 }

@@ -64,11 +64,11 @@ pub async fn list_audit(
     // name (ClickHouse 26.1 rejects `toUnixTimestamp64Nano(timestamp) AS timestamp`
     // with an AMBIGUOUS_COLUMN_NAME / block-structure-mismatch error).
     let sql = format!(
-        "SELECT id, seq, ts AS timestamp, tenant_id, \
+        "SELECT id, seq, chain_id, ts AS timestamp, tenant_id, \
          actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
          ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
          FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events {where_clause}) \
-         ORDER BY seq DESC LIMIT {limit} OFFSET {offset}"
+         ORDER BY ts DESC, id DESC LIMIT {limit} OFFSET {offset}"
     );
 
     let rows = state
@@ -152,7 +152,7 @@ fn audit_where_clause(params: &AuditQuery) -> String {
 
 /// GET /api/v1/audit/verify — recompute the full hash chain (admin only).
 ///
-/// Walks the chain in `seq ASC` order and recomputes each row's hash using the
+/// Walks each writer chain in `seq ASC` order and recomputes each row's hash using the
 /// SAME canonical function as the writer. Reports `intact`, how many rows were
 /// `checked`, and the `first_broken_seq` if any link fails to reproduce —
 /// either because a row's own hash was tampered, or because its `prev_hash`
@@ -163,10 +163,10 @@ pub async fn verify_audit(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    let sql = "SELECT id, seq, ts AS timestamp, tenant_id, \
+    let sql = "SELECT id, seq, chain_id, ts AS timestamp, tenant_id, \
          actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
          ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
-         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY seq ASC";
+         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id ASC, seq ASC";
 
     let rows = state
         .admin_ch
@@ -181,35 +181,37 @@ pub async fn verify_audit(
             )
         })?;
 
+    let result = verify_rows(&rows, |key_id| state.audit.secret_for_key(key_id));
+    Ok(Json(result))
+}
+
+/// Verify each writer independently, including the legacy chain with an empty
+/// id. Input must be ordered by sequence within each chain.
+pub(crate) fn verify_rows<'a>(
+    rows: &[AuditRow],
+    secret_for_key: impl Fn(&str) -> Option<&'a [u8]>,
+) -> serde_json::Value {
     let mut checked: u64 = 0;
-    let mut first_broken_seq: Option<u64> = None;
-    let mut expected_prev = String::new();
-
-    for row in &rows {
+    let mut broken: Option<&AuditRow> = None;
+    let mut tails = std::collections::HashMap::<&str, (u64, &str)>::new();
+    for row in rows {
         checked += 1;
-        // Link check: this row's prev_hash must equal the previous row's hash.
-        if row.prev_hash != expected_prev {
-            first_broken_seq = Some(row.seq);
+        let (seq, hash) = tails.get(row.chain_id.as_str()).copied().unwrap_or((0, ""));
+        let valid = row.seq == seq + 1
+            && row.prev_hash == hash
+            && secret_for_key(&row.key_id).is_some_and(|key| compute_hash(key, row) == row.hash);
+        if !valid {
+            broken = Some(row);
             break;
         }
-        // Integrity check: recompute this row's hash from its fields.
-        let Some(secret) = state.audit.secret_for_key(&row.key_id) else {
-            first_broken_seq = Some(row.seq);
-            break;
-        };
-        let recomputed = compute_hash(secret, row);
-        if recomputed != row.hash {
-            first_broken_seq = Some(row.seq);
-            break;
-        }
-        expected_prev = row.hash.clone();
+        tails.insert(&row.chain_id, (row.seq, &row.hash));
     }
-
-    Ok(Json(serde_json::json!({
-        "intact": first_broken_seq.is_none(),
+    serde_json::json!({
+        "intact": broken.is_none(),
         "checked": checked,
-        "first_broken_seq": first_broken_seq,
-    })))
+        "first_broken_seq": broken.map(|row| row.seq),
+        "first_broken_chain_id": broken.map(|row| &row.chain_id),
+    })
 }
 
 /// Render an `AuditRow` as JSON with the timestamp as an RFC3339 string instead
@@ -219,6 +221,7 @@ fn audit_row_json(row: &AuditRow) -> serde_json::Value {
     serde_json::json!({
         "id": row.id,
         "seq": row.seq,
+        "chain_id": row.chain_id,
         "timestamp": ts.to_rfc3339(),
         "tenant_id": row.tenant_id,
         "actor_id": row.actor_id,
