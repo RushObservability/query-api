@@ -292,10 +292,28 @@ fn selects_failures(filter: &Filter) -> bool {
 /// ([`is_outcome_field`]) are evaluated over the whole trace instead; the other
 /// filters (service, method, path, duration, search) still describe the root span.
 fn trace_outcome_filters_apply(filters: &[Filter]) -> bool {
-    let traces_only = filters.iter().any(|f| {
+    is_traces_only(filters) && filters.iter().any(selects_failures)
+}
+
+/// Whether the request is in Explore's "Traces only" mode: it carries the
+/// `parent_span_id = ''` filter, so each row is a trace's root span.
+pub fn is_traces_only(filters: &[Filter]) -> bool {
+    filters.iter().any(|f| {
         f.field == "parent_span_id" && matches!(f.op, FilterOp::Eq) && f.value.as_str() == Some("")
-    });
-    traces_only && filters.iter().any(selects_failures)
+    })
+}
+
+/// `trace_id IN (...)` over the traces that have a span matching `condition` in
+/// the tenant's `from`..`to` window. Used to describe a root span's whole trace.
+pub fn trace_contains_sql(tenant_id: &str, from: &str, to: &str, condition: &str) -> String {
+    let tenant = escape_string_literal(tenant_id);
+    let from = sanitize_datetime(from);
+    let to = sanitize_datetime(to);
+    format!(
+        "trace_id IN (SELECT trace_id FROM spans WHERE tenant_id = '{tenant}' \
+         AND timestamp >= parseDateTimeBestEffort('{from}') \
+         AND timestamp <= parseDateTimeBestEffort('{to}') AND {condition})"
+    )
 }
 
 fn build_span_clauses(

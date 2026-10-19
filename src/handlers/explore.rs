@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use crate::models::log::LogListRecord;
 use crate::models::query::{CountBucket, Filter, TimeRange};
-use crate::models::trace::SlimEvent;
 use crate::query_builder::{build_where_clause_with_search, clamp_bucket_interval, resolve_field};
 use crate::{AppState, TenantContext};
 
@@ -157,6 +156,25 @@ struct SummaryRow {
     matched_bytes: u64,
 }
 
+/// One Explore span row: the columns the list renders, plus whether the row's
+/// trace contains an error span anywhere. Column order must match the row SELECT.
+/// `trace_error` is only computed in traces-only mode, where a root span can
+/// succeed while a downstream call in the same trace failed; otherwise it is false.
+#[derive(Debug, clickhouse::Row, Serialize, Deserialize)]
+struct ExploreSpanRow {
+    timestamp: i64,
+    service_name: String,
+    span_name: String,
+    http_method: String,
+    http_path: String,
+    http_status_code: u16,
+    duration_ns: u64,
+    status: String,
+    trace_id: String,
+    span_id: String,
+    trace_error: bool,
+}
+
 #[derive(Debug)]
 struct ExplorePlan {
     rows_sql: String,
@@ -198,7 +216,7 @@ async fn execute_spans(
     req: &ExploreSearchRequest,
     plan: ExplorePlan,
     started: Instant,
-) -> Result<ExploreSearchResponse<SlimEvent>, (StatusCode, String)> {
+) -> Result<ExploreSearchResponse<ExploreSpanRow>, (StatusCode, String)> {
     let query_prefix = uuid::Uuid::new_v4();
     if !req.include_rows {
         let summary_result = tokio::time::timeout(
@@ -214,7 +232,7 @@ async fn execute_spans(
             tenant_id,
             req,
             plan.interval_secs,
-            Vec::<SlimEvent>::new(),
+            Vec::<ExploreSpanRow>::new(),
             None,
             Some(summary_result),
             0,
@@ -228,7 +246,7 @@ async fn execute_spans(
         let result = crate::tenant_query(&state.ch, &plan.rows_sql, tenant_id)
             .with_option("query_id", format!("rush-explore-{query_prefix}-rows"))
             .with_option("cancel_http_readonly_queries_on_client_close", "1")
-            .fetch_all::<SlimEvent>()
+            .fetch_all::<ExploreSpanRow>()
             .await;
         (result, rows_started.elapsed().as_millis() as u64)
     };
@@ -733,8 +751,18 @@ fn build_span_plan(
     )
     .with_prewhere_prefix(&format!("tenant_id = '{tenant}'"));
     let predicate = clauses.to_sql();
+    // Traces only lists one root span per trace, so the error flag, status facet and
+    // error rate describe the whole trace: a root that returned 201 while its
+    // downstream call returned 500 is a failed trace. That is also what a failure
+    // filter matches in this mode (see `build_where_clause_with_search`).
+    let outcome = if crate::query_builder::is_traces_only(&req.filters) {
+        SpanOutcome::trace_wide(tenant_id, &req.time_range.from, &req.time_range.to)
+    } else {
+        SpanOutcome::per_span()
+    };
     let rows_sql = format!(
-        "SELECT timestamp, service_name, span_name, http_method, http_path, http_status_code, duration_ns, status, trace_id, span_id FROM spans {predicate} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}"
+        "SELECT timestamp, service_name, span_name, http_method, http_path, http_status_code, duration_ns, status, trace_id, span_id, {trace_error} AS trace_error FROM spans {predicate} ORDER BY timestamp DESC, span_id DESC LIMIT {limit}",
+        trace_error = outcome.trace_error,
     );
     let group_expr = req
         .group_by
@@ -747,7 +775,7 @@ fn build_span_plan(
             "invalid group_by field".to_string(),
         ));
     }
-    let summary_sql = span_summary_sql(&predicate, interval_secs, group_expr.as_deref());
+    let summary_sql = span_summary_sql(&predicate, interval_secs, group_expr.as_deref(), &outcome);
     Ok(ExplorePlan {
         rows_sql,
         summary_sql,
@@ -786,16 +814,63 @@ fn build_log_plan(
     })
 }
 
-fn span_summary_sql(predicate: &str, interval_secs: u64, group_expr: Option<&str>) -> String {
+/// How a span row's outcome is summarized: by the span itself, or by its whole
+/// trace in traces-only mode.
+struct SpanOutcome {
+    /// Status facet key: 500, 400 or 200.
+    status: String,
+    /// Counted as an error in the histogram and error rate.
+    is_error: String,
+    /// The row's `trace_error` column.
+    trace_error: String,
+}
+
+impl SpanOutcome {
+    fn per_span() -> Self {
+        Self {
+            status:
+                "toString(multiIf(http_status_code >= 500, 500, http_status_code >= 400, 400, 200))"
+                    .to_string(),
+            is_error: crate::query_builder::ERROR_SPAN.to_string(),
+            trace_error: "false".to_string(),
+        }
+    }
+
+    /// A trace is bucketed by its worst HTTP status anywhere in the trace, and is an
+    /// error when any of its spans is. A 4xx bucket therefore holds traces with a
+    /// client error and no server error.
+    fn trace_wide(tenant_id: &str, from: &str, to: &str) -> Self {
+        let contains = |condition: &str| {
+            crate::query_builder::trace_contains_sql(tenant_id, from, to, condition)
+        };
+        let is_error = contains(crate::query_builder::ERROR_SPAN);
+        Self {
+            status: format!(
+                "toString(multiIf({}, 500, {}, 400, 200))",
+                contains("http_status_code >= 500"),
+                contains("http_status_code >= 400"),
+            ),
+            trace_error: is_error.clone(),
+            is_error,
+        }
+    }
+}
+
+fn span_summary_sql(
+    predicate: &str,
+    interval_secs: u64,
+    group_expr: Option<&str>,
+    outcome: &SpanOutcome,
+) -> String {
     summary_sql(
         "spans",
         predicate,
         interval_secs,
         "timestamp",
         "service_name",
-        "toString(multiIf(http_status_code >= 500, 500, http_status_code >= 400, 400, 200))",
+        &outcome.status,
         "http_method",
-        crate::query_builder::ERROR_SPAN,
+        &outcome.is_error,
         "length(service_name) + length(span_name) + length(http_path) + length(attributes)",
         group_expr,
         true,
@@ -929,6 +1004,69 @@ mod tests {
             include_rows: true,
             include_summary: true,
         }
+    }
+
+    fn traces_only_request(extra: Vec<Filter>) -> ExploreSearchRequest {
+        let mut req = request(ExploreSignal::Spans);
+        req.search = None;
+        req.filters.push(Filter {
+            field: "parent_span_id".to_string(),
+            op: FilterOp::Eq,
+            value: serde_json::json!(""),
+        });
+        req.filters.extend(extra);
+        req
+    }
+
+    #[test]
+    fn traces_only_summary_and_rows_describe_the_whole_trace() {
+        let server_errors = vec![Filter {
+            field: "http_status_code".to_string(),
+            op: FilterOp::Gte,
+            value: serde_json::json!(500),
+        }];
+        for req in [
+            traces_only_request(Vec::new()),
+            traces_only_request(server_errors),
+        ] {
+            let plan = build_plan(&req, "tenant-a").expect("traces-only plan");
+            assert!(
+                plan.summary_sql.contains(
+                    "toString(multiIf(trace_id IN (SELECT trace_id FROM spans WHERE tenant_id = 'tenant-a'"
+                ),
+                "{}",
+                plan.summary_sql
+            );
+            assert!(
+                plan.summary_sql.contains(&format!(
+                    "AND {})) AS is_error",
+                    crate::query_builder::ERROR_SPAN
+                )),
+                "{}",
+                plan.summary_sql
+            );
+            assert!(
+                plan.rows_sql.contains(&format!(
+                    "AND {}) AS trace_error FROM spans",
+                    crate::query_builder::ERROR_SPAN
+                )),
+                "{}",
+                plan.rows_sql
+            );
+            assert!(!plan.rows_sql.contains('?') && !plan.summary_sql.contains('?'));
+            assert_clickhouse_sql_parses(&plan.rows_sql);
+            assert_clickhouse_sql_parses(&plan.summary_sql);
+        }
+    }
+
+    #[test]
+    fn span_mode_summary_and_rows_describe_each_span() {
+        let plan = build_plan(&request(ExploreSignal::Spans), "tenant-a").expect("span plan");
+        assert!(plan.rows_sql.contains("false AS trace_error"));
+        assert!(plan.summary_sql.contains(
+            "toString(toString(multiIf(http_status_code >= 500, 500, http_status_code >= 400, 400, 200))) AS status_key"
+        ));
+        assert!(!plan.summary_sql.contains("trace_id IN"));
     }
 
     #[test]
