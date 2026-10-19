@@ -153,6 +153,12 @@ fn build_filter_conditions(filters: &[Filter], signal: &str) -> String {
 
     let mut parts = Vec::with_capacity(filters.len());
     for filter in filters {
+        if signal != "logs" {
+            if let Some(condition) = crate::query_builder::span_status_condition(filter) {
+                parts.push(format!("AND {condition}"));
+                continue;
+            }
+        }
         let field = if signal == "logs" {
             resolve_log_filter_field(&filter.field)
         } else {
@@ -483,6 +489,21 @@ pub async fn bubbleup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn span_status_filter_matches_stored_status_spelling() {
+        let filters = vec![Filter {
+            field: "status".into(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("ERROR"),
+        }];
+        assert_eq!(
+            build_filter_conditions(&filters, "spans"),
+            "AND status IN ('STATUS_CODE_ERROR', 'ERROR')"
+        );
+        // A log attribute named "status" is not a span status.
+        assert!(!build_filter_conditions(&filters, "logs").contains("STATUS_CODE_"));
+    }
 
     #[test]
     fn log_environment_dimension_accepts_current_and_legacy_otel_names() {
