@@ -24,6 +24,8 @@ pub struct ApiKeyListEntry {
     pub key_type: String,
     /// `viewer` or `write` for query keys; empty for ingest keys.
     pub role: String,
+    /// Query keys only: may use the SRE agent and natural-language parsing.
+    pub agent: bool,
     pub signals: Vec<String>,
     pub rate_limit_per_minute: u64,
     pub source_cidrs: Vec<String>,
@@ -39,6 +41,7 @@ pub struct ApiKeyCreated {
     pub tenant_id: String,
     pub key_type: String,
     pub role: String,
+    pub agent: bool,
     pub signals: Vec<String>,
     pub rate_limit_per_minute: u64,
     pub source_cidrs: Vec<String>,
@@ -53,6 +56,10 @@ pub struct CreateApiKeyRequest {
     /// Query keys only: `viewer` (default) or `write`.
     #[serde(default)]
     pub role: Option<String>,
+    /// Query keys only: allow SRE-agent investigations and LLM-backed
+    /// natural-language query parsing. Off by default.
+    #[serde(default)]
+    pub agent: bool,
     #[serde(default)]
     pub signals: Vec<String>,
     #[serde(default)]
@@ -148,6 +155,7 @@ pub async fn list_api_keys(
             } else {
                 "viewer".to_string()
             },
+            agent: row.key_type != "ingest" && row.agent,
             key_type: row.key_type,
             signals: row.signals,
             rate_limit_per_minute: row.rate_limit_per_minute,
@@ -181,6 +189,13 @@ pub async fn create_api_key(
     }
     let role = api_key_role(&key_type, req.role.as_deref())
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    if req.agent && key_type == "ingest" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "agent access applies only to query keys".to_string(),
+        ));
+    }
+    let agent = req.agent;
     let signals = if key_type == "ingest" {
         crate::api_key_auth::normalize_signals(&req.signals)
             .map_err(|message| (StatusCode::BAD_REQUEST, message))?
@@ -222,6 +237,7 @@ pub async fn create_api_key(
             &tenant.tenant_id,
             &key_type,
             &role,
+            agent,
             &signals,
             rate_limit_per_minute,
             &source_cidrs,
@@ -256,6 +272,7 @@ pub async fn create_api_key(
                         "tenant": tenant.tenant_id,
                         "key_type": key_type,
                         "role": role,
+                        "agent": agent,
                         "signals": signals,
                         "rate_limit_per_minute": rate_limit_per_minute,
                         "source_restricted": !source_cidrs.is_empty(),
@@ -276,6 +293,7 @@ pub async fn create_api_key(
         tenant_id: tenant.tenant_id,
         key_type,
         role,
+        agent,
         signals,
         rate_limit_per_minute,
         source_cidrs,

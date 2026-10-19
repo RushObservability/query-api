@@ -117,6 +117,57 @@ pub(crate) async fn require_principal_write(
     Ok(caller)
 }
 
+/// [`require_principal`] for SRE-agent and natural-language parsing routes.
+/// Session users pass as usual (the routes apply their own policy); an API key
+/// must also carry the `agent` grant, since these routes spend LLM budget and
+/// can read across every telemetry signal.
+pub(crate) async fn require_agent_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String, String, String, String), (StatusCode, String)> {
+    if let Some(grant) = crate::request_auth::api_key_grant() {
+        return agent_key_principal(&grant);
+    }
+    require_auth(state, headers).await
+}
+
+/// [`require_agent_principal`] plus the write role (admin or write users,
+/// write keys with agent access).
+pub(crate) async fn require_agent_principal_write(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String, String, String, String), (StatusCode, String)> {
+    let caller = require_agent_principal(state, headers).await?;
+    if !role_allows_write(&caller.4) {
+        return Err((StatusCode::FORBIDDEN, "write role required".to_string()));
+    }
+    Ok(caller)
+}
+
+type Principal = (String, String, String, String, String);
+
+fn agent_key_principal(
+    grant: &crate::clickhouse_config::ApiKeyGrant,
+) -> Result<Principal, (StatusCode, String)> {
+    if !grant.allows_agent() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "API key does not have agent access".into(),
+        ));
+    }
+    api_key_principal(grant).ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "API key cannot use this route".into(),
+        )
+    })
+}
+
+/// Whether the resolved caller is an API key rather than a session user.
+pub(crate) fn is_api_key_principal(caller_id: &str) -> bool {
+    caller_id.starts_with(crate::audit::API_KEY_ACTOR_PREFIX)
+}
+
 pub(crate) fn api_key_principal(
     grant: &crate::clickhouse_config::ApiKeyGrant,
 ) -> Option<(String, String, String, String, String)> {
@@ -887,10 +938,30 @@ mod authorization_tests {
             tenant_id: "prod".into(),
             key_type: key_type.into(),
             role: role.into(),
+            agent: false,
             signals: Vec::new(),
             rate_limit_per_minute: 0,
             source_cidrs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn agent_routes_require_an_explicit_grant_on_a_query_key() {
+        let denied = super::agent_key_principal(&grant("query", "write")).unwrap_err();
+        assert_eq!(denied.0, axum::http::StatusCode::FORBIDDEN);
+
+        let mut granted = grant("query", "viewer");
+        granted.agent = true;
+        let principal = super::agent_key_principal(&granted).unwrap();
+        assert_eq!(principal.0, "apikey:k1");
+        assert_eq!(principal.4, "viewer");
+        assert!(super::is_api_key_principal(&principal.0));
+        assert!(!super::is_api_key_principal("user-1"));
+
+        // An ingest key never qualifies, even if the flag were set.
+        let mut ingest = grant("ingest", "");
+        ingest.agent = true;
+        assert!(super::agent_key_principal(&ingest).is_err());
     }
 
     #[test]

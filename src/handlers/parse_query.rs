@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::TenantContext;
-use crate::handlers::users::require_auth;
+use crate::handlers::users::require_agent_principal;
 use crate::llm_gateway::{LlmCaller, LlmOperation, MAX_NATURAL_LANGUAGE_QUERY_BYTES};
 
 #[derive(Debug, Deserialize)]
@@ -41,7 +41,7 @@ pub async fn parse_query(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<ParseQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_auth(&state, &headers).await?;
+    let caller = require_agent_principal(&state, &headers).await?;
     if req.query.is_empty() || req.query.len() > MAX_NATURAL_LANGUAGE_QUERY_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
