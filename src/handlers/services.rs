@@ -805,7 +805,7 @@ fn endpoint_errors_sql(
     };
     format!(
         "WITH if(http_method != '', http_method, \
-                extract(span_name, '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)(?: |$)')) AS method_label \
+                extract(span_name, '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)( |$)')) AS method_label \
          SELECT arrayStringConcat(arrayFilter(x -> x != '', \
                 [if(http_status_code > 0, toString(http_status_code), ''), method_label, http_path]), ' ') AS key, \
             http_status_code AS status_code, http_method AS method, http_path AS path, \
@@ -827,6 +827,17 @@ fn endpoint_errors_sql(
 mod service_errors_tests {
     use super::endpoint_errors_sql;
     use crate::query_builder::ERROR_SPAN;
+
+    /// The clickhouse crate treats `?` in query text as a bind placeholder and
+    /// rejects the query ("unbound query argument") before it reaches ClickHouse,
+    /// so this SQL (which is never bound) must not contain one, e.g. in a regex.
+    #[test]
+    fn sql_has_no_unbound_placeholders() {
+        for server_only in [true, false] {
+            let sql = endpoint_errors_sql("default", "gateway", 60, server_only);
+            assert!(!sql.contains('?'), "{sql}");
+        }
+    }
 
     #[test]
     fn server_scope_filters_to_errored_server_spans() {
@@ -851,7 +862,7 @@ mod service_errors_tests {
         let sql = endpoint_errors_sql("default", "gateway", 60, false);
         // CLIENT spans named "POST" with empty http_method still key as "502 POST /notify".
         assert!(
-            sql.contains("extract(span_name, '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)(?: |$)')")
+            sql.contains("extract(span_name, '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)( |$)')")
         );
         assert!(sql.contains("http_method AS method, http_path AS path"));
         // Column order must stay aligned with the ErrorGroup row struct.
