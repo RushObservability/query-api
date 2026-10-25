@@ -436,6 +436,16 @@ branch is created. Install the tools once with
 the version, or `DRY_RUN=1` to run the gate and print the plan without changing
 anything. Merging the PR runs the release workflow, which tags and publishes.
 
+`make release-rc` publishes a release candidate from your machine, with no PR:
+after `v1.0.8` it builds `1.0.9-rc.1`, then `1.0.9-rc.2`, counting existing
+tags (`VERSION=1.1.0` sets the base). It runs the same security gate, builds
+committed `HEAD` with the candidate version (your checkout is not modified),
+pushes `ghcr.io/rushobservability/query-api:<version>` for
+`linux/amd64,linux/arm64` (override with `PLATFORMS`), then pushes the
+`v<version>` tag. It needs a clean tree and `docker login ghcr.io` with
+`write:packages`. Candidates get no GitHub release, attestations, or licensed
+build, and `make release` still proposes `1.0.9` next.
+
 ## License
 
 [Business Source License 1.1](LICENSE).

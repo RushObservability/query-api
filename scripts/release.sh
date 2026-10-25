@@ -6,6 +6,9 @@ cd "$repo_root"
 
 version="${VERSION:-}"
 dry_run="${DRY_RUN:-0}"
+release_candidate="${RC:-0}"
+rc_image="ghcr.io/rushobservability/query-api"
+rc_platforms="${PLATFORMS:-linux/amd64,linux/arm64}"
 
 for required_command in git cargo gh awk mktemp; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
@@ -14,11 +17,12 @@ for required_command in git cargo gh awk mktemp; do
   fi
 done
 
-latest_semver_tag() {
-  local tag normalized
+# Release candidates are never a bump base: after v0.1.9-rc.1 the next final
+# release is still 0.1.9.
+latest_stable_tag() {
+  local tag
   while IFS= read -r tag; do
-    normalized="${tag#v}"
-    if [[ "$normalized" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    if [[ "${tag#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       printf '%s\n' "$tag"
       return 0
     fi
@@ -26,21 +30,37 @@ latest_semver_tag() {
   return 1
 }
 
-if [[ -z "$version" ]]; then
+if [[ -z "$version" || "$release_candidate" == "1" ]]; then
   git fetch origin --tags
-  if ! latest_tag="$(latest_semver_tag)"; then
+fi
+
+if [[ -z "$version" ]]; then
+  if ! latest_tag="$(latest_stable_tag)"; then
     echo "No semantic-version tags were found. Set VERSION explicitly for the first release." >&2
     exit 2
   fi
-  latest_version="${latest_tag#v}"
-  if [[ ! "$latest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
-    echo "Could not parse semantic-version tag: $latest_tag" >&2
-    exit 2
-  fi
+  [[ "${latest_tag#v}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
   version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((10#${BASH_REMATCH[3]} + 1))"
   echo "No VERSION supplied; bumping $latest_tag to v$version."
 fi
 version="${version#v}"
+
+if [[ "$release_candidate" == "1" ]]; then
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "RC=1 needs a base version such as 0.2.0, not $version." >&2
+    exit 2
+  fi
+  if git rev-parse --verify --quiet "refs/tags/v${version}" >/dev/null; then
+    echo "v$version is already released; a release candidate must precede it." >&2
+    exit 1
+  fi
+  last_rc="$(
+    git tag --list "v${version}-rc.*" |
+      sed -n "s/^v${version//./\\.}-rc\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -n 1
+  )"
+  version="${version}-rc.$((10#${last_rc:-0} + 1))"
+  echo "Release candidate: v$version."
+fi
 
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
   echo "Invalid version: $version" >&2
@@ -64,6 +84,24 @@ read_version() {
   ' "$file"
 }
 
+# Replace the first version line after `package` (same lookup as read_version).
+write_version() {
+  local file="$1"
+  local package="$2"
+  local updated
+  updated="$(awk -v package="$package" -v version="$version" '
+    $0 == package { in_package = 1; print; next }
+    in_package && /^\[/ { in_package = 0 }
+    in_package && !done && /^version = "/ { print "version = \"" version "\""; done = 1; next }
+    { print }
+    END { if (!done) exit 42 }
+  ' "$file")" || {
+    echo "Could not set the rush-api version in $file." >&2
+    exit 1
+  }
+  printf '%s\n' "$updated" > "$file"
+}
+
 package_version="$(read_version Cargo.toml '[package]')"
 lock_version="$(read_version Cargo.lock 'name = "rush-api"')"
 release_tag="v${version}"
@@ -82,8 +120,24 @@ fi
 echo "Release plan"
 echo "  Current version: Cargo.toml=$package_version Cargo.lock=$lock_version"
 echo "  New version:     $version"
-echo "  Branch:          $release_branch"
-echo "  Tag after merge: $release_tag"
+build_context="."
+if [[ "$release_candidate" == "1" ]]; then
+  echo "  Image:           ${rc_image}:${version} (${rc_platforms})"
+  echo "  Tag:             $release_tag at $(git rev-parse --short HEAD) ($(git branch --show-current))"
+  if [[ "$dry_run" != "1" && -n "$(git status --porcelain)" ]]; then
+    echo "The working tree is not clean. Commit or stash your changes; the candidate is built from HEAD." >&2
+    exit 1
+  fi
+  # Build committed HEAD with the candidate version, without touching the checkout.
+  build_context="$(mktemp -d "${TMPDIR:-/tmp}/rush-api-rc.XXXXXX")"
+  trap 'rm -rf "$build_context"' EXIT
+  git archive HEAD | tar -x -C "$build_context"
+  write_version "$build_context/Cargo.toml" '[package]'
+  write_version "$build_context/Cargo.lock" 'name = "rush-api"'
+else
+  echo "  Branch:          $release_branch"
+  echo "  Tag after merge: $release_tag"
+fi
 
 # Security checks run only here, never in CI: whoever releases decides. They run
 # before any branch exists, so a finding stops the release instead of surfacing
@@ -101,12 +155,28 @@ make security
 # compile Rust under emulation. Both images share the base images and Cargo.lock.
 scan_image="rush-api-release-scan:${version}"
 echo "Release security gate: image scan ($(uname -m))"
-docker build --tag "$scan_image" .
+docker build --tag "$scan_image" "$build_context"
 trivy image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$scan_image"
 docker image rm "$scan_image" >/dev/null
 
 if [[ "$dry_run" == "1" ]]; then
-  echo "Dry run complete. No files, branches, commits, or pull requests were changed."
+  echo "Dry run complete. No files, branches, commits, images, or pull requests were changed."
+  exit 0
+fi
+
+if [[ "$release_candidate" == "1" ]]; then
+  docker buildx build \
+    --platform "$rc_platforms" \
+    --tag "${rc_image}:${version}" \
+    --label "org.opencontainers.image.version=${version}" \
+    --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+    --label "org.opencontainers.image.source=https://github.com/RushObservability/query-api" \
+    --push \
+    "$build_context"
+  # Tag only after the push, so a failed build never consumes an rc number.
+  git tag "$release_tag" HEAD
+  git push origin "refs/tags/${release_tag}"
+  echo "Published ${rc_image}:${version} and tag ${release_tag}."
   exit 0
 fi
 

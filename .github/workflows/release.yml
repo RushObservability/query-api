@@ -208,11 +208,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Notes always start at the last non-RC release, so they span every candidate.
           previous_tag="$(
             gh release list \
               --limit 100 \
               --json tagName,isDraft,publishedAt \
-              --jq 'map(select(.isDraft == false)) | sort_by(.publishedAt) | last | .tagName // ""'
+              --jq 'map(select(.isDraft == false and (.tagName | contains("-") | not))) | sort_by(.publishedAt) | last | .tagName // ""'
           )"
           echo "tag=${previous_tag}" >> "$GITHUB_OUTPUT"
           if [[ -n "$previous_tag" ]]; then
