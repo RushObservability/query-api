@@ -439,8 +439,9 @@ anything. Merging the PR runs the release workflow, which tags and publishes.
 `make release-rc` opens the same PR for a release candidate: after `v1.0.8` it
 proposes `1.0.9-rc.1`, then `1.0.9-rc.2`, counting existing tags and open
 `release/` branches. `VERSION=1.1.0` sets the base instead. A candidate's image
-gets its full version and commit tags but not `1.0`, `1`, or `latest`; its
-GitHub release is a prerelease; and `make release` still proposes `1.0.9` next.
+gets its full version and commit tags but not `1.0`, `1`, or `latest`, and
+`make release` still proposes `1.0.9` next. Release notes always start at the
+last non-RC release.
 
 ## License
 
