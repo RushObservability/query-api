@@ -3,16 +3,18 @@ name: Rust quality
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # Only Rust code and what it builds or tests with; workflow YAML, scripts,
+    # and docs do not run this job.
     paths:
       - "**/*.rs"
-      - "**/*.toml"
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "proptest-regressions/**"
+      - ".cargo/**"
+      - "Cargo.toml"
       - "Cargo.lock"
-      - "deny.toml"
       - "rust-toolchain.toml"
-      - "Dockerfile"
-      - "Dockerfile.agent"
-      - "docker-compose.yml"
-      - ".github/workflows/**"
   schedule:
     - cron: "17 9 * * 1"
   workflow_dispatch:
