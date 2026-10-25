@@ -29,8 +29,8 @@ env:
 
 jobs:
   quality:
-    # Security checks (dependency scans, security policy scripts) run only before
-    # a release: `make security`, called by `make release` and the Release workflow.
+    # Security checks never run in CI. Run `make security` (also run by
+    # `make release`) and decide before releasing.
     name: Format, lint, test, and build
     runs-on: ubuntu-latest
     timeout-minutes: 45

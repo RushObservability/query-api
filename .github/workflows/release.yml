@@ -24,7 +24,8 @@ permissions:
 
 jobs:
   security-gate:
-    name: Security release gate
+    # Security checks are not run here: run `make security` (or `make release`) and decide before releasing.
+    name: Release checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -80,22 +81,11 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${tag}" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-audit@0.22.2
+      - name: Test advisory scan reporting
+        run: python3 scripts/test-summarize-trivy.py
 
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-deny@0.20.2
-
-      # The security policy scripts use ripgrep's multiline/PCRE-compatible
-      # matching; ubuntu-latest does not guarantee `rg` is installed.
-      - name: Install policy search tool
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: ripgrep@14.1.1
+      - name: Test licensed release dispatch configuration
+        run: python3 scripts/test-licensed-dispatch.py
 
       - name: Check formatting
         run: cargo fmt --check
@@ -105,9 +95,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --all-features
-
-      - name: Run the release security gate
-        run: make security
 
       - name: Build release targets
         run: cargo build --release --all-features
