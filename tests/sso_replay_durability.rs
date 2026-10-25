@@ -20,7 +20,7 @@ async fn keeper_claims_survive_api_restart_and_coordinate_replicas() -> anyhow::
     // Model a deployment with async insertion enabled. The claim operation
     // must override it so duplicate keys cannot share one acknowledged batch.
     let mut first = first;
-    first.client = first.client.clone().with_option("async_insert", "1");
+    first.client = first.client.clone().with_setting("async_insert", "1");
     for key in &keys {
         assert!(first.claim_sso_key_once(key, expiry).await?);
     }
@@ -29,8 +29,8 @@ async fn keeper_claims_survive_api_restart_and_coordinate_replicas() -> anyhow::
     // Reconstruct all application state, as a new query-api process would.
     let mut restarted = ConfigDb::open(&url, "default", "").await?;
     let mut replica = ConfigDb::open(&url, "default", "").await?;
-    restarted.client = restarted.client.clone().with_option("async_insert", "1");
-    replica.client = replica.client.clone().with_option("async_insert", "1");
+    restarted.client = restarted.client.clone().with_setting("async_insert", "1");
+    replica.client = replica.client.clone().with_setting("async_insert", "1");
     for key in &keys {
         assert!(!restarted.claim_sso_key_once(key, expiry).await?);
         assert!(!replica.claim_sso_key_once(key, expiry).await?);

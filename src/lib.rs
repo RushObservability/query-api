@@ -138,7 +138,7 @@ pub async fn probe_row_policy_support(ch: &Client) -> anyhow::Result<()> {
     }
     let result = ch
         .query("SELECT 1 AS n")
-        .with_option("rush_tenant_id", "probe")
+        .with_setting("rush_tenant_id", "probe")
         .fetch_one::<Probe>()
         .await;
     result.map(|_| ()).map_err(|error| {
@@ -205,37 +205,37 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
         .unwrap_or_else(|| guards.max_bytes_external.clone());
     let mut q = ch
         .query(sql)
-        .with_option("max_result_rows", max_result_rows.as_str())
-        .with_option("result_overflow_mode", "throw")
-        .with_option("max_memory_usage", max_memory_usage.as_str())
-        .with_option(
+        .with_setting("max_result_rows", max_result_rows.as_str())
+        .with_setting("result_overflow_mode", "throw")
+        .with_setting("max_memory_usage", max_memory_usage.as_str())
+        .with_setting(
             "max_bytes_before_external_group_by",
             spill_threshold.as_str(),
         )
-        .with_option("max_bytes_before_external_sort", spill_threshold.as_str())
+        .with_setting("max_bytes_before_external_sort", spill_threshold.as_str())
         // Dropping the HTTP handler future (client disconnect, navigation, or
         // request timeout) closes the ClickHouse response and cancels its
         // read-only query rather than leaving server work detached.
-        .with_option("cancel_http_readonly_queries_on_client_close", "1")
+        .with_setting("cancel_http_readonly_queries_on_client_close", "1")
         // ClickHouse 26.2 query condition cache: caches the per-granule match bitset
         // for a WHERE predicate so repeated identical predicates (dashboard refreshes,
         // the count+list+histogram+timeseries siblings of one Explore search, monitor/
         // detection eval re-runs, service-map polls) skip re-evaluating skip indexes and
         // re-reading granules. Safe on these MergeTree reads (no FINAL on the read path).
-        .with_option("use_query_condition_cache", "1");
+        .with_setting("use_query_condition_cache", "1");
     if let Some(budget) = &active_budget {
         let max_execution_time = budget.max_execution_time_secs.to_string();
         let max_rows_to_read = budget.max_rows_to_read.to_string();
         let max_bytes_to_read = budget.max_bytes_to_read.to_string();
         let max_threads = budget.max_threads.to_string();
         q = q
-            .with_option("max_execution_time", max_execution_time.as_str())
-            .with_option("max_rows_to_read", max_rows_to_read.as_str())
-            .with_option("read_overflow_mode", "throw")
-            .with_option("max_bytes_to_read", max_bytes_to_read.as_str())
-            .with_option("max_threads", max_threads.as_str());
+            .with_setting("max_execution_time", max_execution_time.as_str())
+            .with_setting("max_rows_to_read", max_rows_to_read.as_str())
+            .with_setting("read_overflow_mode", "throw")
+            .with_setting("max_bytes_to_read", max_bytes_to_read.as_str())
+            .with_setting("max_threads", max_threads.as_str());
     } else if let Some(n) = &guards.max_threads {
-        q = q.with_option("max_threads", n.as_str());
+        q = q.with_setting("max_threads", n.as_str());
     }
     if TENANT_ISOLATION_STATE.load(Ordering::SeqCst) == 2 {
         q
@@ -243,7 +243,7 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
         // Uninitialized is intentionally fail closed: ClickHouse will reject
         // this setting when support is absent instead of silently running an
         // unscoped application query.
-        q.with_option("rush_tenant_id", tenant_id)
+        q.with_setting("rush_tenant_id", tenant_id)
     }
 }
 

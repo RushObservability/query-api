@@ -40,7 +40,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, reviewed 2026-08-02
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
           components: rustfmt, clippy
 
       - name: Read and validate package version

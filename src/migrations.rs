@@ -1019,8 +1019,8 @@ pub async fn verify_row_policies(
         );
         let row = read
             .query(&probe)
-            .with_option("rush_tenant_id", "__rush_policy_probe__")
-            .with_option("max_execution_time", "10")
+            .with_setting("rush_tenant_id", "__rush_policy_probe__")
+            .with_setting("max_execution_time", "10")
             .fetch_one::<IsolationProbeRow>()
             .await?;
         if row.leaked != 0 {
@@ -1042,6 +1042,7 @@ pub async fn run(
     _config: &RushConfig,
 ) -> anyhow::Result<()> {
     let client = Client::default()
+        .with_validation(false)
         .with_url(url)
         .with_user(user)
         .with_password(password);
@@ -1254,7 +1255,7 @@ async fn backfill_rollups(client: &Client) -> anyhow::Result<()> {
         tracing::info!("backfilling rollup {target} from {source} (interval {interval})");
         client
             .query(&insert_sql)
-            .with_option("max_execution_time", "600")
+            .with_setting("max_execution_time", "600")
             .execute()
             .await?;
         tracing::info!("rollup {target} backfill complete");
@@ -1268,6 +1269,7 @@ async fn backfill_rollups(client: &Client) -> anyhow::Result<()> {
 pub fn spawn_maintenance(url: String, user: String, password: String, config: RushConfig) {
     tokio::spawn(async move {
         let client = Client::default()
+            .with_validation(false)
             .with_url(&url)
             .with_user(&user)
             .with_password(&password);

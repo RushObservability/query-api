@@ -776,9 +776,9 @@ impl AuditLogger {
         let durable = self
             .ch
             .clone()
-            .with_option("async_insert", "0")
-            .with_option("wait_for_async_insert", "1");
-        let mut insert = durable.insert("audit_events")?;
+            .with_setting("async_insert", "0")
+            .with_setting("wait_for_async_insert", "1");
+        let mut insert = durable.insert::<AuditRow>("audit_events").await?;
         insert.write(row).await?;
         insert.end().await?;
         Ok(())
@@ -1439,9 +1439,10 @@ mod tests {
         let dir = TestDirectory::new();
         let logger = test_logger(
             Client::default()
+                .with_validation(false)
                 .with_url(url)
-                .with_option("async_insert", "1")
-                .with_option("wait_for_async_insert", "0"),
+                .with_setting("async_insert", "1")
+                .with_setting("wait_for_async_insert", "0"),
             dir.0.clone(),
         );
         logger.log(AuditEvent::new("settings.update", "user")).await;
@@ -1496,15 +1497,15 @@ mod tests {
         let ch = admin
             .clone()
             .with_database(&database)
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "0");
+            .with_setting("async_insert", "1")
+            .with_setting("wait_for_async_insert", "0");
         let result: anyhow::Result<()> = async {
             crate::migrations::create_audit_table(&ch).await?;
             let mut legacy = sample_row(1, "");
             legacy.timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap();
             legacy.hash = compute_hash(TEST_SECRET, &legacy);
-            let durable = ch.clone().with_option("async_insert", "0");
-            let mut insert = durable.insert("audit_events")?;
+            let durable = ch.clone().with_setting("async_insert", "0");
+            let mut insert = durable.insert::<AuditRow>("audit_events").await?;
             insert.write(&legacy).await?;
             insert.end().await?;
             ch.query("ALTER TABLE audit_events DROP COLUMN chain_id").execute().await?;
@@ -1579,8 +1580,8 @@ mod tests {
             let a2 = legacy("a2", 2, &a1.hash);
             let b2 = legacy("b2", 2, &b1.hash);
             let b3 = legacy("b3", 3, &b2.hash);
-            let durable = ch.clone().with_option("async_insert", "0");
-            let mut insert = durable.insert("audit_events")?;
+            let durable = ch.clone().with_setting("async_insert", "0");
+            let mut insert = durable.insert::<AuditRow>("audit_events").await?;
             for row in [&a1, &b1, &a2] {
                 insert.write(row).await?;
             }

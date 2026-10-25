@@ -28,7 +28,7 @@ path = "src/bin/anomaly_engine.rs"
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
-clickhouse = { version = "0.13", features = ["time", "uuid", "lz4"] }
+clickhouse = { version = "0.15", features = ["time", "uuid", "lz4"] }
 # "rc" enables Serialize/Deserialize for Arc<T> (and Rc<T>). The ingest row
 # structs in models::ingest share per-resource/per-scope data behind Arc to
 # avoid re-allocating identical strings/Vecs for every datapoint (see the
@@ -93,7 +93,7 @@ tikv-jemallocator = "0.6"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [dev-dependencies]
-clickhouse = { version = "0.13", features = ["test-util"] }
+clickhouse = { version = "0.15", features = ["test-util"] }
 bergshamra = "0.7.0"
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }

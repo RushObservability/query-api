@@ -64,7 +64,7 @@ async fn eval_trace_availability(
         base.to_sql(),
     );
     let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_option("max_execution_time", MAX_EXECUTION_TIME)
+        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
     Ok((row.bad as f64, row.total as f64))
@@ -87,7 +87,7 @@ async fn eval_trace_latency(
         total_clauses.to_sql(),
     );
     let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_option("max_execution_time", MAX_EXECUTION_TIME)
+        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
     Ok((row.bad as f64, row.total as f64))
@@ -143,7 +143,7 @@ async fn eval_metric_availability(
         base.to_sql(),
     );
     let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_option("max_execution_time", MAX_EXECUTION_TIME)
+        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<SumBadTotalRow>()
         .await?;
     Ok((row.bad, row.total))
@@ -176,7 +176,7 @@ async fn eval_metric_latency(
         clauses.to_sql(),
     );
     let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_option("max_execution_time", MAX_EXECUTION_TIME)
+        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<HistTotalFastRow>()
         .await?;
 
@@ -217,7 +217,7 @@ async fn eval_metric_threshold(
         clauses.to_sql(),
     );
     let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_option("max_execution_time", MAX_EXECUTION_TIME)
+        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
         .fetch_one::<BadTotalRow>()
         .await?;
     Ok((row.bad as f64, row.total as f64))
