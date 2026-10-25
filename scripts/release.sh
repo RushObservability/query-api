@@ -102,8 +102,13 @@ make security
 scan_image="rush-api-release-scan:${version}"
 echo "Release security gate: image scan ($(uname -m))"
 docker build --tag "$scan_image" .
-trivy image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$scan_image"
+scan_status=0
+trivy image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$scan_image" || scan_status=$?
 docker image rm "$scan_image" >/dev/null
+if [[ "$scan_status" -ne 0 ]]; then
+  echo "Release stopped: the image scan found fixable HIGH or CRITICAL vulnerabilities (above)." >&2
+  exit "$scan_status"
+fi
 
 if [[ "$dry_run" == "1" ]]; then
   echo "Dry run complete. No files, branches, commits, or pull requests were changed."
