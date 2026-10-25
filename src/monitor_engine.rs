@@ -1361,7 +1361,7 @@ async fn query_metric(
         };
 
         let sql = format!(
-            "SELECT ({group_expr}) AS group_key, {agg} AS value \
+            "SELECT ({group_expr}) AS group_key, toFloat64({agg}) AS value \
              FROM metrics_gauge WHERE {where_clause} \
              GROUP BY group_key"
         );
@@ -1371,7 +1371,8 @@ async fn query_metric(
             .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
-        let sql = format!("SELECT {agg} AS value FROM metrics_gauge WHERE {where_clause}");
+        let sql =
+            format!("SELECT toFloat64({agg}) AS value FROM metrics_gauge WHERE {where_clause}");
         let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_setting("max_execution_time", "30")
             .fetch_one::<ValueRow>()
@@ -1497,7 +1498,7 @@ async fn query_log(
         let group_expr = group_expression(group_by, log_field_expr)?;
 
         let sql = format!(
-            "SELECT ({group_expr}) AS group_key, count() AS value \
+            "SELECT ({group_expr}) AS group_key, toFloat64(count()) AS value \
              FROM logs WHERE {where_clause} \
              GROUP BY group_key"
         );
@@ -1507,7 +1508,7 @@ async fn query_log(
             .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
-        let sql = format!("SELECT count() AS value FROM logs WHERE {where_clause}");
+        let sql = format!("SELECT toFloat64(count()) AS value FROM logs WHERE {where_clause}");
         let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_setting("max_execution_time", "30")
             .fetch_one::<ValueRow>()
@@ -1549,7 +1550,7 @@ async fn query_apm(
         let group_expr = group_expression(group_by, apm_group_expr)?;
 
         let sql = format!(
-            "SELECT ({group_expr}) AS group_key, {agg} AS value \
+            "SELECT ({group_expr}) AS group_key, toFloat64({agg}) AS value \
              FROM spans WHERE {where_clause} \
              GROUP BY group_key"
         );
@@ -1559,7 +1560,7 @@ async fn query_apm(
             .await?;
         Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
     } else {
-        let sql = format!("SELECT {agg} AS value FROM spans WHERE {where_clause}");
+        let sql = format!("SELECT toFloat64({agg}) AS value FROM spans WHERE {where_clause}");
         let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
             .with_setting("max_execution_time", "30")
             .fetch_one::<ValueRow>()
@@ -1936,7 +1937,7 @@ async fn build_preview_series(
 
     let sql = format!(
         "SELECT toString(toStartOfInterval({time_col}, INTERVAL {bucket_secs} SECOND)) AS ts, \
-         ({group_expr}) AS group_key, {agg_expr} AS value \
+         ({group_expr}) AS group_key, toFloat64({agg_expr}) AS value \
          FROM {table} \
          WHERE {extra_conditions} AND {time_col} >= now() - INTERVAL {lookback_secs} SECOND \
          GROUP BY ts, group_key ORDER BY ts, group_key LIMIT 10000"
@@ -2466,6 +2467,85 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    // count()/countIf() are UInt64; decoding them straight into the f64 value
+    // read 10 as ~5e-323, so integer monitors never crossed their threshold.
+    #[tokio::test]
+    #[ignore = "requires isolated ClickHouse at RUSH_TEST_CLICKHOUSE_URL with rush_ custom settings"]
+    async fn integer_aggregates_evaluate_as_their_counts() -> anyhow::Result<()> {
+        let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
+        let database = format!("monitor_test_{}", uuid::Uuid::new_v4().simple());
+        let admin = Client::default().with_url(&url);
+        admin
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let ch = admin
+            .clone()
+            .with_database(&database)
+            .with_validation(false);
+        let result: anyhow::Result<()> = async {
+            for table in ["logs", "spans", "metrics_gauge"] {
+                let ddl = crate::migrations::MIGRATIONS
+                    .iter()
+                    .find(|sql| {
+                        sql.starts_with(&format!("CREATE TABLE IF NOT EXISTS observability.{table}\n"))
+                    })
+                    .unwrap()
+                    .replace("observability.", &format!("{database}."));
+                admin.query(&ddl).execute().await?;
+            }
+            for insert in [
+                "INSERT INTO logs (tenant_id, Timestamp, ServiceName, SeverityText, Body) \
+                 SELECT 'default', now64(9), 'svc', 'ERROR', concat('boom ', toString(number)) FROM numbers(10)",
+                "INSERT INTO spans (tenant_id, timestamp, service_name, status) \
+                 SELECT 'default', now64(9), 'svc', if(number < 3, 'STATUS_CODE_ERROR', 'STATUS_CODE_OK') FROM numbers(5)",
+                "INSERT INTO metrics_gauge (tenant_id, TimeUnix, MetricName, Value) \
+                 SELECT 'default', now64(9), 'm', 1.5 FROM numbers(4)",
+            ] {
+                ch.query(insert).execute().await?;
+            }
+            let cases = [
+                ("log", serde_json::json!({"service": "svc", "search": "boom"}), "service_name", 10.0),
+                ("apm", serde_json::json!({"service": "svc", "metric": "error_count"}), "service_name", 3.0),
+                ("apm", serde_json::json!({"service": "svc", "metric": "count"}), "service_name", 5.0),
+                ("metric", serde_json::json!({"metric_name": "m", "aggregation": "count"}), "", 4.0),
+            ];
+            for (monitor_type, config, group, expected) in cases {
+                let groups: Vec<String> = [group].into_iter().filter(|g| !g.is_empty()).map(String::from).collect();
+                for group_by in [Vec::new(), groups] {
+                    let preview = preview_query(
+                        &ch,
+                        "default",
+                        monitor_type,
+                        &config,
+                        300,
+                        600,
+                        &group_by,
+                        PreviewConditions {
+                            critical: Some(1.0),
+                            critical_recovery: None,
+                            warning: None,
+                            warning_recovery: None,
+                            comparator: "above".into(),
+                        },
+                    )
+                    .await?;
+                    let case = format!("{monitor_type} {config} grouped by {group_by:?}");
+                    assert_eq!(preview.current_value, Some(expected), "{case}");
+                    let total: f64 = preview.timeseries.iter().map(|point| point.value).sum();
+                    assert_eq!(total, expected, "{case} timeseries");
+                }
+            }
+            Ok(())
+        }
+        .await;
+        admin
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await?;
+        result
     }
 }
 

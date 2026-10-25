@@ -188,7 +188,7 @@ pub async fn upgrade_profile_sample_type(client: &Client, database: &str) -> any
 /// Ordered list of DDL statements to ensure the observability schema exists.
 /// v2: Multi-tenant schema — every table carries tenant_id as the first ORDER BY column.
 /// Starts with DROP TABLE IF EXISTS for all v1 tables, then recreates with v2 schemas.
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     // ── Database ──
     "CREATE DATABASE IF NOT EXISTS observability",
     r"CREATE TABLE IF NOT EXISTS observability.profile_samples (
