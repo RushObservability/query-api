@@ -85,18 +85,25 @@ echo "  New version:     $version"
 echo "  Branch:          $release_branch"
 echo "  Tag after merge: $release_tag"
 
-# Run the release workflow's dependency gate locally (.github/workflows/release.yml,
-# "Security release gate") before any branch exists, so a known advisory fails
-# here instead of after the release PR merges. The gate's fmt, Clippy, and test
-# steps run below, after the version bump.
-for gate_tool in cargo-audit cargo-deny python3 rg; do
+# Security checks run only here, never in CI: whoever releases decides. They run
+# before any branch exists, so a finding stops the release instead of surfacing
+# after the release PR merges. fmt, Clippy, and tests run below, after the bump.
+for gate_tool in cargo-audit cargo-deny python3 rg docker trivy; do
   if ! command -v "$gate_tool" >/dev/null 2>&1; then
-    echo "Required for the release security gate: $gate_tool. Install with: cargo install --locked cargo-audit cargo-deny; brew install ripgrep" >&2
+    echo "Required for the release security gate: $gate_tool. Install with: cargo install --locked cargo-audit cargo-deny; brew install ripgrep trivy; and Docker" >&2
     exit 1
   fi
 done
 echo "Release security gate: make security"
 make security
+
+# shortcut: scans only this machine's architecture; amd64 on Apple Silicon would
+# compile Rust under emulation. Both images share the base images and Cargo.lock.
+scan_image="rush-api-release-scan:${version}"
+echo "Release security gate: image scan ($(uname -m))"
+docker build --tag "$scan_image" .
+trivy image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$scan_image"
+docker image rm "$scan_image" >/dev/null
 
 if [[ "$dry_run" == "1" ]]; then
   echo "Dry run complete. No files, branches, commits, or pull requests were changed."

@@ -81,9 +81,6 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${tag}" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Test advisory scan reporting
-        run: python3 scripts/test-summarize-trivy.py
-
       - name: Test licensed release dispatch configuration
         run: python3 scripts/test-licensed-dispatch.py
 
@@ -116,8 +113,8 @@ jobs:
       # github.repository keeps the owner's casing (RushObservability/query-api),
       # but an OCI reference must be lowercase. docker/metadata-action lowercases
       # its own tags, which is why the push succeeds, so the mismatch only shows
-      # up in the steps that build a reference by hand: the Trivy scan, the SBOM,
-      # and both attestations. Overriding IMAGE_NAME here fixes all of them at
+      # up in the steps that build a reference by hand: the SBOM and both
+      # attestations. Overriding IMAGE_NAME here fixes all of them at
       # once and keeps working if the repository is ever renamed.
       - name: Normalise the image name to lower case
         run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
@@ -159,38 +156,6 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
-
-      # Image findings are advisory. Rust tests and dependency policy above
-      # remain release gates; a Trivy outage must not prevent the SBOM either.
-      - name: Report image vulnerabilities with Trivy
-        id: trivy
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          format: json
-          output: trivy-report.json
-          scanners: vuln
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "0"
-
-      - name: Summarize advisory image scan
-        if: ${{ !cancelled() && steps.push.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
-        run: bash scripts/summarize-trivy.sh trivy-report.json
-
-      - name: Upload Trivy report
-        if: ${{ !cancelled() && steps.push.outcome == 'success' && hashFiles('trivy-report.json') != '' }}
-        continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: rush-api-${{ needs.security-gate.outputs.tag }}-trivy
-          path: trivy-report.json
-          retention-days: 90
-          if-no-files-found: warn
 
       - name: Attest image build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
