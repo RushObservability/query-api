@@ -23,8 +23,21 @@ workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
 deny = []
-skip = []
-skip-tree = []
+# Older versions held by dependencies that are already on their latest release.
+skip = [
+    { crate = "hashbrown@0.14.5", reason = "dashmap 6.2 (latest) still uses it" },
+    { crate = "itertools@0.14.0", reason = "prost-derive 0.14 (latest) still uses it" },
+    { crate = "rand@0.9.5", reason = "opentelemetry_sdk 0.33 (latest) and proptest still use it" },
+    { crate = "rand@0.8.7", reason = "bergshamra 0.7 (SAML test signing, dev-dependency) uses it" },
+    { crate = "vob@3.0.6", reason = "sparsevec 0.2 via promql-parser 0.7 uses it" },
+]
+skip-tree = [
+    # Both pin the RustCrypto 0.10 generation (digest, cipher, rand 0.8, der, spki,
+    # crypto-bigint 0.5, ...) while query-api uses the current one. No opensaml or
+    # jsonwebtoken release we can adopt moves off it yet.
+    { crate = "opensaml@0.3.0", reason = "pins the RustCrypto 0.10 generation" },
+    { crate = "jsonwebtoken@10.4.0", reason = "pins the RustCrypto 0.10 generation" },
+]
 
 [licenses]
 confidence-threshold = 0.8

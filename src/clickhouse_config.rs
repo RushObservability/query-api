@@ -7,7 +7,7 @@ use clickhouse::Client;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use openssl::symm::Cipher;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc, OnceLock,
@@ -4709,7 +4709,7 @@ impl ConfigDb {
     ) -> anyhow::Result<IssuedSession> {
         let policy = self.effective_session_policy().await?;
         let token: String = {
-            use rand::Rng;
+            use rand::RngExt;
             let mut rng = rand::rng();
             let bytes: [u8; 32] = rng.random();
             bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -5168,7 +5168,7 @@ impl ConfigDb {
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();
         let new_token: String = {
-            use rand::Rng;
+            use rand::RngExt;
             let bytes: [u8; 32] = rand::rng().random();
             bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         };
