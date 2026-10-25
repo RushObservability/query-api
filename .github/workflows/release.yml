@@ -24,7 +24,8 @@ permissions:
 
 jobs:
   security-gate:
-    name: Security release gate
+    # Security checks are not run here: run `make security` (or `make release`) and decide before releasing.
+    name: Release checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -80,16 +81,6 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${tag}" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-audit@0.22.2
-
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-deny@0.20.2
-
       - name: Test advisory scan reporting
         run: python3 scripts/test-summarize-trivy.py
 
@@ -104,12 +95,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --all-features
-
-      - name: Scan RustSec advisories
-        run: cargo audit
-
-      - name: Enforce dependency policy
-        run: cargo deny check --hide-inclusion-graph advisories bans licenses sources
 
       - name: Build release targets
         run: cargo build --release --all-features

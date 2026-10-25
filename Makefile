@@ -146,9 +146,15 @@ lint:                 ## Run clippy lints
 
 security: security-scripts security-audit security-policy ## Run the release security gate without releasing
 
-security-scripts:     ## Test the release workflow's helper scripts
+security-scripts:     ## Release workflow script tests and security policy checks (needs ripgrep)
+	@# The policy scripts report "passed" when rg is missing, so require it up front.
+	@command -v rg >/dev/null 2>&1 || { echo "ripgrep (rg) is required for the security policy checks: brew install ripgrep" >&2; exit 1; }
 	python3 scripts/test-summarize-trivy.py
 	python3 scripts/test-licensed-dispatch.py
+	bash scripts/check-container-policy.sh
+	bash scripts/check-public-errors.sh
+	bash scripts/check-llm-gateway.sh
+	bash scripts/check-security-regressions.sh
 
 security-audit:       ## Scan Cargo.lock against RustSec (reviewed exceptions in .cargo/audit.toml)
 	cargo audit
