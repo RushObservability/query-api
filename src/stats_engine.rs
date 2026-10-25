@@ -476,7 +476,7 @@ async fn run_ch_probe(
     let query_id = format!("{STATS_QUERY_ID_PREFIX}{name}");
     match ch
         .query(sql)
-        .with_option("query_id", query_id)
+        .with_setting("query_id", query_id)
         .fetch_optional::<F64Row>()
         .await
     {

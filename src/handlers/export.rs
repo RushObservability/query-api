@@ -742,7 +742,7 @@ fn stream_response<T>(
     on_progress: Option<ProgressCallback>,
 ) -> Response
 where
-    T: clickhouse::Row + for<'b> serde::Deserialize<'b> + Send + 'static,
+    T: clickhouse::RowOwned + clickhouse::RowRead + Send + 'static,
 {
     let state = ExportStreamState {
         cursor,
@@ -856,7 +856,7 @@ pub fn stream_csv_response<T>(
     on_progress: Option<ProgressCallback>,
 ) -> Response
 where
-    T: clickhouse::Row + for<'b> serde::Deserialize<'b> + Send + 'static,
+    T: clickhouse::RowOwned + clickhouse::RowRead + Send + 'static,
 {
     stream_response(
         cursor,
@@ -895,7 +895,7 @@ pub fn stream_json_response<T>(
     on_progress: Option<ProgressCallback>,
 ) -> Response
 where
-    T: clickhouse::Row + for<'b> serde::Deserialize<'b> + serde::Serialize + Send + 'static,
+    T: clickhouse::RowOwned + clickhouse::RowRead + serde::Serialize + Send + 'static,
 {
     stream_response(
         cursor,

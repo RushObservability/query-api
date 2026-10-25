@@ -687,77 +687,79 @@ impl ChWriter {
 pub async fn try_insert(ch: &Client, batch: &SpoolBatch) -> Result<(), clickhouse::error::Error> {
     match batch {
         SpoolBatch::Profiles(rows) => {
-            let mut ins = ch.insert("profile_samples")?;
+            let mut ins = ch.insert::<ProfileRow>("profile_samples").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::SpansRaw(rows) => {
-            let mut ins = ch.insert("spans_raw")?;
+            let mut ins = ch.insert::<TraceInsertRow>("spans_raw").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::Spans(rows) => {
-            let mut ins = ch.insert("spans")?;
+            let mut ins = ch.insert::<WideEvent>("spans").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::Logs(rows) => {
-            let mut ins = ch.insert("logs")?;
+            let mut ins = ch.insert::<LogInsertRow>("logs").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::Gauge(rows) => {
-            let mut ins = ch.insert("metrics_gauge")?;
+            let mut ins = ch.insert::<GaugeRow>("metrics_gauge").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::Sum(rows) => {
-            let mut ins = ch.insert("metrics_sum")?;
+            let mut ins = ch.insert::<SumRow>("metrics_sum").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::Rum(rows) => {
-            let mut ins = ch.insert("rum")?;
+            let mut ins = ch.insert::<RumRecord>("rum").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::RumReplay(rows) => {
-            let mut ins = ch.insert("rum_replay")?;
+            let mut ins = ch.insert::<RumReplayChunk>("rum_replay").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::Histogram(rows) => {
-            let mut ins = ch.insert("metrics_histogram")?;
+            let mut ins = ch.insert::<HistogramRow>("metrics_histogram").await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::ExpHistogram(rows) => {
-            let mut ins = ch.insert("metrics_exp_histogram")?;
+            let mut ins = ch
+                .insert::<ExpHistogramRow>("metrics_exp_histogram")
+                .await?;
             for r in rows {
                 ins.write(r).await?;
             }
             ins.end().await
         }
         SpoolBatch::Summary(rows) => {
-            let mut ins = ch.insert("metrics_summary")?;
+            let mut ins = ch.insert::<SummaryRow>("metrics_summary").await?;
             for r in rows {
                 ins.write(r).await?;
             }

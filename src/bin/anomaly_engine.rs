@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let write_ch = clickhouse::Client::default()
+        .with_validation(false)
         .with_url(&clickhouse_url)
         .with_database(&clickhouse_db)
         .with_user(&clickhouse_user)
@@ -53,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("CLICKHOUSE_READ_USER must differ from CLICKHOUSE_USER");
     }
     let read_ch = clickhouse::Client::default()
+        .with_validation(false)
         .with_url(&clickhouse_url)
         .with_database(&clickhouse_db)
         .with_user(&read_user)

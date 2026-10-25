@@ -2011,12 +2011,15 @@ async fn main() -> anyhow::Result<()> {
     let async_insert = clickhouse_boolean_option("RUSH_CLICKHOUSE_ASYNC_INSERT", "1")?;
     let wait_for_async_insert =
         clickhouse_boolean_option("RUSH_CLICKHOUSE_WAIT_FOR_ASYNC_INSERT", "0")?;
+    // clickhouse 0.14+ validates fetched rows against column types by default;
+    // every client keeps the plain RowBinary reads this service was written for.
     let admin_ch = Client::default()
+        .with_validation(false)
         .with_url(&clickhouse_url)
         .with_database(&clickhouse_db)
         .with_user(&clickhouse_user)
         .with_password(&clickhouse_password)
-        .with_option("max_execution_time", "30")
+        .with_setting("max_execution_time", "30")
         // Server-side INSERT buffering: ClickHouse batches writes internally,
         // reducing part creation rate at high ingest volume.
         // These options are silently ignored for SELECT queries.
@@ -2028,8 +2031,8 @@ async fn main() -> anyhow::Result<()> {
         // that window for ingest throughput; the spool covers the common case
         // (CH down/unreachable → insert errors → rows spooled). Operators can
         // select the durability/latency point without rebuilding the service.
-        .with_option("async_insert", &async_insert)
-        .with_option("wait_for_async_insert", &wait_for_async_insert)
+        .with_setting("async_insert", &async_insert)
+        .with_setting("wait_for_async_insert", &wait_for_async_insert)
         .with_compression(clickhouse::Compression::Lz4);
 
     // Tenant reads use a distinct SELECT-only principal. Startup is fail-closed:
@@ -2045,11 +2048,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ch = match (&read_user, &read_password) {
         (Some(user), Some(password)) => Client::default()
+            .with_validation(false)
             .with_url(&clickhouse_url)
             .with_database(&clickhouse_db)
             .with_user(user)
             .with_password(password)
-            .with_option("max_execution_time", "30")
+            .with_setting("max_execution_time", "30")
             .with_compression(clickhouse::Compression::Lz4),
         _ if insecure_tenant_reads => admin_ch.clone(),
         _ => anyhow::bail!(

@@ -828,7 +828,7 @@ async fn eval_alert_rule(
 
     let value = match ch
         .query(&sql)
-        .with_option("max_execution_time", "30")
+        .with_setting("max_execution_time", "30")
         .fetch_one::<CountRow>()
         .await
     {

@@ -161,13 +161,13 @@ pub async fn execute_count(
     }
 
     let row = crate::tenant_query(ch, &compiled.count_sql, tenant_id)
-        .with_option("max_execution_time", MAX_EXECUTION_SECONDS)
-        .with_option("max_rows_to_read", MAX_ROWS_TO_READ)
-        .with_option("max_bytes_to_read", MAX_BYTES_TO_READ)
-        .with_option("max_memory_usage", MAX_MEMORY_USAGE)
-        .with_option("max_threads", MAX_THREADS)
-        .with_option("max_result_rows", "1")
-        .with_option("result_overflow_mode", "throw")
+        .with_setting("max_execution_time", MAX_EXECUTION_SECONDS)
+        .with_setting("max_rows_to_read", MAX_ROWS_TO_READ)
+        .with_setting("max_bytes_to_read", MAX_BYTES_TO_READ)
+        .with_setting("max_memory_usage", MAX_MEMORY_USAGE)
+        .with_setting("max_threads", MAX_THREADS)
+        .with_setting("max_result_rows", "1")
+        .with_setting("result_overflow_mode", "throw")
         .fetch_one::<CountRow>()
         .await
         .map_err(DetectionQueryError::Execution)?;

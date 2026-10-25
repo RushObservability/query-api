@@ -128,7 +128,7 @@ async fn a_live_lease_blocks_takeover_until_it_expires() -> anyhow::Result<()> {
             "ALTER TABLE config_engine_leases UPDATE holder = 'vanished', token = 'x', \
              expires_at = now64(3) + toIntervalSecond(4) WHERE name = ?",
         )
-        .with_option("keeper_map_strict_mode", "1")
+        .with_setting("keeper_map_strict_mode", "1")
         .bind(name)
         .execute()
         .await?;

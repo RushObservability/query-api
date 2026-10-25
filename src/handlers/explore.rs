@@ -222,8 +222,8 @@ async fn execute_spans(
         let summary_result = tokio::time::timeout(
             SUMMARY_TIMEOUT,
             crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
-                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
-                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .with_setting("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_setting("cancel_http_readonly_queries_on_client_close", "1")
                 .fetch_all::<SummaryRow>(),
         )
         .await;
@@ -244,8 +244,8 @@ async fn execute_spans(
     let rows_started = Instant::now();
     let rows_query = async {
         let result = crate::tenant_query(&state.ch, &plan.rows_sql, tenant_id)
-            .with_option("query_id", format!("rush-explore-{query_prefix}-rows"))
-            .with_option("cancel_http_readonly_queries_on_client_close", "1")
+            .with_setting("query_id", format!("rush-explore-{query_prefix}-rows"))
+            .with_setting("cancel_http_readonly_queries_on_client_close", "1")
             .fetch_all::<ExploreSpanRow>()
             .await;
         (result, rows_started.elapsed().as_millis() as u64)
@@ -254,8 +254,8 @@ async fn execute_spans(
         let summary_query = tokio::time::timeout(
             SUMMARY_TIMEOUT,
             crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
-                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
-                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .with_setting("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_setting("cancel_http_readonly_queries_on_client_close", "1")
                 .fetch_all::<SummaryRow>(),
         );
         let (rows_result, summary_result) = tokio::join!(rows_query, summary_query);
@@ -328,8 +328,8 @@ async fn execute_logs(
         let summary_result = tokio::time::timeout(
             SUMMARY_TIMEOUT,
             crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
-                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
-                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .with_setting("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_setting("cancel_http_readonly_queries_on_client_close", "1")
                 .fetch_all::<SummaryRow>(),
         )
         .await;
@@ -350,8 +350,8 @@ async fn execute_logs(
     let rows_started = Instant::now();
     let rows_query = async {
         let result = crate::tenant_query(&state.ch, &plan.rows_sql, tenant_id)
-            .with_option("query_id", format!("rush-explore-{query_prefix}-rows"))
-            .with_option("cancel_http_readonly_queries_on_client_close", "1")
+            .with_setting("query_id", format!("rush-explore-{query_prefix}-rows"))
+            .with_setting("cancel_http_readonly_queries_on_client_close", "1")
             .fetch_all::<LogListRecord>()
             .await;
         (result, rows_started.elapsed().as_millis() as u64)
@@ -360,8 +360,8 @@ async fn execute_logs(
         let summary_query = tokio::time::timeout(
             SUMMARY_TIMEOUT,
             crate::tenant_query(&state.ch, &plan.summary_sql, tenant_id)
-                .with_option("query_id", format!("rush-explore-{query_prefix}-summary"))
-                .with_option("cancel_http_readonly_queries_on_client_close", "1")
+                .with_setting("query_id", format!("rush-explore-{query_prefix}-summary"))
+                .with_setting("cancel_http_readonly_queries_on_client_close", "1")
                 .fetch_all::<SummaryRow>(),
         );
         let (rows_result, summary_result) = tokio::join!(rows_query, summary_query);

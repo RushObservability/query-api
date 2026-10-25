@@ -2618,6 +2618,7 @@ impl ConfigDb {
         let session_policy = SessionPolicy::from_env()?;
         let session_hmac_secret = session_hmac_secret_from_env()?;
         let client = Client::default()
+            .with_validation(false)
             .with_url(url)
             .with_user(user)
             .with_password(password);
@@ -3586,7 +3587,7 @@ impl ConfigDb {
             if let Err(error) = self
                 .client
                 .query(&cleanup)
-                .with_option("keeper_map_strict_mode", "1")
+                .with_setting("keeper_map_strict_mode", "1")
                 .bind(now)
                 .execute()
                 .await
@@ -3604,11 +3605,11 @@ impl ConfigDb {
         match self
             .client
             .query(&insert)
-            .with_option("keeper_map_strict_mode", "1")
+            .with_setting("keeper_map_strict_mode", "1")
             // Async insertion can batch two claims for the same key into one
             // KeeperMap write and acknowledge both callers. Every claim needs
             // its own atomic create, even when the server defaults to async.
-            .with_option("async_insert", "0")
+            .with_setting("async_insert", "0")
             .bind(&claim_key)
             .bind(expires_at)
             .bind(now)
@@ -4692,7 +4693,7 @@ impl ConfigDb {
 
         self.client
             .query("DELETE FROM config_sessions WHERE NOT startsWith(token, ?)")
-            .with_option("lightweight_deletes_sync", "1")
+            .with_setting("lightweight_deletes_sync", "1")
             .bind(SESSION_HMAC_PREFIX)
             .execute()
             .await?;
@@ -5066,7 +5067,7 @@ impl ConfigDb {
             } else {
                 "DELETE FROM config_sessions WHERE session_id = ?"
             })
-            .with_option("lightweight_deletes_sync", "1")
+            .with_setting("lightweight_deletes_sync", "1")
             .bind(session_id);
         if let Some(user_id) = user_id {
             delete = delete.bind(user_id);
@@ -5260,7 +5261,7 @@ impl ConfigDb {
                 .await?;
             self.client
                 .query("DELETE FROM config_sessions WHERE session_id = ?")
-                .with_option("lightweight_deletes_sync", "1")
+                .with_setting("lightweight_deletes_sync", "1")
                 .bind(&row.session_id)
                 .execute()
                 .await?;
@@ -5272,7 +5273,7 @@ impl ConfigDb {
         // no longer accepted by any subsequent request.
         self.client
             .query("DELETE FROM config_sessions WHERE token = ?")
-            .with_option("lightweight_deletes_sync", "1")
+            .with_setting("lightweight_deletes_sync", "1")
             .bind(&stored_token)
             .execute()
             .await?;
@@ -5553,7 +5554,7 @@ impl ConfigDb {
             .query(
                 "DELETE FROM config_sessions WHERE provider_id = ? OR (provider_id = '' AND user_id IN (SELECT id FROM config_users FINAL WHERE auth_provider IN ('oidc', 'saml') AND is_deleted = 0))",
             )
-            .with_option("lightweight_deletes_sync", "1")
+            .with_setting("lightweight_deletes_sync", "1")
             .bind(provider_id)
             .execute()
             .await?;
@@ -11995,8 +11996,13 @@ mod session_tenant_regressions {
     }
 
     fn grants(mock: &Mock, tenant_ids: &[&str]) {
-        mock.add(handlers::provide([("[\"all\"]", "[\"read\"]")]));
-        mock.add(handlers::provide(tenant_ids.iter().map(|id| (*id,))));
+        mock.add(handlers::provide([(
+            String::from("[\"all\"]"),
+            String::from("[\"read\"]"),
+        )]));
+        mock.add(handlers::provide(
+            tenant_ids.iter().map(|id| id.to_string()),
+        ));
     }
 
     #[tokio::test]
@@ -12008,7 +12014,7 @@ mod session_tenant_regressions {
         for _ in 0..2 {
             let mock = Mock::new();
             let db = config(&mock);
-            mock.add(handlers::provide([(0_u64,)]));
+            mock.add(handlers::provide([0_u64]));
             let insert = mock.add(handlers::record_ddl());
             assert_eq!(
                 db.ensure_default_admin().await.unwrap().as_deref(),
@@ -12024,8 +12030,18 @@ mod session_tenant_regressions {
             let mock = Mock::new();
             let db = config(&mock);
             grants(&mock, &["tenant-a-id"]);
-            mock.add(handlers::provide([("default", "default", enabled, 0_u8)]));
-            mock.add(handlers::provide([("tenant-a-id", "tenant-a", 1_u8, 1_u8)]));
+            mock.add(handlers::provide([(
+                String::from("default"),
+                String::from("default"),
+                enabled,
+                0_u8,
+            )]));
+            mock.add(handlers::provide([(
+                String::from("tenant-a-id"),
+                String::from("tenant-a"),
+                1_u8,
+                1_u8,
+            )]));
             assert_eq!(
                 db.resolve_session_tenant("u1", "viewer", "default", None)
                     .await
@@ -12041,7 +12057,12 @@ mod session_tenant_regressions {
             let mock = Mock::new();
             let db = config(&mock);
             grants(&mock, &["tenant-a-id"]);
-            mock.add(handlers::provide([(requested, requested, 1_u8, 0_u8)]));
+            mock.add(handlers::provide([(
+                requested.to_string(),
+                requested.to_string(),
+                1_u8,
+                0_u8,
+            )]));
             assert_eq!(
                 db.resolve_session_tenant("u1", "viewer", "tenant-a", Some(requested))
                     .await
@@ -12057,7 +12078,12 @@ mod session_tenant_regressions {
             let mock = Mock::new();
             let db = config(&mock);
             grants(&mock, &["tenant-a-id"]);
-            mock.add(handlers::provide([("tenant-a-id", "tenant-a", 1_u8, 1_u8)]));
+            mock.add(handlers::provide([(
+                String::from("tenant-a-id"),
+                String::from("tenant-a"),
+                1_u8,
+                1_u8,
+            )]));
             assert_eq!(
                 db.resolve_session_tenant("u1", "viewer", "default", Some(requested))
                     .await
@@ -12076,7 +12102,12 @@ mod session_tenant_regressions {
         ] {
             let mock = Mock::new();
             let db = config(&mock);
-            mock.add(handlers::provide([(id, name, enabled, 1_u8)]));
+            mock.add(handlers::provide([(
+                id.to_string(),
+                name.to_string(),
+                enabled,
+                1_u8,
+            )]));
             assert_eq!(
                 db.resolve_session_tenant("admin", "admin", "default", Some(name))
                     .await
@@ -12091,7 +12122,12 @@ mod session_tenant_regressions {
         let mock = Mock::new();
         let db = config(&mock);
         grants(&mock, &[]);
-        mock.add(handlers::provide([("default", "default", 1_u8, 0_u8)]));
+        mock.add(handlers::provide([(
+            String::from("default"),
+            String::from("default"),
+            1_u8,
+            0_u8,
+        )]));
         assert_eq!(
             db.resolve_session_tenant("u1", "viewer", "default", None)
                 .await
@@ -12123,10 +12159,27 @@ mod session_tenant_regressions {
     async fn admin_with_disabled_default_can_choose_an_enabled_tenant() {
         let mock = Mock::new();
         let db = config(&mock);
-        mock.add(handlers::provide([("default", "default", 0_u8, 0_u8)]));
+        mock.add(handlers::provide([(
+            String::from("default"),
+            String::from("default"),
+            0_u8,
+            0_u8,
+        )]));
         mock.add(handlers::provide([
-            ("_audit", "_audit", 1_u8, 1_u8, "2026-01-01"),
-            ("tenant-a-id", "tenant-a", 1_u8, 1_u8, "2026-01-02"),
+            (
+                String::from("_audit"),
+                String::from("_audit"),
+                1_u8,
+                1_u8,
+                String::from("2026-01-01"),
+            ),
+            (
+                String::from("tenant-a-id"),
+                String::from("tenant-a"),
+                1_u8,
+                1_u8,
+                String::from("2026-01-02"),
+            ),
         ]));
         assert_eq!(
             db.resolve_session_tenant("admin", "admin", "default", None)

@@ -511,8 +511,8 @@ impl Renewer {
             if let Err(error) = self
                 .client
                 .query(&insert)
-                .with_option("keeper_map_strict_mode", "1")
-                .with_option("async_insert", "0")
+                .with_setting("keeper_map_strict_mode", "1")
+                .with_setting("async_insert", "0")
                 .bind(name)
                 .bind(me)
                 .bind(token)
@@ -535,8 +535,8 @@ impl Renewer {
             );
             self.client
                 .query(&update)
-                .with_option("keeper_map_strict_mode", "1")
-                .with_option("mutations_sync", "1")
+                .with_setting("keeper_map_strict_mode", "1")
+                .with_setting("mutations_sync", "1")
                 .bind(me)
                 .bind(me)
                 .bind(me)
@@ -572,8 +572,8 @@ impl Renewer {
         );
         self.client
             .query(&release)
-            .with_option("keeper_map_strict_mode", "1")
-            .with_option("mutations_sync", "1")
+            .with_setting("keeper_map_strict_mode", "1")
+            .with_setting("mutations_sync", "1")
             .bind(self.lease.name)
             .bind(&self.lease.holder)
             .execute()
