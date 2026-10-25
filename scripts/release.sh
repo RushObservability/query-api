@@ -89,9 +89,9 @@ echo "  Tag after merge: $release_tag"
 # "Security release gate") before any branch exists, so a known advisory fails
 # here instead of after the release PR merges. The gate's fmt, Clippy, and test
 # steps run below, after the version bump.
-for gate_tool in cargo-audit cargo-deny python3; do
+for gate_tool in cargo-audit cargo-deny python3 rg; do
   if ! command -v "$gate_tool" >/dev/null 2>&1; then
-    echo "Required for the release security gate: $gate_tool. Install the cargo tools with: cargo install --locked cargo-audit cargo-deny" >&2
+    echo "Required for the release security gate: $gate_tool. Install with: cargo install --locked cargo-audit cargo-deny; brew install ripgrep" >&2
     exit 1
   fi
 done

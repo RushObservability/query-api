@@ -90,11 +90,12 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
 
-      - name: Test advisory scan reporting
-        run: python3 scripts/test-summarize-trivy.py
-
-      - name: Test licensed release dispatch configuration
-        run: python3 scripts/test-licensed-dispatch.py
+      # The security policy scripts use ripgrep's multiline/PCRE-compatible
+      # matching; ubuntu-latest does not guarantee `rg` is installed.
+      - name: Install policy search tool
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: ripgrep@14.1.1
 
       - name: Check formatting
         run: cargo fmt --check
@@ -105,11 +106,8 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features
 
-      - name: Scan RustSec advisories
-        run: cargo audit
-
-      - name: Enforce dependency policy
-        run: cargo deny check --hide-inclusion-graph advisories bans licenses sources
+      - name: Run the release security gate
+        run: make security
 
       - name: Build release targets
         run: cargo build --release --all-features
