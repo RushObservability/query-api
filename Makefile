@@ -24,7 +24,7 @@ DEV_ALLOW_PRIVATE_NOTIFICATION_URLS := true
 DEV_ALLOWED_ORIGINS           := http://localhost:5173,http://localhost:8080
 DEV_ALLOW_ANONYMOUS_DEFAULT  := true
 
-.PHONY: build build-release release run run-anomaly dev check test fmt lint security security-scripts security-audit security-policy clean docker package \
+.PHONY: build build-release release release-rc run run-anomaly dev check test fmt lint security security-scripts security-audit security-policy clean docker package \
         up up-full down deps logs run-local watch watch-anomaly licensed-check licensed-test licensed-build licensed-dev dev-license
 
 ## Development — local binary + ClickHouse in Docker
@@ -150,6 +150,7 @@ security-scripts:     ## Release workflow script tests and security policy check
 	@# The policy scripts report "passed" when rg is missing, so require it up front.
 	@command -v rg >/dev/null 2>&1 || { echo "ripgrep (rg) is required for the security policy checks: brew install ripgrep" >&2; exit 1; }
 	python3 scripts/test-licensed-dispatch.py
+	python3 scripts/test-release-version.py
 	bash scripts/check-container-policy.sh
 	bash scripts/check-public-errors.sh
 	bash scripts/check-llm-gateway.sh
@@ -165,6 +166,9 @@ security-policy:      ## Enforce deny.toml advisory, license, source, and depend
 
 release:              ## Open a version-bump PR; VERSION=x.y.z overrides the automatic patch bump
 	@VERSION="$(if $(filter command line,$(origin VERSION)),$(VERSION),)" DRY_RUN="$(DRY_RUN)" ./scripts/release.sh
+
+release-rc:           ## Open a release-candidate PR (next patch -rc.N); VERSION=x.y.z sets the base
+	@VERSION="$(if $(filter command line,$(origin VERSION)),$(VERSION),)" DRY_RUN="$(DRY_RUN)" RC=1 ./scripts/release.sh
 
 ## Docker Compose
 

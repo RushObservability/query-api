@@ -207,12 +207,17 @@ jobs:
         id: previous-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.security-gate.outputs.tag }}
         run: |
+          # A final release's notes span all its release candidates.
+          STABLE_ONLY=true
+          [[ "$RELEASE_TAG" == *-* ]] && STABLE_ONLY=false
+          export STABLE_ONLY
           previous_tag="$(
             gh release list \
               --limit 100 \
-              --json tagName,isDraft,publishedAt \
-              --jq 'map(select(.isDraft == false)) | sort_by(.publishedAt) | last | .tagName // ""'
+              --json tagName,isDraft,isPrerelease,publishedAt \
+              --jq 'map(select(.isDraft == false and (env.STABLE_ONLY == "false" or .isPrerelease == false))) | sort_by(.publishedAt) | last | .tagName // ""'
           )"
           echo "tag=${previous_tag}" >> "$GITHUB_OUTPUT"
           if [[ -n "$previous_tag" ]]; then
@@ -237,6 +242,9 @@ jobs:
           )
           if [[ -n "$PREVIOUS_TAG" ]]; then
             release_args+=(--notes-start-tag "$PREVIOUS_TAG")
+          fi
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_args+=(--prerelease)
           fi
           gh release create "${release_args[@]}"
 
