@@ -4518,6 +4518,10 @@ impl ConfigDb {
 
     // ── User & session operations ──────────────────────────────────────────────
 
+    /// Create the initial admin when no users exist.
+    ///
+    /// The fixed row id makes concurrent startup by multiple API replicas
+    /// converge on one ReplacingMergeTree row instead of one admin per replica.
     pub async fn ensure_default_admin(&self) -> anyhow::Result<Option<String>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Count {
@@ -4541,13 +4545,13 @@ impl ConfigDb {
                 )
             })?;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        const ID: &str = "bootstrap-admin";
         let password_hash = bounded_hash_password(&initial_password).await?;
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_users (id, username, password_hash, display_name, tenant_id, role, enabled, auth_provider, external_id, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 1, 'local', '', ?, ?, 0)")
-            .bind(&id)
+            .bind(ID)
             .bind("admin")
             .bind(&password_hash)
             .bind("Admin")
@@ -4562,7 +4566,7 @@ impl ConfigDb {
             username = "admin",
             "initial administrator created; retrieve the password from the configured secret and change it after first login"
         );
-        Ok(Some(id))
+        Ok(Some(ID.to_string()))
     }
 
     pub async fn authenticate(
@@ -11993,6 +11997,25 @@ mod session_tenant_regressions {
     fn grants(mock: &Mock, tenant_ids: &[&str]) {
         mock.add(handlers::provide([("[\"all\"]", "[\"read\"]")]));
         mock.add(handlers::provide(tenant_ids.iter().map(|id| (*id,))));
+    }
+
+    #[tokio::test]
+    async fn concurrent_default_admin_bootstrap_converges_on_one_row() {
+        // SAFETY: no other test reads or writes INITIAL_ADMIN_PASSWORD.
+        unsafe { std::env::set_var("INITIAL_ADMIN_PASSWORD", "Bootstrap-Test-Password-9!") };
+        // Two replicas that both see an empty user table insert the same row id,
+        // which ReplacingMergeTree collapses into a single admin.
+        for _ in 0..2 {
+            let mock = Mock::new();
+            let db = config(&mock);
+            mock.add(handlers::provide([(0_u64,)]));
+            let insert = mock.add(handlers::record_ddl());
+            assert_eq!(
+                db.ensure_default_admin().await.unwrap().as_deref(),
+                Some("bootstrap-admin")
+            );
+            assert!(insert.query().await.contains("'bootstrap-admin'"));
+        }
     }
 
     #[tokio::test]
