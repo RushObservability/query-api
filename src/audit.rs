@@ -538,11 +538,25 @@ impl AuditLogger {
             state: Mutex::new(ChainState::default()),
         };
         logger.publish_metrics();
-        logger.recover_spool().await?;
+        let rechained = logger.recover_spool().await?;
         if let Err(error) = logger.flush_spool_locked().await {
             tracing::error!(%error, "audit outbox replay deferred; readiness is degraded");
         }
         drop(_spool_lock);
+        if !rechained.is_empty() {
+            tracing::warn!(
+                rows = rechained.len(),
+                "moved legacy audit outbox rows from a forked pre-0.1.8 chain onto this writer's chain"
+            );
+            logger
+                .log(
+                    AuditEvent::new("audit.outbox_rechain", "system")
+                        .resource("table", "audit_events")
+                        .outcome("success")
+                        .changes(serde_json::json!({ "rows": rechained }).to_string()),
+                )
+                .await;
+        }
         if migrated {
             logger
                 .log(
@@ -640,9 +654,12 @@ impl AuditLogger {
         Ok(())
     }
 
-    async fn recover_spool(&self) -> anyhow::Result<()> {
+    /// Returns a summary of legacy rows moved onto this process's chain, for
+    /// the caller to record once the outbox lock is released.
+    async fn recover_spool(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         let files = pending_files(&self.spool_dir)?;
         let mut tails = HashMap::<String, ChainState>::new();
+        let mut rechained = Vec::new();
         for path in files {
             let (row, bytes) = read_spool_row(&path)?;
             if !tails.contains_key(&row.chain_id) {
@@ -651,31 +668,32 @@ impl AuditLogger {
                     Self::load_chain_tail(&self.ch, &row.chain_id).await?,
                 );
             }
+            // Match the hash too: a legacy chain forked by pre-0.1.8 replicas
+            // holds several rows per sequence.
+            let delivered = self
+                .ch
+                .query(
+                    "SELECT count() FROM audit_events WHERE chain_id = ? AND seq = ? AND hash = ?",
+                )
+                .bind(&row.chain_id)
+                .bind(row.seq)
+                .bind(&row.hash)
+                .fetch_one::<u64>()
+                .await?
+                > 0;
+            if delivered {
+                self.remove_spool_file(&path, bytes)?;
+                continue;
+            }
             let state = tails.get_mut(&row.chain_id).expect("chain tail loaded");
-            if row.seq <= state.last_seq {
-                #[derive(clickhouse::Row, serde::Deserialize)]
-                struct Existing {
-                    hash: String,
-                }
-                let existing = self
-                    .ch
-                    .query("SELECT hash FROM audit_events WHERE chain_id = ? AND seq = ? LIMIT 1")
-                    .bind(&row.chain_id)
-                    .bind(row.seq)
-                    .fetch_optional::<Existing>()
-                    .await?;
-                match existing {
-                    Some(existing) if existing.hash == row.hash => {
-                        self.remove_spool_file(&path, bytes)?;
-                        continue;
-                    }
-                    _ => anyhow::bail!(
+            let links = row.seq == state.last_seq + 1 && row.prev_hash == state.last_hash;
+            if !links && !row.chain_id.is_empty() {
+                if row.seq <= state.last_seq {
+                    anyhow::bail!(
                         "audit outbox row {} conflicts with the persisted chain",
                         row.seq
-                    ),
+                    );
                 }
-            }
-            if row.seq != state.last_seq + 1 || row.prev_hash != state.last_hash {
                 anyhow::bail!("audit outbox ordering/link failure at sequence {}", row.seq);
             }
             let secret = self
@@ -684,11 +702,85 @@ impl AuditLogger {
             if compute_hash(secret, &row) != row.hash {
                 anyhow::bail!("audit outbox integrity failure at sequence {}", row.seq);
             }
+            if !links {
+                // Pre-0.1.8 replicas shared the legacy chain, so its outboxes
+                // can hold rows from a losing fork. Writer chains cannot fork.
+                rechained.push(self.rechain_legacy_row(row).await?);
+                self.remove_spool_file(&path, bytes)?;
+                continue;
+            }
             state.last_seq = row.seq;
             state.last_hash = row.hash;
             state.key_id = row.key_id;
             state.segment_id = row.segment_id;
         }
+        Ok(rechained)
+    }
+
+    /// Re-sign a verified legacy outbox row as the next entry of this process's
+    /// chain, keeping its id, time, and event fields, and insert it before the
+    /// caller deletes the outbox file. A retry after a crash finds the id.
+    async fn rechain_legacy_row(&self, legacy: AuditRow) -> anyhow::Result<serde_json::Value> {
+        let mut summary = serde_json::json!({
+            "id": legacy.id,
+            "action": legacy.action,
+            "legacy_seq": legacy.seq,
+            "legacy_prev_hash": legacy.prev_hash,
+            "legacy_hash": legacy.hash,
+        });
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Moved {
+            chain_id: String,
+            seq: u64,
+        }
+        if let Some(moved) = self
+            .ch
+            .query("SELECT chain_id, seq FROM audit_events WHERE id = ? AND chain_id != '' LIMIT 1")
+            .bind(&legacy.id)
+            .fetch_optional::<Moved>()
+            .await?
+        {
+            summary["chain_id"] = moved.chain_id.into();
+            summary["seq"] = moved.seq.into();
+            return Ok(summary);
+        }
+        let mut state = self.state.lock().await;
+        if state.segment_id.is_empty() || state.key_id != self.current_key_id {
+            state.segment_id = uuid::Uuid::new_v4().to_string();
+        }
+        let mut row = AuditRow {
+            seq: state.last_seq + 1,
+            chain_id: self.chain_id.clone(),
+            key_id: self.current_key_id.clone(),
+            segment_id: state.segment_id.clone(),
+            prev_hash: state.last_hash.clone(),
+            hash: String::new(),
+            ..legacy
+        };
+        let secret = self
+            .secret_for_key(&self.current_key_id)
+            .expect("current audit key is always configured");
+        row.hash = compute_hash(secret, &row);
+        self.insert_durable(&row).await?;
+        state.last_seq = row.seq;
+        state.last_hash = row.hash.clone();
+        state.key_id = row.key_id.clone();
+        summary["chain_id"] = row.chain_id.into();
+        summary["seq"] = row.seq.into();
+        Ok(summary)
+    }
+
+    // Never inherit fire-and-forget ingestion settings. end() must mean
+    // durable storage before we remove the only local copy.
+    async fn insert_durable(&self, row: &AuditRow) -> anyhow::Result<()> {
+        let durable = self
+            .ch
+            .clone()
+            .with_option("async_insert", "0")
+            .with_option("wait_for_async_insert", "1");
+        let mut insert = durable.insert("audit_events")?;
+        insert.write(row).await?;
+        insert.end().await?;
         Ok(())
     }
 
@@ -823,16 +915,7 @@ impl AuditLogger {
                 continue;
             }
 
-            // Never inherit fire-and-forget ingestion settings. end() must mean
-            // durable storage before we remove the only local copy.
-            let durable = self
-                .ch
-                .clone()
-                .with_option("async_insert", "0")
-                .with_option("wait_for_async_insert", "1");
-            let mut insert = durable.insert("audit_events")?;
-            insert.write(&row).await?;
-            insert.end().await?;
+            self.insert_durable(&row).await?;
             self.remove_spool_file(&path, bytes)?;
         }
         // Another process can drain a shared outbox between our attempts.
@@ -1463,6 +1546,88 @@ mod tests {
             assert_eq!(newest.action, "restarted.update");
             Ok(())
         }.await;
+        admin
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ClickHouse at RUSH_TEST_CLICKHOUSE_URL"]
+    async fn forked_legacy_outbox_rows_move_to_the_writer_chain() -> anyhow::Result<()> {
+        let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
+        let admin = Client::default().with_url(&url);
+        let database = format!("audit_test_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let ch = admin.clone().with_database(&database);
+        let result: anyhow::Result<()> = async {
+            crate::migrations::create_audit_table(&ch).await?;
+            // Two pre-0.1.8 replicas forked the legacy chain at sequence 1.
+            let legacy = |id: &str, seq: u64, prev: &str| {
+                let mut row = sample_row(seq, prev);
+                row.id = id.into();
+                row.timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+                row.hash = compute_hash(TEST_SECRET, &row);
+                row
+            };
+            let a1 = legacy("a1", 1, "");
+            let b1 = legacy("b1", 1, "");
+            let a2 = legacy("a2", 2, &a1.hash);
+            let b2 = legacy("b2", 2, &b1.hash);
+            let b3 = legacy("b3", 3, &b2.hash);
+            let durable = ch.clone().with_option("async_insert", "0");
+            let mut insert = durable.insert("audit_events")?;
+            for row in [&a1, &b1, &a2] {
+                insert.write(row).await?;
+            }
+            insert.end().await?;
+            // Replica B's outbox: a delivered row, a losing-fork row, its successor.
+            let root = TestDirectory::new();
+            let spool = root.0.join("b");
+            create_private_directory(&spool)?;
+            let stage = |row: &AuditRow| {
+                fs::write(
+                    spool.join(format!("{:020}-{}.json", row.seq, row.id)),
+                    serde_json::to_vec(row).unwrap(),
+                )
+            };
+            for row in [&b1, &b2, &b3] {
+                stage(row)?;
+            }
+            let logger = open_test_logger(ch.clone(), spool.clone()).await?;
+            assert!(pending_files(&spool)?.is_empty());
+            assert!(logger.health().ready);
+            let select = "SELECT id, seq, chain_id, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) WHERE chain_id != '' ORDER BY chain_id, seq";
+            let moved = ch.query(select).fetch_all::<AuditRow>().await?;
+            let summary: Vec<_> = moved.iter().map(|row| (row.seq, row.id.as_str())).collect();
+            assert_eq!(&summary[..2], &[(1, "b2"), (2, "b3")]);
+            assert_eq!(moved[1].timestamp, b3.timestamp);
+            assert_eq!(moved[2].action, "audit.outbox_rechain");
+            assert!(moved[2].changes.contains(&b2.hash));
+            assert_eq!(crate::handlers::audit::verify_rows(&moved, |_| Some(TEST_SECRET))["intact"], true);
+            // A crash after the insert but before the delete must not duplicate.
+            stage(&b2)?;
+            open_test_logger(ch.clone(), spool.clone()).await?;
+            assert!(pending_files(&spool)?.is_empty());
+            let copies = ch
+                .query("SELECT count() FROM audit_events WHERE id = 'b2'")
+                .fetch_one::<u64>()
+                .await?;
+            assert_eq!(copies, 1);
+            // Writer chains cannot fork, so a conflict there still stops startup.
+            let mut forged = moved[0].clone();
+            forged.id = "forged".into();
+            forged.hash = compute_hash(TEST_SECRET, &forged);
+            stage(&forged)?;
+            let error = open_test_logger(ch.clone(), spool.clone()).await.err().unwrap();
+            assert!(error.to_string().contains("conflicts with the persisted chain"));
+            Ok(())
+        }
+        .await;
         admin
             .query(&format!("DROP DATABASE {database}"))
             .execute()

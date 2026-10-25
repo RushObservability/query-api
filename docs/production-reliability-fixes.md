@@ -16,6 +16,8 @@ The schema migration adds `chain_id` with an empty default. Existing rows keep t
 
 For the first upgrade to this format, drain and stop all old API processes before starting the new version. Old binaries do not understand independent chains, so a mixed-version rollout or binary downgrade after new-chain events exist is unsupported. Later rollouts between versions that understand `chain_id` can overlap. The separate Helm ReadWriteOnce scheduling limitation still applies.
 
+Old releases running more than one replica forked the legacy chain, because every process appended to it. If an old process's outbox still holds a legacy row that no longer fits the stored legacy chain, startup verifies its HMAC and moves it onto the new process's chain. The moved row keeps its `id`, timestamp, and event fields. A following `audit.outbox_rechain` event records each moved row's legacy sequence and hashes. The move is idempotent by `id`. Conflicts on writer chains still stop startup.
+
 Audit inserts force `async_insert=0` and `wait_for_async_insert=1`, regardless of telemetry ingestion settings. An outbox entry is removed only after a successful synchronous insert or confirmation that the same chain and sequence already hold the same hash.
 
 ## Tenant selection
