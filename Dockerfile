@@ -2,8 +2,8 @@
 # Same builder and runtime as the collector images: a digest-pinned Rust
 # builder and the distroless Chainguard glibc-dynamic runtime.
 ARG RUST_IMAGE=rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89
-ARG CHAINGUARD_RUNTIME_IMAGE=cgr.dev/chainguard/glibc-dynamic@sha256:6acf5a19a988abdaf0f3d30247561431a206034e702871442bed66a2c68cc1a2
-ARG CHAINGUARD_WOLFI_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:08df5982c3d27e70a4ce1607e3bb9af09d746f8722cf135a7694afef879fc5a2
+ARG CHAINGUARD_RUNTIME_IMAGE=cgr.dev/chainguard/glibc-dynamic@sha256:2827063c9efb4ba971d8621eb75f4e61b8d19850a6293a797df37358cc6f687b
+ARG CHAINGUARD_WOLFI_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:360896efb0753a5701c48f860e17130c205eae5a264797aa3e7ea126ee2923a7
 
 FROM ${RUST_IMAGE} AS builder
 
