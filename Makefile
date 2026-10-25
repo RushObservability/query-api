@@ -167,8 +167,8 @@ security-policy:      ## Enforce deny.toml advisory, license, source, and depend
 release:              ## Open a version-bump PR; VERSION=x.y.z overrides the automatic patch bump
 	@VERSION="$(if $(filter command line,$(origin VERSION)),$(VERSION),)" DRY_RUN="$(DRY_RUN)" ./scripts/release.sh
 
-release-rc:           ## Open a release-candidate PR (next patch -rc.N); VERSION=x.y.z sets the base
-	@VERSION="$(if $(filter command line,$(origin VERSION)),$(VERSION),)" DRY_RUN="$(DRY_RUN)" RC=1 ./scripts/release.sh
+release-rc:           ## Build and push a release-candidate image + tag (next patch -rc.N, no PR); VERSION=x.y.z sets the base, PLATFORMS overrides linux/amd64,linux/arm64
+	@VERSION="$(if $(filter command line,$(origin VERSION)),$(VERSION),)" DRY_RUN="$(DRY_RUN)" PLATFORMS="$(PLATFORMS)" RC=1 ./scripts/release.sh
 
 ## Docker Compose
 
