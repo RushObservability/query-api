@@ -12,6 +12,7 @@ unmaintained = "workspace"
 unsound = "all"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "RSA is used only for public-key signature verification; no private RSA operation is reachable. Temporary exception expires 2026-11-01; see docs/dependency-security.md." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 comes through elliptic-curve 0.13 (SAML via opensaml/bergshamra, OIDC JWTs via jsonwebtoken). Production only verifies signatures with public keys; signing appears only in tests, so no secret value reaches the non-constant-time code. No saml-rs release uses crypto-bigint 0.7 yet; remove when one does." },
 ]
 
 [bans]

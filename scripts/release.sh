@@ -95,13 +95,8 @@ for gate_tool in cargo-audit cargo-deny python3; do
     exit 1
   fi
 done
-echo "Release security gate: release workflow script tests"
-python3 scripts/test-summarize-trivy.py
-python3 scripts/test-licensed-dispatch.py
-echo "Release security gate: cargo audit"
-cargo audit --ignore RUSTSEC-2023-0071
-echo "Release security gate: cargo deny"
-cargo deny check --hide-inclusion-graph advisories bans licenses sources
+echo "Release security gate: make security"
+make security
 
 if [[ "$dry_run" == "1" ]]; then
   echo "Dry run complete. No files, branches, commits, or pull requests were changed."
