@@ -122,7 +122,7 @@ jobs:
         run: |
           mkdir -p security-report
           set +e
-          cargo audit --json --ignore RUSTSEC-2023-0071 > security-report/audit.json 2> security-report/audit.log
+          cargo audit --json > security-report/audit.json 2> security-report/audit.log
           echo "$?" > security-report/audit-exit.txt
           cargo deny --format json check --hide-inclusion-graph advisories > security-report/deny.stdout 2> security-report/deny.jsonl
           echo "$?" > security-report/deny-exit.txt

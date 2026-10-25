@@ -80,7 +80,7 @@ function summarize(dir) {
     lines.push('', '</details>');
   }
   lines.push('', 'Full results, including findings omitted from this summary, are in the `dependency-security-report` artifact.',
-    'Reviewed exception: RUSTSEC-2023-0071. Release security gates are unchanged.');
+    'Reviewed exceptions: RUSTSEC-2023-0071, RUSTSEC-2026-0387. Release security gates are unchanged.');
   return lines.join('\n') + '\n';
 }
 

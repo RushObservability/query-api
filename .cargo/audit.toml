@@ -1,0 +1,7 @@
+# Reviewed RustSec exceptions for `cargo audit`. Keep in sync with the
+# [advisories].ignore list in deny.toml, which records the reasons.
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa: public-key signature verification only
+    "RUSTSEC-2026-0387", # crypto-bigint 0.5: elliptic-curve signature verification only
+]

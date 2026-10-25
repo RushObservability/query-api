@@ -24,7 +24,7 @@ DEV_ALLOW_PRIVATE_NOTIFICATION_URLS := true
 DEV_ALLOWED_ORIGINS           := http://localhost:5173,http://localhost:8080
 DEV_ALLOW_ANONYMOUS_DEFAULT  := true
 
-.PHONY: build build-release release run run-anomaly dev check test fmt lint security security-audit security-policy clean docker package \
+.PHONY: build build-release release run run-anomaly dev check test fmt lint security security-scripts security-audit security-policy clean docker package \
         up up-full down deps logs run-local watch watch-anomaly licensed-check licensed-test licensed-build licensed-dev dev-license
 
 ## Development — local binary + ClickHouse in Docker
@@ -144,13 +144,17 @@ fmt:                  ## Format code
 lint:                 ## Run clippy lints
 	cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
 
-security: security-audit security-policy ## Run dependency vulnerability, license, source, and yank checks
+security: security-scripts security-audit security-policy ## Run the release security gate without releasing
 
-security-audit:       ## Scan Cargo.lock against RustSec (one documented unreachable exception)
-	cargo audit --ignore RUSTSEC-2023-0071
+security-scripts:     ## Test the release workflow's helper scripts
+	python3 scripts/test-summarize-trivy.py
+	python3 scripts/test-licensed-dispatch.py
+
+security-audit:       ## Scan Cargo.lock against RustSec (reviewed exceptions in .cargo/audit.toml)
+	cargo audit
 
 security-policy:      ## Enforce deny.toml advisory, license, source, and dependency policy
-	cargo deny check advisories bans licenses sources
+	cargo deny check --hide-inclusion-graph advisories bans licenses sources
 
 ## Release
 
