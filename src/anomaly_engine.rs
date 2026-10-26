@@ -2,6 +2,7 @@ use crate::alert_engine::SmtpConfig;
 use crate::clickhouse_config::ConfigDb;
 use crate::models::anomaly::AnomalyRule;
 use crate::query_builder::ERROR_SPAN;
+use chrono::DurationRound;
 use clickhouse::Client;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
@@ -406,15 +407,24 @@ async fn eval_anomaly_rules(
     Ok(())
 }
 
+/// Spans reach ClickHouse a few seconds after they end (collector and ingest
+/// batching), so a minute is only scored once it has been closed this long.
+const LATE_SPAN_GRACE_SECS: i64 = 30;
+
 async fn fetch_apm_data(
     ch: &Client,
     rule: &AnomalyRule,
     now: &chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<Vec<(Vec<f64>, String)>> {
-    let from = (*now - chrono::Duration::seconds(rule.window_secs))
+    // Only whole minutes that ended at least LATE_SPAN_GRACE_SECS ago. Scoring the
+    // minute still filling up read as a sudden drop (and fed that low value
+    // into the EWMA baseline), so steady traffic raised false anomalies.
+    let complete_before = (*now - chrono::Duration::seconds(LATE_SPAN_GRACE_SECS))
+        .duration_trunc(chrono::Duration::minutes(1))?;
+    let from = (complete_before - chrono::Duration::seconds(rule.window_secs))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let until = complete_before.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let escaped_tenant = crate::query_builder::escape_string_literal(&rule.tenant_id);
     let sql = format!(
@@ -425,12 +435,12 @@ async fn fetch_apm_data(
          quantile(0.95)(duration_ns) as p95, \
          quantile(0.99)(duration_ns) as p99 \
          FROM spans \
-         WHERE tenant_id = '{}' AND service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp <= parseDateTimeBestEffort('{}') \
+         WHERE tenant_id = '{}' AND service_name = '{}' AND timestamp >= parseDateTimeBestEffort('{}') AND timestamp < parseDateTimeBestEffort('{}') \
          GROUP BY bucket ORDER BY bucket",
         escaped_tenant,
         crate::query_builder::escape_string_literal(&rule.service_name),
         from,
-        now_str,
+        until,
     );
 
     let rows = crate::tenant_query(ch, &sql, &rule.tenant_id)
@@ -638,4 +648,88 @@ async fn send_notifications(
         smtp_transport,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires isolated ClickHouse at RUSH_TEST_CLICKHOUSE_URL with rush_ custom settings"]
+    async fn apm_series_scores_only_finished_minutes() -> anyhow::Result<()> {
+        let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
+        let database = format!("anomaly_test_{}", uuid::Uuid::new_v4().simple());
+        let admin = Client::default().with_url(&url);
+        admin
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let ch = admin
+            .clone()
+            .with_database(&database)
+            .with_validation(false);
+        let result: anyhow::Result<()> = async {
+            let ddl = crate::migrations::MIGRATIONS
+                .iter()
+                .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS observability.spans\n"))
+                .unwrap()
+                .replace("observability.", &format!("{database}."));
+            admin.query(&ddl).execute().await?;
+            // 10s into minute M: M-1 closed under LATE_SPAN_GRACE_SECS ago, M is filling.
+            let minute = chrono::Utc::now().duration_trunc(chrono::Duration::minutes(1))?;
+            let now = minute + chrono::Duration::seconds(10);
+            let m = minute.format("%Y-%m-%d %H:%M:%S");
+            for (offset_minutes, spans) in [(-1, 20), (0, 20)] {
+                ch.query(&format!(
+                    "INSERT INTO spans (tenant_id, timestamp, service_name, status) \
+                     SELECT 'default', toDateTime64('{m}', 9) + INTERVAL {offset_minutes} MINUTE + INTERVAL 5 SECOND, 'svc', 'STATUS_CODE_OK' \
+                     FROM numbers({spans})"
+                ))
+                .execute()
+                .await?;
+            }
+            // 80 spans in each finished minute M-16 ..= M-2.
+            ch.query(&format!(
+                "INSERT INTO spans (tenant_id, timestamp, service_name, status) \
+                 SELECT 'default', toDateTime64('{m}', 9) - INTERVAL (number % 15 + 2) MINUTE + INTERVAL 5 SECOND, 'svc', 'STATUS_CODE_OK' \
+                 FROM numbers(1200)"
+            ))
+            .execute()
+            .await?;
+            let rule = AnomalyRule {
+                id: "r".into(),
+                tenant_id: "default".into(),
+                name: "r".into(),
+                description: String::new(),
+                enabled: true,
+                source: "apm".into(),
+                pattern: String::new(),
+                query: String::new(),
+                service_name: "svc".into(),
+                apm_metric: "request_rate".into(),
+                sensitivity: 3.0,
+                alpha: 0.25,
+                eval_interval_secs: 60,
+                window_secs: 3600,
+                split_labels: "[]".into(),
+                notification_channel_ids: "[]".into(),
+                state: "normal".into(),
+                last_eval_at: None,
+                last_triggered_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            let series = fetch_apm_data(&ch, &rule, &now).await?;
+            let (values, _) = &series[0];
+            assert_eq!(values, &vec![80.0; 15]);
+            assert!(!ewma_eval(values, rule.alpha, rule.sensitivity).anomalous);
+            Ok(())
+        }
+        .await;
+        admin
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await?;
+        result
+    }
 }
