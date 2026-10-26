@@ -75,8 +75,12 @@ jobs:
 
           tag="v${version}"
           if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-            echo "Tag ${tag} already exists. Bump the Cargo package version before releasing." >&2
-            exit 1
+            # This run pushed the tag already; a re-run continues instead of failing.
+            if [[ "$(git rev-parse "refs/tags/${tag}^{commit}")" != "$GITHUB_SHA" ]]; then
+              echo "Tag ${tag} already exists on another commit. Bump the Cargo package version before releasing." >&2
+              exit 1
+            fi
+            echo "Tag ${tag} already points at this commit; continuing." >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
@@ -84,6 +88,18 @@ jobs:
 
       - name: Test licensed release dispatch configuration
         run: python3 scripts/test-licensed-dispatch.py
+
+      # Pushed now, seconds after the merge, while main still matches this commit.
+      # GITHUB_TOKEN may not create a ref whose workflow files differ from main, and
+      # a workflow change merged during the image build failed v0.1.8 and v0.1.9.
+      - name: Push the release tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if ! git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            git tag "$TAG" "$GITHUB_SHA"
+            git push origin "refs/tags/${TAG}"
+          fi
 
   build:
     # One native runner per architecture: arm64 under QEMU on an amd64 runner
@@ -285,17 +301,18 @@ jobs:
             echo "No previous release found. Release notes will cover the full repository history." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Create tag and GitHub release
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.security-gate.outputs.tag }}
           PREVIOUS_TAG: ${{ steps.previous-release.outputs.tag }}
           SBOM_PATH: rush-api-${{ needs.security-gate.outputs.tag }}.spdx.json
         run: |
+          # The tag was pushed by Release checks; never create a ref this late.
           release_args=(
             "$RELEASE_TAG"
             "$SBOM_PATH"
-            --target "$GITHUB_SHA"
+            --verify-tag
             --title "$RELEASE_TAG"
             --generate-notes
           )
