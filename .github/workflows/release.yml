@@ -25,9 +25,11 @@ permissions:
 jobs:
   security-gate:
     # Security checks are not run here: run `make security` (or `make release`) and decide before releasing.
+    # fmt, Clippy, and tests already ran in `make release` and in Rust quality on the
+    # release PR; the image build compiles from scratch, so nothing here is reused.
     name: Release checks
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -41,7 +43,6 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, reviewed 2026-08-02
         with:
           toolchain: 1.89.0
-          components: rustfmt, clippy
 
       - name: Read and validate package version
         id: version
@@ -84,20 +85,80 @@ jobs:
       - name: Test licensed release dispatch configuration
         run: python3 scripts/test-licensed-dispatch.py
 
-      - name: Check formatting
-        run: cargo fmt --check
+  build:
+    # One native runner per architecture: arm64 under QEMU on an amd64 runner
+    # took over two hours. Each leg pushes by digest; build-and-push tags the pair.
+    name: Build ${{ matrix.arch }}
+    needs: security-gate
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+      # github.repository keeps the owner's casing (RushObservability/query-api),
+      # but an OCI reference must be lowercase.
+      - name: Normalise the image name to lower case
+        run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
-      - name: Run tests
-        run: cargo test --all-targets --all-features
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build release targets
-        run: cargo build --release --all-features
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Docker metadata
+        id: docker-meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
   build-and-push:
-    needs: security-gate
+    name: Publish multi-arch image
+    needs: [security-gate, build]
     runs-on: ubuntu-latest
     outputs:
       image_digest: ${{ steps.push.outputs.digest }}
@@ -110,14 +171,17 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # github.repository keeps the owner's casing (RushObservability/query-api),
-      # but an OCI reference must be lowercase. docker/metadata-action lowercases
-      # its own tags, which is why the push succeeds, so the mismatch only shows
-      # up in the steps that build a reference by hand: the SBOM and both
-      # attestations. Overriding IMAGE_NAME here fixes all of them at
-      # once and keeps working if the repository is ever renamed.
+      # Lowercase for the hand-built references below: the index, the SBOM, and
+      # both attestations. Keeps working if the repository is ever renamed.
       - name: Normalise the image name to lower case
         run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -125,9 +189,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -143,19 +204,21 @@ jobs:
             type=semver,pattern={{major}},value=${{ needs.security-gate.outputs.tag }}
             type=sha,prefix=
 
-      - name: Build and push
+      - name: Create and push the multi-arch index
         id: push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.docker-meta.outputs.tags }}
-          labels: ${{ steps.docker-meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.security-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          digests=(*)
+          [ "${#digests[@]}" -eq 2 ] || { echo "expected 2 platform digests, got: ${digests[*]}" >&2; exit 1; }
+          mapfile -t tag_args < <(jq -r '.tags[] | ("-t", .)' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create "${tag_args[@]}" "${digests[@]/#/${IMAGE}@sha256:}"
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          docker buildx imagetools inspect "${IMAGE}@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Attest image build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
