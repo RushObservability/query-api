@@ -920,7 +920,37 @@ async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Res
                 .into_response());
             }
         };
-        let validation = if bytes.is_empty() {
+        let is_form = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| {
+                value
+                    .trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            });
+        let validation = if is_form {
+            let mut start = None;
+            let mut end = None;
+            for (key, value) in url::form_urlencoded::parse(&bytes) {
+                let field = match key.as_ref() {
+                    "start" => &mut start,
+                    "end" => &mut end,
+                    _ => continue,
+                };
+                if field.replace(value).is_some() {
+                    return Err(time_range_error_response(TimeRangeError::Malformed));
+                }
+            }
+            if start.is_some() || end.is_some() {
+                let from =
+                    start.ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?;
+                let to = end.ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?;
+                validate_range_pair(&from, &to, max_seconds)?;
+            }
+            None
+        } else if bytes.is_empty() {
             None
         } else {
             match serde_json::from_slice::<RequestTimeRangeEnvelope<'_>>(&bytes) {
@@ -4163,6 +4193,86 @@ mod tenant_auth_tests {
                 .unwrap();
             assert_eq!(query_workload_for_request(&request), None, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn prometheus_get_and_form_post_enforce_the_same_range_budget() {
+        for max_seconds in [60, 7 * 24 * 60 * 60, 30 * 24 * 60 * 60] {
+            let values = "query=1&start=0&end=691200&step=3600";
+            let mut get = Request::builder()
+                .uri(format!("/prom/api/v1/query_range?{values}"))
+                .body(Body::empty())
+                .unwrap();
+            let mut post = Request::builder()
+                .method(Method::POST)
+                .uri("/prom/api/v1/query_range")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded; charset=UTF-8",
+                )
+                .body(Body::from(values))
+                .unwrap();
+            let get_result = validate_request_time_range(&mut get, max_seconds).await;
+            let post_result = validate_request_time_range(&mut post, max_seconds).await;
+            assert_eq!(get_result.is_ok(), max_seconds >= 691200);
+            assert_eq!(get_result.is_ok(), post_result.is_ok());
+            if let (Err(get), Err(post)) = (get_result, post_result) {
+                assert_eq!(get.status(), axum::http::StatusCode::BAD_REQUEST);
+                assert_eq!(get.status(), post.status());
+                let get = axum::body::to_bytes(get.into_body(), 4096).await.unwrap();
+                let post = axum::body::to_bytes(post.into_body(), 4096).await.unwrap();
+                let get: serde_json::Value = serde_json::from_slice(&get).unwrap();
+                let post: serde_json::Value = serde_json::from_slice(&post).unwrap();
+                assert_eq!(get["error"]["code"], "time_range_too_large");
+                assert_eq!(get["error"]["code"], post["error"]["code"]);
+                assert_eq!(get["error"]["message"], post["error"]["message"]);
+            } else {
+                let body = axum::body::to_bytes(post.into_body(), 4096).await.unwrap();
+                assert_eq!(body, values);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prometheus_form_range_rejects_malformed_reversed_and_ambiguous_values() {
+        for body in [
+            "start=0",
+            "end=60",
+            "start=bad&end=60",
+            "start=NaN&end=60",
+            "start=61&end=60",
+            "start=0&start=1&end=60",
+            "start=0&end=1&end=2",
+        ] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/prom/api/v1/query_range")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                validate_request_time_range(&mut request, 60)
+                    .await
+                    .unwrap_err()
+                    .status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{body}"
+            );
+        }
+        let body = "query=sum%28rate%28requests%5B5m%5D%29%29&start=0.25&end=60.25&step=15";
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/prom/api/v1/query_range")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        validate_request_time_range(&mut request, 60).await.unwrap();
+        assert_eq!(
+            axum::body::to_bytes(request.into_body(), 4096)
+                .await
+                .unwrap(),
+            body
+        );
     }
 
     #[tokio::test]
