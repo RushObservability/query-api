@@ -10,18 +10,61 @@
 //! Object body = `{table}\n{payload}` (table names have no newline; the payload
 //! is the same serde_json batch bytes the disk spool stores).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::spool::SpoolFull;
+
+const INDEX_BATCH_SIZE: usize = 4096;
+const INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+#[derive(Default)]
+struct BacklogIndex {
+    oldest: BTreeMap<OsPath, u64>,
+    complete: bool,
+    refreshed_at: Option<Instant>,
+}
+
+impl BacklogIndex {
+    fn remember(&mut self, key: OsPath, size: u64) {
+        if self.complete
+            || self
+                .oldest
+                .last_key_value()
+                .is_some_and(|(last, _)| &key < last)
+        {
+            self.oldest.insert(key, size);
+            if self.oldest.len() > INDEX_BATCH_SIZE {
+                self.oldest.pop_last();
+                self.complete = false;
+            }
+        }
+    }
+}
+
+struct AppendReservation<'a> {
+    bytes: &'a AtomicU64,
+    size: u64,
+    committed: bool,
+}
+
+impl Drop for AppendReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.bytes.fetch_sub(self.size, Ordering::Relaxed);
+        }
+    }
+}
 
 pub struct ObjectStoreSpool {
     store: Arc<dyn ObjectStore>,
@@ -31,6 +74,11 @@ pub struct ObjectStoreSpool {
     count: AtomicUsize,
     seq: AtomicU64,
     committed: AtomicU64,
+    index: Mutex<BacklogIndex>,
+    transactions: RwLock<()>,
+    reconciliations: AtomicU64,
+    #[cfg(test)]
+    metadata_visited: AtomicUsize,
 }
 
 impl ObjectStoreSpool {
@@ -82,15 +130,14 @@ impl ObjectStoreSpool {
             count: AtomicUsize::new(0),
             seq: AtomicU64::new(0),
             committed: AtomicU64::new(0),
+            index: Mutex::new(BacklogIndex::default()),
+            transactions: RwLock::new(()),
+            reconciliations: AtomicU64::new(0),
+            #[cfg(test)]
+            metadata_visited: AtomicUsize::new(0),
         };
         // Seed counters from existing objects so the cap + metrics survive restarts.
-        let metas = s.list_sorted().await?;
-        let mut total = 0u64;
-        for m in &metas {
-            total += m.1;
-        }
-        s.bytes.store(total, Ordering::Relaxed);
-        s.count.store(metas.len(), Ordering::Relaxed);
+        s.refresh_counts().await?;
         Ok(s)
     }
 
@@ -101,24 +148,56 @@ impl ObjectStoreSpool {
     /// periodic reconciliation keeps capacity/backlog metrics useful on every
     /// replica and corrects counters after cross-pod recovery.
     pub async fn refresh_counts(&self) -> anyhow::Result<()> {
-        let metas = self.list_sorted().await?;
-        let total = metas.iter().map(|(_, size)| *size).sum();
-        self.bytes.store(total, Ordering::Relaxed);
-        self.count.store(metas.len(), Ordering::Relaxed);
-        Ok(())
+        let _transaction = self.transactions.write().await;
+        let mut index = self.index.lock().await;
+        self.scan(&mut index, true).await
     }
 
-    /// All buffered objects as (key, size), sorted oldest-first by key.
-    async fn list_sorted(&self) -> anyhow::Result<Vec<(OsPath, u64)>> {
+    /// Count in one streaming pass and optionally retain the oldest bounded
+    /// batch. ObjectStore does not guarantee listing order.
+    async fn scan(&self, index: &mut BacklogIndex, rebuild_index: bool) -> anyhow::Result<()> {
         let pfx = OsPath::from(self.prefix.trim_end_matches('/'));
-        let mut out: Vec<(OsPath, u64)> = Vec::new();
+        let mut oldest = BTreeMap::new();
+        let mut count = 0_usize;
+        let mut total = 0_u64;
         let mut stream = self.store.list(Some(&pfx));
         while let Some(meta) = stream.next().await {
             let meta = meta?;
-            out.push((meta.location, meta.size as u64));
+            #[cfg(test)]
+            self.metadata_visited.fetch_add(1, Ordering::Relaxed);
+            count += 1;
+            total = total.saturating_add(meta.size);
+            if rebuild_index {
+                oldest.insert(meta.location, meta.size);
+                if oldest.len() > INDEX_BATCH_SIZE {
+                    oldest.pop_last();
+                }
+            }
         }
-        out.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
-        Ok(out)
+        if rebuild_index {
+            index.oldest = oldest;
+            index.complete = count <= INDEX_BATCH_SIZE;
+            index.refreshed_at = Some(Instant::now());
+        } else if total != self.total_bytes() || count != self.segment_count() {
+            // Another replica changed the backlog; rebuild before selecting
+            // the next batch, without retaining the entire listing here.
+            index.refreshed_at = None;
+        }
+        self.bytes.store(total, Ordering::Relaxed);
+        self.count.store(count, Ordering::Relaxed);
+        self.reconciliations.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    async fn ensure_index(&self, index: &mut BacklogIndex) -> anyhow::Result<()> {
+        if index
+            .refreshed_at
+            .is_none_or(|at| at.elapsed() >= INDEX_REFRESH_INTERVAL)
+            || index.oldest.is_empty() && self.segment_count() > 0
+        {
+            self.scan(index, true).await?;
+        }
+        Ok(())
     }
 
     /// Spill one batch as a new object. Returns `SpoolFull` if over the cap or
@@ -129,11 +208,40 @@ impl ObjectStoreSpool {
         // Two concurrent producers can still race; exact global reservations
         // require a distributed quota/CAS protocol and are intentionally out
         // of scope for this single-writer drain design.
-        let _ = self.refresh_counts().await;
-        let rec_len = (table.len() + 1 + payload.len()) as u64;
-        if self.bytes.load(Ordering::Relaxed) + rec_len > self.max_bytes {
+        let observed = self.reconciliations.load(Ordering::Acquire);
+        let transaction = self.transactions.write().await;
+        let mut index = self.index.lock().await;
+        // Preserve fresh cross-replica capacity accounting. This count-only
+        // pass does not collect/sort the backlog or rebuild the drain index.
+        // Overlapping callers can share the reconciliation completed while
+        // they waited. A subsequent serial append still gets fresh counts.
+        if observed == self.reconciliations.load(Ordering::Acquire)
+            && self.scan(&mut index, false).await.is_err()
+        {
             return Err(SpoolFull);
         }
+        drop(index);
+        drop(transaction);
+        // Concurrent PUTs share a read lock. A reconciliation takes the write
+        // lock, so it cannot count a PUT before its local reservation commits.
+        let transaction = self.transactions.read().await;
+        let rec_len = (table.len() + 1 + payload.len()) as u64;
+        if self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+                bytes
+                    .checked_add(rec_len)
+                    .filter(|total| *total <= self.max_bytes)
+            })
+            .is_err()
+        {
+            return Err(SpoolFull);
+        }
+        let mut reservation = AppendReservation {
+            bytes: &self.bytes,
+            size: rec_len,
+            committed: false,
+        };
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -160,8 +268,12 @@ impl ObjectStoreSpool {
             .await
         {
             Ok(_) => {
-                self.bytes.fetch_add(rec_len, Ordering::Relaxed);
                 self.count.fetch_add(1, Ordering::Relaxed);
+                reservation.committed = true;
+                drop(reservation);
+                drop(transaction);
+                let mut index = self.index.lock().await;
+                index.remember(key, rec_len);
                 Ok(())
             }
             Err(e) => {
@@ -175,14 +287,21 @@ impl ObjectStoreSpool {
     /// Corrupt objects are deleted and skipped.
     pub async fn next_batch(&self) -> Option<(OsPath, u64, Vec<(String, Vec<u8>)>)> {
         loop {
-            let metas = match self.list_sorted().await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(error = %e, "object-store buffer: list failed");
-                    return None;
+            let selected = {
+                let _transaction = self.transactions.write().await;
+                let mut index = self.index.lock().await;
+                match self.ensure_index(&mut index).await {
+                    Ok(()) => index
+                        .oldest
+                        .first_key_value()
+                        .map(|(key, size)| (key.clone(), *size)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "object-store buffer: list failed");
+                        return None;
+                    }
                 }
             };
-            let (key, size) = metas.into_iter().next()?;
+            let (key, size) = selected?;
             let data = match self.store.get(&key).await {
                 Ok(r) => match r.bytes().await {
                     Ok(b) => b,
@@ -191,6 +310,12 @@ impl ObjectStoreSpool {
                         return None;
                     }
                 },
+                Err(object_store::Error::NotFound { .. }) => {
+                    let _transaction = self.transactions.read().await;
+                    let mut index = self.index.lock().await;
+                    self.forget(&mut index, &key, size);
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, key = %key, "buffer: get failed");
                     return None;
@@ -200,13 +325,9 @@ impl ObjectStoreSpool {
                 Some((table, payload)) => return Some((key, size, vec![(table, payload)])),
                 None => {
                     tracing::error!(key = %key, "object-store buffer: corrupt object — discarding");
-                    let _ = self.store.delete(&key).await;
-                    self.bytes.fetch_sub(
-                        size.min(self.bytes.load(Ordering::Relaxed)),
-                        Ordering::Relaxed,
-                    );
-                    self.count
-                        .fetch_sub(self.count.load(Ordering::Relaxed).min(1), Ordering::Relaxed);
+                    if !self.delete_batch(&key, size).await {
+                        return None;
+                    }
                     continue; // try the next object
                 }
             }
@@ -215,17 +336,31 @@ impl ObjectStoreSpool {
 
     /// Delete a successfully-drained object.
     pub async fn commit(&self, key: &OsPath, size: u64) {
+        if self.delete_batch(key, size).await {
+            self.committed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn delete_batch(&self, key: &OsPath, size: u64) -> bool {
+        let _transaction = self.transactions.read().await;
+        let mut index = self.index.lock().await;
         if let Err(e) = self.store.delete(key).await {
             tracing::warn!(error = %e, key = %key, "object-store buffer: delete failed");
-            return;
+            return false;
         }
-        self.bytes.fetch_sub(
-            size.min(self.bytes.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
-        self.count
-            .fetch_sub(self.count.load(Ordering::Relaxed).min(1), Ordering::Relaxed);
-        self.committed.fetch_add(1, Ordering::Relaxed);
+        self.forget(&mut index, key, size);
+        true
+    }
+
+    fn forget(&self, index: &mut BacklogIndex, key: &OsPath, size: u64) {
+        if index.oldest.remove(key).is_some() {
+            self.bytes
+                .fetch_sub(size.min(self.total_bytes()), Ordering::Relaxed);
+            self.count
+                .fetch_sub(self.segment_count().min(1), Ordering::Relaxed);
+        } else {
+            index.refreshed_at = None;
+        }
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -243,8 +378,10 @@ impl ObjectStoreSpool {
 
     /// Age (seconds) of the oldest pending object, parsed from its `{millis}-{seq}.batch` key.
     pub async fn oldest_age_secs(&self) -> Option<u64> {
-        let metas = self.list_sorted().await.ok()?;
-        let (key, _) = metas.into_iter().next()?;
+        let _transaction = self.transactions.write().await;
+        let mut index = self.index.lock().await;
+        self.ensure_index(&mut index).await.ok()?;
+        let (key, _) = index.oldest.first_key_value()?;
         let fname = key.as_ref().rsplit('/').next().unwrap_or("");
         let ms = fname
             .split('-')
@@ -272,6 +409,107 @@ mod tests {
 
     fn store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    async fn seed(store: &Arc<dyn ObjectStore>, count: usize) {
+        for i in (0..count).rev() {
+            store
+                .put(
+                    &OsPath::from(format!("ingest/{i:013}-00000000.batch")),
+                    Bytes::from_static(b"logs\nx").into(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_batches_keep_a_bounded_oldest_index_and_reuse_age_lookups() {
+        let st = store();
+        let count = INDEX_BATCH_SIZE * 2 + 17;
+        seed(&st, count).await;
+        let spool = ObjectStoreSpool::open(st, "ingest", u64::MAX)
+            .await
+            .unwrap();
+        for i in 0..count {
+            assert!(spool.index.lock().await.oldest.len() <= INDEX_BATCH_SIZE);
+            spool.oldest_age_secs().await.unwrap();
+            let (key, size, _) = spool.next_batch().await.unwrap();
+            assert_eq!(key, OsPath::from(format!("ingest/{i:013}-00000000.batch")));
+            spool.commit(&key, size).await;
+        }
+        assert!(spool.next_batch().await.is_none());
+        assert_eq!(spool.total_bytes(), 0);
+        assert_eq!(spool.segment_count(), 0);
+        assert_eq!(spool.reconciliations.load(Ordering::Relaxed), 3);
+        assert!(spool.metadata_visited.load(Ordering::Relaxed) < count * 3);
+    }
+
+    #[tokio::test]
+    async fn overlapping_appends_share_counts_but_serial_appends_reconcile_again() {
+        let spool = ObjectStoreSpool::open(store(), "ingest", 30).await.unwrap();
+        let held = spool.index.lock().await;
+        let mut left = Box::pin(spool.append("m", &[0; 10]));
+        let mut right = Box::pin(spool.append("m", &[0; 10]));
+        assert!(futures_util::poll!(left.as_mut()).is_pending());
+        assert!(futures_util::poll!(right.as_mut()).is_pending());
+        drop(held);
+        let (left, right) = tokio::join!(left, right);
+        left.unwrap();
+        right.unwrap();
+        assert_eq!(spool.reconciliations.load(Ordering::Relaxed), 2);
+        assert_eq!(spool.total_bytes(), 24);
+        assert!(spool.append("m", &[0; 10]).await.is_err());
+        assert_eq!(spool.reconciliations.load(Ordering::Relaxed), 3);
+        assert_eq!(spool.total_bytes(), 24);
+    }
+
+    #[tokio::test]
+    async fn stale_index_skips_external_deletes_and_corrupt_records() {
+        let st = store();
+        seed(&st, 3).await;
+        let spool = ObjectStoreSpool::open(st.clone(), "ingest", 1_000_000)
+            .await
+            .unwrap();
+        st.delete(&OsPath::from("ingest/0000000000000-00000000.batch"))
+            .await
+            .unwrap();
+        st.put(
+            &OsPath::from("ingest/0000000000001-00000000.batch"),
+            Bytes::from_static(b"corrupt").into(),
+        )
+        .await
+        .unwrap();
+        let (key, size, rows) = spool.next_batch().await.unwrap();
+        assert_eq!(key, OsPath::from("ingest/0000000000002-00000000.batch"));
+        assert_eq!(rows[0].1, b"x");
+        spool.commit(&key, size).await;
+        spool.refresh_counts().await.unwrap();
+        assert_eq!(spool.segment_count(), 0);
+        assert_eq!(spool.total_bytes(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual object-store recovery benchmark"]
+    async fn benchmark_backlog_recovery() {
+        for count in [1_000, 10_000, 100_000] {
+            let st = store();
+            seed(&st, count).await;
+            let start = Instant::now();
+            let spool = ObjectStoreSpool::open(st, "ingest", u64::MAX)
+                .await
+                .unwrap();
+            while let Some((key, size, _)) = spool.next_batch().await {
+                spool.commit(&key, size).await;
+            }
+            assert_eq!(spool.segment_count(), 0);
+            eprintln!(
+                "objects={count} prefix_scans={} metadata_visits={} index_limit={INDEX_BATCH_SIZE} elapsed_ms={}",
+                spool.reconciliations.load(Ordering::Relaxed),
+                spool.metadata_visited.load(Ordering::Relaxed),
+                start.elapsed().as_millis()
+            );
+        }
     }
 
     #[tokio::test]
@@ -383,8 +621,8 @@ mod tests {
         left_result.unwrap();
         right_result.unwrap();
 
-        let keys = left.list_sorted().await.unwrap();
-        assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0].0, keys[1].0);
+        left.refresh_counts().await.unwrap();
+        let index = left.index.lock().await;
+        assert_eq!(index.oldest.len(), 2);
     }
 }
