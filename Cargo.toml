@@ -64,7 +64,7 @@ prost = "0.14"
 snap = "1"
 flate2 = "1"
 rmp-serde = "1"
-zstd = "0.13"
+zstd = "0.14.3"
 tokio-stream = "0.1"
 futures-util = "0.3"
 object_store = { version = "0.14.1", features = ["aws"] }
