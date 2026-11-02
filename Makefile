@@ -151,6 +151,7 @@ security-scripts:     ## Release workflow script tests and security policy check
 	@command -v rg >/dev/null 2>&1 || { echo "ripgrep (rg) is required for the security policy checks: brew install ripgrep" >&2; exit 1; }
 	python3 scripts/test-licensed-dispatch.py
 	python3 scripts/test-release-version.py
+	python3 scripts/test-openssl-packages.py
 	bash scripts/check-container-policy.sh
 	bash scripts/check-public-errors.sh
 	bash scripts/check-llm-gateway.sh
