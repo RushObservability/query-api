@@ -962,10 +962,11 @@ pub async fn export_logs(
                 export::ExportFormat::Json => "json",
             }
         );
-        let status =
-            state
-                .export_jobs
-                .create(tenant_id, "logs", req.format, filename.clone(), limit);
+        let status = state
+            .export_jobs
+            .create(tenant_id, "logs", req.format, filename.clone(), limit)
+            .await
+            .map_err(|error| crate::api_error::internal_legacy("create export job", error))?;
         let job_id = status.id.clone();
         state
             .audit
@@ -1020,15 +1021,6 @@ pub async fn export_logs(
                         .export_jobs
                         .mark_failed(&background_job_id, "export capacity unavailable")
                         .await;
-                    export::audit_job_transition(
-                        &background_state,
-                        &background_tenant,
-                        &background_job_id,
-                        "export_job.fail",
-                        "failed",
-                        "failure",
-                    )
-                    .await;
                     return;
                 }
             };
@@ -1082,17 +1074,7 @@ pub async fn export_logs(
             .await;
             drop(guard);
             match result {
-                Ok(Ok(())) => {
-                    export::audit_job_transition(
-                        &background_state,
-                        &background_tenant,
-                        &background_job_id,
-                        "export_job.complete",
-                        "completed",
-                        "success",
-                    )
-                    .await;
-                }
+                Ok(Ok(())) => {}
                 _ if background_state
                     .export_jobs
                     .is_cancelled(&background_job_id) => {}
@@ -1101,15 +1083,6 @@ pub async fn export_logs(
                         .export_jobs
                         .mark_failed(&background_job_id, "export could not be completed")
                         .await;
-                    export::audit_job_transition(
-                        &background_state,
-                        &background_tenant,
-                        &background_job_id,
-                        "export_job.fail",
-                        "failed",
-                        "failure",
-                    )
-                    .await;
                 }
             }
         });

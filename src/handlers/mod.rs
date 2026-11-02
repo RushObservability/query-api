@@ -16,6 +16,7 @@ pub mod deploys;
 pub mod detection;
 pub mod explore;
 pub mod export;
+mod export_store;
 pub mod fluxcd;
 pub mod funnels;
 pub mod groups;
