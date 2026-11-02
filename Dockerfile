@@ -25,12 +25,14 @@ FROM ${CHAINGUARD_RUNTIME_IMAGE} AS runtime-base
 # Trivy and the SBOM report the OpenSSL version the image carries.
 FROM ${CHAINGUARD_WOLFI_IMAGE} AS openssl
 COPY --from=runtime-base /usr/lib/apk/db/installed /tmp/runtime-installed
+COPY scripts/select-openssl-packages.awk /tmp/select-openssl-packages.awk
 RUN apk add --no-cache libssl3 libcrypto3 \
-    && awk 'BEGIN { RS = ""; ORS = "\n\n" } /(^|\n)P:(libssl3|libcrypto3)(\n|$)/' /usr/lib/apk/db/installed > /tmp/openssl-installed \
-    && test "$(grep -c '^P:' /tmp/openssl-installed)" -eq 2 \
+    && awk -f /tmp/select-openssl-packages.awk /usr/lib/apk/db/installed > /tmp/openssl-installed \
     && awk 'BEGIN { RS = ""; ORS = "\n\n" } 1' /tmp/runtime-installed /tmp/openssl-installed > /tmp/installed \
     && mkdir -p /tmp/sbom \
-    && cp /var/lib/db/sbom/libssl3-*.spdx.json /var/lib/db/sbom/libcrypto3-*.spdx.json /tmp/sbom/
+    && for package in $(awk -F: '/^P:/ { name = $2 } /^V:/ { print name "-" $2 }' /tmp/openssl-installed); do \
+         cp "/var/lib/db/sbom/${package}.spdx.json" /tmp/sbom/ || exit 1; \
+       done
 
 FROM runtime-base
 
