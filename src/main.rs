@@ -604,14 +604,22 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         .await
     };
     let request_identity = match (&resolution.credential, resolution.api_key.as_ref()) {
-        (CredentialKind::Session, _) => RequestIdentity {
-            tenant_id: resolution.tenant_id.clone(),
-            authenticated: true,
-            actor_id: String::new(),
-            actor_name: String::new(),
-            actor_type: "user".to_string(),
-            credential_type: "session".to_string(),
-        },
+        (CredentialKind::Session, _) => {
+            // Tenant resolution cached this lookup in the request scope.
+            let user = match session_token.as_deref() {
+                Some(token) => rush_api::request_auth::resolve_session_user(&state, token).await,
+                None => None,
+            };
+            let (actor_id, actor_name) = user.map(|user| (user.0, user.1)).unwrap_or_default();
+            RequestIdentity {
+                tenant_id: resolution.tenant_id.clone(),
+                authenticated: true,
+                actor_id,
+                actor_name,
+                actor_type: "user".to_string(),
+                credential_type: "session".to_string(),
+            }
+        }
         (CredentialKind::QueryKey, Some(grant)) => RequestIdentity {
             tenant_id: resolution.tenant_id.clone(),
             authenticated: true,

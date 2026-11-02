@@ -888,6 +888,7 @@ pub struct LogExportRequest {
 pub async fn export_logs(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    Extension(identity): Extension<crate::RequestIdentity>,
     headers: HeaderMap,
     Json(req): Json<LogExportRequest>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
@@ -921,16 +922,8 @@ pub async fn export_logs(
     // AUDIT: data export. Do NOT log the full search/query text (it may contain
     // sensitive values) — only a has_search boolean and the row cap.
     {
-        let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
-            Some(tok) => crate::request_auth::resolve_session_user(&state, &tok)
-                .await
-                .map(|c| (c.0, c.1))
-                .unwrap_or_default(),
-            None => (String::new(), String::new()),
-        };
         state.audit.log(
-            crate::audit::AuditEvent::new("data.export", if actor_id.is_empty() { "anonymous" } else { "user" })
-                .actor(actor_id, actor_name)
+            crate::audit::AuditEvent::for_request("data.export", &identity)
                 .tenant(tenant.tenant_id.clone())
                 .resource("logs", tenant.tenant_id.clone())
                 .changes(serde_json::json!({
@@ -974,21 +967,10 @@ pub async fn export_logs(
                 .export_jobs
                 .create(tenant_id, "logs", req.format, filename.clone(), limit);
         let job_id = status.id.clone();
-        let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
-            Some(token) => crate::request_auth::resolve_session_user(&state, &token)
-                .await
-                .map(|caller| (caller.0, caller.1))
-                .unwrap_or_default(),
-            None => (String::new(), String::new()),
-        };
         state
             .audit
             .log(
-                crate::audit::AuditEvent::new(
-                    "export_job.create",
-                    if actor_id.is_empty() { "anonymous" } else { "user" },
-                )
-                .actor(actor_id, actor_name)
+                crate::audit::AuditEvent::for_request("export_job.create", &identity)
                 .tenant(tenant_id.clone())
                 .resource("export_job", job_id.clone())
                 .changes(

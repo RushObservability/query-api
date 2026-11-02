@@ -530,6 +530,7 @@ pub async fn get_export_job(
 pub async fn download_export_job(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    Extension(identity): Extension<crate::RequestIdentity>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -537,29 +538,14 @@ pub async fn download_export_job(
         Ok(response) => response,
         Err(status) => return status.into_response(),
     };
-    let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
-        Some(token) => crate::request_auth::resolve_session_user(&state, &token)
-            .await
-            .map(|caller| (caller.0, caller.1))
-            .unwrap_or_default(),
-        None => (String::new(), String::new()),
-    };
     state
         .audit
         .log(
-            crate::audit::AuditEvent::new(
-                "data.export",
-                if actor_id.is_empty() {
-                    "anonymous"
-                } else {
-                    "user"
-                },
-            )
-            .actor(actor_id, actor_name)
-            .tenant(tenant.tenant_id)
-            .resource("export_job", id)
-            .changes(serde_json::json!({ "mode": "async_download" }).to_string())
-            .context(crate::audit::actor_context_from_headers(&headers)),
+            crate::audit::AuditEvent::for_request("data.export", &identity)
+                .tenant(tenant.tenant_id)
+                .resource("export_job", id)
+                .changes(serde_json::json!({ "mode": "async_download" }).to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
         )
         .await;
     response
@@ -568,35 +554,21 @@ pub async fn download_export_job(
 pub async fn cancel_export_job(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    Extension(identity): Extension<crate::RequestIdentity>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
     let Some(status) = state.export_jobs.cancel(&tenant.tenant_id, &id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
-        Some(token) => crate::request_auth::resolve_session_user(&state, &token)
-            .await
-            .map(|caller| (caller.0, caller.1))
-            .unwrap_or_default(),
-        None => (String::new(), String::new()),
-    };
     state
         .audit
         .log(
-            crate::audit::AuditEvent::new(
-                "export_job.cancel",
-                if actor_id.is_empty() {
-                    "anonymous"
-                } else {
-                    "user"
-                },
-            )
-            .actor(actor_id, actor_name)
-            .tenant(tenant.tenant_id)
-            .resource("export_job", id)
-            .changes(serde_json::json!({ "state": "cancelled" }).to_string())
-            .context(crate::audit::actor_context_from_headers(&headers)),
+            crate::audit::AuditEvent::for_request("export_job.cancel", &identity)
+                .tenant(tenant.tenant_id)
+                .resource("export_job", id)
+                .changes(serde_json::json!({ "state": "cancelled" }).to_string())
+                .context(crate::audit::actor_context_from_headers(&headers)),
         )
         .await;
     Json(status).into_response()
