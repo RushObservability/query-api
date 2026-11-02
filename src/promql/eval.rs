@@ -28,6 +28,10 @@ static METRIC_TABLE_CACHE: LazyLock<DashMap<(String, String), (MetricTable, Inst
 const METRIC_TABLE_TTL: Duration = Duration::from_secs(300);
 const METRIC_TABLE_CACHE_MAX: usize = 10_000;
 
+/// Bound the grid before allocating it, including queries that never reach
+/// ClickHouse (for example a scalar expression).
+const MAX_RANGE_POINTS: usize = 11_000;
+
 // ═══════════════════════════════════════════════════════════════════
 // Public API
 // ═══════════════════════════════════════════════════════════════════
@@ -40,6 +44,11 @@ pub async fn evaluate_instant_query(
     lookback: f64,
     tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
+    if !eval_time.is_finite() || !lookback.is_finite() || lookback < 0.0 {
+        return Err(
+            "evaluation time and lookback must be finite, with a non-negative lookback".into(),
+        );
+    }
     let expr = parser::parse(query).map_err(|e| format!("{e}"))?;
     let step_timestamps = vec![eval_time];
     evaluate(
@@ -62,9 +71,9 @@ pub async fn evaluate_range_query(
     step: f64,
     tenant_id: &str,
 ) -> Result<Vec<TimeSeries>, String> {
+    let step_timestamps = generate_steps(start, end, step)?;
     let expr = parser::parse(query).map_err(|e| format!("{e}"))?;
     let lookback = extract_lookback(&expr);
-    let step_timestamps = generate_steps(start, end, step);
     evaluate(
         &expr,
         ch,
@@ -861,14 +870,54 @@ pub fn extract_lookback(expr: &Expr) -> f64 {
     }
 }
 
-fn generate_steps(start: f64, end: f64, step: f64) -> Vec<f64> {
-    let mut timestamps = Vec::new();
-    let mut t = start;
-    while t <= end {
-        timestamps.push(t);
-        t += step;
+fn generate_steps(start: f64, end: f64, step: f64) -> Result<Vec<f64>, String> {
+    if !start.is_finite() || !end.is_finite() {
+        return Err("range timestamps must be finite".into());
     }
-    timestamps
+    if !step.is_finite() || step <= 0.0 {
+        return Err("step must be finite and greater than zero".into());
+    }
+    if end < start {
+        return Err("range end must not precede start".into());
+    }
+    let intervals = (end - start) / step;
+    // Check the floating-point value before converting to usize or allocating.
+    // The inclusive grid has floor(intervals) + 1 points.
+    if !intervals.is_finite() || intervals >= MAX_RANGE_POINTS as f64 {
+        return Err(format!(
+            "range query exceeds {MAX_RANGE_POINTS} evaluation points; increase step"
+        ));
+    }
+    let count = intervals.floor() as usize + 1;
+    let mut timestamps = Vec::with_capacity(count);
+    // Check one extra endpoint candidate: subtraction/division can round an
+    // inclusive fractional endpoint just below an integer count. The loop is
+    // still bounded to at most MAX_RANGE_POINTS + 1 iterations.
+    for index in 0..=count {
+        // Use an integer index instead of repeatedly adding step, which can
+        // stop advancing at contemporary Unix timestamps for very small steps.
+        let mut timestamp = start + index as f64 * step;
+        if timestamp > end {
+            if !timestamp.is_finite() || timestamp != end.next_up() {
+                break;
+            }
+            // A single ULP of rounding must not drop an inclusive endpoint.
+            timestamp = end;
+        }
+        if !timestamp.is_finite() || timestamps.last().is_some_and(|last| timestamp <= *last) {
+            return Err("step is too small to advance the evaluation timestamp".into());
+        }
+        if timestamps.len() == MAX_RANGE_POINTS {
+            return Err(format!(
+                "range query exceeds {MAX_RANGE_POINTS} evaluation points; increase step"
+            ));
+        }
+        timestamps.push(timestamp);
+        if timestamp == end {
+            break;
+        }
+    }
+    Ok(timestamps)
 }
 
 /// Walk a promql-parser Expr tree and extract all metric names from VectorSelectors.
@@ -920,6 +969,91 @@ fn collect_metrics(expr: &Expr, names: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_grid_rejects_invalid_inputs() {
+        for (start, end, step) in [
+            (0.0, 1.0, 0.0),
+            (0.0, 1.0, -1.0),
+            (0.0, 1.0, f64::NAN),
+            (0.0, 1.0, f64::INFINITY),
+            (f64::NAN, 1.0, 1.0),
+            (0.0, f64::INFINITY, 1.0),
+            (f64::NEG_INFINITY, 0.0, 1.0),
+            (1.0, 0.0, 1.0),
+        ] {
+            assert!(generate_steps(start, end, step).is_err());
+        }
+    }
+
+    #[test]
+    fn range_grid_enforces_inclusive_point_limit_before_allocation() {
+        let grid = generate_steps(0.0, (MAX_RANGE_POINTS - 1) as f64, 1.0).unwrap();
+        assert_eq!(grid.len(), MAX_RANGE_POINTS);
+        assert_eq!(grid.last(), Some(&((MAX_RANGE_POINTS - 1) as f64)));
+        for (start, end, step) in [
+            (0.0, MAX_RANGE_POINTS as f64, 1.0),
+            (0.0, 86_400.0, 0.001),
+            (-f64::MAX, f64::MAX, 1.0),
+            (0.0, 1.0, f64::MIN_POSITIVE),
+        ] {
+            assert!(
+                generate_steps(start, end, step)
+                    .unwrap_err()
+                    .contains("evaluation points")
+            );
+        }
+    }
+
+    #[test]
+    fn range_grid_rejects_positive_steps_that_do_not_advance() {
+        let start = 1_700_000_000.0;
+        assert!(
+            generate_steps(start, start + 0.000_001, 0.000_000_01)
+                .unwrap_err()
+                .contains("too small")
+        );
+    }
+
+    #[test]
+    fn range_grid_preserves_fractional_and_single_point_queries() {
+        assert_eq!(generate_steps(10.0, 10.0, 15.0).unwrap(), vec![10.0]);
+        assert_eq!(
+            generate_steps(1_700_000_000.0, 1_700_000_001.0, 0.25).unwrap(),
+            vec![
+                1_700_000_000.0,
+                1_700_000_000.25,
+                1_700_000_000.5,
+                1_700_000_000.75,
+                1_700_000_001.0
+            ]
+        );
+        assert_eq!(generate_steps(0.0, 5.0, 2.0).unwrap(), vec![0.0, 2.0, 4.0]);
+        for start in [0.0, 1_700_000_000.0] {
+            let grid = generate_steps(start, start + 0.3, 0.1).unwrap();
+            assert_eq!(grid.len(), 4);
+            assert_eq!(grid.last(), Some(&(start + 0.3)));
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_range_queries_are_subject_to_the_grid_limit() {
+        let client = Client::default();
+        for step in [0.0, -1.0, 0.001] {
+            assert!(
+                evaluate_range_query(&client, "1", 0.0, 86_400.0, step, "default")
+                    .await
+                    .is_err()
+            );
+        }
+        let series = evaluate_range_query(&client, "1", 0.0, 30.0, 15.0, "default")
+            .await
+            .unwrap();
+        assert_eq!(
+            series[0].samples,
+            vec![(0.0, 1.0), (15.0, 1.0), (30.0, 1.0)]
+        );
+    }
 
     /// Reference implementation of step alignment — the exact pre-optimization
     /// per-step reverse scan — used to pin the two-pointer rewrite's behavior.

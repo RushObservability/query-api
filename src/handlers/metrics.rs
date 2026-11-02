@@ -193,8 +193,10 @@ async fn prom_query_range_inner(
     let end = parse_timestamp(&params.end)?;
     let step = params
         .step
-        .as_ref()
-        .and_then(|s| parse_step(s).ok())
+        .as_deref()
+        .map(parse_step)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?
         .unwrap_or(15.0);
 
     let query_len = params.query.chars().count();
@@ -665,7 +667,8 @@ pub async fn prom_label_values(
 // ═══ Helpers ═══
 
 fn parse_timestamp(s: &str) -> Result<f64, (StatusCode, String)> {
-    s.parse::<f64>()
+    let timestamp = s
+        .parse::<f64>()
         .map_err(|_| {
             // Try ISO 8601
             chrono::DateTime::parse_from_rfc3339(s)
@@ -677,13 +680,21 @@ fn parse_timestamp(s: &str) -> Result<f64, (StatusCode, String)> {
                     )
                 })
         })
-        .or_else(|r| r)
+        .or_else(|r| r)?;
+    if !timestamp.is_finite() {
+        return Err((StatusCode::BAD_REQUEST, "timestamp must be finite".into()));
+    }
+    Ok(timestamp)
 }
 
 fn parse_step(s: &str) -> Result<f64, String> {
     // Try plain number (seconds)
     if let Ok(n) = s.parse::<f64>() {
-        return Ok(n);
+        return if n.is_finite() && n > 0.0 {
+            Ok(n)
+        } else {
+            Err("step must be finite and greater than zero".into())
+        };
     }
     // Try duration string
     let mut total = 0.0;
@@ -692,17 +703,17 @@ fn parse_step(s: &str) -> Result<f64, String> {
         if c.is_ascii_digit() || c == '.' {
             num.push(c);
         } else {
-            let n: f64 = num.parse().unwrap_or(0.0);
+            let n: f64 = num.parse().map_err(|_| "invalid step".to_string())?;
             num.clear();
             total += match c {
                 's' => n,
                 'm' => n * 60.0,
                 'h' => n * 3600.0,
-                _ => 0.0,
+                _ => return Err("invalid step".into()),
             };
         }
     }
-    if total > 0.0 {
+    if num.is_empty() && total.is_finite() && total > 0.0 {
         Ok(total)
     } else {
         Err("invalid step".to_string())
@@ -750,8 +761,22 @@ mod tests {
 
     #[test]
     fn test_parse_step_errors() {
-        assert!(parse_step("").is_err());
-        assert!(parse_step("abc").is_err());
+        for value in [
+            "",
+            "abc",
+            "0",
+            "-1",
+            "NaN",
+            "inf",
+            "-inf",
+            "1e999",
+            "0s",
+            "-1m",
+            "1mgarbage",
+            "1m30",
+        ] {
+            assert!(parse_step(value).is_err(), "accepted {value}");
+        }
     }
 
     // ── parse_timestamp ──
@@ -777,7 +802,9 @@ mod tests {
 
     #[test]
     fn test_parse_timestamp_error() {
-        assert!(parse_timestamp("garbage").is_err());
+        for value in ["garbage", "NaN", "inf", "-inf", "1e999"] {
+            assert!(parse_timestamp(value).is_err(), "accepted {value}");
+        }
     }
 
     // ── format_value ──

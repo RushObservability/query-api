@@ -972,7 +972,7 @@ fn admission_error_response(error: AdmissionError) -> Response {
 
 async fn query_policy_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
-    mut req: Request,
+    req: Request,
     next: Next,
 ) -> Response {
     let Some(class) = query_workload_for_request(&req) else {
@@ -987,31 +987,47 @@ async fn query_policy_middleware(
         Ok(guard) => guard,
         Err(error) => return admission_error_response(error),
     };
+    execute_admitted_query(guard, &state.self_metrics, class, req, |req| next.run(req)).await
+}
+
+async fn execute_admitted_query<F, Fut>(
+    guard: rush_api::query_governor::QueryAdmissionGuard,
+    metrics: &rush_api::self_metrics::SelfMetrics,
+    class: WorkloadClass,
+    mut req: Request,
+    next: F,
+) -> Response
+where
+    F: FnOnce(Request) -> Fut,
+    Fut: std::future::Future<Output = Response>,
+{
     let budget = guard.budget().clone();
-    if let Err(response) = validate_request_time_range(&mut req, budget.max_time_range_secs).await {
-        return response;
-    }
+    // Body collection holds the same admission permits as execution, so it
+    // must be inside the deadline too. Keep one deadline through streaming.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(budget.request_timeout_secs);
     let label = class.label();
     let result = rush_api::query_governor::with_budget(
         budget.clone(),
-        tokio::time::timeout(
-            Duration::from_secs(budget.request_timeout_secs),
-            next.run(req),
-        ),
+        tokio::time::timeout_at(deadline, async {
+            if let Err(response) =
+                validate_request_time_range(&mut req, budget.max_time_range_secs).await
+            {
+                return response;
+            }
+            next(req).await
+        }),
     )
     .await;
     match result {
         Ok(response) => {
-            state.self_metrics.inc_counter(
+            metrics.inc_counter(
                 "rush_query_requests_total",
                 &[("workload", label), ("outcome", "completed")],
                 1,
             );
             if class == WorkloadClass::Export {
-                rush_api::query_governor::retain_admission_until_body_end(
-                    response,
-                    guard,
-                    Duration::from_secs(budget.request_timeout_secs),
+                rush_api::query_governor::retain_admission_until_body_deadline(
+                    response, guard, deadline,
                 )
             } else {
                 drop(guard);
@@ -1020,7 +1036,7 @@ async fn query_policy_middleware(
         }
         Err(_) => {
             drop(guard);
-            state.self_metrics.inc_counter(
+            metrics.inc_counter(
                 "rush_query_requests_total",
                 &[("workload", label), ("outcome", "timeout")],
                 1,
@@ -3670,6 +3686,159 @@ async fn graceful_shutdown_drain(
         tracing::warn!(%error, "graceful shutdown: replayer task ended with an error");
     }
     tracing::info!("graceful shutdown: durable ingest queue is empty");
+}
+
+#[cfg(test)]
+mod query_deadline_tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use futures_util::StreamExt;
+    use rush_api::self_metrics::SelfMetrics;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn governor() -> (QueryGovernor, Arc<SelfMetrics>) {
+        let mut config = QueryGovernorConfig::default();
+        config.interactive.global_concurrency = 1;
+        config.interactive.per_tenant_concurrency = 1;
+        config.interactive.queue_timeout_ms = 0;
+        config.interactive.request_timeout_secs = 1;
+        config.interactive.max_execution_time_secs = 1;
+        let metrics = Arc::new(SelfMetrics::new());
+        (
+            QueryGovernor::new(config, metrics.clone()).unwrap(),
+            metrics,
+        )
+    }
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn stalled_request(dropped: Arc<AtomicBool>) -> Request {
+        let marker = DropMarker(dropped);
+        let first = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"{"))]);
+        let tail = futures_util::stream::once(async move {
+            let _marker = marker;
+            std::future::pending::<Result<Bytes, std::io::Error>>().await
+        });
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query")
+            .body(Body::from_stream(first.chain(tail)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn slow_body_times_out_before_dispatch_and_releases_query_capacity() {
+        let (governor, metrics) = governor();
+        let guard = governor
+            .admit(WorkloadClass::Interactive, "tenant-a")
+            .await
+            .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let handler_called = dispatched.clone();
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            execute_admitted_query(
+                guard,
+                &metrics,
+                WorkloadClass::Interactive,
+                stalled_request(dropped.clone()),
+                move |_| async move {
+                    handler_called.store(true, Ordering::SeqCst);
+                    StatusCode::OK.into_response()
+                },
+            ),
+        )
+        .await
+        .expect("the query deadline must cover an incomplete body");
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the upload stream must be cancelled"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "query_timeout");
+        assert!(
+            governor
+                .admit(WorkloadClass::Interactive, "tenant-a")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_body_read_releases_query_capacity() {
+        let (governor, metrics) = governor();
+        let guard = governor
+            .admit(WorkloadClass::Interactive, "tenant-a")
+            .await
+            .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut work = Box::pin(execute_admitted_query(
+            guard,
+            &metrics,
+            WorkloadClass::Interactive,
+            stalled_request(dropped.clone()),
+            |_| async { StatusCode::OK.into_response() },
+        ));
+        assert!(futures_util::poll!(work.as_mut()).is_pending());
+        assert!(matches!(
+            governor.admit(WorkloadClass::Interactive, "tenant-a").await,
+            Err(AdmissionError::TenantBusy { .. })
+        ));
+        drop(work);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            governor
+                .admit(WorkloadClass::Interactive, "tenant-a")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_preserves_valid_bodies_and_handler_dispatch() {
+        let (governor, metrics) = governor();
+        let guard = governor
+            .admit(WorkloadClass::Interactive, "tenant-a")
+            .await
+            .unwrap();
+        let raw = r#"{"time_range":{"from":"100","to":"130"}}"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query")
+            .body(Body::from(raw))
+            .unwrap();
+        let response = execute_admitted_query(
+            guard,
+            &metrics,
+            WorkloadClass::Interactive,
+            req,
+            |req| async move {
+                let bytes = axum::body::to_bytes(req.into_body(), 1024).await.unwrap();
+                assert_eq!(bytes, raw);
+                StatusCode::OK.into_response()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            governor
+                .admit(WorkloadClass::Interactive, "tenant-a")
+                .await
+                .is_ok()
+        );
+    }
 }
 
 #[cfg(test)]

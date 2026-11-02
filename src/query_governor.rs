@@ -483,8 +483,18 @@ pub fn retain_admission_until_body_end(
     guard: QueryAdmissionGuard,
     timeout: Duration,
 ) -> axum::response::Response {
-    let (parts, body) = response.into_parts();
     let deadline = tokio::time::Instant::now() + timeout;
+    retain_admission_until_body_deadline(response, guard, deadline)
+}
+
+/// Use the request's original deadline so body upload and handler execution do
+/// not grant a fresh timeout when an export starts streaming.
+pub fn retain_admission_until_body_deadline(
+    response: axum::response::Response,
+    guard: QueryAdmissionGuard,
+    deadline: tokio::time::Instant,
+) -> axum::response::Response {
+    let (parts, body) = response.into_parts();
     let state = (
         Box::pin(body.into_data_stream()),
         Some(guard),
@@ -495,6 +505,18 @@ pub fn retain_admission_until_body_end(
         futures_util::stream::unfold(state, |(mut body, mut guard, deadline, done)| async move {
             if done {
                 return None;
+            }
+            // timeout_at polls the future first. Explicitly enforce an expired
+            // deadline even if the next chunk is immediately ready.
+            if tokio::time::Instant::now() >= deadline {
+                guard.take();
+                return Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "export response exceeded its workload timeout",
+                    )),
+                    (body, guard, deadline, true),
+                ));
             }
             match tokio::time::timeout_at(deadline, body.next()).await {
                 Ok(Some(Ok(bytes))) => Some((
@@ -755,6 +777,35 @@ mod tests {
             Err(AdmissionError::TenantBusy { .. })
         ));
         drop(response);
+        assert!(
+            governor
+                .admit(WorkloadClass::Export, "tenant-a")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_response_keeps_the_original_request_deadline() {
+        let mut config = QueryGovernorConfig::default();
+        config.export.global_concurrency = 1;
+        config.export.per_tenant_concurrency = 1;
+        config.export.queue_timeout_ms = 0;
+        let governor = QueryGovernor::new(config, Arc::new(SelfMetrics::new())).unwrap();
+        let guard = governor
+            .admit(WorkloadClass::Export, "tenant-a")
+            .await
+            .unwrap();
+        let response = retain_admission_until_body_deadline(
+            axum::response::Response::new(axum::body::Body::from("already ready")),
+            guard,
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        );
+        assert!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .is_err()
+        );
         assert!(
             governor
                 .admit(WorkloadClass::Export, "tenant-a")
