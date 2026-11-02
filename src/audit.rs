@@ -1580,14 +1580,16 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_database_delivery_does_not_block_new_durable_events() {
-        use axum::{Router, extract::State, routing::any};
+        use axum::{Router, body::Bytes, extract::State, routing::any};
         #[derive(Default)]
         struct Fixture {
             entered: Notify,
             release: Notify,
             pause: AtomicBool,
         }
-        async fn respond(State(f): State<Arc<Fixture>>) -> &'static str {
+        // Consume streamed INSERT bodies before replying. An early response can
+        // close the client's upload channel before insert.end() finishes.
+        async fn respond(State(f): State<Arc<Fixture>>, _body: Bytes) -> &'static str {
             if f.pause.swap(false, Ordering::SeqCst) {
                 f.entered.notify_one();
                 f.release.notified().await;
