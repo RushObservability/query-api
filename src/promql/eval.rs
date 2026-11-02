@@ -332,13 +332,7 @@ async fn evaluate_range_call(
     .await?;
 
     // Apply range function at each step
-    Ok(evaluate_range_at_steps(
-        &raw_series,
-        range_func,
-        range_secs,
-        step_timestamps,
-        param,
-    ))
+    Ok(evaluate_range_at_steps(&raw_series, range_func, range_secs, step_timestamps, param).await)
 }
 
 /// Evaluate a Call node that wraps a scalar function (abs, ceil, histogram_quantile, etc.).
@@ -811,36 +805,48 @@ fn step_align_series(
 // ═══════════════════════════════════════════════════════════════════
 
 /// Evaluate a range function at each step timestamp over a sliding window.
-fn evaluate_range_at_steps(
+async fn evaluate_range_at_steps(
     raw_series: &[TimeSeries],
     func: types::RangeFunc,
     range_secs: f64,
     step_timestamps: &[f64],
     param: Option<f64>,
 ) -> Vec<TimeSeries> {
-    raw_series
-        .iter()
-        .map(|ts| {
-            let samples: Vec<(f64, f64)> = step_timestamps
-                .iter()
-                .filter_map(|&t| {
-                    let window: Vec<(f64, f64)> = ts
-                        .samples
-                        .iter()
-                        .filter(|(st, _)| *st >= t - range_secs && *st <= t)
-                        .copied()
-                        .collect();
-
-                    compute::evaluate_range_func(func, &window, param).map(|v| (t, v))
-                })
-                .collect();
-
-            TimeSeries {
-                labels: ts.labels.clone(),
-                samples,
+    let mut result = Vec::with_capacity(raw_series.len());
+    // Both samples and evaluation steps are sorted by timestamp. Advance
+    // each boundary once; selection costs O(samples + steps) per series.
+    for ts in raw_series {
+        let mut left = 0;
+        let mut right = 0;
+        let mut samples = Vec::with_capacity(step_timestamps.len());
+        for (index, &t) in step_timestamps.iter().enumerate() {
+            while right < ts.samples.len() && ts.samples[right].0 <= t {
+                right += 1;
+                if right % 4096 == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
-        })
-        .collect()
+            // Preserve the existing inclusive lower and upper bounds.
+            while left < right && ts.samples[left].0 < t - range_secs {
+                left += 1;
+                if left % 4096 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            if let Some(value) = compute::evaluate_range_func(func, &ts.samples[left..right], param)
+            {
+                samples.push((t, value));
+            }
+            if index % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        result.push(TimeSeries {
+            labels: ts.labels.clone(),
+            samples,
+        });
+    }
+    result
 }
 
 /// Extract a number literal from an Expr node.
@@ -969,6 +975,158 @@ fn collect_metrics(expr: &Expr, names: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn range_series(samples: &[(f64, f64)]) -> TimeSeries {
+        TimeSeries {
+            labels: BTreeMap::new(),
+            samples: samples.to_vec(),
+        }
+    }
+
+    fn range_reference(
+        raw: &[TimeSeries],
+        func: types::RangeFunc,
+        range: f64,
+        steps: &[f64],
+        param: Option<f64>,
+    ) -> Vec<TimeSeries> {
+        raw.iter()
+            .map(|ts| TimeSeries {
+                labels: ts.labels.clone(),
+                samples: steps
+                    .iter()
+                    .filter_map(|&t| {
+                        let window: Vec<_> = ts
+                            .samples
+                            .iter()
+                            .copied()
+                            .filter(|(st, _)| *st >= t - range && *st <= t)
+                            .collect();
+                        compute::evaluate_range_func(func, &window, param).map(|v| (t, v))
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn assert_range_equal(expected: &[TimeSeries], actual: &[TimeSeries]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.labels, expected.labels);
+            assert_eq!(actual.samples.len(), expected.samples.len());
+            for ((at, av), (et, ev)) in actual.samples.iter().zip(&expected.samples) {
+                assert_eq!(at, et);
+                assert!(
+                    av.to_bits() == ev.to_bits() || av.is_nan() && ev.is_nan(),
+                    "{av} != {ev} at {at}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sliding_ranges_preserve_all_functions_and_window_boundaries() {
+        use types::RangeFunc::*;
+        let functions = [
+            Rate,
+            Irate,
+            Increase,
+            SumOverTime,
+            AvgOverTime,
+            MinOverTime,
+            MaxOverTime,
+            CountOverTime,
+            StddevOverTime,
+            StdvarOverTime,
+            QuantileOverTime,
+            LastOverTime,
+            FirstOverTime,
+            Delta,
+            Idelta,
+            Deriv,
+            PredictLinear,
+            Changes,
+            Resets,
+            AbsentOverTime,
+            PresentOverTime,
+        ];
+        let raw = vec![
+            range_series(&[]),
+            range_series(&[
+                (0.0, 0.0),
+                (0.25, 5.0),
+                (1.0, 7.0),
+                (1.0, 9.0),
+                (3.0, 1.0),
+                (4.0, f64::NAN),
+                (5.0, f64::INFINITY),
+                (10.0, -1.0),
+            ]),
+            range_series(
+                &(0..400)
+                    .filter(|i| i % 7 != 0)
+                    .map(|i| (i as f64 * 0.25, (i % 23) as f64))
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        let steps = [
+            -10.0, 0.0, 0.25, 1.0, 2.0, 3.0, 5.0, 10.0, 70.0, 100.0, 1000.0,
+        ];
+        for func in functions {
+            for range in [0.0, 0.25, 1.0, 3.0, 10.0, 1000.0] {
+                let expected = range_reference(&raw, func, range, &steps, Some(0.7));
+                let actual = evaluate_range_at_steps(&raw, func, range, &steps, Some(0.7)).await;
+                assert_range_equal(&expected, &actual);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn range_evaluation_yields_for_cancellation() {
+        let raw = vec![range_series(
+            &(0..100_000)
+                .map(|i| (i as f64, i as f64))
+                .collect::<Vec<_>>(),
+        )];
+        let steps = [99_999.0];
+        let mut work = Box::pin(evaluate_range_at_steps(
+            &raw,
+            types::RangeFunc::Rate,
+            100_000.0,
+            &steps,
+            None,
+        ));
+        assert!(futures_util::poll!(work.as_mut()).is_pending());
+        drop(work);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual range evaluation benchmark"]
+    async fn benchmark_sliding_ranges() {
+        for (sample_count, step_count) in [(1_000, 100), (10_000, 1_000), (100_000, 1_000)] {
+            let raw = vec![range_series(
+                &(0..sample_count)
+                    .map(|i| (i as f64, (i % 100) as f64))
+                    .collect::<Vec<_>>(),
+            )];
+            let steps: Vec<_> = (0..step_count)
+                .map(|i| (i * (sample_count / step_count)) as f64)
+                .collect();
+            let start = std::time::Instant::now();
+            let expected = range_reference(&raw, types::RangeFunc::Rate, 30.0, &steps, None);
+            let reference = start.elapsed();
+            let start = std::time::Instant::now();
+            let actual =
+                evaluate_range_at_steps(&raw, types::RangeFunc::Rate, 30.0, &steps, None).await;
+            let sliding = start.elapsed();
+            assert_range_equal(&expected, &actual);
+            eprintln!(
+                "samples={sample_count} steps={step_count} reference_us={} sliding_us={}",
+                reference.as_micros(),
+                sliding.as_micros()
+            );
+        }
+    }
 
     #[test]
     fn range_grid_rejects_invalid_inputs() {
