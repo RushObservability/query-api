@@ -28,6 +28,22 @@ Session discovery and tenant listing remain accessible through their own authent
 
 ## Verification
 
+PromQL range queries now reject non-finite timestamps, reversed ranges, invalid
+steps, and steps too small to advance the timestamp. The inclusive grid is
+limited to 11,000 evaluation points before allocation, including scalar queries
+that never contact ClickHouse. Queries above that limit return 400 and must use
+a larger step. An omitted step still defaults to 15 seconds; an invalid supplied
+step returns 400 instead of silently using that default.
+
+An admitted query's deadline now includes reading and validating its body.
+Incomplete uploads time out with the existing 504 `query_timeout` response and
+release their query permits. Export streaming uses the same absolute deadline
+as upload and execution, so returning response headers does not reset the timer.
+
+Regression tests cover unsafe steps, oversized grids, normal scalar evaluation,
+partial uploads that never finish, cancellation, permit recovery, and export
+deadlines.
+
 The ordinary Rust suite includes regressions for concurrent rejected writes, byte limits, recovery, cancellation, independent audit chains, durable insert failures, file locking, and tenant selection.
 
 The audit integration test creates and removes its own database on a disposable ClickHouse server. It exercises an existing-table migration, concurrent writers with separate and shared outboxes, legacy hash verification, and restart recovery:
