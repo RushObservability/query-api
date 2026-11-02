@@ -114,6 +114,20 @@ pub struct AuditEvent {
 }
 
 impl AuditEvent {
+    /// Attribute a request to the principal already selected by tenant
+    /// middleware. Credential values never enter the audit event.
+    pub fn for_request(action: impl Into<String>, identity: &crate::RequestIdentity) -> Self {
+        let event = if identity.authenticated
+            && !identity.actor_id.is_empty()
+            && matches!(identity.actor_type.as_str(), "user" | "api_key")
+        {
+            Self::new(action, &identity.actor_type).actor(&identity.actor_id, &identity.actor_name)
+        } else {
+            Self::new(action, "anonymous")
+        };
+        event.tenant(&identity.tenant_id)
+    }
+
     /// Start a new event with the required `action` + `actor_type`. Defaults
     /// `tenant_id` to the reserved audit tenant and `outcome` to `success`.
     pub fn new(action: impl Into<String>, actor_type: impl Into<String>) -> Self {
@@ -1355,6 +1369,35 @@ mod tests {
             1024 * 1024,
         )
         .await
+    }
+
+    #[test]
+    fn request_events_keep_api_key_user_and_anonymous_actors_distinct() {
+        for action in ["data.export", "export_job.create", "export_job.cancel"] {
+            for (authenticated, actor_type, id, name, expected) in [
+                (true, "api_key", "key-17", "Grafana exporter", "api_key"),
+                (true, "user", "user-1", "alice", "user"),
+                (false, "anonymous", "", "", "anonymous"),
+                (false, "api_key", "untrusted", "untrusted", "anonymous"),
+            ] {
+                let identity = crate::RequestIdentity {
+                    tenant_id: "tenant-a".into(),
+                    authenticated,
+                    actor_id: id.into(),
+                    actor_name: name.into(),
+                    actor_type: actor_type.into(),
+                    credential_type: "not-a-credential-value".into(),
+                };
+                let event = AuditEvent::for_request(action, &identity);
+                assert_eq!(event.action, action);
+                assert_eq!(event.tenant_id, "tenant-a");
+                assert_eq!(event.actor_type, expected);
+                assert_eq!(event.actor_id, if authenticated { id } else { "" });
+                assert_eq!(event.actor_name, if authenticated { name } else { "" });
+                assert!(event.changes.is_empty());
+                assert!(event.metadata.is_empty());
+            }
+        }
     }
 
     #[test]
