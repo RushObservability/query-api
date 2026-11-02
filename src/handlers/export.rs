@@ -13,11 +13,10 @@ use clickhouse::query::RowCursor;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use serde::Serialize;
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{AppState, TenantContext};
 
@@ -27,10 +26,9 @@ pub const DEFAULT_SYNC_EXPORT_MAX_ROWS: u64 = 50_000;
 pub const DEFAULT_EXPORT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STREAM_SUFFIX_RESERVE: u64 = 256;
 const DEFAULT_EXPORT_JOB_TTL_SECS: u64 = 60 * 60;
-const FILE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Export output format, parsed from the request body `{ "format": "csv" | "json" }`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
     Csv,
@@ -93,7 +91,7 @@ pub fn requires_async(_requested: u64, effective: u64) -> bool {
     effective > sync_max_rows()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportJobState {
     Queued,
@@ -123,37 +121,27 @@ pub struct ExportJobStatus {
     pub error: Option<String>,
 }
 
-#[derive(Clone)]
-struct MutableJobState {
-    state: ExportJobState,
-    rows_written: u64,
-    bytes_written: u64,
-    truncated: bool,
-    error: Option<String>,
-}
+use super::export_store::{JobRecord, JobStore};
+use futures_util::TryStreamExt;
+use object_store::ObjectStoreExt;
 
-struct ExportJob {
-    id: String,
+const WORKER_LEASE_SECS: i64 = 120;
+const ARTIFACT_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+
+struct LocalJob {
     tenant_id: String,
-    signal: String,
-    format: ExportFormat,
-    filename: String,
-    requested_rows: u64,
-    created_at: chrono::DateTime<chrono::Utc>,
-    expires_at: chrono::DateTime<chrono::Utc>,
-    path: PathBuf,
     cancelled: AtomicBool,
-    mutable: Mutex<MutableJobState>,
+    progress: Mutex<ExportProgress>,
 }
 
-/// Process-local metadata with files stored beneath a private directory. The
-/// object path is never returned to callers; all access passes through a
-/// tenant-checked API route. A shared volume can back the directory in
-/// Kubernetes, while status metadata deliberately expires in-process.
+/// Durable metadata is authoritative. The local map contains only running
+/// workers' progress and cancellation signals, never discoverability state.
 pub struct ExportJobs {
-    root: PathBuf,
+    store: JobStore,
     ttl: Duration,
-    jobs: DashMap<String, Arc<ExportJob>>,
+    instance: String,
+    jobs: DashMap<String, Arc<LocalJob>>,
+    audit: std::sync::OnceLock<Arc<crate::audit::AuditLogger>>,
 }
 
 impl ExportJobs {
@@ -166,88 +154,225 @@ impl ExportJobs {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_EXPORT_JOB_TTL_SECS)
             .clamp(60, 24 * 60 * 60);
-        Self::with_root(root, Duration::from_secs(ttl_secs))
+        Ok(Self::with_store(
+            JobStore::from_env(&root)?,
+            Duration::from_secs(ttl_secs),
+        ))
     }
 
+    #[cfg(test)]
     fn with_root(root: PathBuf, ttl: Duration) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(&root)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
-        }
-        remove_stale_files(&root, ttl);
-        Ok(Self {
-            root,
-            ttl,
-            jobs: DashMap::new(),
-        })
+        Ok(Self::with_store(JobStore::local(&root)?, ttl))
     }
 
-    pub fn create(
+    fn with_store(store: JobStore, ttl: Duration) -> Self {
+        Self {
+            store,
+            ttl,
+            instance: uuid::Uuid::new_v4().to_string(),
+            jobs: DashMap::new(),
+            audit: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub async fn create(
         &self,
         tenant_id: &str,
         signal: &str,
         format: ExportFormat,
         filename: String,
         requested_rows: u64,
-    ) -> ExportJobStatus {
-        let id = uuid::Uuid::new_v4().to_string();
-        let created_at = chrono::Utc::now();
-        let expires_at = created_at
-            + chrono::Duration::from_std(self.ttl).unwrap_or_else(|_| chrono::Duration::hours(1));
-        let job = Arc::new(ExportJob {
-            path: self.root.join(&id),
-            id: id.clone(),
-            tenant_id: tenant_id.to_string(),
-            signal: signal.to_string(),
+    ) -> anyhow::Result<ExportJobStatus> {
+        let now = chrono::Utc::now();
+        let record = JobRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            tenant_id: tenant_id.into(),
+            signal: signal.into(),
             format,
             filename,
             requested_rows,
-            created_at,
-            expires_at,
-            cancelled: AtomicBool::new(false),
-            mutable: Mutex::new(MutableJobState {
-                state: ExportJobState::Queued,
-                rows_written: 0,
-                bytes_written: 0,
-                truncated: false,
-                error: None,
+            created_at: now,
+            expires_at: now + chrono::Duration::from_std(self.ttl)?,
+            state: ExportJobState::Queued,
+            rows_written: 0,
+            bytes_written: 0,
+            chunks: 0,
+            truncated: false,
+            error: None,
+            owner: self.instance.clone(),
+            lease_until: now + chrono::Duration::seconds(WORKER_LEASE_SECS),
+            revision: 0,
+        };
+        if !self.store.save(&record, None).await? {
+            anyhow::bail!("export job ID collision");
+        }
+        self.jobs.insert(
+            record.id.clone(),
+            Arc::new(LocalJob {
+                tenant_id: tenant_id.into(),
+                cancelled: AtomicBool::new(false),
+                progress: Mutex::new(ExportProgress::default()),
             }),
-        });
-        let status = status_snapshot(
-            &job,
-            &MutableJobState {
-                state: ExportJobState::Queued,
-                rows_written: 0,
-                bytes_written: 0,
-                truncated: false,
-                error: None,
-            },
         );
-        self.jobs.insert(id, job);
-        status
+        Ok(status_snapshot(&record))
+    }
+
+    async fn update(
+        &self,
+        tenant: &str,
+        id: &str,
+        mut change: impl FnMut(&mut JobRecord) -> bool,
+    ) -> anyhow::Result<Option<JobRecord>> {
+        for _ in 0..8 {
+            let Some((mut record, version)) = self.store.load(tenant, id).await? else {
+                return Ok(None);
+            };
+            if !change(&mut record) {
+                return Ok(None);
+            }
+            record.revision = record
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("export revision overflow"))?;
+            match self.store.save(&record, Some(version)).await {
+                Ok(true) => return Ok(Some(record)),
+                Ok(false) => {}
+                Err(error) => {
+                    // A store can commit a conditional write and lose its
+                    // response. Confirm it before reporting a failed mutation.
+                    if let Some((current, _)) = self.store.load(tenant, id).await?
+                        && serde_json::to_vec(&current)? == serde_json::to_vec(&record)?
+                    {
+                        return Ok(Some(current));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        anyhow::bail!("export metadata update contended")
+    }
+
+    async fn audit_transition(
+        &self,
+        record: &JobRecord,
+        action: &'static str,
+        outcome: &'static str,
+    ) {
+        if let Some(audit) = self.audit.get() {
+            audit
+                .log(
+                    crate::audit::AuditEvent::new(action, "system")
+                        .actor_name("query-api")
+                        .tenant(&record.tenant_id)
+                        .resource("export_job", &record.id)
+                        .outcome(outcome)
+                        .changes(serde_json::json!({ "state": record.state }).to_string()),
+                )
+                .await;
+        }
     }
 
     pub fn spawn_janitor(self: &Arc<Self>, audit: Arc<crate::audit::AuditLogger>) {
+        let _ = self.audit.set(audit);
         let jobs = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                for (tenant_id, id) in jobs.cleanup_expired() {
-                    audit
-                        .log(
-                            crate::audit::AuditEvent::new("export_job.expire", "system")
-                                .actor_name("query-api")
-                                .tenant(tenant_id)
-                                .resource("export_job", id)
-                                .changes(serde_json::json!({ "state": "expired" }).to_string()),
-                        )
-                        .await;
+                let mut keys = jobs.store.keys();
+                while let Some(meta) = keys.next().await {
+                    let meta = match meta {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            tracing::warn!(%error, "export cleanup listing failed");
+                            break;
+                        }
+                    };
+                    if !meta.location.as_ref().ends_with("/job.json") {
+                        continue;
+                    }
+                    match jobs.store.record_at(&meta.location).await {
+                        Ok(record) => {
+                            if let Err(error) = jobs.reconcile(record).await {
+                                tracing::warn!(%error, "export cleanup deferred");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "export metadata could not be inspected")
+                        }
+                    }
                 }
             }
         });
+    }
+
+    async fn reconcile(&self, mut record: JobRecord) -> anyhow::Result<JobRecord> {
+        let now = chrono::Utc::now();
+        let expired = record.expires_at <= now;
+        let lost = matches!(
+            record.state,
+            ExportJobState::Queued | ExportJobState::Running
+        ) && record.lease_until <= now;
+        if (expired && record.state != ExportJobState::Expired) || lost {
+            if let Some(updated) = self
+                .update(&record.tenant_id, &record.id, |current| {
+                    if current.expires_at <= now && current.state != ExportJobState::Expired {
+                        current.state = ExportJobState::Expired;
+                        current.error = None;
+                        true
+                    } else if matches!(
+                        current.state,
+                        ExportJobState::Queued | ExportJobState::Running
+                    ) && current.lease_until <= now
+                    {
+                        current.state = ExportJobState::Failed;
+                        current.error =
+                            Some("export worker lease expired; retry the export".into());
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .await?
+            {
+                let action = if updated.state == ExportJobState::Expired {
+                    "export_job.expire"
+                } else {
+                    "export_job.fail"
+                };
+                self.audit_transition(
+                    &updated,
+                    action,
+                    if updated.state == ExportJobState::Failed {
+                        "failure"
+                    } else {
+                        "success"
+                    },
+                )
+                .await;
+                record = updated;
+            } else if let Some((current, _)) =
+                self.store.load(&record.tenant_id, &record.id).await?
+            {
+                record = current;
+            }
+        }
+        if matches!(
+            record.state,
+            ExportJobState::Failed | ExportJobState::Cancelled | ExportJobState::Expired
+        ) {
+            if let Some(local) = self.jobs.get(&record.id) {
+                local.cancelled.store(true, Ordering::Release);
+            }
+            self.store.delete_artifacts(&record).await?;
+            // Keep a tombstone beyond the maximum workload duration so a
+            // fenced old worker cannot leave an undiscoverable artifact.
+            if record.expires_at + chrono::Duration::minutes(15) <= now {
+                self.store.delete_metadata(&record).await?;
+            }
+            self.jobs.remove(&record.id);
+        }
+        Ok(record)
     }
 
     pub fn progress_callback(self: &Arc<Self>, id: &str) -> ProgressCallback {
@@ -255,143 +380,291 @@ impl ExportJobs {
         let id = id.to_string();
         Arc::new(move |progress| {
             if let Some(job) = jobs.jobs.get(&id) {
-                let mut state = job.mutable.lock().expect("export job lock poisoned");
-                state.rows_written = progress.rows;
-                state.bytes_written = progress.bytes;
-                state.truncated = progress.truncated;
+                *job.progress.lock().expect("export progress poisoned") = progress;
             }
         })
     }
 
-    pub async fn mark_running(&self, id: &str) {
-        if let Some(job) = self.jobs.get(id) {
-            if !job.cancelled.load(Ordering::Acquire) {
-                let mut state = job.mutable.lock().expect("export job lock poisoned");
-                if state.state == ExportJobState::Queued {
-                    state.state = ExportJobState::Running;
-                }
-            }
-        }
-    }
-
     pub async fn mark_failed(&self, id: &str, message: &'static str) {
-        if let Some(job) = self.jobs.get(id) {
-            let mut state = job.mutable.lock().expect("export job lock poisoned");
-            if state.state != ExportJobState::Cancelled {
-                state.state = ExportJobState::Failed;
-                state.error = Some(message.to_string());
+        let tenant = self.jobs.get(id).map(|job| job.tenant_id.clone());
+        let Some(tenant) = tenant else {
+            return;
+        };
+        match self
+            .update(&tenant, id, |record| {
+                if record.owner == self.instance
+                    && matches!(
+                        record.state,
+                        ExportJobState::Queued | ExportJobState::Running
+                    )
+                {
+                    record.state = ExportJobState::Failed;
+                    record.error = Some(message.into());
+                    true
+                } else {
+                    false
+                }
+            })
+            .await
+        {
+            Ok(Some(record)) => {
+                self.audit_transition(&record, "export_job.fail", "failure")
+                    .await;
+                let _ = self.reconcile(record).await;
             }
+            Ok(None) => {
+                self.jobs.remove(id);
+            }
+            Err(error) => tracing::error!(%error, "export failure state could not be persisted"),
         }
     }
 
     pub fn is_cancelled(&self, id: &str) -> bool {
         self.jobs
             .get(id)
-            .is_some_and(|job| job.cancelled.load(Ordering::Acquire))
+            .is_none_or(|job| job.cancelled.load(Ordering::Acquire))
     }
 
-    pub async fn cancel(&self, tenant_id: &str, id: &str) -> Option<ExportJobStatus> {
-        let job = self.job_for_tenant(tenant_id, id)?;
-        job.cancelled.store(true, Ordering::Release);
-        let status = {
-            let mut state = job.mutable.lock().expect("export job lock poisoned");
-            state.state = ExportJobState::Cancelled;
-            state.error = None;
-            status_snapshot(&job, &state)
+    pub async fn cancel(&self, tenant: &str, id: &str) -> anyhow::Result<Option<ExportJobStatus>> {
+        let Some((record, _)) = self.store.load(tenant, id).await? else {
+            return Ok(None);
         };
-        let _ = tokio::fs::remove_file(&job.path).await;
-        let _ = tokio::fs::remove_file(part_path(&job.path)).await;
-        Some(status)
+        if record.expires_at <= chrono::Utc::now() {
+            return Ok(None);
+        }
+        let updated = self
+            .update(tenant, id, |record| {
+                if matches!(
+                    record.state,
+                    ExportJobState::Expired | ExportJobState::Cancelled
+                ) {
+                    return false;
+                }
+                record.state = ExportJobState::Cancelled;
+                record.error = None;
+                true
+            })
+            .await?;
+        if let Some(local) = self.jobs.get(id) {
+            local.cancelled.store(true, Ordering::Release);
+        }
+        if let Some(record) = updated {
+            let status = status_snapshot(&record);
+            if let Err(error) = self.reconcile(record).await {
+                // The cancellation already committed. Return it so the
+                // caller records its audit event; cleanup retries separately.
+                tracing::warn!(%error, "cancelled export cleanup deferred");
+            }
+            Ok(Some(status))
+        } else {
+            self.status(tenant, id).await
+        }
     }
 
-    pub async fn status(&self, tenant_id: &str, id: &str) -> Option<ExportJobStatus> {
-        let job = self.job_for_tenant(tenant_id, id)?;
-        let state = job.mutable.lock().expect("export job lock poisoned");
-        Some(status_snapshot(&job, &state))
+    pub async fn status(&self, tenant: &str, id: &str) -> anyhow::Result<Option<ExportJobStatus>> {
+        let Some((record, _)) = self.store.load(tenant, id).await? else {
+            return Ok(None);
+        };
+        let record = self.reconcile(record).await?;
+        if record.expires_at <= chrono::Utc::now() {
+            return Ok(None);
+        }
+        Ok(Some(status_snapshot(&record)))
     }
 
-    pub async fn write_response(&self, id: &str, response: Response) -> anyhow::Result<()> {
-        let job = self
+    async fn renew(
+        &self,
+        id: &str,
+        tenant: &str,
+        expected: ExportJobState,
+    ) -> anyhow::Result<JobRecord> {
+        let now = chrono::Utc::now();
+        let progress = self
             .jobs
             .get(id)
-            .map(|job| job.clone())
-            .ok_or_else(|| anyhow::anyhow!("export job no longer exists"))?;
-        if job.cancelled.load(Ordering::Acquire) {
-            return Err(anyhow::anyhow!("export job cancelled"));
-        }
-        self.mark_running(id).await;
-        let temporary = part_path(&job.path);
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)
-            .await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .await?;
-        }
-        let mut body = response.into_body().into_data_stream();
-        while let Some(chunk) = body.next().await {
-            if job.cancelled.load(Ordering::Acquire) {
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return Err(anyhow::anyhow!("export job cancelled"));
-            }
-            file.write_all(&chunk?).await?;
-        }
-        file.flush().await?;
-        file.sync_all().await?;
-        drop(file);
-        if job.cancelled.load(Ordering::Acquire) {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(anyhow::anyhow!("export job cancelled"));
-        }
-        tokio::fs::rename(&temporary, &job.path).await?;
-        let completed = {
-            let mut state = job.mutable.lock().expect("export job lock poisoned");
-            if job.cancelled.load(Ordering::Acquire) {
-                false
-            } else {
-                state.state = ExportJobState::Completed;
-                state.error = None;
+            .map(|local| *local.progress.lock().expect("export progress poisoned"))
+            .unwrap_or_default();
+        let record = self
+            .update(tenant, id, |record| {
+                if record.owner != self.instance
+                    || record.lease_until <= now
+                    || record.expires_at <= now
+                    || record.state != expected
+                {
+                    return false;
+                }
+                record.state = ExportJobState::Running;
+                record.lease_until = now + chrono::Duration::seconds(WORKER_LEASE_SECS);
+                record.rows_written = progress.rows;
+                record.bytes_written = progress.bytes;
+                record.truncated = progress.truncated;
                 true
+            })
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("export lease was lost or cancelled"))?;
+        self.audit_transition(
+            &record,
+            if expected == ExportJobState::Queued {
+                "export_job.start"
+            } else {
+                "export_job.renew"
+            },
+            "success",
+        )
+        .await;
+        Ok(record)
+    }
+
+    pub async fn write_response(
+        self: &Arc<Self>,
+        id: &str,
+        response: Response,
+    ) -> anyhow::Result<()> {
+        let tenant = self
+            .jobs
+            .get(id)
+            .map(|job| job.tenant_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("export worker not owned by this process"))?;
+        let record = self.renew(id, &tenant, ExportJobState::Queued).await?;
+        let jobs = self.clone();
+        let id = id.to_string();
+        let (mut sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let work = jobs.upload(&record, response);
+            let result = tokio::select! { result = work => result, _ = sender.closed() => Err(anyhow::anyhow!("export worker cancelled")) };
+            let result = match result {
+                Ok((chunks, bytes)) => jobs.publish(&record, chunks, bytes).await,
+                Err(error) => Err(error),
+            };
+            if result.is_err() {
+                jobs.mark_failed(&id, "export could not be completed").await;
             }
-        };
-        if !completed {
-            let _ = tokio::fs::remove_file(&job.path).await;
-            return Err(anyhow::anyhow!("export job cancelled"));
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("export worker stopped"))?
+    }
+
+    async fn upload(&self, record: &JobRecord, response: Response) -> anyhow::Result<(u64, u64)> {
+        let prefix = self.store.artifact_key(record)?;
+        let mut body = response.into_body().into_data_stream();
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        let mut buffer = Vec::with_capacity(ARTIFACT_CHUNK_BYTES);
+        let mut chunks = 0;
+        let mut bytes = 0_u64;
+        loop {
+            if self.is_cancelled(&record.id) {
+                anyhow::bail!("export worker cancelled");
+            }
+            let chunk = tokio::select! {
+                _ = heartbeat.tick() => { self.renew(&record.id, &record.tenant_id, ExportJobState::Running).await?; continue; },
+                chunk = body.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let mut chunk = chunk?;
+            bytes = bytes
+                .checked_add(chunk.len() as u64)
+                .filter(|bytes| *bytes <= max_export_bytes())
+                .ok_or_else(|| anyhow::anyhow!("export exceeds byte limit"))?;
+            while !chunk.is_empty() {
+                let count = (ARTIFACT_CHUNK_BYTES - buffer.len()).min(chunk.len());
+                buffer.extend_from_slice(&chunk.split_to(count));
+                if buffer.len() == ARTIFACT_CHUNK_BYTES {
+                    self.store
+                        .objects
+                        .put(
+                            &prefix.clone().join(format!("{chunks:08}.part")),
+                            Bytes::from(std::mem::take(&mut buffer)).into(),
+                        )
+                        .await?;
+                    chunks += 1;
+                }
+            }
         }
+        if !buffer.is_empty() || chunks == 0 {
+            self.store
+                .objects
+                .put(
+                    &prefix.clone().join(format!("{chunks:08}.part")),
+                    Bytes::from(buffer).into(),
+                )
+                .await?;
+            chunks += 1;
+        }
+        Ok((chunks, bytes))
+    }
+
+    async fn publish(&self, record: &JobRecord, chunks: u64, bytes: u64) -> anyhow::Result<()> {
+        let progress = self
+            .jobs
+            .get(&record.id)
+            .map(|local| *local.progress.lock().expect("export progress poisoned"))
+            .unwrap_or_default();
+        let now = chrono::Utc::now();
+        let updated = self
+            .update(&record.tenant_id, &record.id, |current| {
+                if current.owner != self.instance
+                    || current.lease_until <= now
+                    || current.expires_at <= now
+                    || current.state != ExportJobState::Running
+                {
+                    return false;
+                }
+                current.state = ExportJobState::Completed;
+                current.chunks = chunks;
+                current.bytes_written = bytes;
+                current.rows_written = progress.rows;
+                current.truncated = progress.truncated;
+                true
+            })
+            .await?;
+        let Some(updated) = updated else {
+            anyhow::bail!("export publication was fenced");
+        };
+        self.audit_transition(&updated, "export_job.complete", "success")
+            .await;
+        self.jobs.remove(&record.id);
         Ok(())
     }
 
-    pub async fn download(&self, tenant_id: &str, id: &str) -> Result<Response, StatusCode> {
-        let job = self
-            .job_for_tenant(tenant_id, id)
+    pub async fn download(&self, tenant: &str, id: &str) -> Result<Response, StatusCode> {
+        let (record, _) = self
+            .store
+            .load(tenant, id)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
             .ok_or(StatusCode::NOT_FOUND)?;
-        if job.mutable.lock().expect("export job lock poisoned").state != ExportJobState::Completed
-        {
+        let record = self
+            .reconcile(record)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if record.expires_at <= chrono::Utc::now() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        if record.state != ExportJobState::Completed {
             return Err(StatusCode::CONFLICT);
         }
-        let file = tokio::fs::File::open(&job.path)
-            .await
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-        let stream = futures_util::stream::unfold(file, |mut file| async move {
-            let mut buffer = vec![0u8; FILE_CHUNK_BYTES];
-            match file.read(&mut buffer).await {
-                Ok(0) => None,
-                Ok(read) => {
-                    buffer.truncate(read);
-                    Some((Ok::<Bytes, std::io::Error>(Bytes::from(buffer)), file))
-                }
-                Err(error) => Some((Err(error), file)),
-            }
-        });
+        let store = self.store.objects.clone();
+        let prefix = self
+            .store
+            .artifact_key(&record)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let stream = futures_util::stream::iter(0..record.chunks)
+            .then(move |index| {
+                let store = store.clone();
+                let path = prefix.clone().join(format!("{index:08}.part"));
+                async move { store.get(&path).await.map(|result| result.into_stream()) }
+            })
+            .try_flatten();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static(match job.format {
+            HeaderValue::from_static(match record.format {
                 ExportFormat::Csv => "text/csv; charset=utf-8",
                 ExportFormat::Json => "application/json; charset=utf-8",
             }),
@@ -401,89 +674,34 @@ impl ExportJobs {
             HeaderValue::from_static("private, no-store"),
         );
         if let Ok(value) =
-            HeaderValue::from_str(&format!("attachment; filename=\"{}\"", job.filename))
+            HeaderValue::from_str(&format!("attachment; filename=\"{}\"", record.filename))
         {
             headers.insert(header::CONTENT_DISPOSITION, value);
         }
         Ok((StatusCode::OK, headers, Body::from_stream(stream)).into_response())
     }
-
-    fn job_for_tenant(&self, tenant_id: &str, id: &str) -> Option<Arc<ExportJob>> {
-        self.jobs
-            .get(id)
-            .filter(|job| job.tenant_id == tenant_id && job.expires_at > chrono::Utc::now())
-            .map(|job| job.clone())
-    }
-
-    fn cleanup_expired(&self) -> Vec<(String, String)> {
-        let now = chrono::Utc::now();
-        let expired: Vec<String> = self
-            .jobs
-            .iter()
-            .filter(|entry| entry.expires_at <= now)
-            .map(|entry| entry.key().clone())
-            .collect();
-        let mut removed = Vec::with_capacity(expired.len());
-        for id in expired {
-            if let Some((_, job)) = self.jobs.remove(&id) {
-                job.cancelled.store(true, Ordering::Release);
-                removed.push((job.tenant_id.clone(), job.id.clone()));
-                let path = job.path.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    let _ = tokio::fs::remove_file(part_path(&path)).await;
-                });
-            }
-        }
-        removed
-    }
 }
 
-fn part_path(path: &FsPath) -> PathBuf {
-    path.with_extension("part")
-}
-
-fn remove_stale_files(root: &FsPath, ttl: Duration) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    for entry in entries.flatten() {
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= ttl);
-        if stale {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-fn format_label(format: ExportFormat) -> &'static str {
-    match format {
-        ExportFormat::Csv => "csv",
-        ExportFormat::Json => "json",
-    }
-}
-
-fn status_snapshot(job: &ExportJob, state: &MutableJobState) -> ExportJobStatus {
+fn status_snapshot(record: &JobRecord) -> ExportJobStatus {
     ExportJobStatus {
-        id: job.id.clone(),
-        signal: job.signal.clone(),
-        format: format_label(job.format).to_string(),
-        state: state.state,
-        requested_rows: job.requested_rows,
-        rows_written: state.rows_written,
-        bytes_written: state.bytes_written,
-        truncated: state.truncated,
-        created_at: job.created_at.to_rfc3339(),
-        expires_at: job.expires_at.to_rfc3339(),
-        status_url: format!("/api/v1/exports/{}", job.id),
-        download_url: (state.state == ExportJobState::Completed)
-            .then(|| format!("/api/v1/exports/{}/download", job.id)),
-        error: state.error.clone(),
+        id: record.id.clone(),
+        signal: record.signal.clone(),
+        format: match record.format {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Json => "json",
+        }
+        .into(),
+        state: record.state,
+        requested_rows: record.requested_rows,
+        rows_written: record.rows_written,
+        bytes_written: record.bytes_written,
+        truncated: record.truncated,
+        created_at: record.created_at.to_rfc3339(),
+        expires_at: record.expires_at.to_rfc3339(),
+        status_url: format!("/api/v1/exports/{}", record.id),
+        download_url: (record.state == ExportJobState::Completed)
+            .then(|| format!("/api/v1/exports/{}/download", record.id)),
+        error: record.error.clone(),
     }
 }
 
@@ -522,8 +740,11 @@ pub async fn get_export_job(
     Path(id): Path<String>,
 ) -> Response {
     match state.export_jobs.status(&tenant.tenant_id, &id).await {
-        Some(status) => Json(status).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(status)) => Json(status).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            crate::api_error::ApiError::internal("read export status", error).into_response()
+        }
     }
 }
 
@@ -571,8 +792,12 @@ pub async fn cancel_export_job(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let Some(status) = state.export_jobs.cancel(&tenant.tenant_id, &id).await else {
-        return StatusCode::NOT_FOUND.into_response();
+    let status = match state.export_jobs.cancel(&tenant.tenant_id, &id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            return crate::api_error::ApiError::internal("cancel export", error).into_response();
+        }
     };
     let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
         Some(token) => crate::request_auth::resolve_session_user(&state, &token)
@@ -961,22 +1186,368 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_exports_survive_new_instances_and_stream_across_replicas() {
+        let store =
+            JobStore::shared(Arc::new(object_store::memory::InMemory::new()), "exports").unwrap();
+        let a = Arc::new(ExportJobs::with_store(
+            store.clone(),
+            Duration::from_secs(60),
+        ));
+        let b = Arc::new(ExportJobs::with_store(
+            store.clone(),
+            Duration::from_secs(60),
+        ));
+        let status = a
+            .create("tenant-a", "logs", ExportFormat::Csv, "logs.csv".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            b.status("tenant-a", &status.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ExportJobState::Queued
+        );
+        assert!(b.status("tenant-b", &status.id).await.unwrap().is_none());
+        assert!(b.status("tenant-a", "../job.json").await.unwrap().is_none());
+        assert!(
+            b.write_response(&status.id, Response::new(Body::from("not owned")))
+                .await
+                .is_err()
+        );
+        let expected = vec![b'x'; ARTIFACT_CHUNK_BYTES * 2 + 123];
+        a.write_response(&status.id, Response::new(Body::from(expected.clone())))
+            .await
+            .unwrap();
+        assert!(a.jobs.is_empty());
+        drop(a);
+        let restarted = Arc::new(ExportJobs::with_store(store, Duration::from_secs(60)));
+        let current = restarted
+            .status("tenant-a", &status.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, ExportJobState::Completed);
+        assert_eq!(current.bytes_written, expected.len() as u64);
+        let response = b.download("tenant-a", &status.id).await.unwrap();
+        let actual = axum::body::to_bytes(response.into_body(), expected.len() + 1)
+            .await
+            .unwrap();
+        assert_eq!(actual.as_ref(), &expected);
+        assert_eq!(
+            restarted
+                .download("tenant-b", &status.id)
+                .await
+                .unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_local_metadata_uses_atomic_revision_checks() {
+        let root =
+            std::env::temp_dir().join(format!("rush-export-restart-{}", uuid::Uuid::new_v4()));
+        let a = Arc::new(ExportJobs::with_root(root.clone(), Duration::from_secs(60)).unwrap());
+        let status = a
+            .create(
+                "tenant-a",
+                "spans",
+                ExportFormat::Json,
+                "spans.json".into(),
+                1,
+            )
+            .await
+            .unwrap();
+        let (mut first, version) = a.store.load("tenant-a", &status.id).await.unwrap().unwrap();
+        let mut second = first.clone();
+        first.state = ExportJobState::Running;
+        first.revision += 1;
+        second.state = ExportJobState::Cancelled;
+        second.revision += 1;
+        let (left, right) = tokio::join!(
+            a.store.save(&first, Some(version.clone())),
+            a.store.save(&second, Some(version))
+        );
+        assert_ne!(
+            left.unwrap(),
+            right.unwrap(),
+            "only one update from a shared revision can win"
+        );
+        let status = a
+            .create(
+                "tenant-a",
+                "logs",
+                ExportFormat::Json,
+                "logs.json".into(),
+                1,
+            )
+            .await
+            .unwrap();
+        a.write_response(&status.id, Response::new(Body::from("{}")))
+            .await
+            .unwrap();
+        drop(a);
+        let restarted =
+            Arc::new(ExportJobs::with_root(root.clone(), Duration::from_secs(60)).unwrap());
+        assert_eq!(
+            restarted
+                .status("tenant-a", &status.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ExportJobState::Completed
+        );
+        let response = restarted.download("tenant-a", &status.id).await.unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 10)
+                .await
+                .unwrap(),
+            "{}"
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_cas_fences_duplicate_workers_and_expired_leases() {
+        let store =
+            JobStore::shared(Arc::new(object_store::memory::InMemory::new()), "exports").unwrap();
+        let a = Arc::new(ExportJobs::with_store(
+            store.clone(),
+            Duration::from_secs(60),
+        ));
+        let b = Arc::new(ExportJobs::with_store(store, Duration::from_secs(60)));
+        let status = a
+            .create(
+                "tenant-a",
+                "logs",
+                ExportFormat::Json,
+                "logs.json".into(),
+                1,
+            )
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            a.renew(&status.id, "tenant-a", ExportJobState::Queued),
+            a.renew(&status.id, "tenant-a", ExportJobState::Queued)
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        let (mut old, version) = a.store.load("tenant-a", &status.id).await.unwrap().unwrap();
+        old.lease_until = chrono::Utc::now() - chrono::Duration::seconds(1);
+        old.revision += 1;
+        assert!(a.store.save(&old, Some(version)).await.unwrap());
+        let status = b.status("tenant-a", &status.id).await.unwrap().unwrap();
+        assert_eq!(status.state, ExportJobState::Failed);
+        assert!(status.error.unwrap().contains("lease expired"));
+        assert!(a.publish(&old, 1, 2).await.is_err());
+        assert_eq!(
+            b.status("tenant-a", &old.id).await.unwrap().unwrap().state,
+            ExportJobState::Failed
+        );
+    }
+
+    struct BodyDrop(Arc<AtomicBool>);
+    impl Drop for BodyDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_export_body(dropped: Arc<AtomicBool>) -> Body {
+        let marker = BodyDrop(dropped);
+        Body::from_stream(futures_util::stream::once(async move {
+            let _marker = marker;
+            std::future::pending::<Result<Bytes, std::io::Error>>().await
+        }))
+    }
+
+    #[tokio::test]
+    async fn another_replica_can_cancel_a_stalled_worker() {
+        let store =
+            JobStore::shared(Arc::new(object_store::memory::InMemory::new()), "exports").unwrap();
+        let a = Arc::new(ExportJobs::with_store(
+            store.clone(),
+            Duration::from_secs(60),
+        ));
+        let b = Arc::new(ExportJobs::with_store(store, Duration::from_secs(60)));
+        let status = a
+            .create(
+                "tenant-a",
+                "logs",
+                ExportFormat::Json,
+                "logs.json".into(),
+                1,
+            )
+            .await
+            .unwrap();
+        let id = status.id.clone();
+        let creator = a.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = dropped.clone();
+        let worker = tokio::spawn(async move {
+            creator
+                .write_response(&id, Response::new(pending_export_body(observed)))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while b
+                .status("tenant-a", &status.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                != ExportJobState::Running
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        b.cancel("tenant-a", &status.id).await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(8), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            b.status("tenant-a", &status.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ExportJobState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_waiter_stops_upload_and_records_failure() {
+        let store =
+            JobStore::shared(Arc::new(object_store::memory::InMemory::new()), "exports").unwrap();
+        let jobs = Arc::new(ExportJobs::with_store(store, Duration::from_secs(60)));
+        let status = jobs
+            .create(
+                "tenant-a",
+                "logs",
+                ExportFormat::Json,
+                "logs.json".into(),
+                1,
+            )
+            .await
+            .unwrap();
+        let id = status.id.clone();
+        let creator = jobs.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = dropped.clone();
+        let waiter = tokio::spawn(async move {
+            creator
+                .write_response(&id, Response::new(pending_export_body(observed)))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while jobs
+                .status("tenant-a", &status.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                != ExportJobState::Running
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = jobs
+                    .status("tenant-a", &status.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state;
+                if state == ExportJobState::Failed && dropped.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_metadata_is_an_error_and_expired_jobs_remain_inaccessible() {
+        let store =
+            JobStore::shared(Arc::new(object_store::memory::InMemory::new()), "exports").unwrap();
+        let jobs = Arc::new(ExportJobs::with_store(store, Duration::from_secs(60)));
+        let status = jobs
+            .create(
+                "tenant-a",
+                "logs",
+                ExportFormat::Json,
+                "logs.json".into(),
+                1,
+            )
+            .await
+            .unwrap();
+        let (mut record, version) = jobs
+            .store
+            .load("tenant-a", &status.id)
+            .await
+            .unwrap()
+            .unwrap();
+        record.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        record.revision += 1;
+        assert!(jobs.store.save(&record, Some(version)).await.unwrap());
+        assert!(jobs.status("tenant-a", &status.id).await.unwrap().is_none());
+        assert_eq!(
+            jobs.download("tenant-a", &status.id).await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+        let mut keys = jobs.store.keys();
+        while let Some(Ok(meta)) = keys.next().await {
+            if meta.location.as_ref().ends_with("/job.json") {
+                jobs.store
+                    .objects
+                    .put(&meta.location, Bytes::from_static(b"corrupt").into())
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(jobs.status("tenant-a", &status.id).await.is_err());
+    }
+
+    #[tokio::test]
     async fn async_objects_are_tenant_scoped_and_streamed_from_disk() {
         let root = std::env::temp_dir().join(format!("rush-export-test-{}", uuid::Uuid::new_v4()));
-        let jobs = ExportJobs::with_root(root.clone(), Duration::from_secs(60)).unwrap();
-        let status = jobs.create(
-            "tenant-a",
-            "logs",
-            ExportFormat::Json,
-            "logs.json".to_string(),
-            10,
-        );
-        assert!(jobs.status("tenant-b", &status.id).await.is_none());
+        let jobs = Arc::new(ExportJobs::with_root(root.clone(), Duration::from_secs(60)).unwrap());
+        let status = jobs
+            .create(
+                "tenant-a",
+                "logs",
+                ExportFormat::Json,
+                "logs.json".to_string(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(jobs.status("tenant-b", &status.id).await.unwrap().is_none());
         jobs.write_response(&status.id, Response::new(Body::from("{\"rows\":[]}")))
             .await
             .unwrap();
         assert_eq!(
-            jobs.status("tenant-a", &status.id).await.unwrap().state,
+            jobs.status("tenant-a", &status.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             ExportJobState::Completed
         );
         assert!(jobs.download("tenant-b", &status.id).await.is_err());
@@ -994,14 +1565,17 @@ mod tests {
     async fn cancelled_job_cannot_be_restarted_or_publish_an_object() {
         let root =
             std::env::temp_dir().join(format!("rush-export-cancel-test-{}", uuid::Uuid::new_v4()));
-        let jobs = ExportJobs::with_root(root.clone(), Duration::from_secs(60)).unwrap();
-        let status = jobs.create(
-            "tenant-a",
-            "spans",
-            ExportFormat::Csv,
-            "spans.csv".to_string(),
-            10,
-        );
+        let jobs = Arc::new(ExportJobs::with_root(root.clone(), Duration::from_secs(60)).unwrap());
+        let status = jobs
+            .create(
+                "tenant-a",
+                "spans",
+                ExportFormat::Csv,
+                "spans.csv".to_string(),
+                10,
+            )
+            .await
+            .unwrap();
         jobs.cancel("tenant-a", &status.id).await.unwrap();
         assert!(
             jobs.write_response(&status.id, Response::new(Body::from("row\n")))
@@ -1009,11 +1583,28 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            jobs.status("tenant-a", &status.id).await.unwrap().state,
+            jobs.status("tenant-a", &status.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             ExportJobState::Cancelled
         );
-        let job = jobs.job_for_tenant("tenant-a", &status.id).unwrap();
-        assert!(!job.path.exists());
+        let (record, _) = jobs
+            .store
+            .load("tenant-a", &status.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let prefix = jobs.store.artifact_key(&record).unwrap();
+        assert!(
+            jobs.store
+                .objects
+                .list(Some(&prefix))
+                .next()
+                .await
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

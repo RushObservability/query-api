@@ -364,10 +364,11 @@ pub async fn export_query(
                 export::ExportFormat::Json => "json",
             }
         );
-        let status =
-            state
-                .export_jobs
-                .create(tenant_id, "spans", req.format, filename.clone(), limit);
+        let status = state
+            .export_jobs
+            .create(tenant_id, "spans", req.format, filename.clone(), limit)
+            .await
+            .map_err(|error| crate::api_error::internal_legacy("create export job", error))?;
         let job_id = status.id.clone();
         let (actor_id, actor_name) = match crate::handlers::auth::extract_session_cookie(&headers) {
             Some(token) => crate::request_auth::resolve_session_user(&state, &token)
@@ -433,15 +434,6 @@ pub async fn export_query(
                         .export_jobs
                         .mark_failed(&background_job_id, "export capacity unavailable")
                         .await;
-                    export::audit_job_transition(
-                        &background_state,
-                        &background_tenant,
-                        &background_job_id,
-                        "export_job.fail",
-                        "failed",
-                        "failure",
-                    )
-                    .await;
                     return;
                 }
             };
@@ -504,17 +496,7 @@ pub async fn export_query(
             .await;
             drop(guard);
             match result {
-                Ok(Ok(())) => {
-                    export::audit_job_transition(
-                        &background_state,
-                        &background_tenant,
-                        &background_job_id,
-                        "export_job.complete",
-                        "completed",
-                        "success",
-                    )
-                    .await;
-                }
+                Ok(Ok(())) => {}
                 _ if background_state
                     .export_jobs
                     .is_cancelled(&background_job_id) => {}
@@ -523,15 +505,6 @@ pub async fn export_query(
                         .export_jobs
                         .mark_failed(&background_job_id, "export could not be completed")
                         .await;
-                    export::audit_job_transition(
-                        &background_state,
-                        &background_tenant,
-                        &background_job_id,
-                        "export_job.fail",
-                        "failed",
-                        "failure",
-                    )
-                    .await;
                 }
             }
         });
