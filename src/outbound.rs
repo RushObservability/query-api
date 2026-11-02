@@ -9,6 +9,37 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::Url;
 
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn resolve_with_timeout(
+    lookup: impl std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>,
+    timeout: Duration,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let addresses = tokio::time::timeout(timeout, lookup)
+        .await
+        .map_err(|_| "notification host resolution timed out".to_string())?
+        .map_err(|_| "notification host could not be resolved".to_string())?;
+    if addresses.is_empty() {
+        return Err("notification host could not be resolved".to_string());
+    }
+    Ok(addresses)
+}
+
+fn pinned_client(
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        // A proxy would resolve the target independently of these checked IPs.
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .resolve_to_addrs(host, addresses)
+        .build()
+        .map_err(|_| "failed to prepare notification request".to_string())
+}
+
 pub(crate) fn blocked_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -102,16 +133,18 @@ async fn guarded_request(
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
 
-    let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|_| "notification host could not be resolved".to_string())?
-        .collect();
-    if addresses.is_empty() {
-        return Err("notification host could not be resolved".to_string());
-    }
     if url.scheme() == "http" && !allow_private {
         return Err("endpoint must use HTTPS".to_string());
     }
+    let addresses = resolve_with_timeout(
+        async {
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map(Iterator::collect)
+        },
+        DNS_TIMEOUT,
+    )
+    .await?;
     if !allow_private
         && addresses
             .iter()
@@ -120,13 +153,7 @@ async fn guarded_request(
         return Err("notification URL must resolve only to public addresses".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .resolve_to_addrs(&host, &addresses)
-        .build()
-        .map_err(|_| "failed to prepare notification request".to_string())?;
+    let client = pinned_client(&host, &addresses)?;
     Ok(client.request(method, url))
 }
 
@@ -147,6 +174,104 @@ pub async fn post_json(raw_url: &str, payload: &serde_json::Value) -> Result<(),
 mod tests {
     use super::blocked_address;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[tokio::test]
+    async fn dns_resolution_has_a_deadline_and_rejects_empty_results() {
+        let result = super::resolve_with_timeout(
+            std::future::pending(),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(
+            super::resolve_with_timeout(async { Ok(vec![]) }, std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            super::strict_public_https_request(reqwest::Method::GET, "https://127.0.0.1/")
+                .await
+                .unwrap_err()
+                .contains("public addresses")
+        );
+        assert!(
+            super::strict_public_https_request(reqwest::Method::GET, "http://127.0.0.1/")
+                .await
+                .unwrap_err()
+                .contains("HTTPS")
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_client_ignores_environment_proxies_and_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if let Ok(address) = std::env::var("RUSH_TEST_PINNED_ADDRESS") {
+            let address: std::net::SocketAddr = address.parse().unwrap();
+            let client = super::pinned_client("pinned.invalid", &[address]).unwrap();
+            let response = client
+                .get(format!("http://pinned.invalid:{}/", address.port()))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+            return;
+        }
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = destination.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let proxy_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = proxy_seen.clone();
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        // Isolate proxy variables in a child; mutating process environment
+        // would race other tests and is unsafe in Rust 2024.
+        let output = tokio::task::spawn_blocking(move || {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "outbound::tests::pinned_client_ignores_environment_proxies_and_redirects",
+                    "--nocapture",
+                ])
+                .env("RUSH_TEST_PINNED_ADDRESS", address.to_string())
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+            for variable in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                child.env(variable, &proxy_url);
+            }
+            child.output().unwrap()
+        })
+        .await
+        .unwrap();
+        proxy_task.abort();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!proxy_seen.load(std::sync::atomic::Ordering::SeqCst));
+        target.await.unwrap();
+    }
 
     #[test]
     fn rejects_private_and_loopback_addresses() {
