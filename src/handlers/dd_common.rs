@@ -171,4 +171,41 @@ mod tests {
             )
         );
     }
+
+    #[tokio::test]
+    async fn datadog_zstd_encodings_roundtrip() {
+        let payload = br#"{"message":"zstd test","service":"api"}"#;
+        let compressed = Bytes::from(zstd::encode_all(payload.as_slice(), 1).unwrap());
+        for encoding in ["zstd", "zstandard"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", encoding.parse().unwrap());
+            let decoded = decompress_body(&limits(), &headers, compressed.clone())
+                .await
+                .unwrap();
+            assert_eq!(decoded, payload);
+        }
+    }
+
+    #[test]
+    fn datadog_zstd_bomb_is_bounded_and_returns_413() {
+        let compressed = zstd::encode_all(vec![0_u8; 4097].as_slice(), 1).unwrap();
+        let error = decompress_body_sync(&limits(), "zstd", Bytes::from(compressed)).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn malformed_and_truncated_datadog_zstd_errors_are_stable() {
+        let mut truncated = zstd::encode_all(b"test payload".as_slice(), 1).unwrap();
+        truncated.pop();
+        for body in [Bytes::from_static(b"bad"), Bytes::from(truncated)] {
+            let error = decompress_body_sync(&limits(), "zstd", body).unwrap_err();
+            assert_eq!(
+                error,
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid compressed Datadog payload".into()
+                )
+            );
+        }
+    }
 }
