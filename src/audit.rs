@@ -29,7 +29,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use axum::http::HeaderMap;
 
@@ -54,21 +54,25 @@ struct ChainState {
 
 /// Serialized, hash-chaining audit writer. Construct once at startup and share
 /// via `Arc` (it lives on `AppState`).
+#[derive(Clone)]
 pub struct AuditLogger {
     ch: Client,
     /// Unique per process lifetime. Restarts replay old chains before writing
     /// a new one; no two replicas allocate sequences in the same chain.
     chain_id: String,
     current_key_id: String,
-    keys: HashMap<String, Vec<u8>>,
+    keys: Arc<HashMap<String, Vec<u8>>>,
     spool_dir: PathBuf,
     spool_max_bytes: u64,
-    degraded: AtomicBool,
-    pending_events: AtomicU64,
-    pending_bytes: AtomicU64,
-    write_failures: AtomicU64,
+    degraded: Arc<AtomicBool>,
+    pending_events: Arc<AtomicU64>,
+    pending_bytes: Arc<AtomicU64>,
+    write_failures: Arc<AtomicU64>,
     metrics: Arc<SelfMetrics>,
-    state: Mutex<ChainState>,
+    persist_slots: Arc<Semaphore>,
+    replay_slots: Arc<Semaphore>,
+    replay_wakeup: Arc<Notify>,
+    state: Arc<Mutex<ChainState>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -428,13 +432,85 @@ fn read_spool_row(path: &Path) -> anyhow::Result<(AuditRow, u64)> {
     Ok((row, payload.len() as u64))
 }
 
+#[cfg(test)]
+thread_local! { static USAGE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn spool_usage(path: &Path) -> anyhow::Result<(u64, u64)> {
+    #[cfg(test)]
+    USAGE_SCANS.with(|count| count.set(count.get() + 1));
     let files = pending_files(path)?;
     let mut bytes = 0_u64;
     for file in &files {
         bytes = bytes.saturating_add(fs::metadata(file)?.len());
     }
     Ok((files.len() as u64, bytes))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OutboxUsage {
+    events: u64,
+    bytes: u64,
+}
+
+fn private_file(path: &Path, truncate: bool) -> anyhow::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    Ok(options.open(path)?)
+}
+
+// All index operations run under the cross-process outbox lock. A durable
+// dirty marker precedes every file mutation, so a crash cannot make a stale
+// checkpoint authoritative. The next holder rebuilds it from actual files.
+fn mark_usage_dirty(path: &Path) -> anyhow::Result<()> {
+    private_file(&path.join(".usage.dirty"), false)?.sync_all()?;
+    sync_directory(path)
+}
+
+fn write_usage(path: &Path, usage: &OutboxUsage) -> anyhow::Result<()> {
+    let mut file = private_file(&path.join(".usage.tmp"), true)?;
+    file.write_all(&serde_json::to_vec(usage)?)?;
+    file.sync_all()?;
+    fs::rename(path.join(".usage.tmp"), path.join(".usage"))?;
+    sync_directory(path)?;
+    match fs::remove_file(path.join(".usage.dirty")) {
+        Ok(()) => sync_directory(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn read_usage(path: &Path) -> anyhow::Result<OutboxUsage> {
+    if !path.join(".usage.dirty").try_exists()? {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(path.join(".usage")) {
+            Ok(file) => {
+                if !file.metadata()?.is_file() {
+                    anyhow::bail!("audit usage checkpoint must be a regular file");
+                }
+                if let Ok(usage) = serde_json::from_reader(file.take(4096)) {
+                    return Ok(usage);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (events, bytes) = spool_usage(path)?;
+    let usage = OutboxUsage { events, bytes };
+    write_usage(path, &usage)?;
+    Ok(usage)
 }
 
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
@@ -447,13 +523,17 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
 /// instances in this process. Closing the descriptor releases it on error or
 /// cancellation. Never unlink the lock file, which would create a second lock.
 async fn lock_spool_directory(path: &Path) -> anyhow::Result<fs::File> {
+    lock_named_directory(path, ".lock").await
+}
+
+async fn lock_named_directory(path: &Path, name: &str) -> anyhow::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        let file = options.open(path.join(".lock"))?;
+        let file = options.open(path.join(name))?;
         loop {
             // SAFETY: file owns a live descriptor for the duration of the call.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -509,6 +589,7 @@ impl AuditLogger {
         spool_max_bytes: u64,
     ) -> anyhow::Result<Self> {
         create_private_directory(&spool_dir)?;
+        let replay_lock = lock_named_directory(&spool_dir, ".delivery.lock").await?;
         let _spool_lock = lock_spool_directory(&spool_dir).await?;
         let migrated = crate::migrations::upgrade_audit_writer_chains(&ch).await?;
         let required_key_ids = Self::load_required_key_ids(&ch).await?;
@@ -523,26 +604,34 @@ impl AuditLogger {
         Self::validate_configured_keys(&ch, &keys, &current_key_id, &required_key_ids).await?;
 
         let (pending_events, pending_bytes) = spool_usage(&spool_dir)?;
+        write_usage(
+            &spool_dir,
+            &OutboxUsage {
+                events: pending_events,
+                bytes: pending_bytes,
+            },
+        )?;
         let logger = AuditLogger {
             ch,
             chain_id: uuid::Uuid::new_v4().to_string(),
             current_key_id,
-            keys,
+            keys: Arc::new(keys),
             spool_dir,
             spool_max_bytes,
-            degraded: AtomicBool::new(pending_events > 0),
-            pending_events: AtomicU64::new(pending_events),
-            pending_bytes: AtomicU64::new(pending_bytes),
-            write_failures: AtomicU64::new(0),
+            degraded: Arc::new(AtomicBool::new(pending_events > 0)),
+            pending_events: Arc::new(AtomicU64::new(pending_events)),
+            pending_bytes: Arc::new(AtomicU64::new(pending_bytes)),
+            write_failures: Arc::new(AtomicU64::new(0)),
             metrics,
-            state: Mutex::new(ChainState::default()),
+            persist_slots: Arc::new(Semaphore::new(1)),
+            replay_slots: Arc::new(Semaphore::new(1)),
+            replay_wakeup: Arc::new(Notify::new()),
+            state: Arc::new(Mutex::new(ChainState::default())),
         };
         logger.publish_metrics();
         let rechained = logger.recover_spool().await?;
-        if let Err(error) = logger.flush_spool_locked().await {
-            tracing::error!(%error, "audit outbox replay deferred; readiness is degraded");
-        }
         drop(_spool_lock);
+        drop(replay_lock);
         if !rechained.is_empty() {
             tracing::warn!(
                 rows = rechained.len(),
@@ -572,6 +661,9 @@ impl AuditLogger {
                         ),
                 )
                 .await;
+        }
+        if let Err(error) = logger.retry_pending().await {
+            tracing::error!(%error, "audit outbox replay deferred; readiness is degraded");
         }
         Ok(logger)
     }
@@ -790,6 +882,26 @@ impl AuditLogger {
     /// logs at `error` level and does NOT propagate — callers must never fail
     /// their operation because the audit write failed.
     pub async fn log(&self, ev: AuditEvent) {
+        let Ok(permit) = self.persist_slots.clone().acquire_owned().await else {
+            return;
+        };
+        let logger = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        // One blocking persistence job per logger. Once accepted it retains
+        // its permit and finishes the fsync + chain advance if the caller is
+        // cancelled. No synchronous filesystem work runs on a runtime worker.
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            runtime.block_on(logger.log_locally(ev));
+        })
+        .await
+        {
+            self.mark_failure();
+            tracing::error!(%error, "audit persistence worker failed");
+        }
+    }
+
+    async fn log_locally(&self, ev: AuditEvent) {
         let mut state = self.state.lock().await;
         let _spool_lock = match lock_spool_directory(&self.spool_dir).await {
             Ok(lock) => lock,
@@ -847,17 +959,14 @@ impl AuditLogger {
         state.last_hash = row.hash.clone();
         state.key_id = self.current_key_id.clone();
 
-        if let Err(error) = self.flush_spool_locked().await {
-            self.mark_failure();
-            tracing::error!(%error, "audit delivery failed; durable outbox retained for replay");
-        }
+        self.replay_wakeup.notify_one();
     }
 
     fn persist_spool_row(&self, row: &AuditRow) -> anyhow::Result<()> {
         let payload = serde_json::to_vec(row)?;
         // A different process may have delivered files in a shared directory.
-        let (pending_events, pending_bytes) = spool_usage(&self.spool_dir)?;
-        let projected = pending_bytes.saturating_add(payload.len() as u64);
+        let mut usage = read_usage(&self.spool_dir)?;
+        let projected = usage.bytes.saturating_add(payload.len() as u64);
         if projected > self.spool_max_bytes {
             anyhow::bail!(
                 "audit outbox capacity exhausted ({projected} > {})",
@@ -877,18 +986,29 @@ impl AuditLogger {
         let mut file = options.open(&temp_path)?;
         file.write_all(&payload)?;
         file.sync_all()?;
+        mark_usage_dirty(&self.spool_dir)?;
         fs::rename(&temp_path, &final_path)?;
         sync_directory(&self.spool_dir)?;
-        self.pending_events
-            .store(pending_events + 1, Ordering::Relaxed);
+        usage.events += 1;
+        usage.bytes = projected;
+        self.pending_events.store(usage.events, Ordering::Relaxed);
         self.pending_bytes.store(projected, Ordering::Relaxed);
-        self.degraded.store(true, Ordering::Relaxed);
+        // The row is already durable: a failed checkpoint must not prevent
+        // the chain from advancing. Its dirty marker forces reconstruction.
+        if let Err(error) = write_usage(&self.spool_dir, &usage) {
+            self.mark_failure();
+            tracing::error!(%error, "audit usage checkpoint failed; durable row retained");
+        }
         self.publish_metrics();
         Ok(())
     }
 
-    async fn flush_spool_locked(&self) -> anyhow::Result<()> {
-        for path in pending_files(&self.spool_dir)? {
+    async fn flush_spool(&self) -> anyhow::Result<()> {
+        let files = {
+            let _spool_lock = lock_spool_directory(&self.spool_dir).await?;
+            pending_files(&self.spool_dir)?
+        };
+        for path in files {
             let (row, bytes) = read_spool_row(&path)?;
             let secret = self
                 .secret_for_key(&row.key_id)
@@ -896,50 +1016,77 @@ impl AuditLogger {
             if compute_hash(secret, &row) != row.hash {
                 anyhow::bail!("audit outbox integrity failure at sequence {}", row.seq);
             }
-            #[derive(clickhouse::Row, serde::Deserialize)]
-            struct Existing {
-                hash: String,
-            }
-            if let Some(existing) = self
-                .ch
-                .query("SELECT hash FROM audit_events WHERE chain_id = ? AND seq = ? LIMIT 1")
-                .bind(&row.chain_id)
-                .bind(row.seq)
-                .fetch_optional::<Existing>()
-                .await?
-            {
-                if existing.hash != row.hash {
-                    anyhow::bail!("audit sequence {} already has a different hash", row.seq);
+            // The delivery lock serializes replayers across processes. Local
+            // writers use a different lock and can fsync new events while a
+            // database request is pending. Retried inserts verify the hash.
+            let deliver = async {
+                #[derive(clickhouse::Row, serde::Deserialize)]
+                struct Existing {
+                    hash: String,
                 }
-                self.remove_spool_file(&path, bytes)?;
-                continue;
-            }
-
-            self.insert_durable(&row).await?;
+                if let Some(existing) = self
+                    .ch
+                    .query("SELECT hash FROM audit_events WHERE chain_id = ? AND seq = ? LIMIT 1")
+                    .bind(&row.chain_id)
+                    .bind(row.seq)
+                    .fetch_optional::<Existing>()
+                    .await?
+                {
+                    if existing.hash != row.hash {
+                        anyhow::bail!("audit sequence {} already has a different hash", row.seq);
+                    }
+                } else {
+                    self.insert_durable(&row).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(Duration::from_secs(15), deliver)
+                .await
+                .map_err(|_| anyhow::anyhow!("audit delivery timed out"))??;
+            let _spool_lock = lock_spool_directory(&self.spool_dir).await?;
             self.remove_spool_file(&path, bytes)?;
         }
-        // Another process can drain a shared outbox between our attempts.
-        self.pending_events.store(0, Ordering::Relaxed);
-        self.pending_bytes.store(0, Ordering::Relaxed);
+        let _spool_lock = lock_spool_directory(&self.spool_dir).await?;
+        let usage = read_usage(&self.spool_dir)?;
+        self.pending_events.store(usage.events, Ordering::Relaxed);
+        self.pending_bytes.store(usage.bytes, Ordering::Relaxed);
         self.degraded.store(false, Ordering::Relaxed);
         self.publish_metrics();
         Ok(())
     }
 
-    fn remove_spool_file(&self, path: &Path, _bytes: u64) -> anyhow::Result<()> {
+    fn remove_spool_file(&self, path: &Path, bytes: u64) -> anyhow::Result<()> {
+        let mut usage = read_usage(&self.spool_dir)?;
+        mark_usage_dirty(&self.spool_dir)?;
         fs::remove_file(path)?;
         sync_directory(&self.spool_dir)?;
-        let (events, bytes) = spool_usage(&self.spool_dir)?;
-        self.pending_events.store(events, Ordering::Relaxed);
-        self.pending_bytes.store(bytes, Ordering::Relaxed);
+        usage.events = usage.events.saturating_sub(1);
+        usage.bytes = usage.bytes.saturating_sub(bytes);
+        self.pending_events.store(usage.events, Ordering::Relaxed);
+        self.pending_bytes.store(usage.bytes, Ordering::Relaxed);
         self.publish_metrics();
-        Ok(())
+        write_usage(&self.spool_dir, &usage)
     }
 
     async fn retry_pending(&self) -> anyhow::Result<()> {
-        let _state = self.state.lock().await;
-        let _spool_lock = lock_spool_directory(&self.spool_dir).await?;
-        self.flush_spool_locked().await
+        let permit = self.replay_slots.clone().acquire_owned().await?;
+        let logger = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            runtime.block_on(async {
+                let _delivery_lock =
+                    lock_named_directory(&logger.spool_dir, ".delivery.lock").await?;
+                logger.flush_spool().await
+            })
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        if result.is_err() {
+            self.mark_failure();
+        }
+        result
     }
 
     fn mark_failure(&self) {
@@ -987,13 +1134,13 @@ impl AuditLogger {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                if logger.pending_events.load(Ordering::Relaxed) == 0 {
-                    continue;
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    _ = logger.replay_wakeup.notified() => {},
                 }
                 if let Err(error) = logger.retry_pending().await {
-                    logger.mark_failure();
                     tracing::warn!(%error, "audit outbox replay remains degraded");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         });
@@ -1177,20 +1324,23 @@ mod tests {
             chain_id: uuid::Uuid::new_v4().to_string(),
             ch: Client::default(),
             current_key_id: "primary".into(),
-            keys,
+            keys: Arc::new(keys),
             spool_dir: path.clone(),
             spool_max_bytes: 1024 * 1024,
-            degraded: AtomicBool::new(false),
-            pending_events: AtomicU64::new(0),
-            pending_bytes: AtomicU64::new(0),
-            write_failures: AtomicU64::new(0),
+            degraded: Arc::new(AtomicBool::new(false)),
+            pending_events: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(SelfMetrics::new()),
-            state: Mutex::new(ChainState {
+            persist_slots: Arc::new(Semaphore::new(1)),
+            replay_slots: Arc::new(Semaphore::new(1)),
+            replay_wakeup: Arc::new(Notify::new()),
+            state: Arc::new(Mutex::new(ChainState {
                 last_seq: 0,
                 last_hash: String::new(),
                 key_id: String::new(),
                 segment_id: String::new(),
-            }),
+            })),
         };
         let mut row = sample_row(1, "");
         row.hash = compute_hash(&secret, &row);
@@ -1200,7 +1350,10 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(read_spool_row(&files[0]).unwrap().0.hash, row.hash);
         assert_eq!(logger.health().pending_events, 1);
-        assert!(!logger.health().ready);
+        assert!(
+            logger.health().ready,
+            "healthy queued persistence is not a delivery failure"
+        );
 
         fs::remove_dir_all(path).unwrap();
     }
@@ -1236,23 +1389,27 @@ mod tests {
             chain_id: uuid::Uuid::new_v4().to_string(),
             ch: Client::default().with_url("http://127.0.0.1:9"),
             current_key_id: "primary".into(),
-            keys,
+            keys: Arc::new(keys),
             spool_dir: path.clone(),
             spool_max_bytes: 1024 * 1024,
-            degraded: AtomicBool::new(false),
-            pending_events: AtomicU64::new(0),
-            pending_bytes: AtomicU64::new(0),
-            write_failures: AtomicU64::new(0),
+            degraded: Arc::new(AtomicBool::new(false)),
+            pending_events: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(SelfMetrics::new()),
-            state: Mutex::new(ChainState {
+            persist_slots: Arc::new(Semaphore::new(1)),
+            replay_slots: Arc::new(Semaphore::new(1)),
+            replay_wakeup: Arc::new(Notify::new()),
+            state: Arc::new(Mutex::new(ChainState {
                 last_seq: 0,
                 last_hash: String::new(),
                 key_id: String::new(),
                 segment_id: String::new(),
-            }),
+            })),
         };
 
         logger.log(AuditEvent::new("test.mutation", "system")).await;
+        assert!(logger.retry_pending().await.is_err());
 
         let files = pending_files(&path).unwrap();
         assert_eq!(files.len(), 1);
@@ -1277,20 +1434,23 @@ mod tests {
             chain_id: uuid::Uuid::new_v4().to_string(),
             ch: Client::default(),
             current_key_id: "primary".into(),
-            keys,
+            keys: Arc::new(keys),
             spool_dir: path.clone(),
             spool_max_bytes: 1,
-            degraded: AtomicBool::new(false),
-            pending_events: AtomicU64::new(0),
-            pending_bytes: AtomicU64::new(0),
-            write_failures: AtomicU64::new(0),
+            degraded: Arc::new(AtomicBool::new(false)),
+            pending_events: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(SelfMetrics::new()),
-            state: Mutex::new(ChainState {
+            persist_slots: Arc::new(Semaphore::new(1)),
+            replay_slots: Arc::new(Semaphore::new(1)),
+            replay_wakeup: Arc::new(Notify::new()),
+            state: Arc::new(Mutex::new(ChainState {
                 last_seq: 0,
                 last_hash: String::new(),
                 key_id: String::new(),
                 segment_id: String::new(),
-            }),
+            })),
         };
 
         logger.log(AuditEvent::new("test.mutation", "system")).await;
@@ -1333,15 +1493,18 @@ mod tests {
             ch,
             chain_id: uuid::Uuid::new_v4().to_string(),
             current_key_id: "primary".into(),
-            keys: HashMap::from([("primary".into(), TEST_SECRET.to_vec())]),
+            keys: Arc::new(HashMap::from([("primary".into(), TEST_SECRET.to_vec())])),
             spool_dir,
             spool_max_bytes: 1024 * 1024,
-            degraded: AtomicBool::new(false),
-            pending_events: AtomicU64::new(0),
-            pending_bytes: AtomicU64::new(0),
-            write_failures: AtomicU64::new(0),
+            degraded: Arc::new(AtomicBool::new(false)),
+            pending_events: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(SelfMetrics::new()),
-            state: Mutex::new(ChainState::default()),
+            persist_slots: Arc::new(Semaphore::new(1)),
+            replay_slots: Arc::new(Semaphore::new(1)),
+            replay_wakeup: Arc::new(Notify::new()),
+            state: Arc::new(Mutex::new(ChainState::default())),
         }
     }
 
@@ -1355,6 +1518,172 @@ mod tests {
             1024 * 1024,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn accepted_persistence_finishes_after_caller_cancellation() {
+        let dir = TestDirectory::new();
+        let logger = test_logger(
+            Client::default().with_url("http://127.0.0.1:9"),
+            dir.0.clone(),
+        );
+        let held = lock_spool_directory(&dir.0).await.unwrap();
+        let writer = logger.clone();
+        let call = tokio::spawn(async move {
+            writer.log(AuditEvent::new("first.update", "system")).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while logger.persist_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        call.abort();
+        let _ = call.await;
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while logger.persist_slots.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        logger.log(AuditEvent::new("second.update", "system")).await;
+        let rows: Vec<_> = pending_files(&dir.0)
+            .unwrap()
+            .into_iter()
+            .map(|path| read_spool_row(&path).unwrap().0)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].action, "first.update");
+        assert_eq!(rows[1].prev_hash, rows[0].hash);
+        assert_eq!(
+            crate::handlers::audit::verify_rows(&rows, |_| Some(TEST_SECRET))["intact"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_database_delivery_does_not_block_new_durable_events() {
+        use axum::{Router, extract::State, routing::any};
+        #[derive(Default)]
+        struct Fixture {
+            entered: Notify,
+            release: Notify,
+            pause: AtomicBool,
+        }
+        async fn respond(State(f): State<Arc<Fixture>>) -> &'static str {
+            if f.pause.swap(false, Ordering::SeqCst) {
+                f.entered.notify_one();
+                f.release.notified().await;
+            }
+            ""
+        }
+        let fixture = Arc::new(Fixture::default());
+        fixture.pause.store(true, Ordering::SeqCst);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::default()
+            .with_validation(false)
+            .with_url(format!("http://{}", listener.local_addr().unwrap()));
+        let router = Router::new()
+            .route("/", any(respond))
+            .with_state(fixture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let dir = TestDirectory::new();
+        let logger = test_logger(client, dir.0.clone());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            logger.log(AuditEvent::new("first.update", "system")),
+        )
+        .await
+        .unwrap();
+        let delivery = logger.clone();
+        let replay = tokio::spawn(async move { delivery.retry_pending().await });
+        tokio::time::timeout(Duration::from_secs(2), fixture.entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            logger.log(AuditEvent::new("second.update", "system")),
+        )
+        .await
+        .expect("database delivery must not hold the persistence lock");
+        assert_eq!(pending_files(&dir.0).unwrap().len(), 2);
+        fixture.release.notify_one();
+        replay.await.unwrap().unwrap();
+        logger.retry_pending().await.unwrap();
+        assert!(pending_files(&dir.0).unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn dirty_usage_checkpoint_recovers_both_sides_of_a_crash() {
+        let dir = TestDirectory::new();
+        let logger = test_logger(Client::default(), dir.0.clone());
+        let row = sample_row(1, "");
+        logger.persist_spool_row(&row).unwrap();
+        let file = pending_files(&dir.0).unwrap().pop().unwrap();
+        let bytes = fs::metadata(&file).unwrap().len();
+        mark_usage_dirty(&dir.0).unwrap();
+        // Simulate a crash after deletion but before the checkpoint update.
+        fs::remove_file(&file).unwrap();
+        assert_eq!(read_usage(&dir.0).unwrap().events, 0);
+        // Simulate a durable event rename before the checkpoint update.
+        mark_usage_dirty(&dir.0).unwrap();
+        fs::write(&file, serde_json::to_vec(&row).unwrap()).unwrap();
+        let usage = read_usage(&dir.0).unwrap();
+        assert_eq!((usage.events, usage.bytes), (1, bytes));
+        assert!(!dir.0.join(".usage.dirty").exists());
+    }
+
+    #[tokio::test]
+    async fn shared_outbox_checkpoints_preserve_cross_writer_capacity() {
+        let dir = TestDirectory::new();
+        let a = test_logger(Client::default(), dir.0.clone());
+        let b = test_logger(Client::default(), dir.0.clone());
+        for _ in 0..8 {
+            tokio::join!(
+                a.log(AuditEvent::new("a.update", "system")),
+                b.log(AuditEvent::new("b.update", "system"))
+            );
+        }
+        let held = lock_spool_directory(&dir.0).await.unwrap();
+        let actual = spool_usage(&dir.0).unwrap();
+        let usage = read_usage(&dir.0).unwrap();
+        assert_eq!((usage.events, usage.bytes), actual);
+        assert_eq!(usage.events, 16);
+        drop(held);
+    }
+
+    #[test]
+    #[ignore = "manual durable outbox filesystem benchmark"]
+    fn benchmark_audit_outbox_checkpoint() {
+        for count in [100, 1_000] {
+            let dir = TestDirectory::new();
+            let logger = test_logger(Client::default(), dir.0.clone());
+            USAGE_SCANS.with(|count| count.set(0));
+            let start = std::time::Instant::now();
+            for seq in 1..=count {
+                logger.persist_spool_row(&sample_row(seq, "")).unwrap();
+            }
+            for path in pending_files(&dir.0).unwrap() {
+                let bytes = fs::metadata(&path).unwrap().len();
+                logger.remove_spool_file(&path, bytes).unwrap();
+            }
+            assert_eq!(read_usage(&dir.0).unwrap().events, 0);
+            let scans = USAGE_SCANS.with(std::cell::Cell::get);
+            assert_eq!(
+                scans, 1,
+                "only the missing startup checkpoint needs a usage scan"
+            );
+            eprintln!(
+                "audit_events={count} usage_scans={scans} elapsed_ms={}",
+                start.elapsed().as_millis()
+            );
+        }
     }
 
     #[test]
@@ -1446,6 +1775,7 @@ mod tests {
             dir.0.clone(),
         );
         logger.log(AuditEvent::new("settings.update", "user")).await;
+        assert!(logger.retry_pending().await.is_err());
         assert_eq!(pending_files(&dir.0).unwrap().len(), 1);
         assert!(!logger.health().ready);
         fixture.fail_insert.store(false, Ordering::Relaxed);
@@ -1518,6 +1848,8 @@ mod tests {
             for _ in 0..5 {
                 tokio::join!(a.log(AuditEvent::new("a.update", "user")), b.log(AuditEvent::new("b.update", "user")));
             }
+            a.retry_pending().await?;
+            b.retry_pending().await?;
             assert!(a.health().ready && b.health().ready);
             // Exercise the shared-volume overlap used by rolling deployments.
             let shared = root.0.join("shared");
@@ -1536,6 +1868,7 @@ mod tests {
             assert_ne!(offline.chain_id, restarted.chain_id);
             assert!(restarted.health().ready);
             restarted.log(AuditEvent::new("restarted.update", "user")).await;
+            restarted.retry_pending().await?;
             let rows = ch.query("SELECT id, seq, chain_id, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id, seq")
                 .fetch_all::<AuditRow>().await?;
             assert_eq!(rows.len(), 21);
