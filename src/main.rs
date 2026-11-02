@@ -821,16 +821,9 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
         return None;
     }
 
-    if req
-        .headers()
-        .get("x-rush-workload")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("dashboard"))
-    {
-        Some(WorkloadClass::Dashboard)
-    } else {
-        Some(WorkloadClass::Interactive)
-    }
+    // Workload classes select independent capacity and resource budgets.
+    // Public request headers cannot authorize a larger or additional pool.
+    Some(WorkloadClass::Interactive)
 }
 
 fn time_range_error_response(error: TimeRangeError) -> Response {
@@ -3763,6 +3756,49 @@ mod query_deadline_tests {
     }
 
     #[tokio::test]
+    async fn workload_headers_cannot_increase_budgets_or_bypass_tenant_capacity() {
+        let (governor, _) = governor();
+        let normal = Request::builder()
+            .uri("/api/v1/query")
+            .body(Body::empty())
+            .unwrap();
+        let guard = governor
+            .admit(query_workload_for_request(&normal).unwrap(), "tenant-a")
+            .await
+            .unwrap();
+        let expected_budget = guard.budget().clone();
+        for value in [
+            "dashboard",
+            "DASHBOARD",
+            "background",
+            "export",
+            "integration",
+            "unknown",
+        ] {
+            let request = Request::builder()
+                .uri("/api/v1/query/timeseries")
+                .header("x-rush-workload", value)
+                .body(Body::empty())
+                .unwrap();
+            let class = query_workload_for_request(&request).unwrap();
+            assert_eq!(class, WorkloadClass::Interactive);
+            assert!(matches!(
+                governor.admit(class, "tenant-a").await,
+                Err(AdmissionError::TenantBusy { .. })
+            ));
+        }
+        drop(guard);
+        let next = governor
+            .admit(WorkloadClass::Interactive, "tenant-a")
+            .await
+            .unwrap();
+        assert_eq!(next.budget(), &expected_budget);
+        assert_eq!(next.budget().max_time_range_secs, 7 * 24 * 60 * 60);
+        assert_eq!(next.budget().request_timeout_secs, 1);
+        assert_eq!(next.budget().max_execution_time_secs, 1);
+    }
+
+    #[tokio::test]
     async fn slow_body_times_out_before_dispatch_and_releases_query_capacity() {
         let (governor, metrics) = governor();
         let guard = governor
@@ -4116,7 +4152,7 @@ mod tenant_auth_tests {
             .unwrap();
         assert_eq!(
             query_workload_for_request(&request),
-            Some(rush_api::query_governor::WorkloadClass::Dashboard)
+            Some(rush_api::query_governor::WorkloadClass::Interactive)
         );
 
         let export = Request::builder()
