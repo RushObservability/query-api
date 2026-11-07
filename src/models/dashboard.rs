@@ -209,6 +209,38 @@ pub struct CreateFromTemplateRequest {
     pub name: String,
 }
 
+/// Full dashboard state stored with each version. Widget ids are kept so a
+/// restore updates the same widgets instead of replacing them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSnapshot {
+    pub dashboard: DashboardExportMeta,
+    pub widgets: Vec<WidgetSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetSnapshot {
+    pub id: String,
+    #[serde(flatten)]
+    pub widget: WidgetExport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardVersionSummary {
+    pub id: String,
+    pub dashboard_id: String,
+    pub reason: String,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardVersion {
+    #[serde(flatten)]
+    pub summary: DashboardVersionSummary,
+    pub snapshot: DashboardSnapshot,
+}
+
 fn default_empty_object() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
 }
