@@ -2915,6 +2915,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
         .route("/api/v1/explore/search", post(handlers::explore::search))
+        .route("/api/v1/explore/diagnose", post(handlers::query_diagnostics::diagnose))
         .route("/api/v1/settings/log-views", get(handlers::log_views::get).put(handlers::log_views::put))
         // Identity behind the current credential (session or API key)
         .route("/api/v1/whoami", get(handlers::whoami::whoami))
