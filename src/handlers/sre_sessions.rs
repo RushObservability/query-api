@@ -23,7 +23,7 @@ pub struct SessionListQuery {
     pub limit: Option<u64>,
 }
 
-async fn require_agent_access(
+pub(super) async fn require_agent_access(
     state: &AppState,
     headers: &HeaderMap,
     write: bool,
@@ -45,7 +45,7 @@ async fn require_agent_access(
     }
 }
 
-fn validate_session_id(id: &str) -> Result<(), (StatusCode, String)> {
+pub(super) fn validate_session_id(id: &str) -> Result<(), (StatusCode, String)> {
     if id.is_empty()
         || id.len() > 128
         || !id

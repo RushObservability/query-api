@@ -811,6 +811,7 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
 
     let managed = path.starts_with("/api/v1/query")
         || path.starts_with("/api/v1/explore/")
+        || path.starts_with("/api/v1/sessions/") && path.ends_with("/dashboard-draft")
         || path.starts_with("/api/v1/logs")
         || path.starts_with("/api/v1/traces")
         || path.starts_with("/api/v1/profiles")
@@ -2960,6 +2961,7 @@ async fn main() -> anyhow::Result<()> {
         // while stored session history is served directly from query-api.
         .route("/api/v1/investigate", post(handlers::sre_proxy::investigate))
         .route("/api/v1/sessions", get(handlers::sre_sessions::list_sessions))
+        .route("/api/v1/sessions/{id}/dashboard-draft", post(handlers::dashboard_drafts::create_draft))
         .route(
             "/api/v1/sessions/{id}",
             get(handlers::sre_sessions::get_session)
@@ -4192,6 +4194,15 @@ mod tenant_auth_tests {
 
     #[test]
     fn workload_policy_classifies_queries_and_preserves_explicit_bypasses() {
+        let draft = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/sessions/session-1/dashboard-draft")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&draft),
+            Some(rush_api::query_governor::WorkloadClass::Interactive)
+        );
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/query")
