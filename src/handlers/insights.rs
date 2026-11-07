@@ -175,7 +175,18 @@ pub async fn get_insights(
     Query(params): Query<InsightsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_principal(&state, &headers).await?;
-    let tenant_id = &tenant.tenant_id;
+    Ok(Json(
+        compute_insights(&state, &tenant.tenant_id, &params).await?,
+    ))
+}
+
+/// Shared by the HTTP route and the SRE agent's internal context call; the
+/// caller does the auth check.
+pub(crate) async fn compute_insights(
+    state: &AppState,
+    tenant_id: &str,
+    params: &InsightsParams,
+) -> Result<Insights, (StatusCode, String)> {
     let now = Utc::now();
     let (from, to, explicit_window) = match (params.from.as_deref(), params.to.as_deref()) {
         (None, None) => {
@@ -283,7 +294,7 @@ pub async fn get_insights(
         log_patterns.len() - error_patterns,
     );
 
-    Ok(Json(Insights {
+    Ok(Insights {
         generated_at: now.to_rfc3339(),
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
@@ -292,7 +303,7 @@ pub async fn get_insights(
         summary,
         anomalies,
         log_patterns,
-    }))
+    })
 }
 
 #[cfg(test)]
