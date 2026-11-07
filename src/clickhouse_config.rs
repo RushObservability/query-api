@@ -3145,6 +3145,20 @@ impl ConfigDb {
                 is_deleted     UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            // ── Dashboard versions ────────────────────────────────────────────────
+            // Append-only: one full snapshot (dashboard + widgets) after every edit.
+            "CREATE TABLE IF NOT EXISTS config_dashboard_versions (
+                id              String,
+                dashboard_id    String,
+                tenant_id       String,
+                snapshot        String,
+                reason          String,
+                created_by      String DEFAULT '',
+                created_by_name String DEFAULT '',
+                created_at      String DEFAULT toString(now()),
+                version         UInt64
+            ) ENGINE = MergeTree()
+            ORDER BY (dashboard_id, version)",
             // ── Dashboard templates ───────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_dashboard_templates (
                 id            String,
@@ -8050,6 +8064,177 @@ impl ConfigDb {
             .execute()
             .await?;
         Ok(true)
+    }
+
+    // ── Dashboard version operations ──────────────────────────────────────────
+
+    /// Snapshot the dashboard's current state as a new version. Callers check
+    /// access first; a deleted dashboard records nothing.
+    pub async fn record_dashboard_version(
+        &self,
+        dashboard_id: &str,
+        reason: &str,
+        created_by: &str,
+        created_by_name: &str,
+    ) -> anyhow::Result<()> {
+        use crate::models::dashboard::{
+            DashboardExportMeta, DashboardSnapshot, WidgetExport, WidgetSnapshot,
+        };
+        let Some(dash) = self.get_dashboard_unchecked(dashboard_id).await? else {
+            return Ok(());
+        };
+        let widgets = self.list_widgets(dashboard_id).await?;
+        let snapshot = DashboardSnapshot {
+            dashboard: DashboardExportMeta {
+                defaults: dash.defaults,
+                name: dash.name,
+                description: dash.description,
+                visibility: dash.visibility,
+                tags: dash.tags,
+                variables: dash.variables,
+            },
+            widgets: widgets
+                .into_iter()
+                .map(|w| WidgetSnapshot {
+                    id: w.id,
+                    widget: WidgetExport {
+                        title: w.title,
+                        widget_type: w.widget_type,
+                        query_config: serde_json::from_str(&w.query_config).unwrap_or_default(),
+                        position: serde_json::from_str(&w.position).unwrap_or_default(),
+                        display_config: serde_json::from_str(&w.display_config).unwrap_or_default(),
+                    },
+                })
+                .collect(),
+        };
+        self.client
+            .query("INSERT INTO config_dashboard_versions (id, dashboard_id, tenant_id, snapshot, reason, created_by, created_by_name, created_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(dashboard_id).bind(&dash.tenant_id)
+            .bind(serde_json::to_string(&snapshot)?).bind(reason)
+            .bind(created_by).bind(created_by_name)
+            .bind(Self::now_str()).bind(Self::next_version())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Newest first. Callers check access to the dashboard first.
+    pub async fn list_dashboard_versions(
+        &self,
+        dashboard_id: &str,
+        limit: u64,
+    ) -> anyhow::Result<Vec<crate::models::dashboard::DashboardVersionSummary>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            dashboard_id: String,
+            reason: String,
+            created_by: String,
+            created_by_name: String,
+            created_at: String,
+        }
+        let rows = self.client
+            .query("SELECT id, dashboard_id, reason, created_by, created_by_name, created_at FROM config_dashboard_versions WHERE dashboard_id = ? ORDER BY version DESC LIMIT ?")
+            .bind(dashboard_id).bind(limit)
+            .fetch_all::<Row>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::models::dashboard::DashboardVersionSummary {
+                id: r.id,
+                dashboard_id: r.dashboard_id,
+                reason: r.reason,
+                created_by: r.created_by,
+                created_by_name: r.created_by_name,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    pub async fn get_dashboard_version(
+        &self,
+        dashboard_id: &str,
+        version_id: &str,
+    ) -> anyhow::Result<Option<crate::models::dashboard::DashboardVersion>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            dashboard_id: String,
+            snapshot: String,
+            reason: String,
+            created_by: String,
+            created_by_name: String,
+            created_at: String,
+        }
+        let result = self.client
+            .query("SELECT id, dashboard_id, snapshot, reason, created_by, created_by_name, created_at FROM config_dashboard_versions WHERE dashboard_id = ? AND id = ? LIMIT 1")
+            .bind(dashboard_id).bind(version_id)
+            .fetch_one::<Row>()
+            .await;
+        match result {
+            Ok(r) => Ok(Some(crate::models::dashboard::DashboardVersion {
+                snapshot: serde_json::from_str(&r.snapshot)?,
+                summary: crate::models::dashboard::DashboardVersionSummary {
+                    id: r.id,
+                    dashboard_id: r.dashboard_id,
+                    reason: r.reason,
+                    created_by: r.created_by,
+                    created_by_name: r.created_by_name,
+                    created_at: r.created_at,
+                },
+            })),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Make the dashboard's widgets match `target`: update kept ids, re-create
+    /// ids that were deleted since, and delete widgets the snapshot lacks.
+    pub async fn replace_dashboard_widgets(
+        &self,
+        dashboard_id: &str,
+        target: &[crate::models::dashboard::WidgetSnapshot],
+    ) -> anyhow::Result<()> {
+        let current = self.list_widgets(dashboard_id).await?;
+        for widget in &current {
+            if !target.iter().any(|t| t.id == widget.id) {
+                self.delete_widget(&widget.id, dashboard_id).await?;
+            }
+        }
+        for t in target {
+            let w = &t.widget;
+            let (query_config, position, display_config) = (
+                serde_json::to_string(&w.query_config)?,
+                serde_json::to_string(&w.position)?,
+                serde_json::to_string(&w.display_config)?,
+            );
+            let exists = current.iter().any(|c| c.id == t.id);
+            if !exists
+                || !self
+                    .update_widget(
+                        &t.id,
+                        dashboard_id,
+                        &w.title,
+                        &w.widget_type,
+                        &query_config,
+                        &position,
+                        &display_config,
+                    )
+                    .await?
+            {
+                self.create_widget(
+                    &t.id,
+                    dashboard_id,
+                    &w.title,
+                    &w.widget_type,
+                    &query_config,
+                    &position,
+                    &display_config,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     // ── Dashboard template operations ─────────────────────────────────────────
