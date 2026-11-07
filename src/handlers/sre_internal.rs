@@ -46,6 +46,7 @@ pub enum ContextRequest {
     GetServiceLink {
         service: String,
     },
+    GetInsights(crate::handlers::insights::InsightsParams),
 }
 
 pub async fn context(
@@ -144,6 +145,9 @@ pub async fn context(
                 .get_service_link(&tenant.tenant_id, &service)
                 .await
                 .map_err(internal_error)?,
+        ),
+        ContextRequest::GetInsights(params) => serde_json::to_value(
+            crate::handlers::insights::compute_insights(&state, &tenant.tenant_id, &params).await?,
         ),
     }
     .map_err(|_| internal_error(anyhow::anyhow!("failed to encode SRE context response")))?;
@@ -480,7 +484,23 @@ fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_id;
+    use super::{ContextRequest, validate_id};
+
+    #[test]
+    fn get_insights_takes_the_window_fields_inline() {
+        let request: ContextRequest = serde_json::from_value(serde_json::json!({
+            "operation": "get_insights",
+            "from": "2026-11-07T10:00:00Z",
+            "to": "2026-11-07T11:00:00Z",
+        }))
+        .unwrap();
+        let ContextRequest::GetInsights(params) = request else {
+            panic!("expected GetInsights");
+        };
+        assert_eq!(params.from.as_deref(), Some("2026-11-07T10:00:00Z"));
+        assert_eq!(params.to.as_deref(), Some("2026-11-07T11:00:00Z"));
+        assert_eq!(params.minutes, None);
+    }
 
     #[test]
     fn identifiers_reject_path_syntax() {
