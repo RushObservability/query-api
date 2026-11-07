@@ -886,6 +886,12 @@ mod service_errors_tests {
     }
 }
 
+/// Log `Body` as a template: UUIDs then runs of digits collapse so message
+/// variants group together.
+pub(crate) const LOG_BODY_TEMPLATE: &str = "replaceRegexpAll(replaceRegexpAll(Body, \
+    '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', 'UUID'), \
+    '[0-9]+', 'N')";
+
 pub async fn service_errors(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -898,10 +904,7 @@ pub async fn service_errors(
     let message_mode = params.mode == "message";
 
     let sql = if message_mode {
-        // Normalize: collapse UUIDs then runs of digits so message variants group.
-        let template = "replaceRegexpAll(replaceRegexpAll(Body, \
-            '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', 'UUID'), \
-            '[0-9]+', 'N')";
+        let template = LOG_BODY_TEMPLATE;
         format!(
             "SELECT {template} AS key, \
                 toUInt16(0) AS status_code, '' AS method, '' AS path, \

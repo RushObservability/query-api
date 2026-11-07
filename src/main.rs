@@ -3166,6 +3166,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/anomaly-events/{event_id}/analyze",
             post(handlers::anomalies::analyze_anomaly_event),
         )
+        .route("/api/v1/insights", get(handlers::insights::get_insights))
         // SIEM Detection rules
         .route(
             "/api/v1/detection/rules",
