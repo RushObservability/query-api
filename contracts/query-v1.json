@@ -1,0 +1,21 @@
+{
+  "version": "v1",
+  "endpoint": "/api/v1/query/execute",
+  "max_filters": 30,
+  "max_search_bytes": 512,
+  "routes": [
+    {"path":"/api/v1/query","signal":"spans","operation":"search","options":["limit","offset","cursor","columns","group_by","aggregation"]},
+    {"path":"/api/v1/logs","signal":"logs","operation":"search","options":["limit","offset","cursor","slim","display_fields"]},
+    {"path":"/api/v1/explore/search","signal":"dynamic","operation":"explore","options":["limit","interval","group_by","display_fields","include_rows","include_summary"]},
+    {"path":"/api/v1/query/count","signal":"spans","operation":"count","options":["interval"]},
+    {"path":"/api/v1/logs/count","signal":"logs","operation":"count","options":["interval"]},
+    {"path":"/api/v1/query/group","signal":"spans","operation":"group","options":["group_by","aggregation","limit"]},
+    {"path":"/api/v1/logs/group","signal":"logs","operation":"group","options":["group_by","aggregation","limit"]},
+    {"path":"/api/v1/query/timeseries","signal":"spans","operation":"timeseries","options":["interval","group_by","include_heatmap"]},
+    {"path":"/api/v1/logs/histogram","signal":"logs","operation":"histogram","options":[]},
+    {"path":"/api/v1/logs/patterns","signal":"logs","operation":"patterns","options":["limit"]},
+    {"path":"/api/v1/query/scatter","signal":"dynamic","operation":"scatter","options":["x_field","y_field","limit"]},
+    {"path":"/prom/api/v1/query_range","signal":"metrics","operation":"range","options":["query","step"]},
+    {"path":"/prom/api/v1/query","signal":"metrics","operation":"instant","options":["query"]}
+  ]
+}
