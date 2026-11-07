@@ -24,6 +24,7 @@ pub mod health;
 pub(crate) mod infrastructure;
 pub mod ingest_buffer;
 pub mod ingest_gate;
+pub mod insights;
 pub mod jaeger;
 pub mod kubernetes;
 pub mod license;
