@@ -10,6 +10,7 @@ pub mod log;
 pub mod maintenance;
 pub mod metrics;
 pub mod monitor;
+pub mod notebook;
 pub mod profile;
 pub mod query;
 pub mod rum;

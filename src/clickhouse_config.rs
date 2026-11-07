@@ -3500,6 +3500,44 @@ impl ConfigDb {
             // were never applied by any engine; they land in the default tenant.
             "ALTER TABLE config_maintenance_windows ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default' AFTER id",
             "ALTER TABLE config_maintenance_windows ADD COLUMN IF NOT EXISTS created_by String DEFAULT '' AFTER created_at",
+            // ── Incident notebooks ────────────────────────────────────────────────
+            "CREATE TABLE IF NOT EXISTS config_notebooks (
+                id             String,
+                tenant_id      String DEFAULT 'default',
+                name           String,
+                description    String DEFAULT '',
+                owner_id       String DEFAULT '',
+                owner_name     String DEFAULT '',
+                visibility     String DEFAULT 'tenant',
+                status         String DEFAULT 'open',
+                incident_start String,
+                incident_end   String DEFAULT '',
+                tags           String DEFAULT '[]',
+                created_at     String DEFAULT toString(now()),
+                updated_at     String DEFAULT toString(now()),
+                version        UInt64,
+                is_deleted     UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (id)",
+            "CREATE TABLE IF NOT EXISTS config_notebook_cells (
+                id             String,
+                notebook_id    String,
+                tenant_id      String DEFAULT 'default',
+                position       UInt32,
+                cell_type      String,
+                title          String DEFAULT '',
+                body           String DEFAULT '',
+                query_config   String DEFAULT '{}',
+                time           String DEFAULT '{\"mode\":\"inherit\"}',
+                display_config String DEFAULT '{}',
+                author_id      String DEFAULT '',
+                author_name    String DEFAULT '',
+                created_at     String DEFAULT toString(now()),
+                updated_at     String DEFAULT toString(now()),
+                version        UInt64,
+                is_deleted     UInt8 DEFAULT 0
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY (notebook_id, id)",
             // Last notification sent for each monitor group, so the monitor engine
             // can renotify on schedule and catch up after a maintenance window.
             // Written only by the replica holding the monitors lease.
@@ -11343,6 +11381,109 @@ impl ConfigDb {
                 }
             })
             .collect())
+    }
+
+    // ── Incident notebooks ─────────────────────────────────────────────────────
+
+    /// Write a notebook row: a create, an update, or (`deleted`) a soft delete.
+    pub async fn write_notebook(
+        &self,
+        nb: &crate::models::notebook::Notebook,
+        deleted: bool,
+    ) -> anyhow::Result<()> {
+        self.client
+            .query("INSERT INTO config_notebooks (id, tenant_id, name, description, owner_id, owner_name, visibility, status, incident_start, incident_end, tags, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&nb.id)
+            .bind(&nb.tenant_id)
+            .bind(&nb.name)
+            .bind(&nb.description)
+            .bind(&nb.owner_id)
+            .bind(&nb.owner_name)
+            .bind(&nb.visibility)
+            .bind(&nb.status)
+            .bind(&nb.incident_start)
+            .bind(&nb.incident_end)
+            .bind(&nb.tags)
+            .bind(&nb.created_at)
+            .bind(&nb.updated_at)
+            .bind(Self::next_version())
+            .bind(deleted as u8)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Notebooks the caller can see in this tenant: shared ones and their own
+    /// private ones, most recently edited first.
+    pub async fn list_notebooks(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<crate::models::notebook::Notebook>> {
+        Ok(self.client
+            .query("SELECT id, tenant_id, name, description, owner_id, owner_name, visibility, status, incident_start, incident_end, tags, created_at, updated_at FROM config_notebooks FINAL WHERE tenant_id = ? AND is_deleted = 0 AND (visibility = 'tenant' OR owner_id = ?) ORDER BY updated_at DESC LIMIT 500")
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_all::<crate::models::notebook::Notebook>()
+            .await?)
+    }
+
+    pub async fn get_notebook(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<Option<crate::models::notebook::Notebook>> {
+        Ok(self.client
+            .query("SELECT id, tenant_id, name, description, owner_id, owner_name, visibility, status, incident_start, incident_end, tags, created_at, updated_at FROM config_notebooks FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 AND (visibility = 'tenant' OR owner_id = ?) LIMIT 1")
+            .bind(id)
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_optional::<crate::models::notebook::Notebook>()
+            .await?)
+    }
+
+    /// Write a cell row: a create, an update, or (`deleted`) a soft delete.
+    pub async fn write_notebook_cell(
+        &self,
+        cell: &crate::models::notebook::NotebookCell,
+        deleted: bool,
+    ) -> anyhow::Result<()> {
+        self.client
+            .query("INSERT INTO config_notebook_cells (id, notebook_id, tenant_id, position, cell_type, title, body, query_config, time, display_config, author_id, author_name, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&cell.id)
+            .bind(&cell.notebook_id)
+            .bind(&cell.tenant_id)
+            .bind(cell.position)
+            .bind(&cell.cell_type)
+            .bind(&cell.title)
+            .bind(&cell.body)
+            .bind(&cell.query_config)
+            .bind(&cell.time)
+            .bind(&cell.display_config)
+            .bind(&cell.author_id)
+            .bind(&cell.author_name)
+            .bind(&cell.created_at)
+            .bind(&cell.updated_at)
+            .bind(Self::next_version())
+            .bind(deleted as u8)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// A notebook's cells in display order.
+    pub async fn list_notebook_cells(
+        &self,
+        notebook_id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<crate::models::notebook::NotebookCell>> {
+        Ok(self.client
+            .query("SELECT id, notebook_id, tenant_id, position, cell_type, title, body, query_config, time, display_config, author_id, author_name, created_at, updated_at FROM config_notebook_cells FINAL WHERE notebook_id = ? AND tenant_id = ? AND is_deleted = 0 ORDER BY position, created_at")
+            .bind(notebook_id)
+            .bind(tenant_id)
+            .fetch_all::<crate::models::notebook::NotebookCell>()
+            .await?)
     }
 
     // ── Alert Maintenance Windows ──────────────────────────────────────────────
