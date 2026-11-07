@@ -15,6 +15,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "contracts/**"
+      - "scripts/sync-query-contract.py"
   schedule:
     - cron: "17 9 * * 1"
   workflow_dispatch:
@@ -48,6 +50,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Check generated query schema
+        run: python3 scripts/sync-query-contract.py --check
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious

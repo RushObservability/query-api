@@ -1304,6 +1304,7 @@ fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
             matches!(
                 path,
                 "/api/v1/query"
+                    | "/api/v1/query/execute"
                     | "/api/v1/query/count"
                     | "/api/v1/query/group"
                     | "/api/v1/query/timeseries"
@@ -2912,6 +2913,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/jaeger/api/dependencies", get(handlers::jaeger::dependencies))
         // Query endpoints
         .route("/api/v1/query", post(handlers::query::execute_query))
+        .route("/api/v1/query/execute", post(handlers::query_contract::execute))
+        .route("/api/v1/query/schema", get(handlers::query_contract::schema))
         .route("/api/v1/query/count", post(handlers::query::count_query))
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
@@ -4196,6 +4199,29 @@ mod tenant_auth_tests {
 
     #[test]
     fn workload_policy_classifies_queries_and_preserves_explicit_bypasses() {
+        let unified = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query/execute")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&unified),
+            Some(rush_api::query_governor::WorkloadClass::Interactive)
+        );
+        assert!(internal_sre_route_allowed(
+            &Method::POST,
+            "/api/v1/query/execute"
+        ));
+        assert!(!internal_sre_route_allowed(
+            &Method::DELETE,
+            "/api/v1/query/execute"
+        ));
+        assert!(should_reject_for_tenant_auth(
+            &Method::POST,
+            "/api/v1/query/execute",
+            true,
+            false
+        ));
         let draft = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/sessions/session-1/dashboard-draft")
