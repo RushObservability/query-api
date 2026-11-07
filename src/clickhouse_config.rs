@@ -9955,6 +9955,52 @@ impl ConfigDb {
             .collect())
     }
 
+    /// Events needed to know which rules were anomalous during `[from, to]`:
+    /// every event inside the window plus each rule's last event before it,
+    /// newest first. Times are `YYYY-MM-DD HH:MM:SS` UTC like `created_at`.
+    pub async fn anomaly_events_for_window(
+        &self,
+        tenant_id: &str,
+        from: &str,
+        to: &str,
+    ) -> anyhow::Result<Vec<crate::models::anomaly::AnomalyEventWithRule>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+            rule_id: String,
+            tenant_id: String,
+            rule_name: String,
+            state: String,
+            metric: String,
+            value: f64,
+            expected: f64,
+            deviation: f64,
+            message: String,
+            created_at: String,
+        }
+        let rows = self.client
+            .query("SELECT e.id, e.rule_id, e.tenant_id, coalesce(r.name, 'deleted rule') AS rule_name, e.state, e.metric, e.value, e.expected, e.deviation, e.message, e.created_at FROM config_anomaly_events e LEFT JOIN (SELECT id, name FROM config_anomaly_rules FINAL WHERE is_deleted = 0) r ON e.rule_id = r.id WHERE e.tenant_id = ? AND e.created_at <= ? AND (e.created_at >= ? OR (e.rule_id, e.created_at) IN (SELECT rule_id, max(created_at) FROM config_anomaly_events WHERE tenant_id = ? AND created_at < ? GROUP BY rule_id)) ORDER BY e.created_at DESC LIMIT 1000")
+            .bind(tenant_id).bind(to).bind(from).bind(tenant_id).bind(from)
+            .fetch_all::<Row>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::models::anomaly::AnomalyEventWithRule {
+                id: r.id,
+                rule_id: r.rule_id,
+                tenant_id: r.tenant_id,
+                rule_name: r.rule_name,
+                state: r.state,
+                metric: r.metric,
+                value: r.value,
+                expected: r.expected,
+                deviation: r.deviation,
+                message: r.message,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
     pub async fn list_all_anomaly_events(
         &self,
         tenant_id: &str,
