@@ -201,6 +201,7 @@ fn normalize_server_error(mut response: Response, request_id: &str) -> Response 
 /// non-sensitive response contract as routed handlers.
 pub async fn public_error_middleware(mut req: Request, next: Next) -> Response {
     let request_id = new_request_id();
+    let unified_query = req.uri().path() == "/api/v1/query/execute";
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         req.headers_mut()
             .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
@@ -211,6 +212,38 @@ pub async fn public_error_middleware(mut req: Request, next: Next) -> Response {
             let mut response = next.run(req).await;
             if response.status().is_server_error() {
                 response = normalize_server_error(response, &request_id);
+            } else if unified_query
+                && response.status().is_client_error()
+                && response
+                    .extensions()
+                    .get::<NormalizedPublicError>()
+                    .is_none()
+            {
+                // Auth, JSON extraction, CSRF and admission failures must use the
+                // same safe envelope as errors originating in the query handler.
+                let status = response.status();
+                let (code, message) = match status {
+                    StatusCode::UNAUTHORIZED => ("unauthorized", "authentication is required"),
+                    StatusCode::FORBIDDEN => ("forbidden", "access to this query is denied"),
+                    StatusCode::TOO_MANY_REQUESTS => {
+                        ("rate_limited", "query capacity is busy; retry shortly")
+                    }
+                    StatusCode::PAYLOAD_TOO_LARGE => (
+                        "query_body_too_large",
+                        "query request body exceeds the configured limit",
+                    ),
+                    _ => ("invalid_query", "query does not match the v1 contract"),
+                };
+                let (parts, _) = response.into_parts();
+                response = ApiError::public(status, code, message).into_response();
+                for (name, value) in &parts.headers {
+                    if name != header::CONTENT_TYPE
+                        && name != header::CONTENT_LENGTH
+                        && name != header::CONTENT_ENCODING
+                    {
+                        response.headers_mut().append(name.clone(), value.clone());
+                    }
+                }
             }
             if let Ok(value) = HeaderValue::from_str(&request_id) {
                 response
@@ -292,6 +325,44 @@ mod tests {
         assert!(rendered.contains("operation=\"test.upstream\""));
         assert!(rendered.contains("upstream host=llm.internal response=secret"));
         assert!(rendered.contains(&error.request_id));
+    }
+
+    #[tokio::test]
+    async fn query_contract_normalizes_pre_handler_errors_without_losing_retry_headers() {
+        let app = Router::new()
+            .route(
+                "/api/v1/query/execute",
+                get(|| async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "7")],
+                        "secret SQL details",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(public_error_middleware));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/query/execute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "7");
+        let id = response.headers()[REQUEST_ID_HEADER]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "rate_limited");
+        assert_eq!(value["error"]["request_id"], id);
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret"));
     }
 
     #[tokio::test]

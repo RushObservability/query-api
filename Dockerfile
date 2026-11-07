@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev build-essential c
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY contracts ./contracts
 
 RUN cargo build --locked --release --no-default-features --features oss
 
