@@ -19,6 +19,9 @@ const WIDGET_TYPES: &[&str] = &[
     "bar",
     "table",
     "counter",
+    "log-patterns",
+    "state-timeline",
+    "scatter",
 ];
 
 #[cfg(test)]
@@ -29,6 +32,9 @@ mod widget_type_tests {
     fn pie_is_a_supported_widget_with_donut_as_a_display_option() {
         assert!(WIDGET_TYPES.contains(&"pie"));
         assert!(WIDGET_TYPES.contains(&"histogram"));
+        for kind in ["log-patterns", "state-timeline", "scatter"] {
+            assert!(WIDGET_TYPES.contains(&kind));
+        }
         assert!(!WIDGET_TYPES.contains(&"donut"));
         assert!(!WIDGET_TYPES.contains(&"unknown"));
     }
@@ -42,6 +48,19 @@ mod widget_type_tests {
         });
         let widget: WidgetExport = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(widget).unwrap(), json);
+    }
+
+    #[test]
+    fn analysis_panel_options_survive_export_round_trip() {
+        for kind in ["log-patterns", "state-timeline", "scatter"] {
+            let json = serde_json::json!({
+                "title": "Operations", "widget_type": kind,
+                "query_config": {"source": "spans", "x_field": "attributes.bytes", "y_field": "duration_ms", "limit": 500},
+                "position": {}, "display_config": {"x_unit": "KB", "states": [{"value": 0, "label": "Offline", "color": "red"}]}
+            });
+            let widget: WidgetExport = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(widget).unwrap(), json);
+        }
     }
 }
 
