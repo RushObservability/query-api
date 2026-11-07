@@ -8,6 +8,7 @@ pub mod cloudwatch;
 pub mod csp_reports;
 pub mod custom_skills;
 pub mod dashboard_drafts;
+pub mod dashboard_panels;
 pub mod dashboards;
 pub mod dd_common;
 pub mod dd_logs;

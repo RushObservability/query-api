@@ -2915,6 +2915,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/query/count", post(handlers::query::count_query))
         .route("/api/v1/query/group", post(handlers::query::group_query))
         .route("/api/v1/query/timeseries", post(handlers::query::timeseries_query))
+        .route("/api/v1/query/scatter", post(handlers::dashboard_panels::scatter))
         .route("/api/v1/explore/search", post(handlers::explore::search))
         .route("/api/v1/explore/diagnose", post(handlers::query_diagnostics::diagnose))
         .route("/api/v1/settings/log-views", get(handlers::log_views::get).put(handlers::log_views::put))
@@ -2940,6 +2941,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/logs/count", post(handlers::logs::count_logs))
         .route("/api/v1/logs/histogram", post(handlers::logs::log_histogram))
         .route("/api/v1/logs/group", post(handlers::logs::group_logs))
+        .route("/api/v1/logs/patterns", post(handlers::dashboard_panels::patterns))
         .route("/api/v1/logs/export", post(handlers::logs::export_logs))
         .route(
             "/api/v1/exports/{id}",
