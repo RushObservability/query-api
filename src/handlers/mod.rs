@@ -39,6 +39,7 @@ pub mod parse_promql;
 pub mod parse_query;
 pub mod profiles;
 pub mod query;
+pub mod query_diagnostics;
 pub mod remote_write;
 pub mod repository_access;
 pub mod retention;
