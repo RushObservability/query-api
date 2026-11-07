@@ -1231,21 +1231,52 @@ async fn ingest_content_length_limit_middleware(
     next.run(req).await
 }
 
-fn consume_ingest_rate_limit(state: &AppState, key_id: &str, limit: u64) -> bool {
+/// Seconds an ingest client should wait after a 429/503 that carries no more
+/// specific hint. Twice the OTel exporters' 5s initial backoff, so a whole
+/// fleet of collectors backs off past the first retry wave.
+const INGEST_RETRY_AFTER_SECS: u64 = 10;
+
+/// OTel exporters honour `Retry-After` on 429/503, so every ingest overload
+/// response gets one unless the rejecting layer already set a better value.
+async fn ingest_retry_after_middleware(req: Request, next: Next) -> Response {
+    let is_ingest = ingest_signal_for_route(req.method(), req.uri().path()).is_some();
+    let mut resp = next.run(req).await;
+    if is_ingest {
+        add_default_retry_after(&mut resp);
+    }
+    resp
+}
+
+fn add_default_retry_after(resp: &mut Response) {
+    if matches!(
+        resp.status(),
+        axum::http::StatusCode::TOO_MANY_REQUESTS | axum::http::StatusCode::SERVICE_UNAVAILABLE
+    ) && !resp.headers().contains_key(header::RETRY_AFTER)
+    {
+        resp.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from(INGEST_RETRY_AFTER_SECS),
+        );
+    }
+}
+
+/// Fixed one-minute window per key. `Err` carries the seconds until it resets.
+fn consume_ingest_rate_limit(state: &AppState, key_id: &str, limit: u64) -> Result<(), u64> {
     let now = std::time::Instant::now();
     let mut entry = state
         .ingest_key_limiter
         .entry(key_id.to_string())
         .or_insert((0, now));
-    if entry.1.elapsed() >= std::time::Duration::from_secs(60) {
+    let elapsed = entry.1.elapsed();
+    if elapsed >= std::time::Duration::from_secs(60) {
         *entry = (1, now);
-        return true;
+        return Ok(());
     }
     if entry.0 >= limit {
-        return false;
+        return Err(60 - elapsed.as_secs());
     }
     entry.0 += 1;
-    true
+    Ok(())
 }
 
 fn credential_route_denial(
@@ -1732,7 +1763,9 @@ async fn enforce_tenant_auth_middleware(
                         .into_response();
                 }
             }
-            if !consume_ingest_rate_limit(&state, &grant.id, grant.rate_limit_per_minute) {
+            if let Err(retry_after) =
+                consume_ingest_rate_limit(&state, &grant.id, grant.rate_limit_per_minute)
+            {
                 audit_api_key_denial(
                     &state,
                     req.headers(),
@@ -1743,6 +1776,7 @@ async fn enforce_tenant_auth_middleware(
                 .await;
                 return (
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, HeaderValue::from(retry_after))],
                     "ingest API key rate limit exceeded",
                 )
                     .into_response();
@@ -3599,6 +3633,8 @@ async fn main() -> anyhow::Result<()> {
             state.clone(),
             shutdown_gate_middleware,
         ))
+        // Outermost inner layer, so rejections from every layer above get the hint.
+        .layer(axum::middleware::from_fn(ingest_retry_after_middleware))
         // Keep a writer handle for the graceful-shutdown flush before `state` is
         // consumed by `with_state`.
         .with_state(state.clone());
@@ -4699,6 +4735,32 @@ mod tenant_auth_tests {
             Some("logs")
         );
         assert_eq!(ingest_signal_for_route(&Method::OPTIONS, "/v1/logs"), None);
+    }
+
+    #[test]
+    fn ingest_overload_responses_get_a_retry_after_without_overriding_one() {
+        use super::{INGEST_RETRY_AFTER_SECS, add_default_retry_after};
+        use axum::{http::StatusCode, response::IntoResponse};
+        let retry_after = |status: StatusCode, existing: Option<&'static str>| {
+            let mut resp = status.into_response();
+            if let Some(v) = existing {
+                resp.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static(v));
+            }
+            add_default_retry_after(&mut resp);
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        let default = Some(INGEST_RETRY_AFTER_SECS.to_string());
+        assert_eq!(retry_after(StatusCode::TOO_MANY_REQUESTS, None), default);
+        assert_eq!(retry_after(StatusCode::SERVICE_UNAVAILABLE, None), default);
+        assert_eq!(
+            retry_after(StatusCode::TOO_MANY_REQUESTS, Some("42")),
+            Some("42".to_string())
+        );
+        assert_eq!(retry_after(StatusCode::OK, None), None);
+        assert_eq!(retry_after(StatusCode::BAD_REQUEST, None), None);
     }
 
     #[test]
