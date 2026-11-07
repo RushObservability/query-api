@@ -2991,6 +2991,18 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/dashboards/{id}/export",
             get(handlers::dashboards::export_dashboard),
         )
+        .route(
+            "/api/v1/dashboards/{id}/versions",
+            get(handlers::dashboards::list_dashboard_versions),
+        )
+        .route(
+            "/api/v1/dashboards/{id}/versions/{version_id}",
+            get(handlers::dashboards::get_dashboard_version),
+        )
+        .route(
+            "/api/v1/dashboards/{id}/versions/{version_id}/restore",
+            post(handlers::dashboards::restore_dashboard_version),
+        )
         // Dashboard template endpoints
         .route(
             "/api/v1/dashboard-templates",

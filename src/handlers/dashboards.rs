@@ -73,6 +73,24 @@ async fn resolve_caller(
     )
 }
 
+/// Snapshot the dashboard after a successful edit. A failed snapshot only
+/// leaves a gap in history, so it never fails the edit that already landed.
+async fn record_version(
+    state: &AppState,
+    dashboard_id: &str,
+    reason: &str,
+    user_id: &str,
+    username: &str,
+) {
+    if let Err(e) = state
+        .config_db
+        .record_dashboard_version(dashboard_id, reason, user_id, username)
+        .await
+    {
+        tracing::warn!(dashboard_id, reason, error = %e, "failed to record dashboard version");
+    }
+}
+
 pub async fn list_dashboards(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -162,6 +180,7 @@ pub async fn create_dashboard(
                 "failed to read created dashboard".to_string(),
             )
         })?;
+    record_version(&state, &id, "dashboard.create", &user_id, &username).await;
 
     // AUDIT: dashboard created.
     state
@@ -259,6 +278,7 @@ pub async fn update_dashboard(
                 "failed to read dashboard".to_string(),
             )
         })?;
+    record_version(&state, &id, "dashboard.update", &user_id, &username).await;
 
     // AUDIT: dashboard updated.
     state
@@ -374,6 +394,14 @@ pub async fn create_widget(
             "failed to read created widget".to_string(),
         )
     })?;
+    record_version(
+        &state,
+        &dashboard_id,
+        "dashboard_widget.create",
+        &user_id,
+        &username,
+    )
+    .await;
 
     state.audit.log(
         crate::audit::AuditEvent::new("dashboard_widget.create", "user")
@@ -427,6 +455,14 @@ pub async fn update_widget(
     }
 
     let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    record_version(
+        &state,
+        &dashboard_id,
+        "dashboard_widget.update",
+        &user_id,
+        &username,
+    )
+    .await;
     state.audit.log(
         crate::audit::AuditEvent::new("dashboard_widget.update", "user")
             .actor(user_id, username)
@@ -470,6 +506,14 @@ pub async fn delete_widget(
         return Err((StatusCode::NOT_FOUND, "widget not found".to_string()));
     }
     let (user_id, username, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    record_version(
+        &state,
+        &dashboard_id,
+        "dashboard_widget.delete",
+        &user_id,
+        &username,
+    )
+    .await;
     state
         .audit
         .log(
@@ -516,6 +560,14 @@ pub async fn import_dashboard(
         .import_dashboard(&req, &tenant.tenant_id, &user_id, &role)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    record_version(
+        &state,
+        &dashboard.id,
+        "dashboard.import",
+        &user_id,
+        &username,
+    )
+    .await;
     state
         .audit
         .log(
@@ -643,6 +695,7 @@ pub async fn create_from_template(
                 "failed to read created dashboard".to_string(),
             )
         })?;
+    record_version(&state, &dash_id, "dashboard.create", &user_id, &username).await;
 
     state
         .audit
@@ -660,4 +713,134 @@ pub async fn create_from_template(
         )
         .await;
     Ok((StatusCode::CREATED, Json(dashboard)))
+}
+
+// ── Version history handlers ──
+
+const VERSION_LIST_LIMIT: u64 = 100;
+
+pub async fn list_dashboard_versions(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_principal(&state, &headers).await?;
+    let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    state
+        .config_db
+        .get_dashboard(&id, &tenant.tenant_id, &user_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
+    let versions = state
+        .config_db
+        .list_dashboard_versions(&id, VERSION_LIST_LIMIT)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
+    Ok(Json(serde_json::json!({ "versions": versions })))
+}
+
+pub async fn get_dashboard_version(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    Path((id, version_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_principal(&state, &headers).await?;
+    let (user_id, _, _, _, _) = resolve_caller(&state, &headers, &tenant).await;
+    state
+        .config_db
+        .get_dashboard(&id, &tenant.tenant_id, &user_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
+    let version = state
+        .config_db
+        .get_dashboard_version(&id, &version_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "version not found".to_string()))?;
+    Ok(Json(version))
+}
+
+/// Restores name, description, tags, variables, defaults and widgets from a
+/// version. Visibility is access control, not content, so it is left as is.
+pub async fn restore_dashboard_version(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    Path((id, version_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_principal_write(&state, &headers).await?;
+    let (user_id, username, _, _, role) = resolve_caller(&state, &headers, &tenant).await;
+    let current = state
+        .config_db
+        .get_dashboard(&id, &tenant.tenant_id, &user_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "dashboard not found".to_string()))?;
+    let version = state
+        .config_db
+        .get_dashboard_version(&id, &version_id)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "version not found".to_string()))?;
+    let meta = &version.snapshot.dashboard;
+    let tags_json = serde_json::to_string(&meta.tags)
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
+    let vars_json = serde_json::to_string(&meta.variables)
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
+
+    // update_dashboard applies the same edit permission check as a normal save.
+    let updated = state
+        .config_db
+        .update_dashboard(
+            &id,
+            &meta.name,
+            &meta.description,
+            &current.visibility,
+            &tags_json,
+            &vars_json,
+            &tenant.tenant_id,
+            &user_id,
+            &role,
+            Some(&meta.defaults),
+        )
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "dashboard not found".to_string()));
+    }
+    state
+        .config_db
+        .replace_dashboard_widgets(&id, &version.snapshot.widgets)
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("dashboards", e))?;
+    record_version(&state, &id, "dashboard.restore", &user_id, &username).await;
+
+    // AUDIT: dashboard restored to an earlier version.
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("dashboard.restore", "user")
+                .actor(user_id.clone(), username)
+                .tenant(tenant.tenant_id.clone())
+                .resource("dashboard", id.clone())
+                .outcome("success")
+                .changes(
+                    serde_json::json!({
+                        "restored_version_id": version.summary.id,
+                        "restored_version_created_at": version.summary.created_at,
+                        "name": { "before": current.name, "after": meta.name },
+                        "widget_count": version.snapshot.widgets.len(),
+                    })
+                    .to_string(),
+                )
+                .description("dashboard restored to an earlier version")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+
+    get_dashboard(State(state), Extension(tenant), headers, Path(id)).await
 }
