@@ -38,12 +38,19 @@ fn cell(nb: &Notebook, title: &str, position: u32) -> NotebookCell {
     }
 }
 
+/// The disposable ClickHouse from `RUSH_TEST_CLICKHOUSE_URL`, with an optional
+/// `RUSH_TEST_CLICKHOUSE_PASSWORD` for the default user.
+async fn open_db() -> anyhow::Result<ConfigDb> {
+    let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
+    let password = std::env::var("RUSH_TEST_CLICKHOUSE_PASSWORD").unwrap_or_default();
+    ConfigDb::open(&url, "default", &password).await
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable ClickHouse and test-only config/session secrets"]
 async fn notebooks_stay_in_their_tenant_and_private_ones_stay_with_their_owner()
 -> anyhow::Result<()> {
-    let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
-    let db = ConfigDb::open(&url, "default", "").await?;
+    let db = open_db().await?;
     let (tenant_a, tenant_b) = (
         format!("nb-a-{}", uuid::Uuid::new_v4()),
         format!("nb-b-{}", uuid::Uuid::new_v4()),
@@ -107,8 +114,7 @@ async fn notebooks_stay_in_their_tenant_and_private_ones_stay_with_their_owner()
 #[tokio::test]
 #[ignore = "requires a disposable ClickHouse and test-only config/session secrets"]
 async fn cells_come_back_in_position_order_without_deleted_ones() -> anyhow::Result<()> {
-    let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
-    let db = ConfigDb::open(&url, "default", "").await?;
+    let db = open_db().await?;
     let nb = notebook(&format!("nb-{}", uuid::Uuid::new_v4()), "u1", "tenant");
     db.write_notebook(&nb, false).await?;
 
