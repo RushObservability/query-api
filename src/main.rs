@@ -3006,6 +3006,29 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/suggest/{field}",
             get(handlers::suggest::suggest_values),
         )
+        // Incident notebook endpoints
+        .route(
+            "/api/v1/notebooks",
+            get(handlers::notebooks::list_notebooks).post(handlers::notebooks::create_notebook),
+        )
+        .route(
+            "/api/v1/notebooks/{id}",
+            get(handlers::notebooks::get_notebook)
+                .put(handlers::notebooks::update_notebook)
+                .delete(handlers::notebooks::delete_notebook),
+        )
+        .route(
+            "/api/v1/notebooks/{id}/cells",
+            post(handlers::notebooks::create_cell),
+        )
+        .route(
+            "/api/v1/notebooks/{id}/cells/reorder",
+            post(handlers::notebooks::reorder_cells),
+        )
+        .route(
+            "/api/v1/notebooks/{id}/cells/{cell_id}",
+            put(handlers::notebooks::update_cell).delete(handlers::notebooks::delete_cell),
+        )
         // Dashboard endpoints
         .route(
             "/api/v1/dashboards",
