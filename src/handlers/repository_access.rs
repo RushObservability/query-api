@@ -23,6 +23,18 @@ fn success() -> String {
     "success".to_string()
 }
 
+/// The audit action for an SRE agent repository access. `compare` is a
+/// commit comparison between two deploys.
+fn audit_action(action: &str) -> Option<&'static str> {
+    match action {
+        "list" => Some("repository.list"),
+        "search" => Some("repository.search"),
+        "read" => Some("repository.read"),
+        "compare" => Some("repository.compare"),
+        _ => None,
+    }
+}
+
 pub async fn audit_repository_access(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -34,16 +46,11 @@ pub async fn audit_repository_access(
             "invalid internal credential".to_string(),
         ));
     }
-    let action = match event.action.as_str() {
-        "list" => "repository.list",
-        "search" => "repository.search",
-        "read" => "repository.read",
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "invalid repository action".to_string(),
-            ));
-        }
+    let Some(action) = audit_action(&event.action) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid repository action".to_string(),
+        ));
     };
     if event.tenant_id.is_empty()
         || event.tenant_id.len() > 128
@@ -89,8 +96,15 @@ pub async fn audit_repository_access(
 
 #[cfg(test)]
 mod tests {
+    use super::audit_action;
+
     #[test]
     fn action_names_are_stable() {
-        assert_eq!("repository.read", format!("repository.{}", "read"));
+        assert_eq!(audit_action("list"), Some("repository.list"));
+        assert_eq!(audit_action("search"), Some("repository.search"));
+        assert_eq!(audit_action("read"), Some("repository.read"));
+        assert_eq!(audit_action("compare"), Some("repository.compare"));
+        assert_eq!(audit_action("write"), None);
+        assert_eq!(audit_action(""), None);
     }
 }
