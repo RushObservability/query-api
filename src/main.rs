@@ -819,6 +819,7 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
         || path.starts_with("/api/v1/bubbleup")
         || path.starts_with("/api/v1/suggest")
         || path.starts_with("/api/v1/stats")
+        || path == "/api/v1/telemetry-quality"
         || path.starts_with("/api/v1/rum/")
         || path.starts_with("/prom/api/v1/query")
         || path.starts_with("/prom/api/v1/series")
@@ -3210,6 +3211,7 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::anomalies::analyze_anomaly_event),
         )
         .route("/api/v1/insights", get(handlers::insights::get_insights))
+        .route("/api/v1/telemetry-quality", get(handlers::telemetry_quality::get_quality))
         // SIEM Detection rules
         .route(
             "/api/v1/detection/rules",
@@ -4222,6 +4224,16 @@ mod tenant_auth_tests {
 
     #[test]
     fn workload_policy_classifies_queries_and_preserves_explicit_bypasses() {
+        let quality = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/telemetry-quality?minutes=1440")
+            .header("x-rush-workload", "export")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&quality),
+            Some(rush_api::query_governor::WorkloadClass::Interactive)
+        );
         let unified = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/query/execute")
