@@ -61,6 +61,7 @@ pub mod sre_sessions;
 pub mod sso;
 pub mod stats;
 pub mod suggest;
+pub mod telemetry_quality;
 pub mod tenants;
 pub mod traces;
 pub mod usage;
