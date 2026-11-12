@@ -103,12 +103,12 @@ pub async fn execute_query(
     .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
 
     // Slim projection is opt-in via `columns: "list"`: select only the ~10 columns the
-    // Explore table renders. Default (absent/other) returns the full wide `SELECT *`.
+    // Explore table renders. Default (absent/other) selects the WideEvent columns explicitly.
     let slim = req.columns.as_deref() == Some("list");
     const SLIM_COLS: &str = "timestamp, service_name, span_name, http_method, http_path, \
          http_status_code, duration_ns, status, trace_id, span_id";
 
-    let projection = if slim { SLIM_COLS } else { "*" };
+    let projection = if slim { SLIM_COLS } else { "?fields" };
     let scope = query_scope(
         tenant_id,
         "spans",
@@ -344,7 +344,7 @@ pub async fn export_query(
     )
     .with_prewhere_prefix(&format!("tenant_id = '{escaped_tenant}'"));
     let sql = format!(
-        "SELECT * FROM spans {} ORDER BY timestamp DESC LIMIT {limit}",
+        "SELECT ?fields FROM spans {} ORDER BY timestamp DESC LIMIT {limit}",
         clauses.to_sql(),
     );
 

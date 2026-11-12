@@ -214,7 +214,8 @@ const SPOOL_ZSTD_LEVEL: i32 = 3;
 
 /// Encode a batch for the spool: zstd-compressed MessagePack behind a format tag.
 fn encode_spool(batch: &SpoolBatch) -> Result<Vec<u8>, WriteError> {
-    let mp = rmp_serde::to_vec(batch)
+    // Named row fields let older replicas ignore columns introduced by a newer writer.
+    let mp = rmp_serde::to_vec_named(batch)
         .map_err(|e| WriteError::Fatal(format!("spool msgpack encode: {e}")))?;
     let compressed = zstd::encode_all(mp.as_slice(), SPOOL_ZSTD_LEVEL)
         .map_err(|e| WriteError::Fatal(format!("spool zstd encode: {e}")))?;
@@ -870,6 +871,26 @@ mod batch_tests {
         let decoded = decode_spool(&encoded).expect("decode");
         assert!(same_batch(&batch, &decoded));
         assert_eq!(decoded.len(), 3);
+    }
+
+    #[test]
+    fn named_spool_rows_allow_older_readers_to_ignore_new_fields() {
+        let batch = gauge(1);
+        let encoded = encode_spool(&batch).unwrap();
+        let mp = zstd::decode_all(&encoded[1..]).unwrap();
+        let mut future: serde_json::Value = rmp_serde::from_slice(&mp).unwrap();
+        let row = future["Gauge"][0]
+            .as_object_mut()
+            .expect("rows encode named fields, not positional arrays");
+        row.insert(
+            "future_column".into(),
+            serde_json::json!("a value from a newer binary"),
+        );
+        let future_mp = rmp_serde::to_vec_named(&future).unwrap();
+        let mut payload = vec![SPOOL_FMT_MSGPACK_ZSTD];
+        payload
+            .extend_from_slice(&zstd::encode_all(future_mp.as_slice(), SPOOL_ZSTD_LEVEL).unwrap());
+        assert!(same_batch(&batch, &decode_spool(&payload).unwrap()));
     }
 
     #[test]
