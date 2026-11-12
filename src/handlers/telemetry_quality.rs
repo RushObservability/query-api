@@ -1,4 +1,4 @@
-//! Read-only, bounded telemetry-quality checks. Findings describe the sample,
+//! Bounded telemetry-quality checks. Findings describe the sample,
 //! not the population. Never fetch log bodies or return metric label values.
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -35,82 +35,88 @@ pub struct QualityParams {
     pub minutes: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityRule {
-    pub id: &'static str,
-    pub title: &'static str,
-    pub impact: &'static str,
-    pub signals: &'static str,
-    pub description: &'static str,
-    pub remediation: &'static str,
+    pub id: String,
+    pub title: String,
+    pub impact: String,
+    pub signals: String,
+    pub description: String,
+    pub remediation: String,
 }
 
 pub fn rules() -> Vec<QualityRule> {
     vec![
         QualityRule {
-            id: "service_name",
-            title: "Missing service name",
-            impact: "high",
-            signals: "Logs, metrics, traces",
-            description: "The service name is empty or uses the SDK unknown_service default.",
-            remediation: "Set service.name on the SDK resource so telemetry can be attributed to a service.",
+            id: "service_name".into(),
+            title: "Missing service name".into(),
+            impact: "high".into(),
+            signals: "Logs, metrics, traces".into(),
+            description: "The service name is empty or uses the SDK unknown_service default.".into(),
+            remediation: "Set service.name on the SDK resource so telemetry can be attributed to a service.".into(),
         },
         QualityRule {
-            id: "environment",
-            title: "Missing deployment environment",
-            impact: "high",
-            signals: "Logs, metrics",
-            description: "Neither deployment.environment.name nor its legacy deployment.environment attribute is present.",
-            remediation: "Set deployment.environment.name on the SDK resource or through the Collector resource processor.",
+            id: "environment".into(),
+            title: "Missing deployment environment".into(),
+            impact: "high".into(),
+            signals: "Logs, metrics, traces".into(),
+            description: "Neither deployment.environment.name nor its legacy deployment.environment attribute is present.".into(),
+            remediation: "Set deployment.environment.name on the SDK resource or through the Collector resource processor.".into(),
         },
         QualityRule {
-            id: "instance",
-            title: "Missing service instance ID",
-            impact: "medium",
-            signals: "Logs, metrics",
-            description: "The resource has no service.instance.id. Trace resource attributes are not retained by the current span schema and are not evaluated.",
-            remediation: "Set a unique service.instance.id for each running instance, such as a Kubernetes pod UID.",
+            id: "instance".into(),
+            title: "Missing service instance ID".into(),
+            impact: "medium".into(),
+            signals: "Logs, metrics, traces".into(),
+            description: "The resource has no service.instance.id. Historical spans without retained resource metadata are not evaluated.".into(),
+            remediation: "Set a unique service.instance.id for each running instance, such as a Kubernetes pod UID.".into(),
         },
         QualityRule {
-            id: "severity",
-            title: "Missing or invalid log severity",
-            impact: "medium",
-            signals: "Logs",
-            description: "severityNumber is outside the OpenTelemetry range 1–24.",
-            remediation: "Use an OpenTelemetry logging bridge and map the application log level to severityNumber.",
+            id: "severity".into(),
+            title: "Missing or invalid log severity".into(),
+            impact: "medium".into(),
+            signals: "Logs".into(),
+            description: "severityNumber is outside the OpenTelemetry range 1–24.".into(),
+            remediation: "Use an OpenTelemetry logging bridge and map the application log level to severityNumber.".into(),
         },
         QualityRule {
-            id: "metric_unit",
-            title: "Missing metric unit",
-            impact: "low",
-            signals: "Metrics",
-            description: "The metric unit is empty. Use 1 for dimensionless measurements where appropriate.",
-            remediation: "Declare the unit when creating the instrument and check that recorded values use that unit.",
+            id: "metric_unit".into(),
+            title: "Missing metric unit".into(),
+            impact: "low".into(),
+            signals: "Metrics".into(),
+            description: "The metric unit is empty. Use 1 for dimensionless measurements where appropriate.".into(),
+            remediation: "Declare the unit when creating the instrument and check that recorded values use that unit.".into(),
         },
         QualityRule {
-            id: "unit_conflict",
-            title: "Conflicting metric units",
-            impact: "high",
-            signals: "Metrics",
-            description: "The same service and metric name have multiple non-empty units in the sample.",
-            remediation: "Use one unit per metric name. Convert values and check dashboards and alert thresholds when changing units.",
+            id: "unit_conflict".into(),
+            title: "Conflicting metric units".into(),
+            impact: "high".into(),
+            signals: "Metrics".into(),
+            description: "The same service and metric name have multiple non-empty units in the sample.".into(),
+            remediation: "Use one unit per metric name. Convert values and check dashboards and alert thresholds when changing units.".into(),
         },
         QualityRule {
-            id: "label_cardinality",
-            title: "High-cardinality metric attribute",
-            impact: "medium",
-            signals: "Metrics",
-            description: "Among the first 64 attributes per datapoint, a label has at least 100 distinct sampled values across at least 200 datapoints, with more than 80% distinct. This is a review candidate, not proof of waste.",
-            remediation: "Check whether this label carries request, session, user or URL identifiers. Prefer bounded dimensions; preserve required series identity.",
+            id: "label_cardinality".into(),
+            title: "High-cardinality metric attribute".into(),
+            impact: "medium".into(),
+            signals: "Metrics".into(),
+            description: "Among the first 64 attributes per datapoint, a label has at least 100 distinct sampled values across at least 200 datapoints, with more than 80% distinct. This is a review candidate, not proof of waste.".into(),
+            remediation: "Check whether this label carries request, session, user or URL identifiers. Prefer bounded dimensions; preserve required series identity.".into(),
         },
         QualityRule {
-            id: "span_names",
-            title: "Likely dynamic span names",
-            impact: "medium",
-            signals: "Traces",
-            description: "At least 100 sampled span names are distinct, with more than half the sample distinct, and at least 10 names contain long numeric IDs or UUIDs.",
-            remediation: "Use operation or matched route templates for span names, keeping individual identifiers out of the name.",
+            id: "span_names".into(),
+            title: "Likely dynamic span names".into(),
+            impact: "medium".into(),
+            signals: "Traces".into(),
+            description: "At least 100 sampled span names are distinct, with more than half the sample distinct, and at least 10 names contain long numeric IDs or UUIDs.".into(),
+            remediation: "Use operation or matched route templates for span names, keeping individual identifiers out of the name.".into(),
         },
+        QualityRule { id: "version".into(), title: "Missing service version".into(), impact: "medium".into(), signals: "Logs, metrics, traces".into(), description: "The resource has no service.version, limiting release comparisons.".into(), remediation: "Set service.version to your deployed release or build identifier.".into() },
+        QualityRule { id: "namespace".into(), title: "Missing service namespace".into(), impact: "low".into(), signals: "Logs, metrics, traces".into(), description: "The resource has no service.namespace to distinguish related service groups.".into(), remediation: "Set service.namespace to a stable application or team namespace.".into() },
+        QualityRule { id: "sdk_name".into(), title: "Missing telemetry SDK name".into(), impact: "low".into(), signals: "Logs, metrics, traces".into(), description: "The resource has no telemetry.sdk.name. Non-SDK sources may omit this intentionally.".into(), remediation: "For SDK sources, preserve telemetry.sdk.name through the Collector resource processors.".into() },
+        QualityRule { id: "sdk_language".into(), title: "Missing telemetry SDK language".into(), impact: "low".into(), signals: "Logs, metrics, traces".into(), description: "The resource has no telemetry.sdk.language. Non-SDK sources may omit this intentionally.".into(), remediation: "For SDK sources, preserve telemetry.sdk.language through the Collector resource processors.".into() },
+        QualityRule { id: "metric_description".into(), title: "Missing metric description".into(), impact: "low".into(), signals: "Metrics".into(), description: "The metric description is empty, leaving its meaning undocumented in telemetry.".into(), remediation: "Describe the quantity measured when creating the instrument.".into() },
+        QualityRule { id: "span_kind".into(), title: "Unspecified or invalid span kind".into(), impact: "medium".into(), signals: "Traces".into(), description: "The span kind is not INTERNAL, SERVER, CLIENT, PRODUCER or CONSUMER.".into(), remediation: "Set the span kind for the operation so service topology can distinguish local work, requests and messaging.".into() },
     ]
 }
 
@@ -128,9 +134,15 @@ pub struct Sample {
     pub name_hash: u64,
     pub dynamic_name: u8,
     pub observed_at: i64,
+    pub resource_known: u8,
+    pub has_namespace: u8,
+    pub has_sdk_name: u8,
+    pub has_sdk_language: u8,
+    pub has_description: u8,
+    pub valid_kind: u8,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualitySource {
     pub table: String,
     pub signal: String,
@@ -139,14 +151,14 @@ pub struct QualitySource {
     pub capped: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionEvidence {
     pub version: String,
     pub sampled: u64,
     pub affected: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityFinding {
     pub id: String,
     pub rule_id: String,
@@ -161,7 +173,7 @@ pub struct QualityFinding {
     pub versions: Vec<VersionEvidence>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleEvaluation {
     pub rule_id: String,
     pub status: String,
@@ -169,23 +181,70 @@ pub struct RuleEvaluation {
     pub affected: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityService {
     pub service: String,
     pub status: String,
     pub sampled_records: u64,
     pub finding_count: usize,
     pub checks: Vec<RuleEvaluation>,
+    pub score: QualityScore,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityScore {
+    pub value: Option<u32>,
+    pub passed_weight: u32,
+    pub evaluated_weight: u32,
+    pub evaluated_checks: usize,
+    pub not_evaluated_checks: usize,
+}
+
+/// Rush sample score v1. Each evaluated service/rule pair counts once.
+/// Findings fail the check; unknown checks never contribute passing weight.
+fn score(checks: &[RuleEvaluation], definitions: &[QualityRule]) -> QualityScore {
+    let mut result = QualityScore {
+        value: None,
+        passed_weight: 0,
+        evaluated_weight: 0,
+        evaluated_checks: 0,
+        not_evaluated_checks: 0,
+    };
+    for check in checks {
+        if check.status == "not_evaluated" {
+            result.not_evaluated_checks += 1;
+            continue;
+        }
+        let weight = definitions
+            .iter()
+            .find(|r| r.id == check.rule_id)
+            .map_or(1, |r| match r.impact.as_str() {
+                "high" => 3,
+                "medium" => 2,
+                _ => 1,
+            });
+        result.evaluated_checks += 1;
+        result.evaluated_weight += weight;
+        if check.status == "pass" {
+            result.passed_weight += weight;
+        }
+    }
+    if result.evaluated_weight > 0 {
+        result.value = Some(
+            (100 * result.passed_weight + result.evaluated_weight / 2) / result.evaluated_weight,
+        );
+    }
+    result
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityResponse {
     pub evaluated_at: String,
     pub from: String,
     pub to: String,
     pub minutes: u32,
     pub sample_limit_per_source: usize,
-    pub sampling: &'static str,
+    pub sampling: String,
     pub sources: Vec<QualitySource>,
     pub inventory_available: bool,
     pub inventory_capped: bool,
@@ -199,6 +258,13 @@ pub struct QualityResponse {
     pub rules: Vec<QualityRule>,
     pub findings: Vec<QualityFinding>,
     pub services: Vec<QualityService>,
+    pub score: QualityScore,
+    #[serde(default)]
+    pub history: Vec<crate::quality_engine::FindingHistory>,
+    pub history_available: bool,
+    pub history_capped: bool,
+    pub scheduled_at: Option<String>,
+    pub cache_hit: bool,
 }
 
 fn signal(table: &str) -> &'static str {
@@ -228,10 +294,9 @@ fn sample_sql(table: &str, tenant: &str, from: DateTime<Utc>, to: DateTime<Utc>)
     let from = from.format("%Y-%m-%d %H:%M:%S%.9f");
     let to = to.format("%Y-%m-%d %H:%M:%S%.9f");
     let (fields, time) = if table == "spans" {
-        // Resource metadata is not retained in the wide span schema. Do not
-        // mistake storage loss for an instrumentation failure.
-        ("service_name AS service, JSONExtractString(attributes, 'service.version') AS version, \
-          toUInt8(0) AS has_environment, toUInt8(0) AS has_instance, toUInt8(0) AS has_severity, \
+        // Empty legacy resource metadata remains unknown, not a failed check.
+        ("service_name AS service, if(notEmpty(resource_attributes), JSONExtractString(resource_attributes, 'service.version'), JSONExtractString(attributes, 'service.version')) AS version, \
+          toUInt8(notEmpty(trimBoth(JSONExtractString(resource_attributes, 'deployment.environment.name'))) OR notEmpty(trimBoth(JSONExtractString(resource_attributes, 'deployment.environment')))) AS has_environment, toUInt8(notEmpty(trimBoth(JSONExtractString(resource_attributes, 'service.instance.id')))) AS has_instance, toUInt8(0) AS has_severity, \
           '' AS metric, '' AS unit, CAST([], 'Array(String)') AS label_keys, CAST([], 'Array(UInt64)') AS label_hashes, \
           cityHash64(span_name) AS name_hash, \
           toUInt8(match(span_name, '[0-9]{6,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) AS dynamic_name".to_string(), "timestamp")
@@ -267,8 +332,20 @@ fn sample_sql(table: &str, tenant: &str, from: DateTime<Utc>, to: DateTime<Utc>)
         "logs" => "",
         _ => " ORDER BY MetricName, ServiceName, TimeUnix",
     };
+    let extra = if table == "spans" {
+        "toUInt8(notEmpty(resource_attributes)) AS resource_known, toUInt8(notEmpty(trimBoth(JSONExtractString(resource_attributes, 'service.namespace')))) AS has_namespace, toUInt8(notEmpty(trimBoth(JSONExtractString(resource_attributes, 'telemetry.sdk.name')))) AS has_sdk_name, toUInt8(notEmpty(trimBoth(JSONExtractString(resource_attributes, 'telemetry.sdk.language')))) AS has_sdk_language, toUInt8(0) AS has_description, toUInt8(replaceOne(kind, 'SPAN_KIND_', '') IN ('INTERNAL','SERVER','CLIENT','PRODUCER','CONSUMER')) AS valid_kind".to_string()
+    } else {
+        format!(
+            "toUInt8(1) AS resource_known, toUInt8(notEmpty(trimBoth(ResourceAttributes['service.namespace']))) AS has_namespace, toUInt8(notEmpty(trimBoth(ResourceAttributes['telemetry.sdk.name']))) AS has_sdk_name, toUInt8(notEmpty(trimBoth(ResourceAttributes['telemetry.sdk.language']))) AS has_sdk_language, {} AS has_description, toUInt8(0) AS valid_kind",
+            if table == "logs" {
+                "toUInt8(0)"
+            } else {
+                "toUInt8(notEmpty(trimBoth(MetricDescription)))"
+            }
+        )
+    };
     format!(
-        "SELECT {fields}, toUnixTimestamp64Milli({time}) AS observed_at FROM {table} \
+        "SELECT {fields}, toUnixTimestamp64Milli({time}) AS observed_at, {extra} FROM {table} \
         PREWHERE tenant_id = '{tenant}' AND {time} >= toDateTime64('{from}', 9, 'UTC') \
         AND {time} <= toDateTime64('{to}', 9, 'UTC'){order} LIMIT {}",
         SAMPLE_LIMIT + 1
@@ -326,18 +403,29 @@ pub async fn get_quality(
             "time range exceeds the configured workload limit".into(),
         ));
     }
+    let mut report = state
+        .quality_cache
+        .get(&state.ch, &state.config_db, &tenant.tenant_id, minutes)
+        .await?;
+    crate::quality_engine::attach_history(&state.config_db, &tenant.tenant_id, &mut report).await;
+    Ok(Json(report))
+}
+
+pub(crate) async fn analyze(
+    ch: &clickhouse::Client,
+    config_db: &crate::clickhouse_config::ConfigDb,
+    tenant: &str,
+    minutes: u32,
+) -> QualityResponse {
     let to = Utc::now();
     let from = to - chrono::Duration::minutes(i64::from(minutes));
     let mut records = Vec::new();
     let mut sources = Vec::new();
     // Sequential small reads avoid multiplying a single page's CH concurrency.
     for table in SOURCES {
-        let sql = sample_sql(table, &tenant.tenant_id, from, to);
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            read_sample(&state.ch, &sql, &tenant.tenant_id),
-        )
-        .await;
+        let sql = sample_sql(table, tenant, from, to);
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), read_sample(ch, &sql, tenant)).await;
         match result {
             Ok(Ok(mut rows)) => {
                 let capped = rows.len() > SAMPLE_LIMIT;
@@ -368,15 +456,15 @@ pub async fn get_quality(
     }
     let inventory = tokio::time::timeout(
         Duration::from_secs(2),
-        state.config_db.client.query("SELECT service_name FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY service_name LIMIT 501")
-            .bind(&tenant.tenant_id).fetch_all::<LinkedService>(),
+        config_db.client.query("SELECT service_name FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY service_name LIMIT 501")
+            .bind(tenant).fetch_all::<LinkedService>(),
     )
     .await;
     let (known, inventory_available) = match inventory {
         Ok(Ok(links)) => (links.into_iter().map(|s| s.service_name).collect(), true),
         _ => (Vec::new(), false),
     };
-    Ok(Json(evaluate(
+    evaluate(
         records,
         sources,
         known,
@@ -384,7 +472,7 @@ pub async fn get_quality(
         from,
         to,
         minutes,
-    )))
+    )
 }
 
 #[derive(Default)]
@@ -510,10 +598,14 @@ fn evaluate(
             "service_name",
             service.is_empty() || service.starts_with("unknown_service"),
         )];
-        if *signal != "traces" {
+        if *signal != "traces" || sample.resource_known != 0 {
             checks.extend([
                 ("environment", sample.has_environment == 0),
                 ("instance", sample.has_instance == 0),
+                ("version", sample.version.trim().is_empty()),
+                ("namespace", sample.has_namespace == 0),
+                ("sdk_name", sample.has_sdk_name == 0),
+                ("sdk_language", sample.has_sdk_language == 0),
             ]);
         }
         if *signal == "logs" {
@@ -521,6 +613,7 @@ fn evaluate(
         }
         if *signal == "metrics" {
             checks.push(("metric_unit", sample.unit.trim().is_empty()));
+            checks.push(("metric_description", sample.has_description == 0));
             checks.push((
                 "unit_conflict",
                 units
@@ -545,6 +638,7 @@ fn evaluate(
             }
         }
         if *signal == "traces" {
+            checks.push(("span_kind", sample.valid_kind == 0));
             let bad = names
                 .get(&sample.service)
                 .is_some_and(|(count, dynamic, values)| {
@@ -587,6 +681,30 @@ fn evaluate(
             continue;
         }
         let (observed, expected) = match rule.as_str() {
+            "version" => (
+                "service.version is empty".into(),
+                "An explicit release or build identifier",
+            ),
+            "namespace" => (
+                "service.namespace is empty".into(),
+                "A stable service group namespace",
+            ),
+            "sdk_name" => (
+                "telemetry.sdk.name is empty".into(),
+                "SDK identity for SDK-generated telemetry",
+            ),
+            "sdk_language" => (
+                "telemetry.sdk.language is empty".into(),
+                "SDK language for SDK-generated telemetry",
+            ),
+            "metric_description" => (
+                "Metric description is empty".into(),
+                "A description of the measured quantity",
+            ),
+            "span_kind" => (
+                "Span kind is unspecified or invalid".into(),
+                "INTERNAL, SERVER, CLIENT, PRODUCER or CONSUMER",
+            ),
             "service_name" => (
                 "Service name is missing or uses unknown_service".into(),
                 "An explicit service.name",
@@ -662,7 +780,7 @@ fn evaluate(
         definitions
             .iter()
             .find(|r| r.id == f.rule_id)
-            .map_or(2, |r| match r.impact {
+            .map_or(2, |r| match r.impact.as_str() {
                 "high" => 0,
                 "medium" => 1,
                 _ => 2,
@@ -687,7 +805,7 @@ fn evaluate(
                         .and_then(|v| v.iter().find(|v| v.rule_id == rule.id))
                         .cloned()
                         .unwrap_or(RuleEvaluation {
-                            rule_id: rule.id.into(),
+                            rule_id: rule.id.clone(),
                             status: "not_evaluated".into(),
                             sampled: 0,
                             affected: 0,
@@ -707,6 +825,7 @@ fn evaluate(
                 .into(),
                 sampled_records,
                 finding_count,
+                score: score(&checks, &definitions),
                 checks,
             }
         })
@@ -722,13 +841,19 @@ fn evaluate(
     let omitted_services = services.len().saturating_sub(MAX_SERVICES);
     findings.truncate(MAX_FINDINGS);
     services.truncate(MAX_SERVICES);
+    let combined = services
+        .iter()
+        .flat_map(|s| s.checks.clone())
+        .collect::<Vec<_>>();
     QualityResponse {
+        score: score(&combined, &definitions),
+        history: vec![], history_available: false, history_capped: false, scheduled_at: None, cache_hit: false,
         evaluated_at: Utc::now().to_rfc3339(),
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
         minutes,
         sample_limit_per_source: SAMPLE_LIMIT,
-        sampling: "Bounded storage-order samples, not random or exhaustive. Percentages describe sampled records only. Trace resource checks are not evaluated because the wide span schema does not retain original resource attributes. No overall instrumentation score is calculated.",
+        sampling: "Bounded storage-order samples, not random or exhaustive. Percentages describe sampled records only. Historical spans without retained resource attributes are not evaluated for resource checks. Rush sample score v1 uses high=3, medium=2, low=1: 100 × passing weight / evaluated weight, rounded to nearest integer. Unknown checks are excluded. This is a partial Rush assessment, not the Instrumentation Score standard.".into(),
         partial: !inventory_available
             || sources.iter().any(|s| s.status == "unavailable")
             || omitted_findings > 0
@@ -749,7 +874,7 @@ fn evaluate(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     fn sample(service: &str) -> Sample {
         Sample {
@@ -759,6 +884,11 @@ mod tests {
             has_environment: 1,
             has_instance: 1,
             has_severity: 1,
+            has_namespace: 1,
+            has_sdk_name: 1,
+            has_sdk_language: 1,
+            has_description: 1,
+            valid_kind: 1,
             metric: "duration".into(),
             unit: "s".into(),
             ..Default::default()
@@ -775,6 +905,68 @@ mod tests {
             now,
             60,
         )
+    }
+    pub(crate) fn history_report(bad: bool) -> QualityResponse {
+        let mut row = sample("checkout");
+        row.has_environment = u8::from(!bad);
+        let mut report = run(vec![("logs", row)], vec![]);
+        report.sources = SOURCES
+            .iter()
+            .map(|table| QualitySource {
+                table: (*table).into(),
+                signal: signal(table).into(),
+                status: "available".into(),
+                sampled_records: 1,
+                capped: false,
+            })
+            .collect();
+        report
+    }
+    #[test]
+    fn retained_trace_resources_are_evaluated_and_old_rows_stay_unknown() {
+        let mut retained = sample("checkout");
+        retained.resource_known = 1;
+        retained.has_environment = 0;
+        let mut old = retained.clone();
+        old.resource_known = 0;
+        let report = run(vec![("traces", retained), ("traces", old)], vec![]);
+        let env = report.services[0]
+            .checks
+            .iter()
+            .find(|c| c.rule_id == "environment")
+            .unwrap();
+        assert_eq!(env.sampled, 1);
+        assert_eq!(env.affected, 1);
+    }
+    #[test]
+    fn score_excludes_unknowns_and_uses_disclosed_weights() {
+        let rules = rules();
+        let checks = vec![
+            RuleEvaluation {
+                rule_id: "service_name".into(),
+                status: "pass".into(),
+                sampled: 1,
+                affected: 0,
+            },
+            RuleEvaluation {
+                rule_id: "instance".into(),
+                status: "finding".into(),
+                sampled: 1,
+                affected: 1,
+            },
+            RuleEvaluation {
+                rule_id: "namespace".into(),
+                status: "not_evaluated".into(),
+                sampled: 0,
+                affected: 0,
+            },
+        ];
+        let result = score(&checks, &rules);
+        assert_eq!(result.value, Some(60));
+        assert_eq!(result.passed_weight, 3);
+        assert_eq!(result.evaluated_weight, 5);
+        assert_eq!(result.not_evaluated_checks, 1);
+        assert_eq!(score(&checks[2..], &rules).value, None);
     }
     #[test]
     fn missing_metadata_is_evidence_and_absent_services_are_unknown() {

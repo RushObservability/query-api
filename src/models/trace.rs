@@ -1,5 +1,6 @@
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// A single wide event span as stored in ClickHouse (v2 schema).
 /// Column order must match the `spans` table exactly for `SELECT *`.
@@ -25,6 +26,9 @@ pub struct WideEvent {
     pub event_attributes: Vec<String>,
     pub link_trace_ids: Vec<String>,
     pub link_span_ids: Vec<String>,
+    /// Empty means legacy/spooled data whose resource was not retained.
+    #[serde(default)]
+    pub resource_attributes: Arc<str>,
 }
 
 /// Look up an OTel attribute value by key in a `(key, value)` list.
@@ -51,6 +55,31 @@ impl From<crate::models::ingest::TraceInsertRow> for WideEvent {
     /// port of the former `spans_mv` materialized view — applied at ingest so spans land
     /// directly in the single `spans` table (no `spans_raw` copy + SQL MV).
     fn from(r: crate::models::ingest::TraceInsertRow) -> Self {
+        let resource = Arc::from(attrs_to_json(&r.resource_attributes));
+        Self::with_resource(r, resource)
+    }
+}
+
+impl WideEvent {
+    /// Serialize each shared OTLP resource once per batch. Keep its source Arc
+    /// alive so pointer identities cannot be recycled while converting the batch.
+    pub fn from_rows(rows: Vec<crate::models::ingest::TraceInsertRow>) -> Vec<Self> {
+        let mut resources = std::collections::HashMap::new();
+        rows.into_iter()
+            .map(|row| {
+                let key = Arc::as_ptr(&row.resource_attributes) as usize;
+                let (_, json) = resources.entry(key).or_insert_with(|| {
+                    (
+                        row.resource_attributes.clone(),
+                        Arc::<str>::from(attrs_to_json(&row.resource_attributes)),
+                    )
+                });
+                Self::with_resource(row, json.clone())
+            })
+            .collect()
+    }
+
+    fn with_resource(r: crate::models::ingest::TraceInsertRow, resource: Arc<str>) -> Self {
         let a = &r.span_attributes;
         let http_method = attr_lookup(a, "http.method").unwrap_or("").to_string();
         // COALESCE(http.route, http.target, url.path, SpanName) — first non-empty.
@@ -92,6 +121,7 @@ impl From<crate::models::ingest::TraceInsertRow> for WideEvent {
             event_attributes,
             link_trace_ids: r.links_trace_id,
             link_span_ids: r.links_span_id,
+            resource_attributes: resource,
         }
     }
 }
@@ -175,4 +205,57 @@ pub fn nanos_to_string(nanos: i64) -> String {
     chrono::DateTime::from_timestamp(secs, subsec_nanos)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.9f").to_string())
         .unwrap_or_else(|| nanos.to_string())
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    #[test]
+    fn conversion_retains_original_resource_separately_from_span_attributes() {
+        let row: crate::models::ingest::TraceInsertRow = serde_json::from_value(serde_json::json!({
+            "tenant_id":"t", "Timestamp":0, "TraceId":"trace", "SpanId":"span", "ParentSpanId":"", "TraceState":"", "SpanName":"work", "SpanKind":"SPAN_KIND_INTERNAL", "ServiceName":"checkout", "ResourceAttributes":[["service.version","2.0"],["deployment.environment.name","production"]], "ScopeName":"scope", "ScopeVersion":"1", "SpanAttributes":[["service.version","span-value"]], "Duration":1, "StatusCode":"", "StatusMessage":"", "Events.Timestamp":[], "Events.Name":[], "Events.Attributes":[], "Links.TraceId":[], "Links.SpanId":[], "Links.TraceState":[], "Links.Attributes":[]
+        })).unwrap();
+        let rows = WideEvent::from_rows(vec![row.clone(), row]);
+        assert!(Arc::ptr_eq(
+            &rows[0].resource_attributes,
+            &rows[1].resource_attributes
+        ));
+        let event = &rows[0];
+        let resource: serde_json::Value = serde_json::from_str(&event.resource_attributes).unwrap();
+        assert_eq!(resource["service.version"], "2.0");
+        assert_eq!(resource["deployment.environment.name"], "production");
+        assert!(event.attributes.contains("span-value"));
+    }
+    #[test]
+    fn old_spool_json_does_not_claim_a_known_resource() {
+        let row = serde_json::json!({"tenant_id":"t", "timestamp":0, "trace_id":"trace", "span_id":"span", "parent_span_id":"", "service_name":"s", "span_name":"work", "kind":"INTERNAL", "status":"", "duration_ns":0, "http_method":"", "http_path":"", "http_status_code":0, "attributes":"{}", "event_names":[], "event_timestamps":[], "event_attributes":[], "link_trace_ids":[], "link_span_ids":[]});
+        let event: WideEvent = serde_json::from_value(row).unwrap();
+        assert_eq!(&*event.resource_attributes, "");
+        assert_ne!(&*event.resource_attributes, "{}");
+        // Old MessagePack spools encode structs as positional arrays, not maps.
+        let legacy = serde_json::json!([
+            "t",
+            0,
+            "trace",
+            "span",
+            "",
+            "s",
+            "work",
+            "INTERNAL",
+            "",
+            0,
+            "",
+            "",
+            0,
+            "{}",
+            [],
+            [],
+            [],
+            [],
+            []
+        ]);
+        let packed = rmp_serde::to_vec(&legacy).unwrap();
+        let decoded: WideEvent = rmp_serde::from_slice(&packed).unwrap();
+        assert_eq!(&*decoded.resource_attributes, "");
+    }
 }

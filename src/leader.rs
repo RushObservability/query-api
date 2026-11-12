@@ -54,6 +54,7 @@ pub const ANOMALIES: &str = "anomalies";
 pub const DETECTIONS: &str = "detections";
 pub const RETENTION: &str = "retention";
 pub const COLLECTORS: &str = "collectors";
+pub const TELEMETRY_QUALITY: &str = "telemetry_quality";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseMode {

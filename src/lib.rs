@@ -29,6 +29,7 @@ pub mod outbound;
 pub mod pagination;
 pub mod process_metrics;
 pub mod promql;
+pub mod quality_engine;
 pub mod query_builder;
 pub mod query_governor;
 pub mod request_auth;
@@ -280,6 +281,7 @@ pub struct AppState {
     pub query_governor: Arc<query_governor::QueryGovernor>,
     /// Expiring tenant-scoped asynchronous export objects and progress state.
     pub export_jobs: Arc<handlers::export::ExportJobs>,
+    pub quality_cache: Arc<quality_engine::QualityCache>,
     /// Startup-validated byte/entity limits and bounded blocking decode admission.
     pub ingest_limits: ingest_limits::IngestLimits,
     /// Startup-validated, rate-limited outbound LLM client. Handlers never

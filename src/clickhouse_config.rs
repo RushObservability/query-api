@@ -2712,6 +2712,8 @@ impl ConfigDb {
 
     async fn run_migrations(&self) -> anyhow::Result<()> {
         let ddls = vec![
+            crate::quality_engine::HISTORY_DDL,
+            crate::quality_engine::SNAPSHOT_DDL,
             // ── Tenants ──────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_tenants (
                 id           String,
