@@ -2896,11 +2896,21 @@ async fn main() -> anyhow::Result<()> {
         self_metrics,
         query_governor,
         export_jobs,
+        quality_cache: Arc::new(rush_api::quality_engine::QualityCache::new()),
         ingest_limits: ingest_limits.clone(),
         llm_gateway,
         collectors,
         shutdown: shutdown_controller.clone(),
     };
+
+    if !drain_only && engine_enabled("RUSH_RUN_TELEMETRY_QUALITY_ENGINE") {
+        if let Some(election) = election.as_ref() {
+            rush_api::quality_engine::spawn(
+                state.clone(),
+                election.lease(rush_api::leader::TELEMETRY_QUALITY),
+            );
+        }
+    }
 
     let inner = Router::new()
         // Trace endpoints

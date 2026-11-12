@@ -266,11 +266,7 @@ pub async fn ingest_v04(
     crate::handlers::ingest_gate::write_gated(
         &state,
         tenant_id,
-        SpoolBatch::Spans(
-            rows.into_iter()
-                .map(crate::models::trace::WideEvent::from)
-                .collect(),
-        ),
+        SpoolBatch::Spans(crate::models::trace::WideEvent::from_rows(rows)),
     )
     .await
     .map_err(|e| match e {
@@ -436,11 +432,7 @@ pub async fn ingest_agent(
             crate::handlers::ingest_gate::write_gated(
                 &state,
                 tenant_id,
-                SpoolBatch::Spans(
-                    rows.into_iter()
-                        .map(crate::models::trace::WideEvent::from)
-                        .collect(),
-                ),
+                SpoolBatch::Spans(crate::models::trace::WideEvent::from_rows(rows)),
             )
             .await
             .map_err(|e| match e {
@@ -497,11 +489,7 @@ pub async fn ingest_agent(
             crate::handlers::ingest_gate::write_gated(
                 &state,
                 tenant_id,
-                SpoolBatch::Spans(
-                    rows.into_iter()
-                        .map(crate::models::trace::WideEvent::from)
-                        .collect(),
-                ),
+                SpoolBatch::Spans(crate::models::trace::WideEvent::from_rows(rows)),
             )
             .await
             .map_err(|e| match e {

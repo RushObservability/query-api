@@ -77,7 +77,7 @@ pub async fn get_trace(
         // damaging on the MV-miss fallback where `time_bound` is empty.
         // `optimize_move_to_prewhere` still promotes tenant/time to prewhere.
         let sql = format!(
-            "SELECT * FROM spans WHERE tenant_id = '{escaped_tenant}' AND trace_id = ?{time_bound} ORDER BY timestamp ASC"
+            "SELECT ?fields FROM spans WHERE tenant_id = '{escaped_tenant}' AND trace_id = ?{time_bound} ORDER BY timestamp ASC"
         );
         let q = crate::tenant_query(&state.ch, &sql, tenant_id).bind(&trace_id);
         async move { q.fetch_all::<WideEvent>().await }

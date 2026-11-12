@@ -392,6 +392,8 @@ pub async fn ingest(
                     event_attributes: vec![],
                     link_trace_ids: vec![],
                     link_span_ids: vec![],
+                    // Synthetic RUM spans have no original OTLP resource.
+                    resource_attributes: "".into(),
                 }
             })
             .collect();

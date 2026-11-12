@@ -487,10 +487,8 @@ pub async fn ingest_otlp_traces(
     let count = rows.len();
     // Reshape OTel-native rows into wide `spans` rows at ingest (the former spans_mv
     // transform) and write directly to the single `spans` table — no spans_raw copy.
-    let wide: Vec<crate::models::trace::WideEvent> = rows
-        .into_iter()
-        .map(crate::models::trace::WideEvent::from)
-        .collect();
+    let wide: Vec<crate::models::trace::WideEvent> =
+        crate::models::trace::WideEvent::from_rows(rows);
     crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Spans(wide))
         .await
         .map_err(map_write_err)?;

@@ -257,6 +257,8 @@ PARTITION BY toDate(timestamp)
 ORDER BY (tenant_id, timestamp, service_name, trace_id, span_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+    // Append only: WideEvent / SELECT * and old durable spool rows stay compatible.
+    "ALTER TABLE observability.spans ADD COLUMN IF NOT EXISTS resource_attributes String DEFAULT '' CODEC(ZSTD(1))",
     // ── Drop the legacy spans_raw landing table + its transform MV ──
     // Spans are now ingested directly into `spans` (the transform moved to Rust). Drop the
     // MV before the table (the MV depends on it). No-ops on a fresh install; on existing
