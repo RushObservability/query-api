@@ -2,7 +2,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 /// A single wide event span as stored in ClickHouse (v2 schema).
-/// Column order must match the `spans` table exactly for `SELECT *`.
+/// Use `SELECT ?fields` so the projection follows this model as the table evolves.
 /// timestamp/event_timestamps are i64 nanoseconds since epoch (DateTime64(9)).
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct WideEvent {

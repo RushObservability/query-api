@@ -215,7 +215,7 @@ pub async fn search(
         ));
     }
     let span_sql = format!(
-        "SELECT * FROM spans WHERE {} ORDER BY trace_id, timestamp ASC",
+        "SELECT ?fields FROM spans WHERE {} ORDER BY trace_id, timestamp ASC",
         span_conds.join(" AND ")
     );
     let rows = crate::tenant_query(&state.ch, &span_sql, tenant_id)
@@ -259,7 +259,7 @@ pub async fn get_trace(
     let rows = crate::tenant_query(
         &state.ch,
         &format!(
-            "SELECT * FROM spans WHERE tenant_id = '{esc_t}' AND trace_id = '{esc_id}' \
+            "SELECT ?fields FROM spans WHERE tenant_id = '{esc_t}' AND trace_id = '{esc_id}' \
              ORDER BY timestamp ASC"
         ),
         tenant_id,
