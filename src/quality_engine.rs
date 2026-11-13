@@ -71,20 +71,21 @@ struct Payload {
     payload: String,
 }
 
-type CacheSlot = Arc<Mutex<Option<(Instant, QualityResponse)>>>;
-pub struct QualityCache {
-    entries: Mutex<BTreeMap<(String, u32), CacheSlot>>,
+type CacheSlot<T> = Arc<Mutex<Option<(Instant, T)>>>;
+pub type QualityCache = AnalysisCache<QualityResponse>;
+pub struct AnalysisCache<T> {
+    entries: Mutex<BTreeMap<(String, u32), CacheSlot<T>>>,
     // Different tenant/window requests cannot multiply seven-source scans indefinitely.
     scans: Semaphore,
 }
 
-impl Default for QualityCache {
+impl<T: Clone> Default for AnalysisCache<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl QualityCache {
+impl<T: Clone> AnalysisCache<T> {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(BTreeMap::new()),
@@ -92,35 +93,12 @@ impl QualityCache {
         }
     }
 
-    pub async fn get(
-        &self,
-        ch: &clickhouse::Client,
-        db: &ConfigDb,
-        tenant: &str,
-        minutes: u32,
-    ) -> Result<QualityResponse, (StatusCode, String)> {
-        self.cached(tenant, minutes, async {
-            let snapshot = if minutes == 1440 {
-                fresh_snapshot(db, tenant).await
-            } else {
-                None
-            };
-            let mut report = match snapshot {
-                Some(report) => report,
-                None => crate::handlers::telemetry_quality::analyze(ch, db, tenant, minutes).await,
-            };
-            report.cache_hit = report.scheduled_at.is_some();
-            report
-        })
-        .await
-    }
-
-    async fn cached(
+    pub(crate) async fn cached(
         &self,
         tenant: &str,
         minutes: u32,
-        compute: impl std::future::Future<Output = QualityResponse>,
-    ) -> Result<QualityResponse, (StatusCode, String)> {
+        compute: impl std::future::Future<Output = T>,
+    ) -> Result<(T, bool), (StatusCode, String)> {
         let key = (tenant.to_owned(), minutes);
         let slot = {
             let mut entries = self.entries.lock().await;
@@ -135,7 +113,7 @@ impl QualityCache {
                 } else {
                     return Err((
                         StatusCode::TOO_MANY_REQUESTS,
-                        "Quality analysis is busy. Try again shortly.".into(),
+                        "Telemetry analysis is busy. Try again shortly.".into(),
                     ));
                 }
             }
@@ -149,30 +127,58 @@ impl QualityCache {
             .map_err(|_| {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Quality analysis is busy. Try again shortly.".into(),
+                    "Telemetry analysis is busy. Try again shortly.".into(),
                 )
             })?;
         if let Some((_, report)) = cached.as_ref().filter(|(at, _)| at.elapsed() < CACHE_TTL) {
-            let mut result = report.clone();
-            result.cache_hit = true;
-            return Ok(result);
+            return Ok((report.clone(), true));
         }
         let _permit = tokio::time::timeout(Duration::from_secs(3), self.scans.acquire())
             .await
             .map_err(|_| {
                 (
                     StatusCode::TOO_MANY_REQUESTS,
-                    "Quality analysis is busy. Try again shortly.".into(),
+                    "Telemetry analysis is busy. Try again shortly.".into(),
                 )
             })?
             .map_err(|_| {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Quality analysis unavailable".into(),
+                    "Telemetry analysis unavailable".into(),
                 )
             })?;
         let report = compute.await;
         *cached = Some((Instant::now(), report.clone()));
+        Ok((report, false))
+    }
+}
+
+impl AnalysisCache<QualityResponse> {
+    pub async fn get(
+        &self,
+        ch: &clickhouse::Client,
+        db: &ConfigDb,
+        tenant: &str,
+        minutes: u32,
+    ) -> Result<QualityResponse, (StatusCode, String)> {
+        let (mut report, hit) = self
+            .cached(tenant, minutes, async {
+                let snapshot = if minutes == 1440 {
+                    fresh_snapshot(db, tenant).await
+                } else {
+                    None
+                };
+                let mut report = match snapshot {
+                    Some(report) => report,
+                    None => {
+                        crate::handlers::telemetry_quality::analyze(ch, db, tenant, minutes).await
+                    }
+                };
+                report.cache_hit = report.scheduled_at.is_some();
+                report
+            })
+            .await?;
+        report.cache_hit |= hit;
         Ok(report)
     }
 }
@@ -476,7 +482,7 @@ mod tests {
         };
         let (first, shared) =
             tokio::join!(cache.cached("a", 60, work()), cache.cached("a", 60, work()));
-        assert!(first.is_ok() && shared.unwrap().cache_hit);
+        assert!(first.is_ok() && shared.unwrap().1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         cache.cached("b", 60, work()).await.unwrap();
         cache.cached("a", 360, work()).await.unwrap();

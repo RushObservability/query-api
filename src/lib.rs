@@ -282,6 +282,7 @@ pub struct AppState {
     /// Expiring tenant-scoped asynchronous export objects and progress state.
     pub export_jobs: Arc<handlers::export::ExportJobs>,
     pub quality_cache: Arc<quality_engine::QualityCache>,
+    pub waste_cache: Arc<quality_engine::AnalysisCache<handlers::noise_waste::WasteResponse>>,
     /// Startup-validated byte/entity limits and bounded blocking decode admission.
     pub ingest_limits: ingest_limits::IngestLimits,
     /// Startup-validated, rate-limited outbound LLM client. Handlers never

@@ -37,6 +37,7 @@ pub mod maintenance;
 pub mod metric_firewall;
 pub mod metrics;
 pub mod monitors;
+pub mod noise_waste;
 pub mod notebooks;
 pub mod otlp;
 pub mod parse_promql;

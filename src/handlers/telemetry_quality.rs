@@ -275,7 +275,7 @@ fn signal(table: &str) -> &'static str {
     }
 }
 
-fn validated_minutes(params: &QualityParams) -> Result<u32, (StatusCode, String)> {
+pub(crate) fn validated_minutes(params: &QualityParams) -> Result<u32, (StatusCode, String)> {
     let value = params.minutes.unwrap_or(1440);
     if !(5..=10_080).contains(&value) {
         return Err((
@@ -357,6 +357,14 @@ async fn read_sample(
     sql: &str,
     tenant: &str,
 ) -> Result<Vec<Sample>, clickhouse::error::Error> {
+    read_bounded::<Sample>(client, sql, tenant).await
+}
+
+pub(crate) async fn read_bounded<T: clickhouse::RowOwned + clickhouse::RowRead>(
+    client: &clickhouse::Client,
+    sql: &str,
+    tenant: &str,
+) -> Result<Vec<T>, clickhouse::error::Error> {
     let budget = crate::query_governor::active_budget();
     let max_memory = budget
         .as_ref()
@@ -384,7 +392,7 @@ async fn read_sample(
         .with_setting("preferred_block_size_bytes", "1048576")
         .with_setting("read_overflow_mode", "throw")
         .with_setting("timeout_overflow_mode", "throw");
-    query.fetch_all::<Sample>().await
+    query.fetch_all::<T>().await
 }
 
 pub async fn get_quality(
