@@ -14,6 +14,7 @@ pub mod eval_state;
 pub mod github_repository_policy;
 pub mod handlers;
 pub mod ingest_limits;
+pub mod instrumentation_score;
 pub mod integrations;
 pub mod internal_auth;
 pub mod leader;

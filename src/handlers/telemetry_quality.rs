@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::handlers::users::require_principal;
+use crate::instrumentation_score::{
+    self as standard, InstrumentationScore, MET_007_KEYS, StandardRule,
+};
 use crate::query_builder::escape_string_literal;
 use crate::{AppState, TenantContext};
 
@@ -140,6 +143,15 @@ pub struct Sample {
     pub has_sdk_language: u8,
     pub has_description: u8,
     pub valid_kind: u8,
+    pub env_name: u8,
+    pub severity_set: u8,
+    pub pod: u8,
+    pub has_pod_uid: u8,
+    pub criticality: String,
+    pub forbidden_resource_key: u8,
+    pub bounds_hash: u64,
+    pub is_root: u8,
+    pub client_root: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +201,11 @@ pub struct QualityService {
     pub finding_count: usize,
     pub checks: Vec<RuleEvaluation>,
     pub score: QualityScore,
+    /// Implemented Instrumentation Score rules for this service.
+    #[serde(default)]
+    pub standard: Vec<RuleEvaluation>,
+    #[serde(default)]
+    pub instrumentation_score: InstrumentationScore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +276,12 @@ pub struct QualityResponse {
     pub findings: Vec<QualityFinding>,
     pub services: Vec<QualityService>,
     pub score: QualityScore,
+    #[serde(default)]
+    pub standard_spec: String,
+    #[serde(default)]
+    pub standard_rules: Vec<StandardRule>,
+    #[serde(default)]
+    pub instrumentation_score: InstrumentationScore,
     #[serde(default)]
     pub history: Vec<crate::quality_engine::FindingHistory>,
     pub history_available: bool,
@@ -344,8 +367,38 @@ fn sample_sql(table: &str, tenant: &str, from: DateTime<Utc>, to: DateTime<Utc>)
             }
         )
     };
+    let standard = if table == "spans" {
+        "toUInt8(notEmpty(trimBoth(JSONExtractString(resource_attributes, 'deployment.environment.name')))) AS env_name, toUInt8(0) AS severity_set, \
+         toUInt8(notEmpty(JSONExtractString(resource_attributes, 'k8s.pod.name'))) AS pod, toUInt8(notEmpty(trimBoth(JSONExtractString(resource_attributes, 'k8s.pod.uid')))) AS has_pod_uid, \
+         JSONExtractString(resource_attributes, 'service.criticality') AS criticality, toUInt8(0) AS forbidden_resource_key, toUInt64(0) AS bounds_hash, \
+         toUInt8(parent_span_id = '') AS is_root, toUInt8(parent_span_id = '' AND replaceOne(kind, 'SPAN_KIND_', '') = 'CLIENT') AS client_root".to_string()
+    } else {
+        format!(
+            "toUInt8(notEmpty(trimBoth(ResourceAttributes['deployment.environment.name']))) AS env_name, {} AS severity_set, \
+             toUInt8(notEmpty(ResourceAttributes['k8s.pod.name'])) AS pod, toUInt8(notEmpty(trimBoth(ResourceAttributes['k8s.pod.uid']))) AS has_pod_uid, \
+             ResourceAttributes['service.criticality'] AS criticality, {} AS forbidden_resource_key, {} AS bounds_hash, toUInt8(0) AS is_root, toUInt8(0) AS client_root",
+            if table == "logs" {
+                "toUInt8(SeverityNumber != 0)"
+            } else {
+                "toUInt8(0)"
+            },
+            if table == "logs" {
+                "toUInt8(0)".into()
+            } else {
+                format!(
+                    "toUInt8(hasAny(mapKeys(ResourceAttributes), [{}]))",
+                    MET_007_KEYS.map(|k| format!("'{k}'")).join(",")
+                )
+            },
+            if table == "metrics_histogram" {
+                "cityHash64(ExplicitBounds)"
+            } else {
+                "toUInt64(0)"
+            },
+        )
+    };
     format!(
-        "SELECT {fields}, toUnixTimestamp64Milli({time}) AS observed_at, {extra} FROM {table} \
+        "SELECT {fields}, toUnixTimestamp64Milli({time}) AS observed_at, {extra}, {standard} FROM {table} \
         PREWHERE tenant_id = '{tenant}' AND {time} >= toDateTime64('{from}', 9, 'UTC') \
         AND {time} <= toDateTime64('{to}', 9, 'UTC'){order} LIMIT {}",
         SAMPLE_LIMIT + 1
@@ -553,6 +606,47 @@ fn finding(
     }
 }
 
+/// Implemented Instrumentation Score rules for one sampled record, as (rule, failed).
+/// Resource rules skip historical spans whose resource attributes were not retained.
+fn standard_checks(
+    signal: &str,
+    sample: &Sample,
+    units: &BTreeMap<(String, String), BTreeSet<String>>,
+    buckets: &BTreeMap<(String, String), BTreeSet<u64>>,
+) -> Vec<(&'static str, bool)> {
+    let mut checks = vec![("RES-005", sample.service.trim().is_empty())];
+    if signal != "traces" || sample.resource_known != 0 {
+        checks.extend([
+            ("RES-007", sample.env_name == 0),
+            ("RES-001", sample.has_instance == 0),
+            ("RES-006", !standard::criticality_ok(&sample.criticality)),
+        ]);
+        if sample.pod != 0 {
+            checks.push(("RES-003", sample.has_pod_uid == 0));
+        }
+    }
+    match signal {
+        "logs" => checks.push(("LOG-002", sample.severity_set == 0)),
+        "metrics" => {
+            let key = (sample.service.clone(), sample.metric.clone());
+            checks.extend([
+                ("MET-003", units.get(&key).is_some_and(|u| u.len() > 1)),
+                (
+                    "MET-005",
+                    standard::unit_in_name(&sample.metric, &sample.unit),
+                ),
+                ("MET-007", sample.forbidden_resource_key != 0),
+            ]);
+            if sample.bounds_hash != 0 {
+                checks.push(("MET-004", buckets.get(&key).is_some_and(|b| b.len() > 1)));
+            }
+        }
+        _ if sample.is_root != 0 => checks.push(("SPA-004", sample.client_root != 0)),
+        _ => {}
+    }
+    checks
+}
+
 fn evaluate(
     records: Vec<(&str, Sample)>,
     sources: Vec<QualitySource>,
@@ -565,13 +659,26 @@ fn evaluate(
     let definitions = rules();
     let inventory_capped = known.len() > MAX_SERVICES;
     let mut tallies: BTreeMap<(String, String), Tally> = BTreeMap::new();
+    let mut standard_tallies: BTreeMap<(String, &str), Tally> = BTreeMap::new();
+    let standard_rules = standard::rules();
     let mut service_records: BTreeMap<String, u64> = known.into_iter().map(|s| (s, 0)).collect();
     let mut units: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut labels: BTreeMap<(String, String, String), (usize, BTreeSet<u64>)> = BTreeMap::new();
     let mut names: BTreeMap<String, (usize, usize, BTreeSet<u64>)> = BTreeMap::new();
+    // MET-003 counts an empty unit as a unit; MET-004 compares classic histogram bounds.
+    let mut spec_units: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let mut buckets: BTreeMap<(String, String), BTreeSet<u64>> = BTreeMap::new();
     for (signal, sample) in &records {
         *service_records.entry(sample.service.clone()).or_default() += 1;
         if *signal == "metrics" {
+            let key = (sample.service.clone(), sample.metric.clone());
+            spec_units
+                .entry(key.clone())
+                .or_default()
+                .insert(sample.unit.trim().into());
+            if sample.bounds_hash != 0 {
+                buckets.entry(key).or_default().insert(sample.bounds_hash);
+            }
             if !sample.unit.trim().is_empty() {
                 units
                     .entry((sample.service.clone(), sample.metric.clone()))
@@ -664,6 +771,12 @@ fn evaluate(
         for (rule, bad) in checks {
             tallies
                 .entry((sample.service.clone(), rule.into()))
+                .or_default()
+                .add(sample, bad);
+        }
+        for (rule, bad) in standard_checks(signal, sample, &spec_units, &buckets) {
+            standard_tallies
+                .entry((sample.service.clone(), rule))
                 .or_default()
                 .add(sample, bad);
         }
@@ -821,7 +934,27 @@ fn evaluate(
                 })
                 .collect::<Vec<_>>();
             let finding_count = checks.iter().filter(|c| c.status == "finding").count();
+            let spec_checks: Vec<_> = standard_rules
+                .iter()
+                .filter(|r| r.implemented)
+                .map(|rule| {
+                    let tally = standard_tallies.get(&(service.clone(), rule.id.as_str()));
+                    RuleEvaluation {
+                        rule_id: rule.id.clone(),
+                        status: match tally {
+                            None => "not_evaluated",
+                            Some(t) if t.affected > 0 => "finding",
+                            Some(_) => "pass",
+                        }
+                        .into(),
+                        sampled: tally.map_or(0, |t| t.sampled),
+                        affected: tally.map_or(0, |t| t.affected),
+                    }
+                })
+                .collect();
             QualityService {
+                instrumentation_score: standard::score(&spec_checks, &standard_rules),
+                standard: spec_checks,
                 service,
                 status: if sampled_records == 0 {
                     "unknown"
@@ -853,8 +986,15 @@ fn evaluate(
         .iter()
         .flat_map(|s| s.checks.clone())
         .collect::<Vec<_>>();
+    let service_scores: Vec<_> = services
+        .iter()
+        .map(|s| s.instrumentation_score.clone())
+        .collect();
     QualityResponse {
         score: score(&combined, &definitions),
+        standard_spec: standard::SPEC.into(),
+        instrumentation_score: standard::mean(&service_scores),
+        standard_rules,
         history: vec![], history_available: false, history_capped: false, scheduled_at: None, cache_hit: false,
         evaluated_at: Utc::now().to_rfc3339(),
         from: from.to_rfc3339(),
@@ -897,6 +1037,8 @@ pub(crate) mod tests {
             has_sdk_language: 1,
             has_description: 1,
             valid_kind: 1,
+            env_name: 1,
+            severity_set: 1,
             metric: "duration".into(),
             unit: "s".into(),
             ..Default::default()
@@ -1114,6 +1256,96 @@ pub(crate) mod tests {
         assert!(r.findings.iter().any(|f| f.rule_id == "span_names"));
         let r = run(vec![("traces", sample("checkout")); 200], vec![]);
         assert!(!r.findings.iter().any(|f| f.rule_id == "span_names"));
+    }
+
+    fn spec(r: &QualityResponse, service: &str, rule: &str) -> String {
+        let s = r.services.iter().find(|s| s.service == service).unwrap();
+        s.standard
+            .iter()
+            .find(|c| c.rule_id == rule)
+            .unwrap()
+            .status
+            .clone()
+    }
+
+    #[test]
+    fn spec_rules_follow_their_criteria_not_rush_checks() {
+        // unknown_service is a non-empty name (RES-005 passes) but fails Rush's check;
+        // the legacy deployment.environment key satisfies Rush but not RES-007.
+        let mut legacy = sample("unknown_service:java");
+        legacy.has_environment = 1;
+        legacy.env_name = 0;
+        legacy.criticality = "High".into();
+        let mut pod = sample("cart");
+        pod.env_name = 1;
+        pod.pod = 1;
+        pod.severity_set = 0;
+        let r = run(vec![("logs", legacy), ("logs", pod)], vec![]);
+        assert_eq!(spec(&r, "unknown_service:java", "RES-005"), "pass");
+        assert_eq!(spec(&r, "unknown_service:java", "RES-007"), "finding");
+        assert_eq!(spec(&r, "unknown_service:java", "RES-006"), "finding");
+        assert_eq!(spec(&r, "unknown_service:java", "RES-003"), "not_evaluated");
+        assert_eq!(spec(&r, "cart", "RES-003"), "finding");
+        assert_eq!(spec(&r, "cart", "LOG-002"), "finding");
+    }
+
+    #[test]
+    fn spec_metric_and_root_span_rules() {
+        let mut a = sample("payments");
+        a.metric = "queue.wait.seconds".into();
+        a.bounds_hash = 1;
+        let mut b = a.clone();
+        b.bounds_hash = 2;
+        b.unit = "".into();
+        b.forbidden_resource_key = 1;
+        let mut root = sample("payments");
+        root.resource_known = 1;
+        root.is_root = 1;
+        root.client_root = 1;
+        let mut child = root.clone();
+        child.is_root = 0;
+        child.client_root = 0;
+        let r = run(
+            vec![
+                ("metrics", a),
+                ("metrics", b),
+                ("traces", root),
+                ("traces", child),
+            ],
+            vec![],
+        );
+        for rule in ["MET-003", "MET-004", "MET-005", "MET-007", "SPA-004"] {
+            assert_eq!(spec(&r, "payments", rule), "finding", "{rule}");
+        }
+        let svc = &r.services[0];
+        let spa = svc
+            .standard
+            .iter()
+            .find(|c| c.rule_id == "SPA-004")
+            .unwrap();
+        assert_eq!((spa.sampled, spa.affected), (1, 1), "only root spans count");
+        assert!(svc.instrumentation_score.value.unwrap() < 100.0);
+        assert_eq!(r.standard_rules.len(), 26);
+        assert_eq!(
+            r.instrumentation_score.value,
+            svc.instrumentation_score.value
+        );
+    }
+
+    #[test]
+    fn old_snapshots_without_the_standard_score_still_load() {
+        let mut json = serde_json::to_value(run(vec![("logs", sample("a"))], vec![])).unwrap();
+        for key in ["standard_spec", "standard_rules", "instrumentation_score"] {
+            json.as_object_mut().unwrap().remove(key);
+        }
+        let services = json["services"].as_array_mut().unwrap();
+        services[0].as_object_mut().unwrap().remove("standard");
+        services[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("instrumentation_score");
+        let report: QualityResponse = serde_json::from_value(json).unwrap();
+        assert!(report.standard_rules.is_empty());
     }
 
     #[tokio::test]
