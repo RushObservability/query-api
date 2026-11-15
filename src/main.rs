@@ -3120,7 +3120,7 @@ async fn main() -> anyhow::Result<()> {
         run_replayer,
         require_object_store,
     )?;
-    let writer = ChWriter::new(admin_ch.clone(), buffer);
+    let writer = ChWriter::new(admin_ch.clone(), buffer).with_metrics(self_metrics.clone());
     let replayer_handle = if drain_only || run_replayer {
         Some(writer.clone().spawn_replayer(shutdown_controller.clone()))
     } else {

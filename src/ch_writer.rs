@@ -11,6 +11,7 @@
 /// Replay:       `spawn_replayer` consumes the oldest segment every ~5 s,
 ///               retrying with exponential back-off up to 60 s.
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clickhouse::Client;
@@ -25,6 +26,7 @@ use crate::models::ingest::{
 use crate::models::profile::ProfileRow;
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
+use crate::self_metrics::SelfMetrics;
 use crate::shutdown::{ShutdownController, ShutdownPhase};
 use crate::spool::{IngestBuffer, SpoolFull};
 
@@ -336,12 +338,66 @@ struct TableBuffer {
     needs_flush: bool,
 }
 
+const BATCH_TABLES: [&str; SpoolBatch::SLOTS] = [
+    "spans_raw",
+    "spans",
+    "logs",
+    "metrics_gauge",
+    "metrics_sum",
+    "rum",
+    "rum_replay",
+    "metrics_histogram",
+    "metrics_exp_histogram",
+    "metrics_summary",
+    "profile_samples",
+];
+
+#[derive(Default)]
+struct BatchHealth {
+    rows: AtomicU64,
+    bytes: AtomicU64,
+    first_row_ms: AtomicU64,
+    blocked: AtomicBool,
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Records a cancelled attempt too: cancellation must not look like delivery.
+struct DeliveryObservation<'a> {
+    metrics: &'a SelfMetrics,
+    table: &'static str,
+    rows: u64,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl Drop for DeliveryObservation<'_> {
+    fn drop(&mut self) {
+        let labels = [("table", self.table), ("outcome", self.outcome)];
+        self.metrics
+            .inc_counter("rush_ingest_delivery_total", &labels, 1);
+        self.metrics
+            .inc_counter("rush_ingest_delivery_rows_total", &labels, self.rows);
+        self.metrics.observe_histogram(
+            "rush_ingest_delivery_duration_ms",
+            &labels,
+            self.started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+}
+
 /// The in-process batching layer: one buffer per ClickHouse table, each behind
 /// its own async mutex so independent ingest tasks contend only with same-table
 /// peers and the flusher.
 pub struct BatchAccumulator {
     cfg: BatchConfig,
     slots: [AsyncMutex<TableBuffer>; SpoolBatch::SLOTS],
+    health: [BatchHealth; SpoolBatch::SLOTS],
 }
 
 impl BatchAccumulator {
@@ -349,6 +405,7 @@ impl BatchAccumulator {
         BatchAccumulator {
             cfg,
             slots: std::array::from_fn(|_| AsyncMutex::new(TableBuffer::default())),
+            health: std::array::from_fn(|_| BatchHealth::default()),
         }
     }
 
@@ -371,6 +428,7 @@ impl BatchAccumulator {
 #[derive(Clone)]
 pub struct ChWriter {
     ch: Client,
+    metrics: Arc<SelfMetrics>,
     /// Durable failure-path buffer. Backend-agnostic: `Disk` (default, no object
     /// store) or, later, `ObjectStore`. See `crate::spool::IngestBuffer`.
     pub buffer: Arc<IngestBuffer>,
@@ -391,11 +449,48 @@ impl ChWriter {
     pub fn with_batch_config(ch: Client, buffer: Arc<IngestBuffer>, cfg: BatchConfig) -> Self {
         ChWriter {
             ch,
+            metrics: Arc::new(SelfMetrics::new()),
             buffer,
             firewall: Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::metric_firewall::MetricFirewall::default(),
             ))),
             batcher: Arc::new(BatchAccumulator::new(cfg)),
+        }
+    }
+
+    /// Attach the process registry before cloning or starting background work.
+    pub fn with_metrics(mut self, metrics: Arc<SelfMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    fn record_pending(&self, index: usize) {
+        let health = &self.batcher.health[index];
+        let labels = [("table", BATCH_TABLES[index])];
+        let first = health.first_row_ms.load(Ordering::Relaxed);
+        for (name, value) in [
+            (
+                "rush_ingest_batch_pending_rows",
+                health.rows.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "rush_ingest_batch_pending_bytes",
+                health.bytes.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "rush_ingest_batch_oldest_age_seconds",
+                if first == 0 {
+                    0.0
+                } else {
+                    unix_millis().saturating_sub(first) as f64 / 1000.0
+                },
+            ),
+            (
+                "rush_ingest_batch_flush_blocked",
+                u8::from(health.blocked.load(Ordering::Relaxed)) as f64,
+            ),
+        ] {
+            self.metrics.set_gauge(name, &labels, value);
         }
     }
 
@@ -459,9 +554,15 @@ impl ChWriter {
         let bytes = batch_serialized_size(&batch)?;
         // Do not turn pending mutex waiters into an unbounded second queue of
         // request bodies while ClickHouse is slow or unresponsive.
-        let mut slot = self.batcher.slots[batch.slot()]
-            .try_lock()
-            .map_err(|_| WriteError::Backpressure)?;
+        let index = batch.slot();
+        let mut slot = self.batcher.slots[index].try_lock().map_err(|_| {
+            self.metrics.inc_counter(
+                "rush_ingest_batch_rejections_total",
+                &[("table", batch.table()), ("reason", "busy")],
+                1,
+            );
+            WriteError::Backpressure
+        })?;
         let rows = slot.batch.as_ref().map_or(0, SpoolBatch::len);
         if slot.needs_flush
             || rows.saturating_add(batch.len()) >= self.batcher.cfg.max_rows
@@ -482,6 +583,19 @@ impl ChWriter {
             }
         }
         slot.bytes = slot.bytes.saturating_add(bytes);
+        let health = &self.batcher.health[index];
+        health.rows.store(
+            slot.batch.as_ref().map_or(0, SpoolBatch::len) as u64,
+            Ordering::Relaxed,
+        );
+        health.bytes.store(slot.bytes as u64, Ordering::Relaxed);
+        let _ = health.first_row_ms.compare_exchange(
+            0,
+            unix_millis(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.record_pending(index);
         Ok(())
     }
 
@@ -490,7 +604,16 @@ impl ChWriter {
     async fn flush_slot(&self, slot: &mut TableBuffer) -> Result<(), WriteError> {
         if let Some(batch) = &slot.batch {
             slot.needs_flush = true;
+            let index = batch.slot();
+            let health = &self.batcher.health[index];
+            health.blocked.store(true, Ordering::Relaxed);
+            self.record_pending(index);
             self.write_now(batch).await?;
+            health.rows.store(0, Ordering::Relaxed);
+            health.bytes.store(0, Ordering::Relaxed);
+            health.first_row_ms.store(0, Ordering::Relaxed);
+            health.blocked.store(false, Ordering::Relaxed);
+            self.record_pending(index);
         }
         *slot = TableBuffer::default();
         Ok(())
@@ -507,9 +630,24 @@ impl ChWriter {
         let row_count = batch.len();
         let table = batch.table();
 
+        let mut observation = DeliveryObservation {
+            metrics: &self.metrics,
+            table,
+            rows: row_count as u64,
+            started: Instant::now(),
+            outcome: "cancelled",
+        };
         match try_insert(&self.ch, batch).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                observation.outcome = "inserted";
+                Ok(())
+            }
             Err(e) => {
+                self.metrics.inc_counter(
+                    "rush_ingest_insert_failures_total",
+                    &[("table", table)],
+                    1,
+                );
                 tracing::warn!(
                     error = %e,
                     table = table,
@@ -518,11 +656,19 @@ impl ChWriter {
                 );
 
                 // Serialise for the spool (zstd-compressed MessagePack).
-                let payload = encode_spool(batch)?;
+                let payload = encode_spool(batch).inspect_err(|_| {
+                    observation.outcome = "encode_error";
+                })?;
 
                 match self.buffer.append(table, payload).await {
-                    Ok(()) => Ok(()),
-                    Err(SpoolFull) => Err(WriteError::Backpressure),
+                    Ok(()) => {
+                        observation.outcome = "spooled";
+                        Ok(())
+                    }
+                    Err(SpoolFull) => {
+                        observation.outcome = "backpressure";
+                        Err(WriteError::Backpressure)
+                    }
                 }
             }
         }
@@ -556,6 +702,19 @@ impl ChWriter {
         if self.batcher.cfg.disabled() {
             return;
         }
+        // A separate sampler uses atomics, so a network-stalled flush cannot
+        // freeze the age or hide the accepted rows behind the slot mutex.
+        let sampler = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                for index in 0..SpoolBatch::SLOTS {
+                    sampler.record_pending(index);
+                }
+            }
+        });
         let me = self.clone();
         let tick = me
             .batcher
@@ -948,6 +1107,50 @@ mod batch_tests {
     }
 
     #[tokio::test]
+    async fn pending_and_delivery_metrics_distinguish_acceptance_failure_and_recovery() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let test = TestWriter::new(
+            mock.url(),
+            BatchConfig {
+                max_rows: 3,
+                ..BatchConfig::default()
+            },
+        );
+        test.0.write(gauge(2)).await.unwrap();
+        test.0.batcher.health[gauge(1).slot()]
+            .first_row_ms
+            .store(unix_millis() - 2_000, Ordering::Relaxed);
+        test.0.record_pending(gauge(1).slot());
+        let before = test.0.metrics.render_prometheus();
+        assert!(before.contains("rush_ingest_batch_pending_rows{table=\"metrics_gauge\"} 2"));
+        assert!(!before.contains("rush_ingest_delivery_total"));
+        mock.add(handlers::failure(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+        assert!(matches!(
+            test.0.write(gauge(1)).await,
+            Err(WriteError::Backpressure)
+        ));
+        let failed = test.0.metrics.render_prometheus();
+        assert!(failed.contains("rush_ingest_batch_flush_blocked{table=\"metrics_gauge\"} 1"));
+        assert!(failed.contains(
+            "rush_ingest_delivery_rows_total{outcome=\"backpressure\",table=\"metrics_gauge\"} 2"
+        ));
+        let received = mock.add(handlers::record::<GaugeRow>());
+        test.0.flush_all().await;
+        assert_eq!(received.collect::<Vec<_>>().await.len(), 2);
+        let recovered = test.0.metrics.render_prometheus();
+        assert!(recovered.contains("rush_ingest_batch_pending_rows{table=\"metrics_gauge\"} 0"));
+        assert!(
+            recovered.contains("rush_ingest_batch_oldest_age_seconds{table=\"metrics_gauge\"} 0")
+        );
+        assert!(recovered.contains(
+            "rush_ingest_delivery_rows_total{outcome=\"inserted\",table=\"metrics_gauge\"} 2"
+        ));
+    }
+
+    #[tokio::test]
     async fn rejected_retries_do_not_enter_the_buffer() {
         let test = TestWriter::new(
             "http://127.0.0.1:9",
@@ -1112,6 +1315,11 @@ mod batch_tests {
         let slot = test.0.batcher.slots[gauge(1).slot()].lock().await;
         assert_eq!(slot.batch.as_ref().unwrap().len(), 1);
         assert!(slot.needs_flush);
+        let metrics = test.0.metrics.render_prometheus();
+        assert!(metrics.contains(
+            "rush_ingest_delivery_total{outcome=\"cancelled\",table=\"metrics_gauge\"} 1"
+        ));
+        assert!(metrics.contains("rush_ingest_batch_pending_rows{table=\"metrics_gauge\"} 1"));
         server.abort();
     }
 }
