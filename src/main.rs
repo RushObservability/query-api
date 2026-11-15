@@ -901,79 +901,115 @@ async fn dashboard_source_readable(
     state: &AppState,
     lookup: DashboardSourceLookup<'_>,
 ) -> anyhow::Result<bool> {
-    Ok(match lookup.kind {
-        WorkloadSourceKind::Dashboard => state
-            .config_db
-            .get_dashboard(lookup.id, lookup.tenant_id, lookup.user_id)
-            .await?
-            .is_some(),
-        WorkloadSourceKind::Notebook => state
-            .config_db
-            .get_notebook(lookup.id, lookup.tenant_id, lookup.user_id)
-            .await?
-            .is_some(),
-    })
+    match lookup.kind {
+        WorkloadSourceKind::Dashboard => {
+            state
+                .config_db
+                .dashboard_readable(lookup.id, lookup.tenant_id, lookup.user_id)
+                .await
+        }
+        WorkloadSourceKind::Notebook => {
+            state
+                .config_db
+                .notebook_readable(lookup.id, lookup.tenant_id, lookup.user_id)
+                .await
+        }
+    }
+}
+
+/// One source check, shared by every read that names the same source while
+/// it runs and, when it finds the source readable, for `ttl` after.
+struct SourceCheck {
+    started: std::time::Instant,
+    result: tokio::sync::OnceCell<bool>,
 }
 
 /// The source check runs before admission, so no workload pool bounds it.
-/// Results are reused per replica for `ttl` (a revoked share keeps the
-/// dashboard pool at most that long; data access is still checked by each
-/// handler), and at most `in_flight` checks run at once. When all are busy
-/// the read stays interactive instead of waiting.
+/// Concurrent reads naming the same source share one lookup (a dashboard's
+/// panels load together), at most `in_flight` lookups run at once, and a
+/// read waits at most `wait` for its answer before running as interactive.
+/// Only readable results are cached, for `ttl` per replica: a revoked share
+/// keeps the dashboard pool at most that long (each handler still checks data
+/// access), and made-up ids never fill the cache.
 struct DashboardSourceChecks {
-    results: dashmap::DashMap<String, (bool, std::time::Instant)>,
+    checks: dashmap::DashMap<String, Arc<SourceCheck>>,
     in_flight: tokio::sync::Semaphore,
     capacity: usize,
     ttl: Duration,
+    wait: Duration,
 }
 
 impl DashboardSourceChecks {
-    fn new(in_flight: usize, capacity: usize, ttl: Duration) -> Self {
+    fn new(in_flight: usize, capacity: usize, ttl: Duration, wait: Duration) -> Self {
         Self {
-            results: dashmap::DashMap::new(),
+            checks: dashmap::DashMap::new(),
             in_flight: tokio::sync::Semaphore::new(in_flight),
             capacity,
             ttl,
+            wait,
         }
     }
 
-    /// `check` is polled only on a cache miss with a free check slot.
-    /// Failed checks are not cached.
+    /// `check` is polled only when this read runs the shared lookup.
     async fn readable(
         &self,
         key: String,
         check: impl std::future::Future<Output = anyhow::Result<bool>>,
     ) -> bool {
         let now = std::time::Instant::now();
-        if let Some(entry) = self.results.get(&key)
-            && now.duration_since(entry.1) < self.ttl
-        {
-            return entry.0;
+        if !self.checks.contains_key(&key) && self.checks.len() >= self.capacity {
+            self.checks
+                .retain(|_, entry| now.duration_since(entry.started) < self.ttl);
+            if self.checks.len() >= self.capacity {
+                self.checks.clear();
+            }
         }
-        let Ok(_permit) = self.in_flight.try_acquire() else {
-            return false;
+        let entry = {
+            let mut slot = self.checks.entry(key.clone()).or_insert_with(|| {
+                Arc::new(SourceCheck {
+                    started: now,
+                    result: tokio::sync::OnceCell::new(),
+                })
+            });
+            if now.duration_since(slot.started) >= self.ttl {
+                *slot = Arc::new(SourceCheck {
+                    started: now,
+                    result: tokio::sync::OnceCell::new(),
+                });
+            }
+            slot.clone()
         };
-        let readable = match check.await {
-            Ok(readable) => readable,
-            Err(error) => {
+        let outcome = tokio::time::timeout(
+            self.wait,
+            entry.result.get_or_try_init(|| async {
+                let _permit = self.in_flight.acquire().await?;
+                check.await
+            }),
+        )
+        .await;
+        let readable = match outcome {
+            Ok(Ok(readable)) => *readable,
+            Ok(Err(error)) => {
                 tracing::warn!(%error, "dashboard workload source check failed; using interactive");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("dashboard workload source check timed out; using interactive");
                 return false;
             }
         };
-        if self.results.len() >= self.capacity {
-            self.results
-                .retain(|_, (_, checked)| now.duration_since(*checked) < self.ttl);
-            if self.results.len() >= self.capacity {
-                self.results.clear();
-            }
+        if !readable {
+            self.checks
+                .remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
         }
-        self.results.insert(key, (readable, now));
         readable
     }
 }
 
 static DASHBOARD_SOURCE_CHECKS: std::sync::LazyLock<DashboardSourceChecks> =
-    std::sync::LazyLock::new(|| DashboardSourceChecks::new(8, 4_096, Duration::from_secs(30)));
+    std::sync::LazyLock::new(|| {
+        DashboardSourceChecks::new(8, 4_096, Duration::from_secs(30), Duration::from_secs(2))
+    });
 
 /// Moves an interactive read into the dashboard pool when its named source
 /// is readable. Takes the extracted lookup, not the request: the request body
@@ -4550,17 +4586,16 @@ mod tenant_auth_tests {
     }
 
     #[tokio::test]
-    async fn dashboard_upgrade_is_checked_cached_and_bounded() {
+    async fn dashboard_upgrade_is_shared_cached_and_bounded() {
         use rush_api::query_governor::WorkloadClass;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        let checks = DashboardSourceChecks::new(1, 2, Duration::from_secs(60));
-        let calls = AtomicUsize::new(0);
         async fn classify(
             request: &Request<Body>,
             checks: &DashboardSourceChecks,
             calls: &AtomicUsize,
+            delay: Duration,
             answer: anyhow::Result<bool>,
         ) -> WorkloadClass {
             let class = query_workload_for_request(request).unwrap();
@@ -4570,9 +4605,10 @@ mod tenant_auth_tests {
                 checks,
                 |lookup| {
                     assert_eq!(lookup.user_id, "user-1");
-                    // Counted when polled: a cache hit or a busy slot never polls.
+                    // Counted when polled: a shared or cached result never polls.
                     async move {
                         calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
                         answer
                     }
                 },
@@ -4586,30 +4622,60 @@ mod tenant_auth_tests {
                 &format!("dashboard:{id}"),
             )
         };
+        let quick = Duration::ZERO;
+        let checks =
+            DashboardSourceChecks::new(1, 2, Duration::from_secs(60), Duration::from_secs(5));
+        let calls = AtomicUsize::new(0);
 
-        // A readable source upgrades; the result is reused without a lookup.
-        let readable = panel("dash-1");
-        assert_eq!(
-            classify(&readable, &checks, &calls, Ok(true)).await,
-            WorkloadClass::Dashboard
+        // A whole dashboard loading at once shares one lookup, even with a
+        // single check slot, and every panel is upgraded.
+        let panels: Vec<_> = (0..20).map(|_| panel("dash-1")).collect();
+        let classes = futures_util::future::join_all(panels.iter().map(|request| {
+            classify(
+                request,
+                &checks,
+                &calls,
+                Duration::from_millis(20),
+                Ok(true),
+            )
+        }))
+        .await;
+        assert!(
+            classes
+                .iter()
+                .all(|class| *class == WorkloadClass::Dashboard)
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // ...and later reads reuse it.
         assert_eq!(
-            classify(&readable, &checks, &calls, Ok(false)).await,
+            classify(&panel("dash-1"), &checks, &calls, quick, Ok(false)).await,
             WorkloadClass::Dashboard
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Unreadable stays interactive; a failed check is not cached.
-        let failing = panel("dash-2");
-        assert_eq!(
-            classify(&failing, &checks, &calls, Err(anyhow::anyhow!("down"))).await,
-            WorkloadClass::Interactive
+        // Unreadable and failed checks stay interactive and are not cached.
+        let answers: [fn() -> anyhow::Result<bool>; 2] =
+            [|| Ok(false), || Err(anyhow::anyhow!("down"))];
+        for answer in answers {
+            for _ in 0..2 {
+                assert_eq!(
+                    classify(&panel("dash-2"), &checks, &calls, quick, answer()).await,
+                    WorkloadClass::Interactive
+                );
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert!(
+            !checks.checks.contains_key(
+                &DashboardSourceLookup {
+                    kind: WorkloadSourceKind::Dashboard,
+                    id: "dash-2",
+                    tenant_id: "tenant-a",
+                    user_id: "user-1",
+                }
+                .cache_key()
+            )
         );
-        assert_eq!(
-            classify(&failing, &checks, &calls, Ok(false)).await,
-            WorkloadClass::Interactive
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
 
         // Without a session there is no lookup at all.
         let mut keyed = panel("dash-3");
@@ -4619,25 +4685,31 @@ mod tenant_auth_tests {
             .unwrap()
             .credential = CredentialKind::QueryKey;
         assert_eq!(
-            classify(&keyed, &checks, &calls, Ok(true)).await,
+            classify(&keyed, &checks, &calls, quick, Ok(true)).await,
             WorkloadClass::Interactive
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
 
-        // With every check slot busy the read stays interactive, unchecked.
-        let _busy = checks.in_flight.try_acquire().unwrap();
+        // A lookup slower than the wait leaves the read interactive.
+        let impatient =
+            DashboardSourceChecks::new(1, 2, Duration::from_secs(60), Duration::from_millis(10));
         assert_eq!(
-            classify(&panel("dash-4"), &checks, &calls, Ok(true)).await,
+            classify(
+                &panel("dash-4"),
+                &impatient,
+                &calls,
+                Duration::from_secs(1),
+                Ok(true)
+            )
+            .await,
             WorkloadClass::Interactive
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-        drop(_busy);
 
         // The cache stays within its capacity.
         for id in ["dash-5", "dash-6", "dash-7"] {
-            classify(&panel(id), &checks, &calls, Ok(true)).await;
+            classify(&panel(id), &checks, &calls, quick, Ok(true)).await;
         }
-        assert!(checks.results.len() <= 2);
+        assert!(checks.checks.len() <= 2);
     }
 
     #[test]

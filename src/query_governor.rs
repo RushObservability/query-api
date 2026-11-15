@@ -368,6 +368,9 @@ impl QueryGovernor {
     /// `seen_generation` (a save on this replica landed while the read was in
     /// flight, so the read may be older than it). Returns whether it applied.
     pub fn apply_reloaded(&self, config: QueryGovernorConfig, seen_generation: u64) -> bool {
+        if config.validate().is_err() {
+            return false;
+        }
         let mut state = self.state.write().expect("query governor lock poisoned");
         if self.generation.load(Ordering::SeqCst) != seen_generation || state.config == config {
             return false;
@@ -821,6 +824,12 @@ mod tests {
         saved.interactive.per_tenant_concurrency = 3;
         governor.reconfigure(saved.clone()).unwrap();
         assert!(!governor.apply_reloaded(changed, seen));
+        assert_eq!(governor.config(), saved);
+
+        // Limits that fail validation are never applied.
+        let mut invalid = saved.clone();
+        invalid.dashboard.per_tenant_concurrency = 0;
+        assert!(!governor.apply_reloaded(invalid, governor.generation()));
         assert_eq!(governor.config(), saved);
     }
 
