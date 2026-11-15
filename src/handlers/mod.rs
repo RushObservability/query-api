@@ -69,3 +69,5 @@ pub mod usage;
 pub mod usage_metering;
 pub mod users;
 pub mod whoami;
+
+pub mod frontend_telemetry;

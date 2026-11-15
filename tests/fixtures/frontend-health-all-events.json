@@ -1,0 +1,112 @@
+{
+  "meta": {
+    "app_name": "health-smoke",
+    "app_version": "0.1.17",
+    "environment": "test",
+    "session_id": "fixture-session-0",
+    "user_id": "fixture-user",
+    "page_url": "https://frontend.example.test/logs/fixture?secret=fixture",
+    "page_path": "/logs/fixture?secret=fixture",
+    "view_name": "Fixture page",
+    "referrer": "https://frontend.example.test/fixture",
+    "browser_name": "Chrome",
+    "browser_version": "157.0.0.0",
+    "os_name": "macOS",
+    "os_version": "10.15.7",
+    "device_type": "desktop",
+    "screen_width": 1280,
+    "screen_height": 720
+  },
+  "events": [
+    {
+      "event_type": "custom",
+      "event_name": "frontend_api_request",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"operation\":\"auth\",\"method\":\"GET\",\"outcome\":\"success\",\"status_class\":\"1xx\",\"cancel_reason\":\"none\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_api_attempt",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"operation\":\"auth\",\"method\":\"GET\",\"outcome\":\"success\",\"status_class\":\"1xx\",\"cancel_reason\":\"none\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_api_retry",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"operation\":\"auth\",\"method\":\"GET\",\"outcome\":\"success\",\"status_class\":\"1xx\",\"cancel_reason\":\"none\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_api_body",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"operation\":\"auth\",\"method\":\"GET\",\"outcome\":\"success\",\"status_class\":\"1xx\",\"cancel_reason\":\"none\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_started",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"startup_duration_ms\":42}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_telemetry_dropped",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"count\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_exception",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"source\":\"vue\",\"stage\":\"setup\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_navigation",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"route\":\"alert-channel-add\",\"outcome\":\"success\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_investigation_stream",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"outcome\":\"completed\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_investigation_first_response",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"kind\":\"report\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_investigation_discarded",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"reason\":\"malformed\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_api_probe",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"outcome\":\"reachable\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "frontend_api_outage",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"reason\":\"offline\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":42,\"duration_ms_max\":42,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "query_request_cache",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"cache_hits\":1,\"fresh_hits\":1,\"stale_hits\":1,\"revalidation_failures\":1,\"oversized_bypasses\":1,\"cache_entries\":1,\"cache_bytes\":1,\"in_flight\":1,\"in_flight_deduplications\":1,\"superseded_or_aborted\":1,\"cache_misses\":1,\"cache_evictions\":1}"
+    },
+    {
+      "event_type": "custom",
+      "event_name": "polling_refresh",
+      "timestamp": 1794780000000000000,
+      "attributes": "{\"category\":\"alert_list\",\"refreshes\":1,\"failures\":1,\"skipped_overlaps\":1,\"backoffs\":1,\"average_duration_ms\":1,\"maximum_duration_ms\":1,\"maximum_backoff_ms\":1}"
+    }
+  ]
+}
