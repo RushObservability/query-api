@@ -582,6 +582,73 @@ pub fn retain_admission_until_body_end(
     retain_admission_until_body_deadline(response, guard, deadline)
 }
 
+const EXPORT_BODY_LATENCY_BUCKETS_MS: &[f64] = &[
+    10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 30_000.0, 60_000.0, 120_000.0, 300_000.0,
+    600_000.0,
+];
+const EXPORT_BODY_BYTES_BUCKETS: &[f64] = &[
+    0.0,
+    1_024.0,
+    16_384.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+    268_435_456.0,
+    1_073_741_824.0,
+    4_294_967_296.0,
+];
+
+struct ExportBodyObservation {
+    metrics: Arc<SelfMetrics>,
+    kind: &'static str,
+    started: std::time::Instant,
+    bytes: u64,
+    recorded: bool,
+}
+
+impl ExportBodyObservation {
+    fn new(metrics: Arc<SelfMetrics>, kind: &'static str) -> Self {
+        metrics.add_gauge("rush_export_streams_inflight", &[("kind", kind)], 1.0);
+        Self {
+            metrics,
+            kind,
+            started: std::time::Instant::now(),
+            bytes: 0,
+            recorded: false,
+        }
+    }
+    fn finish(&mut self, outcome: &'static str) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        self.metrics
+            .add_gauge("rush_export_streams_inflight", &[("kind", self.kind)], -1.0);
+        let labels = [("kind", self.kind), ("outcome", outcome)];
+        self.metrics
+            .inc_counter("rush_export_streams_total", &labels, 1);
+        self.metrics.observe_histogram_with(
+            "rush_export_stream_duration_ms",
+            &labels,
+            self.started.elapsed().as_secs_f64() * 1000.0,
+            EXPORT_BODY_LATENCY_BUCKETS_MS,
+        );
+        self.metrics.observe_histogram_with(
+            "rush_export_stream_bytes",
+            &labels,
+            self.bytes as f64,
+            EXPORT_BODY_BYTES_BUCKETS,
+        );
+    }
+}
+impl Drop for ExportBodyObservation {
+    fn drop(&mut self) {
+        self.finish("cancelled");
+    }
+}
+
 /// Use the request's original deadline so body upload and handler execution do
 /// not grant a fresh timeout when an export starts streaming.
 pub fn retain_admission_until_body_deadline(
@@ -589,58 +656,92 @@ pub fn retain_admission_until_body_deadline(
     guard: QueryAdmissionGuard,
     deadline: tokio::time::Instant,
 ) -> axum::response::Response {
+    observe_export_body(response, guard, deadline, "response")
+}
+
+/// Background artifact generation has the same lifecycle but a separate kind,
+/// so its bytes are not confused with a later HTTP artifact download.
+pub fn retain_artifact_until_body_deadline(
+    response: axum::response::Response,
+    guard: QueryAdmissionGuard,
+    deadline: tokio::time::Instant,
+) -> axum::response::Response {
+    observe_export_body(response, guard, deadline, "artifact")
+}
+
+fn observe_export_body(
+    response: axum::response::Response,
+    guard: QueryAdmissionGuard,
+    deadline: tokio::time::Instant,
+    kind: &'static str,
+) -> axum::response::Response {
+    let observation = ExportBodyObservation::new(guard.metrics.clone(), kind);
     let (parts, body) = response.into_parts();
     let state = (
-        Box::pin(body.into_data_stream()),
+        Some(Box::pin(body.into_data_stream())),
         Some(guard),
         deadline,
         false,
+        observation,
     );
-    let stream =
-        futures_util::stream::unfold(state, |(mut body, mut guard, deadline, done)| async move {
+    let stream = futures_util::stream::unfold(
+        state,
+        |(mut body, mut guard, deadline, done, mut observation)| async move {
             if done {
                 return None;
             }
-            // timeout_at polls the future first. Explicitly enforce an expired
-            // deadline even if the next chunk is immediately ready.
             if tokio::time::Instant::now() >= deadline {
+                observation.finish("timeout");
+                body.take();
                 guard.take();
                 return Some((
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "export response exceeded its workload timeout",
                     )),
-                    (body, guard, deadline, true),
+                    (body, guard, deadline, true, observation),
                 ));
             }
-            match tokio::time::timeout_at(deadline, body.next()).await {
-                Ok(Some(Ok(bytes))) => Some((
-                    Ok::<bytes::Bytes, std::io::Error>(bytes),
-                    (body, guard, deadline, false),
-                )),
+            let next =
+                tokio::time::timeout_at(deadline, body.as_mut().expect("active body").next()).await;
+            match next {
+                Ok(Some(Ok(bytes))) => {
+                    observation.bytes = observation.bytes.saturating_add(bytes.len() as u64);
+                    Some((
+                        Ok::<bytes::Bytes, std::io::Error>(bytes),
+                        (body, guard, deadline, false, observation),
+                    ))
+                }
                 Ok(Some(Err(error))) => {
+                    observation.finish("body_error");
+                    body.take();
                     guard.take();
                     Some((
                         Err(std::io::Error::other(error)),
-                        (body, guard, deadline, true),
+                        (body, guard, deadline, true, observation),
                     ))
                 }
                 Ok(None) => {
+                    observation.finish("complete");
+                    body.take();
                     guard.take();
                     None
                 }
                 Err(_) => {
+                    observation.finish("timeout");
+                    body.take();
                     guard.take();
                     Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "export response exceeded its workload timeout",
                         )),
-                        (body, guard, deadline, true),
+                        (body, guard, deadline, true, observation),
                     ))
                 }
             }
-        });
+        },
+    );
     axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
@@ -917,12 +1018,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_metrics_distinguish_eof_error_timeout_and_artifact_generation() {
+        let metrics = Arc::new(SelfMetrics::new());
+        let governor = QueryGovernor::new(QueryGovernorConfig::default(), metrics.clone()).unwrap();
+        let guard = governor
+            .admit(WorkloadClass::Export, "tenant-secret")
+            .await
+            .unwrap();
+        let response = retain_admission_until_body_end(
+            axum::response::Response::new(axum::body::Body::from("hello")),
+            guard,
+            Duration::from_secs(1),
+        );
+        assert!(
+            metrics
+                .render_prometheus()
+                .contains("rush_export_streams_inflight{kind=\"response\"} 1")
+        );
+        assert!(
+            !metrics
+                .render_prometheus()
+                .contains("rush_export_streams_total")
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+        let guard = governor
+            .admit(WorkloadClass::Export, "tenant-secret")
+            .await
+            .unwrap();
+        let body = axum::body::Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("secret error"))
+        }));
+        assert!(
+            axum::body::to_bytes(
+                retain_admission_until_body_end(
+                    axum::response::Response::new(body),
+                    guard,
+                    Duration::from_secs(1)
+                )
+                .into_body(),
+                1024
+            )
+            .await
+            .is_err()
+        );
+        let guard = governor
+            .admit(WorkloadClass::Export, "tenant-secret")
+            .await
+            .unwrap();
+        let response = retain_artifact_until_body_deadline(
+            axum::response::Response::new(axum::body::Body::from("artifact")),
+            guard,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        );
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let text = metrics.render_prometheus();
+        assert!(
+            text.contains("rush_export_streams_total{kind=\"response\",outcome=\"complete\"} 1")
+        );
+        assert!(
+            text.contains("rush_export_streams_total{kind=\"response\",outcome=\"body_error\"} 1")
+        );
+        assert!(
+            text.contains("rush_export_streams_total{kind=\"artifact\",outcome=\"complete\"} 1")
+        );
+        assert!(
+            text.contains("rush_export_stream_bytes_sum{kind=\"response\",outcome=\"complete\"} 5")
+        );
+        assert!(!text.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_stream_drops_cursor_even_if_consumer_keeps_failed_body() {
+        struct DropWatch(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropWatch {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch = DropWatch(dropped.clone());
+        let stream = futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>().map(
+            move |chunk| {
+                let _ = &watch;
+                chunk
+            },
+        );
+        let metrics = Arc::new(SelfMetrics::new());
+        let governor = QueryGovernor::new(QueryGovernorConfig::default(), metrics.clone()).unwrap();
+        let guard = governor
+            .admit(WorkloadClass::Export, "tenant-a")
+            .await
+            .unwrap();
+        let response = retain_admission_until_body_end(
+            axum::response::Response::new(axum::body::Body::from_stream(stream)),
+            guard,
+            Duration::from_millis(5),
+        );
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.unwrap().is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+        let text = metrics.render_prometheus();
+        assert!(text.contains("rush_export_streams_inflight{kind=\"response\"} 0"));
+        assert!(
+            text.contains("rush_export_streams_total{kind=\"response\",outcome=\"timeout\"} 1")
+        );
+        drop(body);
+        assert_eq!(text, metrics.render_prometheus());
+    }
+
+    #[tokio::test]
     async fn streaming_response_holds_permit_until_body_is_dropped() {
         let mut config = QueryGovernorConfig::default();
         config.export.global_concurrency = 1;
         config.export.per_tenant_concurrency = 1;
         config.export.queue_timeout_ms = 0;
-        let governor = QueryGovernor::new(config, Arc::new(SelfMetrics::new())).unwrap();
+        let metrics = Arc::new(SelfMetrics::new());
+        let governor = QueryGovernor::new(config, metrics.clone()).unwrap();
         let guard = governor
             .admit(WorkloadClass::Export, "tenant-a")
             .await
@@ -941,6 +1160,11 @@ mod tests {
             Err(AdmissionError::TenantBusy { .. })
         ));
         drop(response);
+        let text = metrics.render_prometheus();
+        assert!(
+            text.contains("rush_export_streams_total{kind=\"response\",outcome=\"cancelled\"} 1")
+        );
+        assert!(text.contains("rush_export_streams_inflight{kind=\"response\"} 0"));
         assert!(
             governor
                 .admit(WorkloadClass::Export, "tenant-a")
