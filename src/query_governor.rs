@@ -687,7 +687,10 @@ impl ValidatedTimeRange {
         }
         let seconds = to.signed_duration_since(from).num_seconds().max(0) as u64;
         if seconds > max_seconds {
-            return Err(TimeRangeError::TooLarge { max_seconds });
+            return Err(TimeRangeError::TooLarge {
+                max_seconds,
+                seconds,
+            });
         }
         Ok(Self { from, to })
     }
@@ -718,7 +721,11 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
 pub enum TimeRangeError {
     Malformed,
     Reversed,
-    TooLarge { max_seconds: u64 },
+    /// `seconds` is the requested span.
+    TooLarge {
+        max_seconds: u64,
+        seconds: u64,
+    },
 }
 
 #[cfg(test)]
@@ -769,7 +776,10 @@ mod tests {
         );
         assert_eq!(
             ValidatedTimeRange::parse("2026-08-10T00:00:00Z", "2026-08-10T00:02:00Z", 60),
-            Err(TimeRangeError::TooLarge { max_seconds: 60 })
+            Err(TimeRangeError::TooLarge {
+                max_seconds: 60,
+                seconds: 120
+            })
         );
         assert!(ValidatedTimeRange::parse("1786320000", "1786320030", 60).is_ok());
     }
