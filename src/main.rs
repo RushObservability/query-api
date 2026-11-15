@@ -809,17 +809,24 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
     // the class follows the credential tenant middleware verified, and the
     // dashboard pool additionally needs a verified source (see
     // `dashboard_source_candidate`).
-    let credential = req
+    //
+    // PromQL reads by API keys (Grafana, KEDA) get the integration pool so
+    // they cannot starve the UI. Keys an admin granted agent access (the MCP
+    // server, assistants) are interactive, as is anonymous access: on an
+    // open tenant that is the UI itself, and anonymous callers already get
+    // the interactive pool for every other read.
+    let integration_client = req
         .extensions()
         .get::<TenantResolution>()
-        .map(|resolution| &resolution.credential);
-    if path.starts_with("/prom/")
-        && !matches!(
-            credential,
-            Some(CredentialKind::Session | CredentialKind::InternalSre)
-        )
-    {
-        // Grafana, KEDA, and other API-key or anonymous PromQL clients.
+        .is_some_and(|resolution| match resolution.credential {
+            CredentialKind::QueryKey => !resolution
+                .api_key
+                .as_ref()
+                .is_some_and(|grant| grant.allows_agent()),
+            CredentialKind::IngestKey => true,
+            _ => false,
+        });
+    if path.starts_with("/prom/") && integration_client {
         return Some(WorkloadClass::Integration);
     }
     Some(WorkloadClass::Interactive)
@@ -881,25 +888,114 @@ fn dashboard_source_candidate(
     })
 }
 
-/// Checked on every request, like the dashboard and notebook handlers, so a
-/// revoked share or deleted dashboard stops granting the pool immediately.
-async fn dashboard_source_readable(state: &AppState, lookup: DashboardSourceLookup<'_>) -> bool {
-    let found = match lookup.kind {
+impl DashboardSourceLookup<'_> {
+    fn cache_key(&self) -> String {
+        format!(
+            "{:?}\n{}\n{}\n{}",
+            self.kind, self.id, self.tenant_id, self.user_id
+        )
+    }
+}
+
+async fn dashboard_source_readable(
+    state: &AppState,
+    lookup: DashboardSourceLookup<'_>,
+) -> anyhow::Result<bool> {
+    Ok(match lookup.kind {
         WorkloadSourceKind::Dashboard => state
             .config_db
             .get_dashboard(lookup.id, lookup.tenant_id, lookup.user_id)
-            .await
-            .map(|dashboard| dashboard.is_some()),
+            .await?
+            .is_some(),
         WorkloadSourceKind::Notebook => state
             .config_db
             .get_notebook(lookup.id, lookup.tenant_id, lookup.user_id)
-            .await
-            .map(|notebook| notebook.is_some()),
-    };
-    found.unwrap_or_else(|error| {
-        tracing::warn!(%error, "dashboard workload source check failed; using interactive");
-        false
+            .await?
+            .is_some(),
     })
+}
+
+/// The source check runs before admission, so no workload pool bounds it.
+/// Results are reused per replica for `ttl` (a revoked share keeps the
+/// dashboard pool at most that long; data access is still checked by each
+/// handler), and at most `in_flight` checks run at once. When all are busy
+/// the read stays interactive instead of waiting.
+struct DashboardSourceChecks {
+    results: dashmap::DashMap<String, (bool, std::time::Instant)>,
+    in_flight: tokio::sync::Semaphore,
+    capacity: usize,
+    ttl: Duration,
+}
+
+impl DashboardSourceChecks {
+    fn new(in_flight: usize, capacity: usize, ttl: Duration) -> Self {
+        Self {
+            results: dashmap::DashMap::new(),
+            in_flight: tokio::sync::Semaphore::new(in_flight),
+            capacity,
+            ttl,
+        }
+    }
+
+    /// `check` is polled only on a cache miss with a free check slot.
+    /// Failed checks are not cached.
+    async fn readable(
+        &self,
+        key: String,
+        check: impl std::future::Future<Output = anyhow::Result<bool>>,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        if let Some(entry) = self.results.get(&key)
+            && now.duration_since(entry.1) < self.ttl
+        {
+            return entry.0;
+        }
+        let Ok(_permit) = self.in_flight.try_acquire() else {
+            return false;
+        };
+        let readable = match check.await {
+            Ok(readable) => readable,
+            Err(error) => {
+                tracing::warn!(%error, "dashboard workload source check failed; using interactive");
+                return false;
+            }
+        };
+        if self.results.len() >= self.capacity {
+            self.results
+                .retain(|_, (_, checked)| now.duration_since(*checked) < self.ttl);
+            if self.results.len() >= self.capacity {
+                self.results.clear();
+            }
+        }
+        self.results.insert(key, (readable, now));
+        readable
+    }
+}
+
+static DASHBOARD_SOURCE_CHECKS: std::sync::LazyLock<DashboardSourceChecks> =
+    std::sync::LazyLock::new(|| DashboardSourceChecks::new(8, 4_096, Duration::from_secs(30)));
+
+/// Moves an interactive read into the dashboard pool when its named source
+/// is readable. Takes the extracted lookup, not the request: the request body
+/// is not `Sync`, so a borrow of it cannot be held across the check.
+async fn dashboard_upgrade<'a, Fut>(
+    class: WorkloadClass,
+    lookup: Option<DashboardSourceLookup<'a>>,
+    checks: &DashboardSourceChecks,
+    check: impl FnOnce(DashboardSourceLookup<'a>) -> Fut,
+) -> WorkloadClass
+where
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let Some(lookup) = lookup else {
+        return class;
+    };
+    let key = lookup.cache_key();
+    if checks.readable(key, check(lookup)).await {
+        WorkloadClass::Dashboard
+    } else {
+        class
+    }
 }
 
 fn time_range_error_response(error: TimeRangeError) -> Response {
@@ -1074,14 +1170,16 @@ async fn query_policy_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(mut class) = query_workload_for_request(&req) else {
+    let Some(class) = query_workload_for_request(&req) else {
         return next.run(req).await;
     };
-    if let Some(lookup) = dashboard_source_candidate(&req, class)
-        && dashboard_source_readable(&state, lookup).await
-    {
-        class = WorkloadClass::Dashboard;
-    }
+    let class = dashboard_upgrade(
+        class,
+        dashboard_source_candidate(&req, class),
+        &DASHBOARD_SOURCE_CHECKS,
+        |lookup| dashboard_source_readable(&state, lookup),
+    )
+    .await;
     let tenant = req
         .extensions()
         .get::<TenantContext>()
@@ -2256,22 +2354,12 @@ async fn main() -> anyhow::Result<()> {
     // outbox degradation is visible even if no one has scraped `/metrics` yet.
     let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
         std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
-    let query_governor_config = match config_db.get_setting(QUERY_LIMITS_SETTING_KEY).await? {
-        Some(raw) => match serde_json::from_str::<QueryGovernorConfig>(&raw) {
-            Ok(config) => match config.validate() {
-                Ok(()) => config,
-                Err(error) => {
-                    tracing::error!(%error, "stored query workload limits are invalid; using safe defaults");
-                    QueryGovernorConfig::default()
-                }
-            },
-            Err(error) => {
-                tracing::error!(%error, "stored query workload limits cannot be decoded; using safe defaults");
-                QueryGovernorConfig::default()
-            }
-        },
-        None => QueryGovernorConfig::default(),
-    };
+    let query_governor_config = QueryGovernorConfig::at_startup(
+        config_db
+            .get_setting(QUERY_LIMITS_SETTING_KEY)
+            .await?
+            .as_deref(),
+    );
     let query_governor = Arc::new(
         QueryGovernor::new(query_governor_config, self_metrics.clone())
             .map_err(anyhow::Error::msg)
@@ -4086,14 +4174,15 @@ mod query_deadline_tests {
 #[cfg(test)]
 mod tenant_auth_tests {
     use super::{
-        CredentialKind, DashboardSourceLookup, KeyLookup, TenantResolution, WorkloadSourceKind,
-        allows_unauthenticated_tenant_request, api_key_public_prefix, credential_route_denial,
-        dashboard_source_candidate, effective_route_ingest_auth_required, explicit_ingest_tenant,
-        ingest_signal_for_route, internal_sre_route_allowed, is_explain_collector_route,
-        is_state_changing_method, presented_key_resolution, query_workload_for_request,
-        request_log_path, request_origin_allowed_with_policy, requires_csrf_origin,
-        should_audit_rejected_key, should_audit_route_denial, should_reject_for_tenant_auth,
-        should_reject_interactive_llm, trust_forwarded_origin_headers, validate_request_time_range,
+        CredentialKind, DashboardSourceChecks, DashboardSourceLookup, KeyLookup, TenantResolution,
+        WorkloadSourceKind, allows_unauthenticated_tenant_request, api_key_public_prefix,
+        credential_route_denial, dashboard_source_candidate, dashboard_upgrade,
+        effective_route_ingest_auth_required, explicit_ingest_tenant, ingest_signal_for_route,
+        internal_sre_route_allowed, is_explain_collector_route, is_state_changing_method,
+        presented_key_resolution, query_workload_for_request, request_log_path,
+        request_origin_allowed_with_policy, requires_csrf_origin, should_audit_rejected_key,
+        should_audit_route_denial, should_reject_for_tenant_auth, should_reject_interactive_llm,
+        trust_forwarded_origin_headers, validate_request_time_range,
     };
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, Method, Request, header};
@@ -4460,6 +4549,97 @@ mod tenant_auth_tests {
         request
     }
 
+    #[tokio::test]
+    async fn dashboard_upgrade_is_checked_cached_and_bounded() {
+        use rush_api::query_governor::WorkloadClass;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let checks = DashboardSourceChecks::new(1, 2, Duration::from_secs(60));
+        let calls = AtomicUsize::new(0);
+        async fn classify(
+            request: &Request<Body>,
+            checks: &DashboardSourceChecks,
+            calls: &AtomicUsize,
+            answer: anyhow::Result<bool>,
+        ) -> WorkloadClass {
+            let class = query_workload_for_request(request).unwrap();
+            dashboard_upgrade(
+                class,
+                dashboard_source_candidate(request, class),
+                checks,
+                |lookup| {
+                    assert_eq!(lookup.user_id, "user-1");
+                    // Counted when polled: a cache hit or a busy slot never polls.
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        answer
+                    }
+                },
+            )
+            .await
+        }
+        let panel = |id: &str| {
+            with_path_and_source(
+                resolved(CredentialKind::Session, "user-1"),
+                "/api/v1/query/timeseries",
+                &format!("dashboard:{id}"),
+            )
+        };
+
+        // A readable source upgrades; the result is reused without a lookup.
+        let readable = panel("dash-1");
+        assert_eq!(
+            classify(&readable, &checks, &calls, Ok(true)).await,
+            WorkloadClass::Dashboard
+        );
+        assert_eq!(
+            classify(&readable, &checks, &calls, Ok(false)).await,
+            WorkloadClass::Dashboard
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Unreadable stays interactive; a failed check is not cached.
+        let failing = panel("dash-2");
+        assert_eq!(
+            classify(&failing, &checks, &calls, Err(anyhow::anyhow!("down"))).await,
+            WorkloadClass::Interactive
+        );
+        assert_eq!(
+            classify(&failing, &checks, &calls, Ok(false)).await,
+            WorkloadClass::Interactive
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Without a session there is no lookup at all.
+        let mut keyed = panel("dash-3");
+        keyed
+            .extensions_mut()
+            .get_mut::<TenantResolution>()
+            .unwrap()
+            .credential = CredentialKind::QueryKey;
+        assert_eq!(
+            classify(&keyed, &checks, &calls, Ok(true)).await,
+            WorkloadClass::Interactive
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // With every check slot busy the read stays interactive, unchecked.
+        let _busy = checks.in_flight.try_acquire().unwrap();
+        assert_eq!(
+            classify(&panel("dash-4"), &checks, &calls, Ok(true)).await,
+            WorkloadClass::Interactive
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        drop(_busy);
+
+        // The cache stays within its capacity.
+        for id in ["dash-5", "dash-6", "dash-7"] {
+            classify(&panel(id), &checks, &calls, Ok(true)).await;
+        }
+        assert!(checks.results.len() <= 2);
+    }
+
     #[test]
     fn dashboard_pool_needs_a_session_and_a_named_dashboard_or_notebook() {
         use rush_api::query_governor::WorkloadClass;
@@ -4543,13 +4723,37 @@ mod tenant_auth_tests {
     }
 
     #[test]
-    fn prometheus_reads_use_the_integration_pool_outside_the_ui() {
+    fn prometheus_reads_by_plain_api_keys_use_the_integration_pool() {
         use rush_api::query_governor::WorkloadClass;
-        for (credential, expected) in [
-            (CredentialKind::Session, WorkloadClass::Interactive),
-            (CredentialKind::InternalSre, WorkloadClass::Interactive),
-            (CredentialKind::QueryKey, WorkloadClass::Integration),
-            (CredentialKind::Anonymous, WorkloadClass::Integration),
+        let key = |agent: bool| ApiKeyGrant {
+            id: "key-id".to_string(),
+            name: "client".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            key_type: "query".to_string(),
+            role: String::new(),
+            agent,
+            signals: Vec::new(),
+            rate_limit_per_minute: 100,
+            source_cidrs: Vec::new(),
+        };
+        for (credential, grant, expected) in [
+            (CredentialKind::Session, None, WorkloadClass::Interactive),
+            (
+                CredentialKind::InternalSre,
+                None,
+                WorkloadClass::Interactive,
+            ),
+            (CredentialKind::Anonymous, None, WorkloadClass::Interactive),
+            (
+                CredentialKind::QueryKey,
+                Some(key(false)),
+                WorkloadClass::Integration,
+            ),
+            (
+                CredentialKind::QueryKey,
+                Some(key(true)),
+                WorkloadClass::Interactive,
+            ),
         ] {
             for path in [
                 "/prom/api/v1/query_range",
@@ -4559,10 +4763,16 @@ mod tenant_auth_tests {
             ] {
                 let mut request = resolved(credential.clone(), "user-1");
                 *request.uri_mut() = path.parse().unwrap();
+                request
+                    .extensions_mut()
+                    .get_mut::<TenantResolution>()
+                    .unwrap()
+                    .api_key = grant.clone();
                 assert_eq!(
                     query_workload_for_request(&request),
                     Some(expected),
-                    "{credential:?} {path}"
+                    "{credential:?} agent={:?} {path}",
+                    grant.as_ref().map(|grant| grant.agent)
                 );
             }
         }
