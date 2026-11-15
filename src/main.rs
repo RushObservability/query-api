@@ -917,26 +917,38 @@ async fn dashboard_source_readable(
     }
 }
 
+/// What a dashboard source check found. `Unknown` means the lookup failed or
+/// didn't answer in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceAccess {
+    Readable,
+    NotReadable,
+    Unknown,
+}
+
 /// One source check, shared by every read that names the same source while
-/// it runs and, when it finds the source readable, for `ttl` after.
-struct SourceCheck {
+/// it runs and, when it finds the source readable, for `ttl` after. It runs
+/// once: a failure is shared with the waiting reads, not retried by each.
+struct SharedSourceCheck {
     started: std::time::Instant,
-    result: tokio::sync::OnceCell<bool>,
+    result: tokio::sync::OnceCell<SourceAccess>,
 }
 
 /// The source check runs before admission, so no workload pool bounds it.
 /// Concurrent reads naming the same source share one lookup (a dashboard's
 /// panels load together), at most `in_flight` lookups run at once, and a
-/// read waits at most `wait` for its answer before running as interactive.
-/// Only readable results are cached, for `ttl` per replica: a revoked share
-/// keeps the dashboard pool at most that long (each handler still checks data
-/// access), and made-up ids never fill the cache.
+/// read waits at most `wait` for its answer. Only readable results are
+/// cached, for `ttl` per replica: a revoked share keeps the dashboard pool at
+/// most that long (each handler still checks data access), and made-up ids
+/// never stay in the cache.
 struct DashboardSourceChecks {
-    checks: dashmap::DashMap<String, Arc<SourceCheck>>,
+    checks: dashmap::DashMap<String, Arc<SharedSourceCheck>>,
     in_flight: tokio::sync::Semaphore,
     capacity: usize,
     ttl: Duration,
     wait: Duration,
+    /// Set while lookups fail, so an outage logs once, not once per read.
+    degraded: std::sync::atomic::AtomicBool,
 }
 
 impl DashboardSourceChecks {
@@ -947,15 +959,34 @@ impl DashboardSourceChecks {
             capacity,
             ttl,
             wait,
+            degraded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn note_failure(&self, reason: &dyn std::fmt::Display) {
+        if !self
+            .degraded
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(%reason, "dashboard workload source checks are failing; affected reads get a retryable error or run as interactive");
+        }
+    }
+
+    fn note_success(&self) {
+        if self
+            .degraded
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::info!("dashboard workload source checks recovered");
         }
     }
 
     /// `check` is polled only when this read runs the shared lookup.
-    async fn readable(
+    async fn access(
         &self,
         key: String,
         check: impl std::future::Future<Output = anyhow::Result<bool>>,
-    ) -> bool {
+    ) -> SourceAccess {
         let now = std::time::Instant::now();
         if !self.checks.contains_key(&key) && self.checks.len() >= self.capacity {
             self.checks
@@ -966,13 +997,13 @@ impl DashboardSourceChecks {
         }
         let entry = {
             let mut slot = self.checks.entry(key.clone()).or_insert_with(|| {
-                Arc::new(SourceCheck {
+                Arc::new(SharedSourceCheck {
                     started: now,
                     result: tokio::sync::OnceCell::new(),
                 })
             });
             if now.duration_since(slot.started) >= self.ttl {
-                *slot = Arc::new(SourceCheck {
+                *slot = Arc::new(SharedSourceCheck {
                     started: now,
                     result: tokio::sync::OnceCell::new(),
                 });
@@ -981,28 +1012,40 @@ impl DashboardSourceChecks {
         };
         let outcome = tokio::time::timeout(
             self.wait,
-            entry.result.get_or_try_init(|| async {
-                let _permit = self.in_flight.acquire().await?;
-                check.await
+            entry.result.get_or_init(|| async {
+                let Ok(_permit) = self.in_flight.acquire().await else {
+                    return SourceAccess::Unknown;
+                };
+                match check.await {
+                    Ok(readable) => {
+                        self.note_success();
+                        if readable {
+                            SourceAccess::Readable
+                        } else {
+                            SourceAccess::NotReadable
+                        }
+                    }
+                    Err(error) => {
+                        self.note_failure(&error);
+                        SourceAccess::Unknown
+                    }
+                }
             }),
         )
         .await;
-        let readable = match outcome {
-            Ok(Ok(readable)) => *readable,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "dashboard workload source check failed; using interactive");
-                false
-            }
+        let access = match outcome {
+            Ok(access) => *access,
             Err(_) => {
-                tracing::warn!("dashboard workload source check timed out; using interactive");
-                return false;
+                self.note_failure(&"lookup did not answer in time");
+                SourceAccess::Unknown
             }
         };
-        if !readable {
+        if access != SourceAccess::Readable {
+            // Only readable results stay; the next read checks again.
             self.checks
                 .remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
         }
-        readable
+        access
     }
 }
 
@@ -1011,28 +1054,39 @@ static DASHBOARD_SOURCE_CHECKS: std::sync::LazyLock<DashboardSourceChecks> =
         DashboardSourceChecks::new(8, 4_096, Duration::from_secs(30), Duration::from_secs(2))
     });
 
+/// Marks a read that named a dashboard or notebook whose access check
+/// couldn't finish. It runs as interactive; if its range fits only the
+/// dashboard window, it gets a retryable 503 instead of a 400.
+#[derive(Clone, Copy)]
+struct UnverifiedDashboardSource;
+
 /// Moves an interactive read into the dashboard pool when its named source
 /// is readable. Takes the extracted lookup, not the request: the request body
 /// is not `Sync`, so a borrow of it cannot be held across the check.
+/// Returns the class and whether a named source went unverified.
 async fn dashboard_upgrade<'a, Fut>(
     class: WorkloadClass,
     lookup: Option<DashboardSourceLookup<'a>>,
     checks: &DashboardSourceChecks,
     check: impl FnOnce(DashboardSourceLookup<'a>) -> Fut,
-) -> WorkloadClass
+) -> (WorkloadClass, bool)
 where
     Fut: std::future::Future<Output = anyhow::Result<bool>>,
 {
     let Some(lookup) = lookup else {
-        return class;
+        return (class, false);
     };
     let key = lookup.cache_key();
-    if checks.readable(key, check(lookup)).await {
-        WorkloadClass::Dashboard
-    } else {
-        class
+    match checks.access(key, check(lookup)).await {
+        SourceAccess::Readable => (WorkloadClass::Dashboard, false),
+        SourceAccess::NotReadable => (class, false),
+        SourceAccess::Unknown => (class, true),
     }
 }
+
+/// Set on a `time_range_too_large` response so callers can tell it apart.
+#[derive(Clone, Copy)]
+struct RangeTooLarge;
 
 fn time_range_error_response(error: TimeRangeError) -> Response {
     let (code, message) = match error {
@@ -1049,8 +1103,26 @@ fn time_range_error_response(error: TimeRangeError) -> Response {
             "time range exceeds the configured workload limit",
         ),
     };
-    rush_api::api_error::ApiError::public(axum::http::StatusCode::BAD_REQUEST, code, message)
-        .into_response()
+    let mut response =
+        rush_api::api_error::ApiError::public(axum::http::StatusCode::BAD_REQUEST, code, message)
+            .into_response();
+    if matches!(error, TimeRangeError::TooLarge { .. }) {
+        response.extensions_mut().insert(RangeTooLarge);
+    }
+    response
+}
+
+fn dashboard_source_unverified_response() -> Response {
+    let mut response = rush_api::api_error::ApiError::public(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "dashboard_source_check_unavailable",
+        "dashboard access could not be confirmed in time; retry shortly",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 fn validate_range_pair(from: &str, to: &str, max_seconds: u64) -> Result<(), Response> {
@@ -1209,13 +1281,17 @@ async fn query_policy_middleware(
     let Some(class) = query_workload_for_request(&req) else {
         return next.run(req).await;
     };
-    let class = dashboard_upgrade(
+    let (class, unverified) = dashboard_upgrade(
         class,
         dashboard_source_candidate(&req, class),
         &DASHBOARD_SOURCE_CHECKS,
         |lookup| dashboard_source_readable(&state, lookup),
     )
     .await;
+    let mut req = req;
+    if unverified {
+        req.extensions_mut().insert(UnverifiedDashboardSource);
+    }
     let tenant = req
         .extensions()
         .get::<TenantContext>()
@@ -1250,7 +1326,15 @@ where
             if let Err(response) =
                 validate_request_time_range(&mut req, budget.max_time_range_secs).await
             {
-                return response;
+                let unverified = req
+                    .extensions()
+                    .get::<UnverifiedDashboardSource>()
+                    .is_some();
+                return if unverified && response.extensions().get::<RangeTooLarge>().is_some() {
+                    dashboard_source_unverified_response()
+                } else {
+                    response
+                };
             }
             next(req).await
         }),
@@ -4173,6 +4257,41 @@ mod query_deadline_tests {
     }
 
     #[tokio::test]
+    async fn unverified_dashboard_reads_get_a_retryable_error_only_when_the_range_needs_it() {
+        let (governor, metrics) = governor();
+        let month = 30 * 24 * 60 * 60;
+        for (unverified, range_secs, expected) in [
+            (true, month, StatusCode::SERVICE_UNAVAILABLE),
+            (false, month, StatusCode::BAD_REQUEST),
+            (true, 60, StatusCode::OK),
+        ] {
+            let guard = governor
+                .admit(WorkloadClass::Interactive, "tenant-a")
+                .await
+                .unwrap();
+            let mut req = Request::builder()
+                .uri(format!("/api/v1/query/timeseries?from=0&to={range_secs}"))
+                .body(Body::empty())
+                .unwrap();
+            if unverified {
+                req.extensions_mut().insert(UnverifiedDashboardSource);
+            }
+            let response = execute_admitted_query(
+                guard,
+                &metrics,
+                WorkloadClass::Interactive,
+                req,
+                |_| async { StatusCode::OK.into_response() },
+            )
+            .await;
+            assert_eq!(response.status(), expected, "unverified={unverified}");
+            if expected == StatusCode::SERVICE_UNAVAILABLE {
+                assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn deadline_preserves_valid_bodies_and_handler_dispatch() {
         let (governor, metrics) = governor();
         let guard = governor
@@ -4597,7 +4716,7 @@ mod tenant_auth_tests {
             calls: &AtomicUsize,
             delay: Duration,
             answer: anyhow::Result<bool>,
-        ) -> WorkloadClass {
+        ) -> (WorkloadClass, bool) {
             let class = query_workload_for_request(request).unwrap();
             dashboard_upgrade(
                 class,
@@ -4643,24 +4762,28 @@ mod tenant_auth_tests {
         assert!(
             classes
                 .iter()
-                .all(|class| *class == WorkloadClass::Dashboard)
+                .all(|outcome| *outcome == (WorkloadClass::Dashboard, false))
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // ...and later reads reuse it.
         assert_eq!(
             classify(&panel("dash-1"), &checks, &calls, quick, Ok(false)).await,
-            WorkloadClass::Dashboard
+            (WorkloadClass::Dashboard, false)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Unreadable and failed checks stay interactive and are not cached.
-        let answers: [fn() -> anyhow::Result<bool>; 2] =
-            [|| Ok(false), || Err(anyhow::anyhow!("down"))];
-        for answer in answers {
+        // A failed lookup leaves the source unverified; unreadable doesn't.
+        for failed in [false, true] {
             for _ in 0..2 {
+                let answer = if failed {
+                    Err(anyhow::anyhow!("down"))
+                } else {
+                    Ok(false)
+                };
                 assert_eq!(
-                    classify(&panel("dash-2"), &checks, &calls, quick, answer()).await,
-                    WorkloadClass::Interactive
+                    classify(&panel("dash-2"), &checks, &calls, quick, answer).await,
+                    (WorkloadClass::Interactive, failed)
                 );
             }
         }
@@ -4686,7 +4809,7 @@ mod tenant_auth_tests {
             .credential = CredentialKind::QueryKey;
         assert_eq!(
             classify(&keyed, &checks, &calls, quick, Ok(true)).await,
-            WorkloadClass::Interactive
+            (WorkloadClass::Interactive, false)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 5);
 
@@ -4702,8 +4825,30 @@ mod tenant_auth_tests {
                 Ok(true)
             )
             .await,
-            WorkloadClass::Interactive
+            (WorkloadClass::Interactive, true)
         );
+        assert!(impatient.checks.is_empty());
+
+        // A failed lookup is shared by the reads waiting on it, not retried
+        // by each of them.
+        let before = calls.load(Ordering::SeqCst);
+        let panels: Vec<_> = (0..10).map(|_| panel("dash-8")).collect();
+        let outcomes = futures_util::future::join_all(panels.iter().map(|request| {
+            classify(
+                request,
+                &checks,
+                &calls,
+                Duration::from_millis(20),
+                Err(anyhow::anyhow!("down")),
+            )
+        }))
+        .await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| *outcome == (WorkloadClass::Interactive, true))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
 
         // The cache stays within its capacity.
         for id in ["dash-5", "dash-6", "dash-7"] {

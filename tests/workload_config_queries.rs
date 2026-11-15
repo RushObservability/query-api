@@ -28,22 +28,25 @@ async fn the_newest_setting_save_wins_even_after_a_future_version() -> anyhow::R
 
 #[tokio::test]
 #[ignore = "requires a disposable ClickHouse and test-only config/session secrets"]
-async fn readable_checks_match_the_full_lookups() -> anyhow::Result<()> {
+async fn readable_checks_follow_the_visibility_rules() -> anyhow::Result<()> {
     let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
     let db = ConfigDb::open(&url, "default", "").await?;
     let defaults = DashboardDefaults::default();
-    let (private, shared) = (
+    let (private, shared, global) = (
+        uuid::Uuid::new_v4().to_string(),
         uuid::Uuid::new_v4().to_string(),
         uuid::Uuid::new_v4().to_string(),
     );
-    db.create_dashboard(
-        &private, "Mine", "", "tenant-a", "u1", "private", "[]", "[]", &defaults,
-    )
-    .await?;
-    db.create_dashboard(
-        &shared, "Team", "", "tenant-a", "u1", "tenant", "[]", "[]", &defaults,
-    )
-    .await?;
+    for (id, visibility) in [
+        (&private, "private"),
+        (&shared, "tenant"),
+        (&global, "global"),
+    ] {
+        db.create_dashboard(
+            id, "Board", "", "tenant-a", "u1", visibility, "[]", "[]", &defaults,
+        )
+        .await?;
+    }
     let notebook = |visibility: &str| Notebook {
         id: uuid::Uuid::new_v4().to_string(),
         tenant_id: "tenant-a".into(),
@@ -63,28 +66,44 @@ async fn readable_checks_match_the_full_lookups() -> anyhow::Result<()> {
     db.write_notebook(&own_nb, false).await?;
     db.write_notebook(&team_nb, false).await?;
 
-    for (tenant, user) in [
+    // Expected access, as (tenant-a u1, tenant-a u2, tenant-b u1, tenant-b u2).
+    // A private dashboard follows its owner across tenants; notebooks don't.
+    let viewers = [
         ("tenant-a", "u1"),
         ("tenant-a", "u2"),
         ("tenant-b", "u1"),
         ("tenant-b", "u2"),
+    ];
+    let missing = "missing".to_string();
+    for (id, expected) in [
+        (&private, [true, false, true, false]),
+        (&shared, [true, true, false, false]),
+        (&global, [true, true, true, true]),
+        (&missing, [false, false, false, false]),
     ] {
-        for id in [&private, &shared, &"missing".to_string()] {
+        for ((tenant, user), expected) in viewers.into_iter().zip(expected) {
+            let readable = db.dashboard_readable(id, tenant, user).await?;
+            assert_eq!(readable, expected, "dashboard {id} {tenant} {user}");
             assert_eq!(
-                db.dashboard_readable(id, tenant, user).await?,
                 db.get_dashboard(id, tenant, user).await?.is_some(),
-                "dashboard {id} {tenant} {user}"
-            );
-        }
-        for id in [&own_nb.id, &team_nb.id] {
-            assert_eq!(
-                db.notebook_readable(id, tenant, user).await?,
-                db.get_notebook(id, tenant, user).await?.is_some(),
-                "notebook {id} {tenant} {user}"
+                expected,
+                "get_dashboard {id} {tenant} {user}"
             );
         }
     }
-    assert!(db.dashboard_readable(&shared, "tenant-a", "u2").await?);
-    assert!(!db.dashboard_readable(&private, "tenant-a", "u2").await?);
+    for (id, expected) in [
+        (&own_nb.id, [true, false, false, false]),
+        (&team_nb.id, [true, true, false, false]),
+    ] {
+        for ((tenant, user), expected) in viewers.into_iter().zip(expected) {
+            let readable = db.notebook_readable(id, tenant, user).await?;
+            assert_eq!(readable, expected, "notebook {id} {tenant} {user}");
+            assert_eq!(
+                db.get_notebook(id, tenant, user).await?.is_some(),
+                expected,
+                "get_notebook {id} {tenant} {user}"
+            );
+        }
+    }
     Ok(())
 }
