@@ -833,8 +833,101 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
     }
 
     // Workload classes select independent capacity and resource budgets.
-    // Public request headers cannot authorize a larger or additional pool.
+    // Public request headers cannot authorize a larger or additional pool:
+    // the class follows the credential tenant middleware verified, and the
+    // dashboard pool additionally needs a verified source (see
+    // `dashboard_source_candidate`).
+    let credential = req
+        .extensions()
+        .get::<TenantResolution>()
+        .map(|resolution| &resolution.credential);
+    if path.starts_with("/prom/")
+        && !matches!(
+            credential,
+            Some(CredentialKind::Session | CredentialKind::InternalSre)
+        )
+    {
+        // Grafana, KEDA, and other API-key or anonymous PromQL clients.
+        return Some(WorkloadClass::Integration);
+    }
     Some(WorkloadClass::Interactive)
+}
+
+/// Names the dashboard or notebook a panel or cell read belongs to, as
+/// `dashboard:<id>` or `notebook:<id>`. On its own it grants nothing.
+const WORKLOAD_SOURCE_HEADER: &str = "x-rush-workload-source";
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkloadSourceKind {
+    Dashboard,
+    Notebook,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DashboardSourceLookup<'a> {
+    kind: WorkloadSourceKind,
+    id: &'a str,
+    tenant_id: &'a str,
+    user_id: &'a str,
+}
+
+/// The read-access check that would move an interactive read into the
+/// dashboard pool, or `None` when the request cannot qualify. Only signed-in
+/// browser sessions qualify: the source must be a dashboard or notebook that
+/// user can read in the request's tenant.
+fn dashboard_source_candidate(
+    req: &Request,
+    class: WorkloadClass,
+) -> Option<DashboardSourceLookup<'_>> {
+    if class != WorkloadClass::Interactive {
+        return None;
+    }
+    let resolution = req.extensions().get::<TenantResolution>()?;
+    if resolution.credential != CredentialKind::Session {
+        return None;
+    }
+    let user_id = req.extensions().get::<RequestIdentity>()?.actor_id.as_str();
+    if user_id.is_empty() {
+        return None;
+    }
+    let source = req.headers().get(WORKLOAD_SOURCE_HEADER)?.to_str().ok()?;
+    let (kind, id) = source.split_once(':')?;
+    let kind = match kind {
+        "dashboard" => WorkloadSourceKind::Dashboard,
+        "notebook" => WorkloadSourceKind::Notebook,
+        _ => return None,
+    };
+    let valid_id = (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    valid_id.then_some(DashboardSourceLookup {
+        kind,
+        id,
+        tenant_id: &resolution.tenant_id,
+        user_id,
+    })
+}
+
+/// Checked on every request, like the dashboard and notebook handlers, so a
+/// revoked share or deleted dashboard stops granting the pool immediately.
+async fn dashboard_source_readable(state: &AppState, lookup: DashboardSourceLookup<'_>) -> bool {
+    let found = match lookup.kind {
+        WorkloadSourceKind::Dashboard => state
+            .config_db
+            .get_dashboard(lookup.id, lookup.tenant_id, lookup.user_id)
+            .await
+            .map(|dashboard| dashboard.is_some()),
+        WorkloadSourceKind::Notebook => state
+            .config_db
+            .get_notebook(lookup.id, lookup.tenant_id, lookup.user_id)
+            .await
+            .map(|notebook| notebook.is_some()),
+    };
+    found.unwrap_or_else(|error| {
+        tracing::warn!(%error, "dashboard workload source check failed; using interactive");
+        false
+    })
 }
 
 fn time_range_error_response(error: TimeRangeError) -> Response {
@@ -1009,9 +1102,14 @@ async fn query_policy_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(class) = query_workload_for_request(&req) else {
+    let Some(mut class) = query_workload_for_request(&req) else {
         return next.run(req).await;
     };
+    if let Some(lookup) = dashboard_source_candidate(&req, class)
+        && dashboard_source_readable(&state, lookup).await
+    {
+        class = WorkloadClass::Dashboard;
+    }
     let tenant = req
         .extensions()
         .get::<TenantContext>()
@@ -2208,6 +2306,7 @@ async fn main() -> anyhow::Result<()> {
             .context("query workload configuration is invalid")?,
     );
     rush_api::query_governor::install_global(query_governor.clone());
+    rush_api::query_governor::spawn_limits_reload(query_governor.clone(), config_db.clone());
     let ingest_limits = rush_api::ingest_limits::IngestLimits::from_env(self_metrics.clone())
         .map_err(anyhow::Error::msg)
         .context("ingest limit configuration is invalid")?;
@@ -4013,14 +4112,14 @@ mod query_deadline_tests {
 #[cfg(test)]
 mod tenant_auth_tests {
     use super::{
-        CredentialKind, KeyLookup, TenantResolution, allows_unauthenticated_tenant_request,
-        api_key_public_prefix, credential_route_denial, effective_route_ingest_auth_required,
-        explicit_ingest_tenant, ingest_signal_for_route, internal_sre_route_allowed,
-        is_explain_collector_route, is_state_changing_method, presented_key_resolution,
-        query_workload_for_request, request_log_path, request_origin_allowed_with_policy,
-        requires_csrf_origin, should_audit_rejected_key, should_audit_route_denial,
-        should_reject_for_tenant_auth, should_reject_interactive_llm,
-        trust_forwarded_origin_headers, validate_request_time_range,
+        CredentialKind, DashboardSourceLookup, KeyLookup, TenantResolution, WorkloadSourceKind,
+        allows_unauthenticated_tenant_request, api_key_public_prefix, credential_route_denial,
+        dashboard_source_candidate, effective_route_ingest_auth_required, explicit_ingest_tenant,
+        ingest_signal_for_route, internal_sre_route_allowed, is_explain_collector_route,
+        is_state_changing_method, presented_key_resolution, query_workload_for_request,
+        request_log_path, request_origin_allowed_with_policy, requires_csrf_origin,
+        should_audit_rejected_key, should_audit_route_denial, should_reject_for_tenant_auth,
+        should_reject_interactive_llm, trust_forwarded_origin_headers, validate_request_time_range,
     };
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, Method, Request, header};
@@ -4348,6 +4447,155 @@ mod tenant_auth_tests {
                 .unwrap();
             assert_eq!(query_workload_for_request(&request), None, "{path}");
         }
+    }
+
+    fn resolved(credential: CredentialKind, user_id: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/query/timeseries")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(TenantResolution {
+            tenant_id: "tenant-a".to_string(),
+            authenticated: credential != CredentialKind::Anonymous,
+            credential,
+            api_key: None,
+        });
+        request.extensions_mut().insert(rush_api::RequestIdentity {
+            tenant_id: "tenant-a".to_string(),
+            authenticated: true,
+            actor_id: user_id.to_string(),
+            actor_name: String::new(),
+            actor_type: "user".to_string(),
+            credential_type: "session".to_string(),
+        });
+        request
+    }
+
+    fn with_path_and_source(mut request: Request<Body>, path: &str, source: &str) -> Request<Body> {
+        *request.uri_mut() = path.parse().unwrap();
+        request.headers_mut().insert(
+            "x-rush-workload-source",
+            HeaderValue::from_str(source).unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("x-rush-workload", HeaderValue::from_static("dashboard"));
+        request
+    }
+
+    #[test]
+    fn dashboard_pool_needs_a_session_and_a_named_dashboard_or_notebook() {
+        use rush_api::query_governor::WorkloadClass;
+        fn candidate(request: &Request<Body>) -> Option<DashboardSourceLookup<'_>> {
+            query_workload_for_request(request)
+                .and_then(|class| dashboard_source_candidate(request, class))
+        }
+
+        let request = with_path_and_source(
+            resolved(CredentialKind::Session, "user-1"),
+            "/api/v1/query/timeseries",
+            "dashboard:dash-1",
+        );
+        assert_eq!(
+            candidate(&request),
+            Some(DashboardSourceLookup {
+                kind: WorkloadSourceKind::Dashboard,
+                id: "dash-1",
+                tenant_id: "tenant-a",
+                user_id: "user-1",
+            })
+        );
+        let request = with_path_and_source(
+            resolved(CredentialKind::Session, "user-1"),
+            "/prom/api/v1/query_range",
+            "notebook:nb_2",
+        );
+        assert_eq!(
+            candidate(&request).map(|lookup| lookup.kind),
+            Some(WorkloadSourceKind::Notebook)
+        );
+
+        // The header alone, a non-session caller, or a malformed source never
+        // reaches the read-access check, so it stays in its verified class.
+        let header_only = resolved(CredentialKind::Session, "user-1");
+        assert_eq!(candidate(&header_only), None);
+        for credential in [
+            CredentialKind::QueryKey,
+            CredentialKind::Anonymous,
+            CredentialKind::InternalSre,
+        ] {
+            let request = with_path_and_source(
+                resolved(credential, "user-1"),
+                "/api/v1/query/timeseries",
+                "dashboard:dash-1",
+            );
+            assert_eq!(candidate(&request), None);
+        }
+        let anonymous_session = with_path_and_source(
+            resolved(CredentialKind::Session, ""),
+            "/api/v1/query/timeseries",
+            "dashboard:dash-1",
+        );
+        assert_eq!(candidate(&anonymous_session), None);
+        for source in [
+            "dashboard:",
+            "dashboard",
+            "monitor:m-1",
+            "dashboard:../x",
+            "dashboard:a b",
+            &format!("dashboard:{}", "a".repeat(129)),
+        ] {
+            let request = with_path_and_source(
+                resolved(CredentialKind::Session, "user-1"),
+                "/api/v1/query/timeseries",
+                source,
+            );
+            assert_eq!(candidate(&request), None, "{source}");
+        }
+        // Export and integration routes keep their own pools.
+        for path in ["/api/v1/logs/export", "/jaeger/api/traces"] {
+            let request = with_path_and_source(
+                resolved(CredentialKind::Session, "user-1"),
+                path,
+                "dashboard:dash-1",
+            );
+            let class = query_workload_for_request(&request).unwrap();
+            assert_ne!(class, WorkloadClass::Interactive, "{path}");
+            assert_eq!(dashboard_source_candidate(&request, class), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn prometheus_reads_use_the_integration_pool_outside_the_ui() {
+        use rush_api::query_governor::WorkloadClass;
+        for (credential, expected) in [
+            (CredentialKind::Session, WorkloadClass::Interactive),
+            (CredentialKind::InternalSre, WorkloadClass::Interactive),
+            (CredentialKind::QueryKey, WorkloadClass::Integration),
+            (CredentialKind::Anonymous, WorkloadClass::Integration),
+        ] {
+            for path in [
+                "/prom/api/v1/query_range",
+                "/prom/api/v1/series",
+                "/prom/api/v1/labels",
+                "/prom/api/v1/label/job/values",
+            ] {
+                let mut request = resolved(credential.clone(), "user-1");
+                *request.uri_mut() = path.parse().unwrap();
+                assert_eq!(
+                    query_workload_for_request(&request),
+                    Some(expected),
+                    "{credential:?} {path}"
+                );
+            }
+        }
+        // Non-Prometheus reads by an API key stay interactive.
+        let request = resolved(CredentialKind::QueryKey, "user-1");
+        assert_eq!(
+            query_workload_for_request(&request),
+            Some(WorkloadClass::Interactive)
+        );
     }
 
     #[tokio::test]
