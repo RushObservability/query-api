@@ -1,3 +1,4 @@
+use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -342,8 +343,11 @@ async fn run_evaluation_cycle(
     let now_str_ref = now_str.as_str();
     let monitor_states_ref = &monitor_states;
 
-    let outcomes: Vec<(String, u64, bool)> =
+    crate::engine_metrics::due(config_db.self_metrics(), "monitor_engine", jobs.len());
+    let outcomes: Vec<(String, u64, bool, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
+            let mut observation =
+                EvaluationObservation::new(config_db.self_metrics(), "monitor_engine");
             let result = match crate::query_governor::run_background(
                 &monitor.tenant_id,
                 evaluate_monitor(
@@ -361,9 +365,20 @@ async fn run_evaluation_cycle(
             )
             .await
             {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!("background admission rejected: {error:?}")),
+                Ok(result) => {
+                    observation.finish(if result.is_ok() {
+                        EvaluationOutcome::Completed
+                    } else {
+                        EvaluationOutcome::Error
+                    });
+                    result
+                }
+                Err(error) => {
+                    observation.finish(EvaluationOutcome::AdmissionRejected);
+                    Err(anyhow::anyhow!("background admission rejected: {error:?}"))
+                }
             };
+            let failed = result.is_err();
             let (changes, persisted) = match result {
                 Ok(cp) => cp,
                 Err(e) => {
@@ -388,18 +403,21 @@ async fn run_evaluation_cycle(
                     .await
                 }
             };
-            (monitor.id, changes, persisted)
+            (monitor.id, changes, persisted, failed)
         }))
         .buffer_unordered(ENGINE_CONCURRENCY)
         .collect()
         .await;
 
     let mut state_changes: u64 = 0;
-    for (id, changes, persisted) in outcomes {
+    let mut failures = 0;
+    for (id, changes, persisted, failed) in outcomes {
+        failures += usize::from(failed);
         state_changes += changes;
         eval_state.record(id, now, persisted);
     }
 
+    anyhow::ensure!(failures == 0, "{failures} monitor evaluation job(s) failed");
     Ok((evaluated, state_changes))
 }
 
