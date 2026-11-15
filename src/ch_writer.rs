@@ -595,7 +595,7 @@ impl ChWriter {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
-        self.record_pending(index);
+        // The independent sampler publishes these atomics off the ingest hot path.
         Ok(())
     }
 
