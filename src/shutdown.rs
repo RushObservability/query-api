@@ -55,6 +55,11 @@ impl ShutdownController {
             .await;
     }
 
+    pub async fn wait_for_finish(&self) {
+        self.wait_until(|phase| phase == ShutdownPhase::Finished)
+            .await;
+    }
+
     pub async fn wait_for_drain(&self) {
         self.wait_until(|phase| phase >= ShutdownPhase::Draining)
             .await;

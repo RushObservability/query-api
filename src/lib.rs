@@ -25,6 +25,7 @@ pub mod metric_firewall;
 pub mod migrations;
 pub mod models;
 pub mod monitor_engine;
+pub mod notification_metrics;
 pub mod object_store_spool;
 pub mod outbound;
 pub mod pagination;
@@ -45,6 +46,7 @@ pub mod spool;
 pub mod stats_engine;
 pub mod usage_accumulator;
 pub mod usage_tracker;
+pub mod worker_metrics;
 
 use clickhouse::Client;
 use clickhouse::query::Query;
