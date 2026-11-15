@@ -3120,7 +3120,7 @@ async fn main() -> anyhow::Result<()> {
         run_replayer,
         require_object_store,
     )?;
-    let writer = ChWriter::new(admin_ch.clone(), buffer);
+    let writer = ChWriter::new(admin_ch.clone(), buffer).with_metrics(self_metrics.clone());
     let replayer_handle = if drain_only || run_replayer {
         Some(writer.clone().spawn_replayer(shutdown_controller.clone()))
     } else {
@@ -3152,6 +3152,9 @@ async fn main() -> anyhow::Result<()> {
     // Drain-worker-only: this process exists solely to drain the ingest buffer
     // into ClickHouse. Don't serve HTTP, run engines, or load the firewall.
     if drain_only {
+        let _metrics_server =
+            rush_api::worker_metrics::spawn(self_metrics.clone(), shutdown_controller.clone())
+                .await?;
         tracing::info!(
             backend = effective_backend,
             "RUSH_DRAIN_WORKER_ONLY — draining ingest buffer to ClickHouse; not serving HTTP"

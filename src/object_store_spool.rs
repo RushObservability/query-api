@@ -10,9 +10,11 @@
 //! Object body = `{table}\n{payload}` (table names have no newline; the payload
 //! is the same serde_json batch bytes the disk spool stores).
 
+use crate::self_metrics::SelfMetrics;
+use crate::spool::{record_spool_discard, record_spool_error};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -67,6 +69,7 @@ impl Drop for AppendReservation<'_> {
 }
 
 pub struct ObjectStoreSpool {
+    metrics: OnceLock<Arc<SelfMetrics>>,
     store: Arc<dyn ObjectStore>,
     prefix: String,
     max_bytes: u64,
@@ -82,6 +85,15 @@ pub struct ObjectStoreSpool {
 }
 
 impl ObjectStoreSpool {
+    pub fn attach_metrics(&self, metrics: Arc<SelfMetrics>) {
+        let _ = self.metrics.set(metrics);
+    }
+    fn record_error(&self, operation: &'static str) {
+        if let Some(metrics) = self.metrics.get() {
+            record_spool_error(metrics, "object_store", operation);
+        }
+    }
+
     /// Build an S3/MinIO-backed buffer and seed counters from any objects left
     /// over from a previous run (durable across restarts/pods).
     pub async fn open_s3(
@@ -123,6 +135,7 @@ impl ObjectStoreSpool {
             format!("{prefix}/")
         };
         let s = ObjectStoreSpool {
+            metrics: OnceLock::new(),
             store,
             prefix,
             max_bytes,
@@ -296,6 +309,7 @@ impl ObjectStoreSpool {
                         .first_key_value()
                         .map(|(key, size)| (key.clone(), *size)),
                     Err(e) => {
+                        self.record_error("list");
                         tracing::warn!(error = %e, "object-store buffer: list failed");
                         return None;
                     }
@@ -306,6 +320,7 @@ impl ObjectStoreSpool {
                 Ok(r) => match r.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
+                        self.record_error("read");
                         tracing::warn!(error = %e, key = %key, "buffer: get bytes failed");
                         return None;
                     }
@@ -317,6 +332,7 @@ impl ObjectStoreSpool {
                     continue;
                 }
                 Err(e) => {
+                    self.record_error("get");
                     tracing::warn!(error = %e, key = %key, "buffer: get failed");
                     return None;
                 }
@@ -328,6 +344,15 @@ impl ObjectStoreSpool {
                     if !self.delete_batch(&key, size).await {
                         return None;
                     }
+                    if let Some(metrics) = self.metrics.get() {
+                        record_spool_discard(
+                            metrics,
+                            "object_store",
+                            "frame_decode",
+                            "object",
+                            size,
+                        );
+                    }
                     continue; // try the next object
                 }
             }
@@ -335,9 +360,12 @@ impl ObjectStoreSpool {
     }
 
     /// Delete a successfully-drained object.
-    pub async fn commit(&self, key: &OsPath, size: u64) {
+    pub async fn commit(&self, key: &OsPath, size: u64) -> bool {
         if self.delete_batch(key, size).await {
             self.committed.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 
@@ -345,6 +373,7 @@ impl ObjectStoreSpool {
         let _transaction = self.transactions.read().await;
         let mut index = self.index.lock().await;
         if let Err(e) = self.store.delete(key).await {
+            self.record_error("delete");
             tracing::warn!(error = %e, key = %key, "object-store buffer: delete failed");
             return false;
         }
@@ -421,6 +450,26 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn corrupt_objects_are_discarded_without_inflating_committed_batches() {
+        let store = store();
+        store
+            .put(
+                &OsPath::from("ingest/0000000000000-00000000.batch"),
+                Bytes::from_static(b"broken").into(),
+            )
+            .await
+            .unwrap();
+        let spool = ObjectStoreSpool::open(store, "ingest", 1024).await.unwrap();
+        let metrics = Arc::new(SelfMetrics::new());
+        spool.attach_metrics(metrics.clone());
+        assert!(spool.next_batch().await.is_none());
+        assert!(spool.next_batch().await.is_none());
+        assert_eq!(spool.committed_total(), 0);
+        assert_eq!(spool.total_bytes(), 0);
+        assert!(metrics.render_prometheus().contains("rush_ingest_spool_discarded_total{backend=\"object_store\",reason=\"frame_decode\",unit=\"object\"} 1"));
     }
 
     #[tokio::test]

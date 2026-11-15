@@ -25,6 +25,7 @@ use crate::models::ingest::{
 use crate::models::profile::ProfileRow;
 use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
+use crate::self_metrics::SelfMetrics;
 use crate::shutdown::{ShutdownController, ShutdownPhase};
 use crate::spool::{IngestBuffer, SpoolFull};
 
@@ -371,6 +372,7 @@ impl BatchAccumulator {
 #[derive(Clone)]
 pub struct ChWriter {
     ch: Client,
+    metrics: Arc<SelfMetrics>,
     /// Durable failure-path buffer. Backend-agnostic: `Disk` (default, no object
     /// store) or, later, `ObjectStore`. See `crate::spool::IngestBuffer`.
     pub buffer: Arc<IngestBuffer>,
@@ -391,12 +393,19 @@ impl ChWriter {
     pub fn with_batch_config(ch: Client, buffer: Arc<IngestBuffer>, cfg: BatchConfig) -> Self {
         ChWriter {
             ch,
+            metrics: Arc::new(SelfMetrics::new()),
             buffer,
             firewall: Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::metric_firewall::MetricFirewall::default(),
             ))),
             batcher: Arc::new(BatchAccumulator::new(cfg)),
         }
+    }
+
+    /// Attach the process registry before cloning or starting background work.
+    pub fn with_metrics(mut self, metrics: Arc<SelfMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// The active batching configuration.
@@ -598,6 +607,43 @@ impl ChWriter {
 
     /// Spawn a background tokio task that replays spooled segments to CH.
     pub fn spawn_replayer(self, shutdown: ShutdownController) -> tokio::task::JoinHandle<()> {
+        self.buffer.attach_metrics(self.metrics.clone());
+        let sampler = self.clone();
+        let sampler_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = sampler_shutdown.wait_for_finish() => break,
+                    _ = interval.tick() => {}
+                }
+                let backend = sampler.buffer.backend_name();
+                if sampler.buffer.refresh_counts().await.is_err() {
+                    crate::spool::record_spool_error(&sampler.metrics, backend, "refresh");
+                }
+                let labels = [("backend", backend)];
+                for (name, value) in [
+                    (
+                        "rush_ingest_replay_pending_bytes",
+                        sampler.buffer.total_bytes() as f64,
+                    ),
+                    (
+                        "rush_ingest_replay_pending_batches",
+                        sampler.buffer.segment_count() as f64,
+                    ),
+                    (
+                        "rush_ingest_replay_oldest_age_seconds",
+                        sampler.buffer.oldest_age_secs().await.unwrap_or(0) as f64,
+                    ),
+                    (
+                        "rush_ingest_replay_max_bytes",
+                        sampler.buffer.max_bytes() as f64,
+                    ),
+                ] {
+                    sampler.metrics.set_gauge(name, &labels, value);
+                }
+            }
+        });
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(5);
             const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -634,16 +680,20 @@ impl ChWriter {
                     }
                 };
 
+                let started = Instant::now();
+                let backend = self.buffer.backend_name();
                 let mut all_ok = true;
+                let mut partial = drain.discarded_bytes > 0;
+                let mut discarded_records = 0;
+                let mut discarded_bytes = 0;
                 for (table, payload) in &drain.records {
                     let batch: SpoolBatch = match decode_spool(payload) {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                table = table,
-                                "replayer: deserialise failed — skipping record"
-                            );
+                            discarded_records += 1;
+                            discarded_bytes += payload.len() as u64;
+                            partial = true;
+                            tracing::warn!(error = %e, table = table, "replayer: deserialise failed — skipping record");
                             continue;
                         }
                     };
@@ -654,17 +704,73 @@ impl ChWriter {
                             table = table,
                             "replayer: CH insert failed — backing off"
                         );
+                        self.metrics.inc_counter(
+                            "rush_ingest_replay_records_total",
+                            &[("backend", backend), ("outcome", "insert_error")],
+                            1,
+                        );
                         all_ok = false;
                         break;
                     }
+                    self.metrics.inc_counter(
+                        "rush_ingest_replay_records_total",
+                        &[("backend", backend), ("outcome", "inserted")],
+                        1,
+                    );
                 }
 
+                self.metrics.observe_histogram(
+                    "rush_ingest_replay_duration_ms",
+                    &[("backend", backend)],
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
                 if all_ok {
                     let n = drain.records.len();
-                    self.buffer.commit(drain).await;
+                    let committed = self.buffer.commit(drain).await;
+                    if committed && discarded_records > 0 {
+                        let labels = [
+                            ("backend", backend),
+                            ("reason", "payload_decode"),
+                            ("unit", "record"),
+                        ];
+                        self.metrics.inc_counter(
+                            "rush_ingest_spool_discarded_total",
+                            &labels,
+                            discarded_records,
+                        );
+                        self.metrics.inc_counter(
+                            "rush_ingest_spool_discarded_bytes_total",
+                            &labels,
+                            discarded_bytes,
+                        );
+                    }
+                    let outcome = if !committed {
+                        "commit_error"
+                    } else if partial {
+                        "partial"
+                    } else {
+                        "committed"
+                    };
+                    self.metrics.inc_counter(
+                        "rush_ingest_replay_batches_total",
+                        &[("backend", backend), ("outcome", outcome)],
+                        1,
+                    );
+                    if committed && !partial {
+                        self.metrics.set_gauge(
+                            "rush_ingest_replay_last_success_timestamp_seconds",
+                            &[("backend", backend)],
+                            chrono::Utc::now().timestamp() as f64,
+                        );
+                    }
                     tracing::info!(records = n, "replayer: batch replayed and committed");
                     backoff = Duration::from_secs(5); // reset on success
                 } else {
+                    self.metrics.inc_counter(
+                        "rush_ingest_replay_batches_total",
+                        &[("backend", backend), ("outcome", "insert_error")],
+                        1,
+                    );
                     // CH is still down — back off and stop this replay pass.
                     // (drain not committed → retried next pass.) During graceful
                     // shutdown this intentionally waits rather than exiting;
@@ -945,6 +1051,47 @@ mod batch_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.1);
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_replay_payload_is_partial_not_successful_delivery() {
+        let test = TestWriter::new("http://127.0.0.1:9", BatchConfig::default());
+        // TestWriter's spool has a zero-byte cap; use a separate bounded spool.
+        let dir = test.1.join("replay");
+        let buffer = Arc::new(IngestBuffer::Disk(
+            crate::spool::Spool::open(&dir, 1024).unwrap(),
+        ));
+        buffer
+            .append("untrusted-table-name", b"bad".to_vec())
+            .await
+            .unwrap();
+        let metrics = Arc::new(SelfMetrics::new());
+        let writer = ChWriter::new(
+            Client::default().with_url("http://127.0.0.1:9"),
+            buffer.clone(),
+        )
+        .with_metrics(metrics.clone());
+        let shutdown = ShutdownController::new();
+        shutdown.begin_drain();
+        let task = writer.spawn_replayer(shutdown.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while buffer.segment_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.finish();
+        task.await.unwrap();
+        let text = metrics.render_prometheus();
+        assert!(text.contains("rush_ingest_spool_discarded_total{backend=\"disk\",reason=\"payload_decode\",unit=\"record\"} 1"));
+        assert!(
+            text.contains(
+                "rush_ingest_replay_batches_total{backend=\"disk\",outcome=\"partial\"} 1"
+            )
+        );
+        assert!(!text.contains("last_success_timestamp"));
+        assert!(!text.contains("untrusted-table-name"));
     }
 
     #[tokio::test]
