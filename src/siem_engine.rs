@@ -1,4 +1,5 @@
 use crate::clickhouse_config::ConfigDb;
+use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use crate::models::detection::DetectionRule;
 use clickhouse::Client;
 use std::sync::Arc;
@@ -59,6 +60,7 @@ async fn run_detection_cycle(
 
     let rules = config_db.list_enabled_detection_rules().await?;
     if rules.is_empty() {
+        crate::engine_metrics::due(config_db.self_metrics(), "siem_engine", 0);
         tracing::debug!(engine = "siem", "tick -- no enabled detection rules");
         return Ok(());
     }
@@ -76,11 +78,14 @@ async fn run_detection_cycle(
         })
         .collect();
 
+    crate::engine_metrics::due(config_db.self_metrics(), "siem_engine", jobs.len());
     let evaluated = jobs.len() as u32;
     let now_str_ref = now_str.as_str();
 
-    let outcomes: Vec<(String, bool, bool)> =
+    let outcomes: Vec<(String, bool, bool, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(rule, should_flush)| async move {
+            let mut observation =
+                EvaluationObservation::new(config_db.self_metrics(), "siem_engine");
             let evaluated = crate::query_governor::run_background(
                 &rule.tenant_id,
                 evaluate_rule(
@@ -95,8 +100,12 @@ async fn run_detection_cycle(
             )
             .await;
             match evaluated {
-                Ok(Ok((did_fire, persisted))) => (rule.id, did_fire, persisted),
+                Ok(Ok((did_fire, persisted))) => {
+                    observation.finish(EvaluationOutcome::Completed);
+                    (rule.id, did_fire, persisted, false)
+                }
                 Ok(Err(e)) => {
+                    observation.finish(EvaluationOutcome::Error);
                     tracing::warn!(
                         error = %e,
                         engine = "siem",
@@ -104,9 +113,10 @@ async fn run_detection_cycle(
                         rule_id = %rule.id,
                         "rule evaluation failed"
                     );
-                    (rule.id, false, false)
+                    (rule.id, false, false, true)
                 }
                 Err(e) => {
+                    observation.finish(EvaluationOutcome::AdmissionRejected);
                     tracing::warn!(
                         error = ?e,
                         engine = "siem",
@@ -114,7 +124,7 @@ async fn run_detection_cycle(
                         rule_id = %rule.id,
                         "rule evaluation admission rejected"
                     );
-                    (rule.id, false, false)
+                    (rule.id, false, false, true)
                 }
             }
         }))
@@ -123,7 +133,9 @@ async fn run_detection_cycle(
         .await;
 
     let mut fired = 0u32;
-    for (id, did_fire, persisted) in outcomes {
+    let mut failures = 0;
+    for (id, did_fire, persisted, failed) in outcomes {
+        failures += usize::from(failed);
         if did_fire {
             fired += 1;
         }
@@ -141,6 +153,10 @@ async fn run_detection_cycle(
         tracing::debug!(engine = "siem", "tick -- no rules due");
     }
 
+    anyhow::ensure!(
+        failures == 0,
+        "{failures} detection evaluation job(s) failed"
+    );
     Ok(())
 }
 

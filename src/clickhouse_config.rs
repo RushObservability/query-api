@@ -87,6 +87,15 @@ struct SavedQueryRow {
 }
 
 impl ConfigDb {
+    /// Attach the shared process registry before starting background work.
+    pub fn attach_metrics(&self, metrics: std::sync::Arc<crate::self_metrics::SelfMetrics>) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    pub fn self_metrics(&self) -> Option<&crate::self_metrics::SelfMetrics> {
+        self.metrics.get().map(std::sync::Arc::as_ref)
+    }
+
     pub async fn create_investigation_session(
         &self,
         id: &str,
@@ -2443,6 +2452,7 @@ mod sql_shape_tests {
 }
 
 pub struct ConfigDb {
+    metrics: std::sync::OnceLock<std::sync::Arc<crate::self_metrics::SelfMetrics>>,
     pub client: Client,
     /// Tenant name-or-id → flags. Negative results are cached too so unknown
     /// tenants on the ingest path don't hammer ClickHouse.
@@ -2635,6 +2645,7 @@ impl ConfigDb {
             .with_user(user)
             .with_password(password);
         let db = Self {
+            metrics: std::sync::OnceLock::new(),
             client,
             tenant_cache: DashMap::new(),
             ingest_auth_cache: DashMap::new(),
@@ -12407,6 +12418,7 @@ mod session_tenant_regressions {
 
     fn config(mock: &Mock) -> ConfigDb {
         ConfigDb {
+            metrics: std::sync::OnceLock::new(),
             client: Client::default()
                 .with_url(mock.url())
                 .with_compression(clickhouse::Compression::None),

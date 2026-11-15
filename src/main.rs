@@ -2584,6 +2584,7 @@ async fn main() -> anyhow::Result<()> {
     // outbox degradation is visible even if no one has scraped `/metrics` yet.
     let self_metrics: std::sync::Arc<rush_api::self_metrics::SelfMetrics> =
         std::sync::Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    config_db.attach_metrics(self_metrics.clone());
     let query_governor_config = QueryGovernorConfig::at_startup(
         config_db
             .get_setting(QUERY_LIMITS_SETTING_KEY)

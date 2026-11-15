@@ -75,9 +75,10 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("RUSH_PROM_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
     tracing::info!("wide-anomaly-engine starting");
-    // The standalone engine has no /metrics endpoint; give it a private registry so the
-    // engine-loop instrumentation still works (record_engine just updates in-memory atomics).
+    // The standalone worker exports the same bounded metrics as the API process.
     let self_metrics = Arc::new(rush_api::self_metrics::SelfMetrics::new());
+    config_db.attach_metrics(self_metrics.clone());
+    rush_api::process_metrics::spawn(self_metrics.clone());
     let query_limits = rush_api::query_governor::QueryGovernorConfig::at_startup(
         config_db
             .get_setting(rush_api::query_governor::QUERY_LIMITS_SETTING_KEY)
@@ -94,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
     // Takes the same lease as the in-process engine, so this deployment and any
     // API replica can never both evaluate rules.
     let shutdown = rush_api::shutdown::ShutdownController::new();
+    let _metrics_server =
+        rush_api::worker_metrics::spawn(self_metrics.clone(), shutdown.clone()).await?;
     let election = rush_api::leader::LeaderElection::from_env(
         config_db.client.clone(),
         &rush_api::stats_engine::configured_instance_id(),
@@ -120,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    shutdown.finish();
     Ok(())
 }
 
