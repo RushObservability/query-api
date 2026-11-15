@@ -836,7 +836,7 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
 /// `dashboard:<id>` or `notebook:<id>`. On its own it grants nothing.
 const WORKLOAD_SOURCE_HEADER: &str = "x-rush-workload-source";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkloadSourceKind {
     Dashboard,
     Notebook,
@@ -932,6 +932,27 @@ enum SourceAccess {
 struct SharedSourceCheck {
     started: std::time::Instant,
     result: tokio::sync::OnceCell<SourceAccess>,
+    /// True while a read is running the lookup for this cell.
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl SharedSourceCheck {
+    fn new(started: std::time::Instant) -> Arc<Self> {
+        Arc::new(Self {
+            started,
+            result: tokio::sync::OnceCell::new(),
+            running: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+/// Clears `SharedSourceCheck::running` when the lookup ends or is cancelled.
+struct RunningLookup<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for RunningLookup<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// The source check runs before admission, so no workload pool bounds it.
@@ -947,8 +968,10 @@ struct DashboardSourceChecks {
     capacity: usize,
     ttl: Duration,
     wait: Duration,
-    /// Set while lookups fail, so an outage logs once, not once per read.
-    degraded: std::sync::atomic::AtomicBool,
+    /// When the last lookup failed, while checks are degraded. An outage
+    /// logs once when it starts and once after `quiet` without failures.
+    degraded_since_failure: std::sync::Mutex<Option<std::time::Instant>>,
+    quiet: Duration,
 }
 
 impl DashboardSourceChecks {
@@ -959,25 +982,30 @@ impl DashboardSourceChecks {
             capacity,
             ttl,
             wait,
-            degraded: std::sync::atomic::AtomicBool::new(false),
+            degraded_since_failure: std::sync::Mutex::new(None),
+            quiet: Duration::from_secs(60),
         }
     }
 
     fn note_failure(&self, reason: &dyn std::fmt::Display) {
-        if !self
-            .degraded
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
+        let mut last = self
+            .degraded_since_failure
+            .lock()
+            .expect("source check log state poisoned");
+        if last.is_none() {
             tracing::warn!(%reason, "dashboard workload source checks are failing; affected reads get a retryable error or run as interactive");
         }
+        *last = Some(std::time::Instant::now());
     }
 
     fn note_success(&self) {
-        if self
-            .degraded
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+        let mut last = self
+            .degraded_since_failure
+            .lock()
+            .expect("source check log state poisoned");
+        if last.is_some_and(|failed| failed.elapsed() >= self.quiet) {
             tracing::info!("dashboard workload source checks recovered");
+            *last = None;
         }
     }
 
@@ -989,30 +1017,34 @@ impl DashboardSourceChecks {
     ) -> SourceAccess {
         let now = std::time::Instant::now();
         if !self.checks.contains_key(&key) && self.checks.len() >= self.capacity {
-            self.checks
-                .retain(|_, entry| now.duration_since(entry.started) < self.ttl);
+            // Keep fresh readable answers and lookups still running; drop
+            // expired entries and ones every waiting read gave up on.
+            self.checks.retain(|_, entry| {
+                now.duration_since(entry.started) < self.ttl
+                    && (entry.result.get() == Some(&SourceAccess::Readable)
+                        || entry.running.load(std::sync::atomic::Ordering::SeqCst))
+            });
             if self.checks.len() >= self.capacity {
                 self.checks.clear();
             }
         }
         let entry = {
-            let mut slot = self.checks.entry(key.clone()).or_insert_with(|| {
-                Arc::new(SharedSourceCheck {
-                    started: now,
-                    result: tokio::sync::OnceCell::new(),
-                })
-            });
+            let mut slot = self
+                .checks
+                .entry(key.clone())
+                .or_insert_with(|| SharedSourceCheck::new(now));
             if now.duration_since(slot.started) >= self.ttl {
-                *slot = Arc::new(SharedSourceCheck {
-                    started: now,
-                    result: tokio::sync::OnceCell::new(),
-                });
+                *slot = SharedSourceCheck::new(now);
             }
             slot.clone()
         };
         let outcome = tokio::time::timeout(
             self.wait,
             entry.result.get_or_init(|| async {
+                entry
+                    .running
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let _running = RunningLookup(&entry.running);
                 let Ok(_permit) = self.in_flight.acquire().await else {
                     return SourceAccess::Unknown;
                 };
@@ -1033,6 +1065,7 @@ impl DashboardSourceChecks {
             }),
         )
         .await;
+        let answered = outcome.is_ok();
         let access = match outcome {
             Ok(access) => *access,
             Err(_) => {
@@ -1040,8 +1073,10 @@ impl DashboardSourceChecks {
                 SourceAccess::Unknown
             }
         };
-        if access != SourceAccess::Readable {
-            // Only readable results stay; the next read checks again.
+        // Only readable answers stay; the next read checks again. A read that
+        // gave up waiting leaves the entry: another read may be checking it
+        // or take the check over, and later reads should join that one.
+        if answered && access != SourceAccess::Readable {
             self.checks
                 .remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
         }
@@ -1058,7 +1093,11 @@ static DASHBOARD_SOURCE_CHECKS: std::sync::LazyLock<DashboardSourceChecks> =
 /// couldn't finish. It runs as interactive; if its range fits only the
 /// dashboard window, it gets a retryable 503 instead of a 400.
 #[derive(Clone, Copy)]
-struct UnverifiedDashboardSource;
+struct UnverifiedDashboardSource {
+    /// The dashboard window when the read was classified; a longer range
+    /// gets the 400 because retrying can't help it.
+    dashboard_max_secs: u64,
+}
 
 /// Moves an interactive read into the dashboard pool when its named source
 /// is readable. Takes the extracted lookup, not the request: the request body
@@ -1084,10 +1123,6 @@ where
     }
 }
 
-/// Set on a `time_range_too_large` response so callers can tell it apart.
-#[derive(Clone, Copy)]
-struct RangeTooLarge;
-
 fn time_range_error_response(error: TimeRangeError) -> Response {
     let (code, message) = match error {
         TimeRangeError::Malformed => (
@@ -1103,13 +1138,8 @@ fn time_range_error_response(error: TimeRangeError) -> Response {
             "time range exceeds the configured workload limit",
         ),
     };
-    let mut response =
-        rush_api::api_error::ApiError::public(axum::http::StatusCode::BAD_REQUEST, code, message)
-            .into_response();
-    if matches!(error, TimeRangeError::TooLarge { .. }) {
-        response.extensions_mut().insert(RangeTooLarge);
-    }
-    response
+    rush_api::api_error::ApiError::public(axum::http::StatusCode::BAD_REQUEST, code, message)
+        .into_response()
 }
 
 fn dashboard_source_unverified_response() -> Response {
@@ -1125,10 +1155,31 @@ fn dashboard_source_unverified_response() -> Response {
     response
 }
 
-fn validate_range_pair(from: &str, to: &str, max_seconds: u64) -> Result<(), Response> {
+fn validate_range_pair(from: &str, to: &str, max_seconds: u64) -> Result<(), RangeRejection> {
     ValidatedTimeRange::parse(from, to, max_seconds)
         .map(|_| ())
-        .map_err(time_range_error_response)
+        .map_err(RangeRejection::Range)
+}
+
+/// Why a query's time range or body was rejected before dispatch.
+#[derive(Debug)]
+enum RangeRejection {
+    Range(TimeRangeError),
+    BodyTooLarge,
+}
+
+impl IntoResponse for RangeRejection {
+    fn into_response(self) -> Response {
+        match self {
+            RangeRejection::Range(error) => time_range_error_response(error),
+            RangeRejection::BodyTooLarge => rush_api::api_error::ApiError::public(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "query_body_too_large",
+                "query request body exceeds the configured limit",
+            )
+            .into_response(),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1157,7 +1208,10 @@ fn json_time_range(
     )))
 }
 
-async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Result<(), Response> {
+async fn check_request_time_range(
+    req: &mut Request,
+    max_seconds: u64,
+) -> Result<(), RangeRejection> {
     if let Some(query) = req.uri().query() {
         let values = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
@@ -1169,14 +1223,14 @@ async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Res
                 values
                     .get("from")
                     .zip(values.get("to"))
-                    .ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?,
+                    .ok_or(RangeRejection::Range(TimeRangeError::Malformed))?,
             )
         } else if start_end_present {
             Some(
                 values
                     .get("start")
                     .zip(values.get("end"))
-                    .ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?,
+                    .ok_or(RangeRejection::Range(TimeRangeError::Malformed))?,
             )
         } else {
             None
@@ -1191,14 +1245,7 @@ async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Res
         let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
         let bytes = match axum::body::to_bytes(body, MAX_QUERY_BODY_BYTES).await {
             Ok(bytes) => bytes,
-            Err(_) => {
-                return Err(rush_api::api_error::ApiError::public(
-                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                    "query_body_too_large",
-                    "query request body exceeds the configured limit",
-                )
-                .into_response());
-            }
+            Err(_) => return Err(RangeRejection::BodyTooLarge),
         };
         let is_form = req
             .headers()
@@ -1220,13 +1267,12 @@ async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Res
                     _ => continue,
                 };
                 if field.replace(value).is_some() {
-                    return Err(time_range_error_response(TimeRangeError::Malformed));
+                    return Err(RangeRejection::Range(TimeRangeError::Malformed));
                 }
             }
             if start.is_some() || end.is_some() {
-                let from =
-                    start.ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?;
-                let to = end.ok_or_else(|| time_range_error_response(TimeRangeError::Malformed))?;
+                let from = start.ok_or(RangeRejection::Range(TimeRangeError::Malformed))?;
+                let to = end.ok_or(RangeRejection::Range(TimeRangeError::Malformed))?;
                 validate_range_pair(&from, &to, max_seconds)?;
             }
             None
@@ -1234,12 +1280,12 @@ async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Res
             None
         } else {
             match serde_json::from_slice::<RequestTimeRangeEnvelope<'_>>(&bytes) {
-                Ok(value) => json_time_range(value).map_err(time_range_error_response)?,
+                Ok(value) => json_time_range(value).map_err(RangeRejection::Range)?,
                 // Invalid JSON is still left to the downstream extractor, as
                 // before. A valid document with the wrong time_range shape is
                 // a stable workload-policy error here.
                 Err(error) if error.is_data() => {
-                    return Err(time_range_error_response(TimeRangeError::Malformed));
+                    return Err(RangeRejection::Range(TimeRangeError::Malformed));
                 }
                 Err(_) => None,
             }
@@ -1250,6 +1296,13 @@ async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Res
         *req.body_mut() = axum::body::Body::from(bytes);
     }
     Ok(())
+}
+
+#[cfg(test)]
+async fn validate_request_time_range(req: &mut Request, max_seconds: u64) -> Result<(), Response> {
+    check_request_time_range(req, max_seconds)
+        .await
+        .map_err(IntoResponse::into_response)
 }
 
 fn admission_error_response(error: AdmissionError) -> Response {
@@ -1278,30 +1331,87 @@ async fn query_policy_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(class) = query_workload_for_request(&req) else {
-        return next.run(req).await;
-    };
-    let (class, unverified) = dashboard_upgrade(
-        class,
-        dashboard_source_candidate(&req, class),
+    run_query_policy(
+        &state.query_governor,
+        &state.self_metrics,
         &DASHBOARD_SOURCE_CHECKS,
-        |lookup| dashboard_source_readable(&state, lookup),
+        req,
+        |lookup| {
+            let (kind, id, tenant_id, user_id) = (
+                lookup.kind,
+                lookup.id.to_owned(),
+                lookup.tenant_id.to_owned(),
+                lookup.user_id.to_owned(),
+            );
+            let state = &state;
+            async move {
+                dashboard_source_readable(
+                    state,
+                    DashboardSourceLookup {
+                        kind,
+                        id: &id,
+                        tenant_id: &tenant_id,
+                        user_id: &user_id,
+                    },
+                )
+                .await
+            }
+        },
+        |req| next.run(req),
     )
-    .await;
+    .await
+}
+
+/// Classify, admit and run one query request. Split from the middleware so
+/// tests can drive it with their own governor, source check and handler.
+async fn run_query_policy<C, CFut, F, Fut>(
+    governor: &QueryGovernor,
+    metrics: &rush_api::self_metrics::SelfMetrics,
+    checks: &DashboardSourceChecks,
+    req: Request,
+    check: C,
+    next: F,
+) -> Response
+where
+    C: FnOnce(DashboardSourceLookup<'_>) -> CFut,
+    CFut: std::future::Future<Output = anyhow::Result<bool>>,
+    F: FnOnce(Request) -> Fut,
+    Fut: std::future::Future<Output = Response>,
+{
+    let Some(class) = query_workload_for_request(&req) else {
+        return next(req).await;
+    };
+    let lookup = dashboard_source_candidate(&req, class);
+    let named_source = lookup.is_some();
+    let (class, unverified) = dashboard_upgrade(class, lookup, checks, check).await;
+    if named_source {
+        let result = match (class, unverified) {
+            (WorkloadClass::Dashboard, _) => "readable",
+            (_, true) => "unknown",
+            _ => "not_readable",
+        };
+        metrics.inc_counter(
+            "rush_dashboard_source_checks_total",
+            &[("result", result)],
+            1,
+        );
+    }
     let mut req = req;
     if unverified {
-        req.extensions_mut().insert(UnverifiedDashboardSource);
+        req.extensions_mut().insert(UnverifiedDashboardSource {
+            dashboard_max_secs: governor.config().dashboard.max_time_range_secs,
+        });
     }
     let tenant = req
         .extensions()
         .get::<TenantContext>()
         .map(|context| context.tenant_id.clone())
         .unwrap_or_else(|| "default".to_string());
-    let guard = match state.query_governor.admit(class, &tenant).await {
+    let guard = match governor.admit(class, &tenant).await {
         Ok(guard) => guard,
         Err(error) => return admission_error_response(error),
     };
-    execute_admitted_query(guard, &state.self_metrics, class, req, |req| next.run(req)).await
+    execute_admitted_query(guard, metrics, class, req, next).await
 }
 
 async fn execute_admitted_query<F, Fut>(
@@ -1323,28 +1433,28 @@ where
     let result = rush_api::query_governor::with_budget(
         budget.clone(),
         tokio::time::timeout_at(deadline, async {
-            if let Err(response) =
-                validate_request_time_range(&mut req, budget.max_time_range_secs).await
-            {
-                let unverified = req
-                    .extensions()
-                    .get::<UnverifiedDashboardSource>()
-                    .is_some();
-                return if unverified && response.extensions().get::<RangeTooLarge>().is_some() {
-                    dashboard_source_unverified_response()
-                } else {
-                    response
-                };
+            match check_request_time_range(&mut req, budget.max_time_range_secs).await {
+                Ok(()) => (next(req).await, "completed"),
+                // Fits the dashboard window, so a retry once the access check
+                // answers can succeed.
+                Err(RangeRejection::Range(TimeRangeError::TooLarge { seconds, .. }))
+                    if req
+                        .extensions()
+                        .get::<UnverifiedDashboardSource>()
+                        .is_some_and(|source| seconds <= source.dashboard_max_secs) =>
+                {
+                    (dashboard_source_unverified_response(), "source_unverified")
+                }
+                Err(rejection) => (rejection.into_response(), "completed"),
             }
-            next(req).await
         }),
     )
     .await;
     match result {
-        Ok(response) => {
+        Ok((response, outcome)) => {
             metrics.inc_counter(
                 "rush_query_requests_total",
-                &[("workload", label), ("outcome", "completed")],
+                &[("workload", label), ("outcome", outcome)],
                 1,
             );
             if class == WorkloadClass::Export {
@@ -4257,13 +4367,16 @@ mod query_deadline_tests {
     }
 
     #[tokio::test]
-    async fn unverified_dashboard_reads_get_a_retryable_error_only_when_the_range_needs_it() {
+    async fn unverified_dashboard_reads_get_a_retryable_error_only_when_a_retry_can_help() {
         let (governor, metrics) = governor();
-        let month = 30 * 24 * 60 * 60;
+        let (day, month) = (24 * 60 * 60, 30 * 24 * 60 * 60);
         for (unverified, range_secs, expected) in [
+            // Too long for interactive but within the dashboard window.
             (true, month, StatusCode::SERVICE_UNAVAILABLE),
+            // Too long for the dashboard window too: a retry can't help.
+            (true, 3 * month, StatusCode::BAD_REQUEST),
             (false, month, StatusCode::BAD_REQUEST),
-            (true, 60, StatusCode::OK),
+            (true, day, StatusCode::OK),
         ] {
             let guard = governor
                 .admit(WorkloadClass::Interactive, "tenant-a")
@@ -4274,7 +4387,9 @@ mod query_deadline_tests {
                 .body(Body::empty())
                 .unwrap();
             if unverified {
-                req.extensions_mut().insert(UnverifiedDashboardSource);
+                req.extensions_mut().insert(UnverifiedDashboardSource {
+                    dashboard_max_secs: month,
+                });
             }
             let response = execute_admitted_query(
                 guard,
@@ -4284,11 +4399,19 @@ mod query_deadline_tests {
                 |_| async { StatusCode::OK.into_response() },
             )
             .await;
-            assert_eq!(response.status(), expected, "unverified={unverified}");
+            assert_eq!(
+                response.status(),
+                expected,
+                "unverified={unverified} range={range_secs}"
+            );
             if expected == StatusCode::SERVICE_UNAVAILABLE {
                 assert_eq!(response.headers()[header::RETRY_AFTER], "1");
             }
         }
+        let text = metrics.render_prometheus();
+        assert!(text.contains(
+            "rush_query_requests_total{outcome=\"source_unverified\",workload=\"interactive\"} 1"
+        ));
     }
 
     #[tokio::test]
@@ -4335,15 +4458,17 @@ mod tenant_auth_tests {
         effective_route_ingest_auth_required, explicit_ingest_tenant, ingest_signal_for_route,
         internal_sre_route_allowed, is_explain_collector_route, is_state_changing_method,
         presented_key_resolution, query_workload_for_request, request_log_path,
-        request_origin_allowed_with_policy, requires_csrf_origin, should_audit_rejected_key,
-        should_audit_route_denial, should_reject_for_tenant_auth, should_reject_interactive_llm,
-        trust_forwarded_origin_headers, validate_request_time_range,
+        request_origin_allowed_with_policy, requires_csrf_origin, run_query_policy,
+        should_audit_rejected_key, should_audit_route_denial, should_reject_for_tenant_auth,
+        should_reject_interactive_llm, trust_forwarded_origin_headers, validate_request_time_range,
     };
     use axum::body::Body;
-    use axum::http::{HeaderMap, HeaderValue, Method, Request, header};
+    use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+    use axum::response::IntoResponse;
     use rush_api::clickhouse_config::ApiKeyGrant;
     use rush_api::cors::CorsPolicy;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
 
     #[test]
     fn startup_validates_api_key_secret_before_running_migrations() {
@@ -4827,7 +4952,36 @@ mod tenant_auth_tests {
             .await,
             (WorkloadClass::Interactive, true)
         );
-        assert!(impatient.checks.is_empty());
+        // The entry stays for later reads to pick up the check...
+        assert_eq!(impatient.checks.len(), 1);
+        assert_eq!(
+            classify(&panel("dash-4"), &impatient, &calls, quick, Ok(true)).await,
+            (WorkloadClass::Dashboard, false)
+        );
+        // ...and when the map is full, entries every read gave up on go
+        // before readable answers.
+        classify(
+            &panel("dash-slow"),
+            &impatient,
+            &calls,
+            Duration::from_secs(1),
+            Ok(true),
+        )
+        .await;
+        assert_eq!(impatient.checks.len(), 2);
+        classify(&panel("dash-new"), &impatient, &calls, quick, Ok(true)).await;
+        let key = |id| {
+            DashboardSourceLookup {
+                kind: WorkloadSourceKind::Dashboard,
+                id,
+                tenant_id: "tenant-a",
+                user_id: "user-1",
+            }
+            .cache_key()
+        };
+        assert!(impatient.checks.contains_key(&key("dash-4")));
+        assert!(impatient.checks.contains_key(&key("dash-new")));
+        assert!(!impatient.checks.contains_key(&key("dash-slow")));
 
         // A failed lookup is shared by the reads waiting on it, not retried
         // by each of them.
@@ -4855,6 +5009,84 @@ mod tenant_auth_tests {
             classify(&panel(id), &checks, &calls, quick, Ok(true)).await;
         }
         assert!(checks.checks.len() <= 2);
+    }
+
+    #[test]
+    fn source_check_outage_state_clears_only_after_a_quiet_period() {
+        use std::time::Duration;
+        let mut checks =
+            DashboardSourceChecks::new(1, 2, Duration::from_secs(60), Duration::from_secs(1));
+        let degraded = |checks: &DashboardSourceChecks| {
+            checks.degraded_since_failure.lock().unwrap().is_some()
+        };
+        checks.note_failure(&"down");
+        // A success right after a failure doesn't end the outage...
+        checks.note_success();
+        assert!(degraded(&checks));
+        // ...one after the quiet period does.
+        checks.quiet = Duration::ZERO;
+        checks.note_success();
+        assert!(!degraded(&checks));
+    }
+
+    #[tokio::test]
+    async fn query_policy_marks_unverified_dashboard_reads() {
+        use rush_api::query_governor::{QueryGovernor, QueryGovernorConfig, WorkloadClass};
+        use rush_api::self_metrics::SelfMetrics;
+        use std::time::Duration;
+
+        let month = 30 * 24 * 60 * 60;
+        let governor =
+            QueryGovernor::new(QueryGovernorConfig::default(), Arc::new(SelfMetrics::new()))
+                .unwrap();
+        for (answer, expected_status, expected_class, result) in [
+            (
+                Ok(true),
+                StatusCode::OK,
+                Some(WorkloadClass::Dashboard),
+                "readable",
+            ),
+            (Ok(false), StatusCode::BAD_REQUEST, None, "not_readable"),
+            (
+                Err(anyhow::anyhow!("down")),
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                "unknown",
+            ),
+        ] {
+            let metrics = SelfMetrics::new();
+            let checks =
+                DashboardSourceChecks::new(1, 8, Duration::from_secs(60), Duration::from_secs(5));
+            let request = with_path_and_source(
+                resolved(CredentialKind::Session, "user-1"),
+                &format!("/api/v1/query/timeseries?from=0&to={month}"),
+                "dashboard:dash-1",
+            );
+            let seen_class = std::sync::Mutex::new(None);
+            let response = run_query_policy(
+                &governor,
+                &metrics,
+                &checks,
+                request,
+                |_| async move { answer },
+                |_| async {
+                    *seen_class.lock().unwrap() = rush_api::query_governor::active_budget()
+                        .map(|budget| budget.max_time_range_secs);
+                    StatusCode::OK.into_response()
+                },
+            )
+            .await;
+            assert_eq!(response.status(), expected_status, "{result}");
+            if expected_class == Some(WorkloadClass::Dashboard) {
+                assert_eq!(*seen_class.lock().unwrap(), Some(month));
+            }
+            assert!(
+                metrics.render_prometheus().contains(&format!(
+                    "rush_dashboard_source_checks_total{{result=\"{result}\"}} 1"
+                )),
+                "{result}"
+            );
+        }
     }
 
     #[test]
