@@ -348,9 +348,28 @@ pub async fn notify_channels(
 ) {
     for channel_id in channel_ids {
         let channel = match config_db.get_channel(channel_id, tenant_id).await {
-            Ok(Some(channel)) if channel.enabled => channel,
-            Ok(_) => continue,
+            Ok(Some(channel)) if channel.enabled => {
+                crate::notification_metrics::record_lookup(
+                    config_db.self_metrics(),
+                    notification.source,
+                    "ready",
+                );
+                channel
+            }
+            Ok(_) => {
+                crate::notification_metrics::record_lookup(
+                    config_db.self_metrics(),
+                    notification.source,
+                    "skipped",
+                );
+                continue;
+            }
             Err(error) => {
+                crate::notification_metrics::record_lookup(
+                    config_db.self_metrics(),
+                    notification.source,
+                    "error",
+                );
                 tracing::warn!(source = notification.source, %channel_id, %error, "failed to load notification channel");
                 continue;
             }
@@ -360,22 +379,27 @@ pub async fn notify_channels(
         } else {
             notification.alert_id
         };
-        let result = send_channel_notification_with_fields(
-            &channel,
-            notification.message,
-            notification.alert_name,
-            notification.alert_state,
-            notification.value,
-            notification.threshold,
-            notification.signal_type,
-            notification.condition_op,
-            notification.description,
-            notification_id,
-            notification.runbook_url,
-            notification.webhook_fields,
-            http_client,
-            smtp_config,
-            smtp_transport,
+        let result = crate::notification_metrics::observe_delivery(
+            config_db.self_metrics(),
+            notification.source,
+            &channel.channel_type,
+            send_channel_notification_with_fields(
+                &channel,
+                notification.message,
+                notification.alert_name,
+                notification.alert_state,
+                notification.value,
+                notification.threshold,
+                notification.signal_type,
+                notification.condition_op,
+                notification.description,
+                notification_id,
+                notification.runbook_url,
+                notification.webhook_fields,
+                http_client,
+                smtp_config,
+                smtp_transport,
+            ),
         )
         .await;
         let (status, error_msg) = match &result {
@@ -385,7 +409,7 @@ pub async fn notify_channels(
                 ("failed", error.clone())
             }
         };
-        let _ = config_db
+        let logged = config_db
             .create_notification_log(
                 channel_id,
                 tenant_id,
@@ -396,6 +420,11 @@ pub async fn notify_channels(
                 &error_msg,
             )
             .await;
+        crate::notification_metrics::record_log_write(
+            config_db.self_metrics(),
+            notification.source,
+            logged.is_ok(),
+        );
     }
 }
 
@@ -899,25 +928,53 @@ async fn eval_alert_rule(
             serde_json::from_str(&rule.notification_channel_ids).unwrap_or_default();
         let alert_state_str = if triggered { "FIRING" } else { "RESOLVED" };
         for channel_id in &channel_ids {
-            if let Ok(Some(channel)) = config_db.get_channel_by_id(channel_id).await {
-                if !channel.enabled {
+            let channel = match config_db.get_channel_by_id(channel_id).await {
+                Ok(Some(channel)) if channel.enabled => {
+                    crate::notification_metrics::record_lookup(
+                        config_db.self_metrics(),
+                        "alert_rule",
+                        "ready",
+                    );
+                    channel
+                }
+                Ok(_) => {
+                    crate::notification_metrics::record_lookup(
+                        config_db.self_metrics(),
+                        "alert_rule",
+                        "skipped",
+                    );
                     continue;
                 }
-                let result = send_channel_notification(
-                    &channel,
-                    &message,
-                    &rule.name,
-                    alert_state_str,
-                    value,
-                    threshold,
-                    &rule.signal_type,
-                    &rule.condition_op,
-                    &rule.description,
-                    &rule.id,
-                    &rule.runbook_url,
-                    http_client,
-                    smtp_config,
-                    smtp_transport,
+                Err(_) => {
+                    crate::notification_metrics::record_lookup(
+                        config_db.self_metrics(),
+                        "alert_rule",
+                        "error",
+                    );
+                    continue;
+                }
+            };
+            {
+                let result = crate::notification_metrics::observe_delivery(
+                    config_db.self_metrics(),
+                    "alert_rule",
+                    &channel.channel_type,
+                    send_channel_notification(
+                        &channel,
+                        &message,
+                        &rule.name,
+                        alert_state_str,
+                        value,
+                        threshold,
+                        &rule.signal_type,
+                        &rule.condition_op,
+                        &rule.description,
+                        &rule.id,
+                        &rule.runbook_url,
+                        http_client,
+                        smtp_config,
+                        smtp_transport,
+                    ),
                 )
                 .await;
 
@@ -933,7 +990,7 @@ async fn eval_alert_rule(
                     }
                 };
 
-                let _ = config_db
+                let logged = config_db
                     .create_notification_log(
                         channel_id,
                         &channel.tenant_id,
@@ -944,6 +1001,11 @@ async fn eval_alert_rule(
                         &error_msg,
                     )
                     .await;
+                crate::notification_metrics::record_log_write(
+                    config_db.self_metrics(),
+                    "alert_rule",
+                    logged.is_ok(),
+                );
             }
         }
 
