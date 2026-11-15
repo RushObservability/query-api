@@ -1,4 +1,5 @@
 use crate::clickhouse_config::ConfigDb;
+use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use crate::models::query::{Filter, FilterOp};
 use crate::query_builder::{QueryClauses, build_metrics_where_clause, build_where_clause};
 use clickhouse::Client;
@@ -405,9 +406,12 @@ async fn eval_slos(
         })
         .collect();
 
+    crate::engine_metrics::due(config_db.self_metrics(), "slo_engine", jobs.len());
     let now_str_ref = now_str.as_str();
     let outcomes: Vec<(String, bool, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(slo, should_flush)| async move {
+            let mut observation =
+                EvaluationObservation::new(config_db.self_metrics(), "slo_engine");
             let evaluated = crate::query_governor::run_background(
                 &slo.tenant_id,
                 eval_one_slo(
@@ -423,12 +427,17 @@ async fn eval_slos(
             )
             .await;
             let (persisted, succeeded) = match evaluated {
-                Ok(Ok(p)) => (p, true),
+                Ok(Ok(p)) => {
+                    observation.finish(EvaluationOutcome::Completed);
+                    (p, true)
+                }
                 Ok(Err(e)) => {
+                    observation.finish(EvaluationOutcome::Error);
                     tracing::warn!("slo {}: evaluation error: {e}", slo.id);
                     (false, false)
                 }
                 Err(e) => {
+                    observation.finish(EvaluationOutcome::AdmissionRejected);
                     tracing::warn!("slo {}: background admission rejected: {e:?}", slo.id);
                     (false, false)
                 }

@@ -409,6 +409,13 @@ impl SelfMetrics {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.set_gauge("rush_engine_last_run_timestamp", &labels, now as f64);
+        if ok {
+            self.set_gauge(
+                "rush_engine_last_success_timestamp_seconds",
+                &labels,
+                now as f64,
+            );
+        }
     }
 
     /// Convenience: record one log/span SEARCH and update all search self-metrics.

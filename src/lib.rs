@@ -10,6 +10,7 @@ pub mod config;
 pub mod cors;
 pub mod detection_query;
 pub mod edition;
+pub mod engine_metrics;
 pub mod eval_state;
 pub mod github_repository_policy;
 pub mod handlers;
