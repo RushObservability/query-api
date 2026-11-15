@@ -3152,6 +3152,9 @@ async fn main() -> anyhow::Result<()> {
     // Drain-worker-only: this process exists solely to drain the ingest buffer
     // into ClickHouse. Don't serve HTTP, run engines, or load the firewall.
     if drain_only {
+        let _metrics_server =
+            rush_api::worker_metrics::spawn(self_metrics.clone(), shutdown_controller.clone())
+                .await?;
         tracing::info!(
             backend = effective_backend,
             "RUSH_DRAIN_WORKER_ONLY — draining ingest buffer to ClickHouse; not serving HTTP"
