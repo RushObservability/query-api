@@ -1,5 +1,6 @@
 use crate::alert_engine::SmtpConfig;
 use crate::clickhouse_config::ConfigDb;
+use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use crate::models::anomaly::AnomalyRule;
 use crate::query_builder::ERROR_SPAN;
 use chrono::DurationRound;
@@ -192,6 +193,7 @@ async fn eval_anomaly_rules(
     let now = chrono::Utc::now();
     let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let due_rules = config_db.get_due_anomaly_rules(&now_str).await?;
+    crate::engine_metrics::due(config_db.self_metrics(), "anomaly_engine", due_rules.len());
 
     if due_rules.is_empty() {
         tracing::debug!(engine = "anomaly", "tick -- no rules due");
@@ -206,6 +208,8 @@ async fn eval_anomaly_rules(
     // Prefetch every due rule's data concurrently — the fetches are independent
     // reads, so the tick pays for the slowest fetch instead of the sum of all.
     let fetched = futures_util::future::join_all(due_rules.iter().map(|rule| async move {
+        let mut observation =
+            EvaluationObservation::new(config_db.self_metrics(), "anomaly_engine");
         let fetched = crate::query_governor::run_background(&rule.tenant_id, async {
             match rule.source.as_str() {
                 "apm" => Some(fetch_apm_data(read_ch, rule, &now).await),
@@ -214,12 +218,17 @@ async fn eval_anomaly_rules(
             }
         })
         .await;
-        match fetched {
+        let rejected = fetched.is_err();
+        let result = match fetched {
             Ok(result) => result,
-            Err(error) => Some(Err(anyhow::anyhow!(
-                "background admission rejected: {error:?}"
-            ))),
-        }
+            Err(error) => {
+                observation.finish(EvaluationOutcome::AdmissionRejected);
+                Some(Err(anyhow::anyhow!(
+                    "background admission rejected: {error:?}"
+                )))
+            }
+        };
+        (result, observation, rejected)
     }))
     .await;
 
@@ -227,7 +236,11 @@ async fn eval_anomaly_rules(
     // at the end of the tick (previously one INSERT per series per rule).
     let mut eval_log_values: Vec<String> = Vec::new();
 
-    for (rule, prefetched) in due_rules.into_iter().zip(fetched) {
+    let mut failures = 0;
+    for (rule, (prefetched, mut observation, rejected)) in due_rules.into_iter().zip(fetched) {
+        if !rejected {
+            observation.finish(EvaluationOutcome::Error);
+        }
         tracing::debug!(
             engine = "anomaly",
             rule_name = %rule.name,
@@ -239,6 +252,8 @@ async fn eval_anomaly_rules(
         let all_series = match prefetched {
             Some(r) => r,
             None => {
+                observation.finish(EvaluationOutcome::InvalidConfig);
+                failures += 1;
                 tracing::warn!(engine = "anomaly", rule_id = %rule.id, source = %rule.source, "unknown data source");
                 continue;
             }
@@ -251,9 +266,11 @@ async fn eval_anomaly_rules(
                 config_db
                     .update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None)
                     .await?;
+                observation.finish(EvaluationOutcome::NoData);
                 continue;
             }
             Err(e) => {
+                failures += 1;
                 tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "data fetch failed");
                 config_db
                     .update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None)
@@ -391,6 +408,7 @@ async fn eval_anomaly_rules(
                 .update_anomaly_state(&rule.id, &rule.tenant_id, new_state, &now_str, None)
                 .await?;
         }
+        observation.finish(EvaluationOutcome::Completed);
     }
 
     // Flush all per-series eval logs in one INSERT (previously one per series).
@@ -400,10 +418,22 @@ async fn eval_anomaly_rules(
             eval_log_values.join(", ")
         );
         if let Err(e) = write_ch.query(&sql).execute().await {
+            failures += 1;
+            if let Some(metrics) = config_db.self_metrics() {
+                metrics.inc_counter(
+                    "rush_engine_persistence_failures_total",
+                    &[("engine", "anomaly_engine"), ("operation", "eval_log")],
+                    1,
+                );
+            }
             tracing::warn!(error = %e, engine = "anomaly", rows = eval_log_values.len(), "failed to write eval log batch");
         }
     }
 
+    anyhow::ensure!(
+        failures == 0,
+        "{failures} anomaly evaluation operation(s) failed"
+    );
     Ok(())
 }
 

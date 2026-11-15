@@ -10,6 +10,7 @@ pub mod config;
 pub mod cors;
 pub mod detection_query;
 pub mod edition;
+pub mod engine_metrics;
 pub mod eval_state;
 pub mod github_repository_policy;
 pub mod handlers;
@@ -45,6 +46,7 @@ pub mod spool;
 pub mod stats_engine;
 pub mod usage_accumulator;
 pub mod usage_tracker;
+pub mod worker_metrics;
 
 use clickhouse::Client;
 use clickhouse::query::Query;
