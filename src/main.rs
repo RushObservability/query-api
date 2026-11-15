@@ -1680,6 +1680,16 @@ fn consume_ingest_rate_limit(state: &AppState, key_id: &str, limit: u64) -> Resu
     Ok(())
 }
 
+fn should_reject_frontend_telemetry(
+    method: &Method,
+    path: &str,
+    credential: &CredentialKind,
+) -> bool {
+    method == Method::POST
+        && path == "/api/v1/frontend/telemetry"
+        && *credential != CredentialKind::Session
+}
+
 fn credential_route_denial(
     credential: &CredentialKind,
     ingest_route: bool,
@@ -1961,6 +1971,16 @@ async fn enforce_tenant_auth_middleware(
             return (StatusCode::FORBIDDEN, "tenant access denied").into_response();
         }
         _ => {}
+    }
+
+    if should_reject_frontend_telemetry(&method, &path, &resolution.credential) {
+        // This narrow telemetry path deliberately rejects unauthenticated users
+        // even when a tenant allows anonymous queries. No generic ingest grant.
+        return (
+            StatusCode::UNAUTHORIZED,
+            "frontend telemetry requires a browser session",
+        )
+            .into_response();
     }
 
     let agent_key = resolution
@@ -3861,6 +3881,13 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::groups::get_user_groups)
                 .put(handlers::groups::set_user_groups),
         )
+        // Dedicated session-authenticated, restricted health telemetry for this UI.
+        // General RUM/telemetry ingestion continues to require ingest credentials.
+        .route(
+            "/api/v1/frontend/telemetry",
+            post(handlers::frontend_telemetry::ingest)
+                .layer(DefaultBodyLimit::max(handlers::frontend_telemetry::MAX_BODY_BYTES)),
+        )
         // RUM (Real User Monitoring)
         .route("/api/v1/rum/ingest", post(handlers::rum::ingest))
         .route("/api/v1/rum/apps", get(handlers::rum::list_apps))
@@ -4469,6 +4496,42 @@ mod tenant_auth_tests {
     use rush_api::cors::CorsPolicy;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+
+    #[test]
+    fn frontend_health_is_a_separate_session_only_contract() {
+        let path = "/api/v1/frontend/telemetry";
+        assert_eq!(ingest_signal_for_route(&Method::POST, path), None);
+        assert!(!super::should_reject_frontend_telemetry(
+            &Method::POST,
+            path,
+            &CredentialKind::Session
+        ));
+        for kind in [
+            CredentialKind::Anonymous,
+            CredentialKind::QueryKey,
+            CredentialKind::IngestKey,
+            CredentialKind::InternalSre,
+        ] {
+            assert!(super::should_reject_frontend_telemetry(
+                &Method::POST,
+                path,
+                &kind
+            ));
+        }
+        assert!(requires_csrf_origin(
+            &Method::POST,
+            path,
+            Some(&CredentialKind::Session)
+        ));
+        assert_eq!(
+            credential_route_denial(&CredentialKind::Session, true, false),
+            Some("ingest_key_required")
+        );
+        assert_eq!(
+            credential_route_denial(&CredentialKind::Session, true, true),
+            Some("ingest_key_required")
+        );
+    }
 
     #[test]
     fn startup_validates_api_key_secret_before_running_migrations() {

@@ -1,0 +1,19 @@
+<clickhouse>
+    <custom_settings_prefixes>rush_</custom_settings_prefixes>
+    <storage_configuration>
+        <disks>
+            <frontend_test_cold>
+                <type>local</type>
+                <path>/var/lib/clickhouse/frontend_test_cold/</path>
+            </frontend_test_cold>
+        </disks>
+        <policies>
+            <tiered>
+                <volumes>
+                    <hot><disk>default</disk></hot>
+                    <cold><disk>frontend_test_cold</disk></cold>
+                </volumes>
+            </tiered>
+        </policies>
+    </storage_configuration>
+</clickhouse>

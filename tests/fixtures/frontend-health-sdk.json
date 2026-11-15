@@ -1,0 +1,297 @@
+[
+  {
+    "meta": {
+      "app_name": "health-smoke",
+      "app_version": "0.1.17",
+      "environment": "test",
+      "session_id": "fixture-session-0",
+      "user_id": "fixture-user",
+      "page_url": "https://frontend.example.test/logs/fixture?secret=fixture",
+      "page_path": "/logs/fixture?secret=fixture",
+      "view_name": "Fixture page",
+      "referrer": "https://frontend.example.test/fixture",
+      "browser_name": "Chrome",
+      "browser_version": "157.0.0.0",
+      "os_name": "macOS",
+      "os_version": "10.15.7",
+      "device_type": "desktop",
+      "screen_width": 1280,
+      "screen_height": 720
+    },
+    "events": [
+      {
+        "event_type": "pageview",
+        "event_name": "Fixture page",
+        "duration_ms": 58.39999997615814,
+        "trace_id": "fixture-trace",
+        "span_id": "fixture-span",
+        "timestamp": 1794780651734400000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_started",
+        "attributes": "{\"startup_duration_ms\":84}",
+        "timestamp": 1794780651734500000
+      },
+      {
+        "event_type": "web_vital",
+        "vital_name": "FCP",
+        "vital_value": 80,
+        "vital_rating": "good",
+        "timestamp": 1794780651741599700
+      },
+      {
+        "event_type": "web_vital",
+        "vital_name": "TTFB",
+        "vital_value": 4.799999982118607,
+        "vital_rating": "good",
+        "timestamp": 1794780651741800000
+      },
+      {
+        "event_type": "pageview",
+        "event_name": "Fixture page",
+        "duration_ms": 58.39999997615814,
+        "trace_id": "fixture-trace",
+        "span_id": "fixture-span",
+        "timestamp": 1794780651742900000
+      }
+    ]
+  },
+  {
+    "meta": {
+      "app_name": "health-smoke",
+      "app_version": "0.1.17",
+      "environment": "test",
+      "session_id": "fixture-session-1",
+      "user_id": "fixture-user",
+      "page_url": "https://frontend.example.test/logs/fixture?secret=fixture",
+      "page_path": "/logs/fixture?secret=fixture",
+      "view_name": "Fixture page",
+      "referrer": "https://frontend.example.test/fixture",
+      "browser_name": "Chrome",
+      "browser_version": "157.0.0.0",
+      "os_name": "macOS",
+      "os_version": "10.15.7",
+      "device_type": "desktop",
+      "screen_width": 1280,
+      "screen_height": 720
+    },
+    "events": [
+      {
+        "event_type": "interaction",
+        "interaction_type": "click",
+        "interaction_target": "a",
+        "timestamp": 1794780652536400000
+      },
+      {
+        "event_type": "web_vital",
+        "vital_name": "LCP",
+        "vital_value": 128,
+        "vital_rating": "good",
+        "timestamp": 1794780652572500000
+      }
+    ]
+  },
+  {
+    "meta": {
+      "app_name": "health-smoke",
+      "app_version": "0.1.17",
+      "environment": "test",
+      "session_id": "fixture-session-2",
+      "user_id": "fixture-user",
+      "page_url": "https://frontend.example.test/logs/fixture?secret=fixture",
+      "page_path": "/logs/fixture?secret=fixture",
+      "view_name": "Fixture page",
+      "referrer": "https://frontend.example.test/fixture",
+      "browser_name": "Chrome",
+      "browser_version": "157.0.0.0",
+      "os_name": "macOS",
+      "os_version": "10.15.7",
+      "device_type": "desktop",
+      "screen_width": 1280,
+      "screen_height": 720
+    },
+    "events": [
+      {
+        "event_type": "pageview",
+        "event_name": "Fixture page",
+        "duration_ms": 58.39999997615814,
+        "trace_id": "fixture-trace",
+        "span_id": "fixture-span",
+        "timestamp": 1794780652964000000
+      }
+    ]
+  },
+  {
+    "meta": {
+      "app_name": "health-smoke",
+      "app_version": "0.1.17",
+      "environment": "test",
+      "session_id": "fixture-session-3",
+      "user_id": "fixture-user",
+      "page_url": "https://frontend.example.test/logs/fixture?secret=fixture",
+      "page_path": "/logs/fixture?secret=fixture",
+      "view_name": "Fixture page",
+      "referrer": "https://frontend.example.test/fixture",
+      "browser_name": "Chrome",
+      "browser_version": "157.0.0.0",
+      "os_name": "macOS",
+      "os_version": "10.15.7",
+      "device_type": "desktop",
+      "screen_width": 1280,
+      "screen_height": 720
+    },
+    "events": [
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_attempt",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"features\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":50.099999994039536,\"duration_ms_max\":44.5,\"duration_ms_le_50\":2,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2}",
+        "timestamp": 1794780652964899800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_attempt",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"license\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":52.90000003576279,\"duration_ms_max\":47.10000002384186,\"duration_ms_le_50\":2,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2}",
+        "timestamp": 1794780652965000000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_attempt",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"auth\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":46.900000005960464,\"duration_ms_max\":46.900000005960464,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_body",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"features\",\"outcome\":\"completed\",\"status_class\":\"2xx\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":6.299999982118607,\"duration_ms_max\":4.799999982118607,\"duration_ms_le_50\":2,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_body",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"license\",\"outcome\":\"completed\",\"status_class\":\"2xx\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":2.9999999701976776,\"duration_ms_max\":1.699999988079071,\"duration_ms_le_50\":2,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_body",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"auth\",\"outcome\":\"completed\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":1.199999988079071,\"duration_ms_max\":1.199999988079071,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_request",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"auth\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":49.29999998211861,\"duration_ms_max\":49.29999998211861,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_probe",
+        "attributes": "{\"outcome\":\"reachable\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":56.599999994039536,\"duration_ms_max\":54,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2,\"duration_ms_le_50\":1}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_attempt",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"tenants\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":5,\"duration_ms_max\":5,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_body",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"tenants\",\"outcome\":\"completed\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":0.30000001192092896,\"duration_ms_max\":0.30000001192092896,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_navigation",
+        "attributes": "{\"outcome\":\"success\",\"route\":\"investigate\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":61.5,\"duration_ms_max\":61.5,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965099800
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_attempt",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"sessions\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":9.699999988079071,\"duration_ms_max\":6.699999988079071,\"duration_ms_le_50\":2,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2}",
+        "timestamp": 1794780652965200000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_body",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"sessions\",\"outcome\":\"completed\",\"status_class\":\"2xx\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":0.20000001788139343,\"duration_ms_max\":0.10000002384185791,\"duration_ms_le_50\":2,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2}",
+        "timestamp": 1794780652965200000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_request",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"GET\",\"operation\":\"sessions\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":2,\"duration_count\":2,\"duration_ms_sum\":9.900000005960464,\"duration_ms_max\":6.799999982118607,\"duration_ms_le_50\":2,\"duration_ms_le_100\":2,\"duration_ms_le_250\":2,\"duration_ms_le_500\":2,\"duration_ms_le_1000\":2,\"duration_ms_le_2500\":2,\"duration_ms_le_5000\":2,\"duration_ms_le_10000\":2,\"duration_ms_le_30000\":2,\"duration_ms_le_60000\":2}",
+        "timestamp": 1794780652965200000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_attempt",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"POST\",\"operation\":\"investigate\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":2.9000000059604645,\"duration_ms_max\":2.9000000059604645,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965200000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_body",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"POST\",\"operation\":\"investigate\",\"outcome\":\"completed\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":0.19999998807907104,\"duration_ms_max\":0.19999998807907104,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965200000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_investigation_discarded",
+        "attributes": "{\"reason\":\"malformed\",\"count\":1}",
+        "timestamp": 1794780652965200000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_investigation_first_response",
+        "attributes": "{\"kind\":\"evidence\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":3.199999988079071,\"duration_ms_max\":3.199999988079071,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965300000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_investigation_stream",
+        "attributes": "{\"outcome\":\"completed\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":3.4000000059604645,\"duration_ms_max\":3.4000000059604645,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965300000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_attempt",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"POST\",\"operation\":\"auth\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":35.79999998211861,\"duration_ms_max\":35.79999998211861,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965300000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_body",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"POST\",\"operation\":\"auth\",\"outcome\":\"completed\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":0.7000000178813934,\"duration_ms_max\":0.7000000178813934,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965300000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_request",
+        "attributes": "{\"cancel_reason\":\"none\",\"method\":\"POST\",\"operation\":\"auth\",\"outcome\":\"success\",\"status_class\":\"2xx\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":36.80000001192093,\"duration_ms_max\":36.80000001192093,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965300000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_exception",
+        "attributes": "{\"source\":\"router\",\"stage\":\"lazy_chunk\",\"count\":1}",
+        "timestamp": 1794780652965300000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_navigation",
+        "attributes": "{\"outcome\":\"failed\",\"route\":\"services\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":36.89999997615814,\"duration_ms_max\":36.89999997615814,\"duration_ms_le_50\":1,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965300000
+      },
+      {
+        "event_type": "custom",
+        "event_name": "frontend_api_outage",
+        "attributes": "{\"reason\":\"offline\",\"count\":1,\"duration_count\":1,\"duration_ms_sum\":61.400000005960464,\"duration_ms_max\":61.400000005960464,\"duration_ms_le_100\":1,\"duration_ms_le_250\":1,\"duration_ms_le_500\":1,\"duration_ms_le_1000\":1,\"duration_ms_le_2500\":1,\"duration_ms_le_5000\":1,\"duration_ms_le_10000\":1,\"duration_ms_le_30000\":1,\"duration_ms_le_60000\":1}",
+        "timestamp": 1794780652965300000
+      }
+    ]
+  }
+]

@@ -260,7 +260,7 @@ pub struct RumSessionRow {
 /// serde_json::to_string solely to count bytes.
 /// Whether RUM is enabled (admin toggle in Settings → General). Defaults ON;
 /// only an explicit "false" disables it. Gates both RUM ingest endpoints.
-async fn rum_enabled(state: &AppState) -> bool {
+pub(super) async fn rum_enabled(state: &AppState) -> bool {
     state
         .config_db
         .get_setting("rum_enabled")
@@ -283,6 +283,16 @@ pub async fn ingest(
     state.ingest_limits.check_decompressed("rum", body.len())?;
     let payload: RumIngestPayload = serde_json::from_slice(&body)
         .map_err(|_| state.ingest_limits.malformed("rum", "invalid RUM payload"))?;
+    ingest_events(state, tenant, payload, body.len()).await
+}
+
+/// Shared durable RUM write path after the route-specific credential and payload checks.
+pub(super) async fn ingest_events(
+    state: AppState,
+    tenant: TenantContext,
+    payload: RumIngestPayload,
+    wire_bytes: usize,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     state
         .ingest_limits
         .check_entities("rum", payload.events.len())?;
@@ -420,7 +430,7 @@ pub async fn ingest(
         tenant_id,
         "rum",
         payload.events.len() as u64,
-        body.len() as u64,
+        wire_bytes as u64,
     );
 
     tracing::info!(

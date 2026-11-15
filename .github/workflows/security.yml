@@ -63,5 +63,8 @@ jobs:
           # PRs stay bounded; the weekly schedule exercises a much larger corpus.
           PROPTEST_CASES: ${{ github.event_name == 'schedule' && '4096' || '256' }}
 
+      - name: Test frontend telemetry session delivery
+        run: bash tests/run-frontend-telemetry.sh
+
       - name: Build release targets
         run: cargo build --release --all-features
