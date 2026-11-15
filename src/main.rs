@@ -918,19 +918,17 @@ impl DashboardSourceLookup<'_> {
 }
 
 async fn dashboard_source_readable(
-    state: &AppState,
+    config_db: &rush_api::clickhouse_config::ConfigDb,
     lookup: DashboardSourceLookup<'_>,
 ) -> anyhow::Result<bool> {
     match lookup.kind {
         WorkloadSourceKind::Dashboard => {
-            state
-                .config_db
+            config_db
                 .dashboard_readable(lookup.id, lookup.tenant_id, lookup.user_id)
                 .await
         }
         WorkloadSourceKind::Notebook => {
-            state
-                .config_db
+            config_db
                 .notebook_readable(lookup.id, lookup.tenant_id, lookup.user_id)
                 .await
         }
@@ -938,59 +936,58 @@ async fn dashboard_source_readable(
 }
 
 /// What a dashboard source check found. `Unknown` means the lookup failed or
-/// didn't answer in time.
+/// didn't answer in time; `Busy` means it was still waiting for a check slot
+/// when the read stopped waiting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceAccess {
     Readable,
     NotReadable,
     Unknown,
+    Busy,
+}
+
+impl SourceAccess {
+    fn label(self) -> &'static str {
+        match self {
+            SourceAccess::Readable => "readable",
+            SourceAccess::NotReadable => "not_readable",
+            SourceAccess::Unknown => "unknown",
+            SourceAccess::Busy => "busy",
+        }
+    }
 }
 
 /// One source check, shared by every read that names the same source while
-/// it runs and, when it finds the source readable, for `ttl` after. It runs
-/// once: a failure is shared with the waiting reads, not retried by each.
+/// it runs and, when it finds the source readable, for `ttl` after. The
+/// lookup runs in its own task, so it finishes, and its answer is cached,
+/// even when every read waiting on it has given up.
 struct SharedSourceCheck {
+    id: u64,
     started: std::time::Instant,
-    result: tokio::sync::OnceCell<SourceAccess>,
-    /// True while a read is running the lookup for this cell.
-    running: std::sync::atomic::AtomicBool,
-}
-
-impl SharedSourceCheck {
-    fn new(started: std::time::Instant) -> Arc<Self> {
-        Arc::new(Self {
-            started,
-            result: tokio::sync::OnceCell::new(),
-            running: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-}
-
-/// Clears `SharedSourceCheck::running` when the lookup ends or is cancelled.
-struct RunningLookup<'a>(&'a std::sync::atomic::AtomicBool);
-
-impl Drop for RunningLookup<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
+    answer: futures_util::future::Shared<futures_util::future::BoxFuture<'static, SourceAccess>>,
+    /// Set once the lookup holds a check slot.
+    lookup_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The source check runs before admission, so no workload pool bounds it.
 /// Concurrent reads naming the same source share one lookup (a dashboard's
-/// panels load together), at most `in_flight` lookups run at once, and a
-/// read waits at most `wait` for its answer. Only readable results are
-/// cached, for `ttl` per replica: a revoked share keeps the dashboard pool at
-/// most that long (each handler still checks data access), and made-up ids
-/// never stay in the cache.
+/// panels load together), at most `in_flight` lookups run at once, each for
+/// at most `lookup_timeout`, and a read waits at most `wait` for its answer.
+/// Only readable results are cached, for `ttl` per replica: a revoked share
+/// keeps the dashboard pool at most that long (each handler still checks data
+/// access), and made-up ids never stay in the cache.
 struct DashboardSourceChecks {
     checks: dashmap::DashMap<String, Arc<SharedSourceCheck>>,
     in_flight: tokio::sync::Semaphore,
+    next_id: std::sync::atomic::AtomicU64,
     capacity: usize,
     ttl: Duration,
     wait: Duration,
-    /// When the last lookup failed, while checks are degraded. An outage
-    /// logs once when it starts and once after `quiet` without failures.
-    degraded_since_failure: std::sync::Mutex<Option<std::time::Instant>>,
+    lookup_timeout: Duration,
+    /// When the last lookup failed. A failure logs when none is recorded or
+    /// the last one is older than `quiet`; a success after `quiet` without
+    /// failures logs the recovery.
+    last_failure: std::sync::Mutex<Option<std::time::Instant>>,
     quiet: Duration,
 }
 
@@ -999,28 +996,33 @@ impl DashboardSourceChecks {
         Self {
             checks: dashmap::DashMap::new(),
             in_flight: tokio::sync::Semaphore::new(in_flight),
+            next_id: std::sync::atomic::AtomicU64::new(0),
             capacity,
             ttl,
             wait,
-            degraded_since_failure: std::sync::Mutex::new(None),
+            lookup_timeout: Duration::from_secs(10),
+            last_failure: std::sync::Mutex::new(None),
             quiet: Duration::from_secs(60),
         }
     }
 
-    fn note_failure(&self, reason: &dyn std::fmt::Display) {
+    /// Records a failure; returns whether it started a new outage (and logged).
+    fn note_failure(&self, reason: &dyn std::fmt::Display) -> bool {
         let mut last = self
-            .degraded_since_failure
+            .last_failure
             .lock()
             .expect("source check log state poisoned");
-        if last.is_none() {
+        let new_outage = last.is_none_or(|failed| failed.elapsed() >= self.quiet);
+        if new_outage {
             tracing::warn!(%reason, "dashboard workload source checks are failing; affected reads get a retryable error or run as interactive");
         }
         *last = Some(std::time::Instant::now());
+        new_outage
     }
 
     fn note_success(&self) {
         let mut last = self
-            .degraded_since_failure
+            .last_failure
             .lock()
             .expect("source check log state poisoned");
         if last.is_some_and(|failed| failed.elapsed() >= self.quiet) {
@@ -1029,84 +1031,134 @@ impl DashboardSourceChecks {
         }
     }
 
-    /// `check` is polled only when this read runs the shared lookup.
-    async fn access(
+    async fn run_lookup(
         &self,
-        key: String,
+        lookup_started: &std::sync::atomic::AtomicBool,
         check: impl std::future::Future<Output = anyhow::Result<bool>>,
+    ) -> SourceAccess {
+        let Ok(_permit) = self.in_flight.acquire().await else {
+            return SourceAccess::Unknown;
+        };
+        lookup_started.store(true, std::sync::atomic::Ordering::SeqCst);
+        match tokio::time::timeout(self.lookup_timeout, check).await {
+            Ok(Ok(readable)) => {
+                self.note_success();
+                if readable {
+                    SourceAccess::Readable
+                } else {
+                    SourceAccess::NotReadable
+                }
+            }
+            Ok(Err(error)) => {
+                self.note_failure(&error);
+                SourceAccess::Unknown
+            }
+            Err(_) => {
+                self.note_failure(&"lookup timed out");
+                SourceAccess::Unknown
+            }
+        }
+    }
+
+    fn start_check(
+        self: &Arc<Self>,
+        key: String,
+        now: std::time::Instant,
+        check: impl std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
+    ) -> Arc<SharedSourceCheck> {
+        use futures_util::FutureExt;
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lookup_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let checks = self.clone();
+            let lookup_started = lookup_started.clone();
+            async move {
+                let access = checks.run_lookup(&lookup_started, check).await;
+                // Only readable answers stay; the next read checks again.
+                if access != SourceAccess::Readable {
+                    checks.checks.remove_if(&key, |_, current| current.id == id);
+                }
+                access
+            }
+        });
+        let answer = async move { task.await.unwrap_or(SourceAccess::Unknown) }
+            .boxed()
+            .shared();
+        Arc::new(SharedSourceCheck {
+            id,
+            started: now,
+            answer,
+            lookup_started,
+        })
+    }
+
+    /// Makes room for one more entry: drops expired entries, then the oldest
+    /// tenth, rather than the whole cache.
+    fn make_room(&self, now: std::time::Instant) {
+        self.checks
+            .retain(|_, entry| now.duration_since(entry.started) < self.ttl);
+        if self.checks.len() < self.capacity {
+            return;
+        }
+        let mut by_age: Vec<_> = self
+            .checks
+            .iter()
+            .map(|entry| (entry.started, entry.key().clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(started, _)| *started);
+        for (_, key) in by_age.into_iter().take(self.capacity / 10 + 1) {
+            self.checks.remove(&key);
+        }
+    }
+
+    /// `check` runs only when this read starts the shared lookup.
+    async fn access(
+        self: &Arc<Self>,
+        key: String,
+        check: impl std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
     ) -> SourceAccess {
         let now = std::time::Instant::now();
         if !self.checks.contains_key(&key) && self.checks.len() >= self.capacity {
-            // Keep fresh readable answers and lookups still running; drop
-            // expired entries and ones every waiting read gave up on.
-            self.checks.retain(|_, entry| {
-                now.duration_since(entry.started) < self.ttl
-                    && (entry.result.get() == Some(&SourceAccess::Readable)
-                        || entry.running.load(std::sync::atomic::Ordering::SeqCst))
-            });
-            if self.checks.len() >= self.capacity {
-                self.checks.clear();
-            }
+            self.make_room(now);
         }
+        let mut check = Some(check);
         let entry = {
-            let mut slot = self
-                .checks
-                .entry(key.clone())
-                .or_insert_with(|| SharedSourceCheck::new(now));
-            if now.duration_since(slot.started) >= self.ttl {
-                *slot = SharedSourceCheck::new(now);
+            let mut slot = self.checks.entry(key.clone()).or_insert_with(|| {
+                self.start_check(key.clone(), now, check.take().expect("check unused"))
+            });
+            if now.duration_since(slot.started) >= self.ttl
+                && let Some(check) = check.take()
+            {
+                *slot = self.start_check(key.clone(), now, check);
             }
             slot.clone()
         };
-        let outcome = tokio::time::timeout(
-            self.wait,
-            entry.result.get_or_init(|| async {
-                entry
-                    .running
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                let _running = RunningLookup(&entry.running);
-                let Ok(_permit) = self.in_flight.acquire().await else {
-                    return SourceAccess::Unknown;
-                };
-                match check.await {
-                    Ok(readable) => {
-                        self.note_success();
-                        if readable {
-                            SourceAccess::Readable
-                        } else {
-                            SourceAccess::NotReadable
-                        }
-                    }
-                    Err(error) => {
-                        self.note_failure(&error);
-                        SourceAccess::Unknown
-                    }
-                }
-            }),
-        )
-        .await;
-        let answered = outcome.is_ok();
-        let access = match outcome {
-            Ok(access) => *access,
-            Err(_) => {
+        match tokio::time::timeout(self.wait, entry.answer.clone()).await {
+            Ok(access) => access,
+            // The lookup keeps running and later reads get its answer.
+            Err(_)
+                if entry
+                    .lookup_started
+                    .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
                 self.note_failure(&"lookup did not answer in time");
                 SourceAccess::Unknown
             }
-        };
-        // Only readable answers stay; the next read checks again. A read that
-        // gave up waiting leaves the entry: another read may be checking it
-        // or take the check over, and later reads should join that one.
-        if answered && access != SourceAccess::Readable {
-            self.checks
-                .remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
+            Err(_) => SourceAccess::Busy,
         }
-        access
     }
 }
 
-static DASHBOARD_SOURCE_CHECKS: std::sync::LazyLock<DashboardSourceChecks> =
+static DASHBOARD_SOURCE_CHECKS: std::sync::LazyLock<Arc<DashboardSourceChecks>> =
     std::sync::LazyLock::new(|| {
-        DashboardSourceChecks::new(8, 4_096, Duration::from_secs(30), Duration::from_secs(2))
+        Arc::new(DashboardSourceChecks::new(
+            8,
+            4_096,
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        ))
     });
 
 /// Marks a read that named a dashboard or notebook whose access check
@@ -1122,25 +1174,27 @@ struct UnverifiedDashboardSource {
 /// Moves an interactive read into the dashboard pool when its named source
 /// is readable. Takes the extracted lookup, not the request: the request body
 /// is not `Sync`, so a borrow of it cannot be held across the check.
-/// Returns the class and whether a named source went unverified.
+/// Returns the class and, when the read named a source, what its check found.
 async fn dashboard_upgrade<'a, Fut>(
     class: WorkloadClass,
     lookup: Option<DashboardSourceLookup<'a>>,
-    checks: &DashboardSourceChecks,
+    checks: &Arc<DashboardSourceChecks>,
     check: impl FnOnce(DashboardSourceLookup<'a>) -> Fut,
-) -> (WorkloadClass, bool)
+) -> (WorkloadClass, Option<SourceAccess>)
 where
-    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+    Fut: std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
 {
     let Some(lookup) = lookup else {
-        return (class, false);
+        return (class, None);
     };
     let key = lookup.cache_key();
-    match checks.access(key, check(lookup)).await {
-        SourceAccess::Readable => (WorkloadClass::Dashboard, false),
-        SourceAccess::NotReadable => (class, false),
-        SourceAccess::Unknown => (class, true),
-    }
+    let access = checks.access(key, check(lookup)).await;
+    let class = if access == SourceAccess::Readable {
+        WorkloadClass::Dashboard
+    } else {
+        class
+    };
+    (class, Some(access))
 }
 
 fn time_range_error_response(error: TimeRangeError) -> Response {
@@ -1363,10 +1417,10 @@ async fn query_policy_middleware(
                 lookup.tenant_id.to_owned(),
                 lookup.user_id.to_owned(),
             );
-            let state = &state;
+            let config_db = state.config_db.clone();
             async move {
                 dashboard_source_readable(
-                    state,
+                    &config_db,
                     DashboardSourceLookup {
                         kind,
                         id: &id,
@@ -1387,14 +1441,14 @@ async fn query_policy_middleware(
 async fn run_query_policy<C, CFut, F, Fut>(
     governor: &QueryGovernor,
     metrics: &rush_api::self_metrics::SelfMetrics,
-    checks: &DashboardSourceChecks,
+    checks: &Arc<DashboardSourceChecks>,
     req: Request,
     check: C,
     next: F,
 ) -> Response
 where
     C: FnOnce(DashboardSourceLookup<'_>) -> CFut,
-    CFut: std::future::Future<Output = anyhow::Result<bool>>,
+    CFut: std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
     F: FnOnce(Request) -> Fut,
     Fut: std::future::Future<Output = Response>,
 {
@@ -1402,20 +1456,15 @@ where
         return next(req).await;
     };
     let lookup = dashboard_source_candidate(&req, class);
-    let named_source = lookup.is_some();
-    let (class, unverified) = dashboard_upgrade(class, lookup, checks, check).await;
-    if named_source {
-        let result = match (class, unverified) {
-            (WorkloadClass::Dashboard, _) => "readable",
-            (_, true) => "unknown",
-            _ => "not_readable",
-        };
+    let (class, access) = dashboard_upgrade(class, lookup, checks, check).await;
+    if let Some(access) = access {
         metrics.inc_counter(
             "rush_dashboard_source_checks_total",
-            &[("result", result)],
+            &[("result", access.label())],
             1,
         );
     }
+    let unverified = matches!(access, Some(SourceAccess::Unknown | SourceAccess::Busy));
     let mut req = req;
     if unverified {
         req.extensions_mut().insert(UnverifiedDashboardSource {
@@ -4508,15 +4557,16 @@ mod query_deadline_tests {
 #[cfg(test)]
 mod tenant_auth_tests {
     use super::{
-        CredentialKind, DashboardSourceChecks, DashboardSourceLookup, KeyLookup, TenantResolution,
-        WorkloadSourceKind, allows_unauthenticated_tenant_request, api_key_public_prefix,
-        credential_route_denial, dashboard_source_candidate, dashboard_upgrade,
-        effective_route_ingest_auth_required, explicit_ingest_tenant, ingest_signal_for_route,
-        internal_sre_route_allowed, is_explain_collector_route, is_state_changing_method,
-        presented_key_resolution, query_workload_for_request, request_log_path,
-        request_origin_allowed_with_policy, requires_csrf_origin, run_query_policy,
-        should_audit_rejected_key, should_audit_route_denial, should_reject_for_tenant_auth,
-        should_reject_interactive_llm, trust_forwarded_origin_headers, validate_request_time_range,
+        CredentialKind, DashboardSourceChecks, DashboardSourceLookup, KeyLookup, SourceAccess,
+        TenantResolution, WorkloadSourceKind, allows_unauthenticated_tenant_request,
+        api_key_public_prefix, credential_route_denial, dashboard_source_candidate,
+        dashboard_upgrade, effective_route_ingest_auth_required, explicit_ingest_tenant,
+        ingest_signal_for_route, internal_sre_route_allowed, is_explain_collector_route,
+        is_state_changing_method, presented_key_resolution, query_workload_for_request,
+        request_log_path, request_origin_allowed_with_policy, requires_csrf_origin,
+        run_query_policy, should_audit_rejected_key, should_audit_route_denial,
+        should_reject_for_tenant_auth, should_reject_interactive_llm,
+        trust_forwarded_origin_headers, validate_request_time_range,
     };
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
@@ -4940,19 +4990,21 @@ mod tenant_auth_tests {
 
         async fn classify(
             request: &Request<Body>,
-            checks: &DashboardSourceChecks,
-            calls: &AtomicUsize,
+            checks: &Arc<DashboardSourceChecks>,
+            calls: &Arc<AtomicUsize>,
             delay: Duration,
             answer: anyhow::Result<bool>,
-        ) -> (WorkloadClass, bool) {
+        ) -> (WorkloadClass, Option<SourceAccess>) {
             let class = query_workload_for_request(request).unwrap();
+            let calls = calls.clone();
             dashboard_upgrade(
                 class,
                 dashboard_source_candidate(request, class),
                 checks,
                 |lookup| {
                     assert_eq!(lookup.user_id, "user-1");
-                    // Counted when polled: a shared or cached result never polls.
+                    // Counted when the lookup runs: a shared or cached
+                    // answer never runs it.
                     async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(delay).await;
@@ -4969,110 +5021,6 @@ mod tenant_auth_tests {
                 &format!("dashboard:{id}"),
             )
         };
-        let quick = Duration::ZERO;
-        let checks =
-            DashboardSourceChecks::new(1, 2, Duration::from_secs(60), Duration::from_secs(5));
-        let calls = AtomicUsize::new(0);
-
-        // A whole dashboard loading at once shares one lookup, even with a
-        // single check slot, and every panel is upgraded.
-        let panels: Vec<_> = (0..20).map(|_| panel("dash-1")).collect();
-        let classes = futures_util::future::join_all(panels.iter().map(|request| {
-            classify(
-                request,
-                &checks,
-                &calls,
-                Duration::from_millis(20),
-                Ok(true),
-            )
-        }))
-        .await;
-        assert!(
-            classes
-                .iter()
-                .all(|outcome| *outcome == (WorkloadClass::Dashboard, false))
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // ...and later reads reuse it.
-        assert_eq!(
-            classify(&panel("dash-1"), &checks, &calls, quick, Ok(false)).await,
-            (WorkloadClass::Dashboard, false)
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        // Unreadable and failed checks stay interactive and are not cached.
-        // A failed lookup leaves the source unverified; unreadable doesn't.
-        for failed in [false, true] {
-            for _ in 0..2 {
-                let answer = if failed {
-                    Err(anyhow::anyhow!("down"))
-                } else {
-                    Ok(false)
-                };
-                assert_eq!(
-                    classify(&panel("dash-2"), &checks, &calls, quick, answer).await,
-                    (WorkloadClass::Interactive, failed)
-                );
-            }
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
-        assert!(
-            !checks.checks.contains_key(
-                &DashboardSourceLookup {
-                    kind: WorkloadSourceKind::Dashboard,
-                    id: "dash-2",
-                    tenant_id: "tenant-a",
-                    user_id: "user-1",
-                }
-                .cache_key()
-            )
-        );
-
-        // Without a session there is no lookup at all.
-        let mut keyed = panel("dash-3");
-        keyed
-            .extensions_mut()
-            .get_mut::<TenantResolution>()
-            .unwrap()
-            .credential = CredentialKind::QueryKey;
-        assert_eq!(
-            classify(&keyed, &checks, &calls, quick, Ok(true)).await,
-            (WorkloadClass::Interactive, false)
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
-
-        // A lookup slower than the wait leaves the read interactive.
-        let impatient =
-            DashboardSourceChecks::new(1, 2, Duration::from_secs(60), Duration::from_millis(10));
-        assert_eq!(
-            classify(
-                &panel("dash-4"),
-                &impatient,
-                &calls,
-                Duration::from_secs(1),
-                Ok(true)
-            )
-            .await,
-            (WorkloadClass::Interactive, true)
-        );
-        // The entry stays for later reads to pick up the check...
-        assert_eq!(impatient.checks.len(), 1);
-        assert_eq!(
-            classify(&panel("dash-4"), &impatient, &calls, quick, Ok(true)).await,
-            (WorkloadClass::Dashboard, false)
-        );
-        // ...and when the map is full, entries every read gave up on go
-        // before readable answers.
-        classify(
-            &panel("dash-slow"),
-            &impatient,
-            &calls,
-            Duration::from_secs(1),
-            Ok(true),
-        )
-        .await;
-        assert_eq!(impatient.checks.len(), 2);
-        classify(&panel("dash-new"), &impatient, &calls, quick, Ok(true)).await;
         let key = |id| {
             DashboardSourceLookup {
                 kind: WorkloadSourceKind::Dashboard,
@@ -5082,14 +5030,62 @@ mod tenant_auth_tests {
             }
             .cache_key()
         };
-        assert!(impatient.checks.contains_key(&key("dash-4")));
-        assert!(impatient.checks.contains_key(&key("dash-new")));
-        assert!(!impatient.checks.contains_key(&key("dash-slow")));
+        let readable = (WorkloadClass::Dashboard, Some(SourceAccess::Readable));
+        let quick = Duration::ZERO;
+        let checks = Arc::new(DashboardSourceChecks::new(
+            1,
+            3,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
 
-        // A failed lookup is shared by the reads waiting on it, not retried
-        // by each of them.
-        let before = calls.load(Ordering::SeqCst);
-        let panels: Vec<_> = (0..10).map(|_| panel("dash-8")).collect();
+        // A whole dashboard loading at once shares one lookup, even with a
+        // single check slot, and every panel is upgraded.
+        let panels: Vec<_> = (0..20).map(|_| panel("dash-1")).collect();
+        let outcomes = futures_util::future::join_all(panels.iter().map(|request| {
+            classify(
+                request,
+                &checks,
+                &calls,
+                Duration::from_millis(20),
+                Ok(true),
+            )
+        }))
+        .await;
+        assert!(outcomes.iter().all(|outcome| *outcome == readable));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // ...and later reads reuse it.
+        assert_eq!(
+            classify(&panel("dash-1"), &checks, &calls, quick, Ok(false)).await,
+            readable
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Unreadable and failed answers stay interactive and aren't cached.
+        for failed in [false, true] {
+            for _ in 0..2 {
+                let answer = if failed {
+                    Err(anyhow::anyhow!("down"))
+                } else {
+                    Ok(false)
+                };
+                let expected = if failed {
+                    SourceAccess::Unknown
+                } else {
+                    SourceAccess::NotReadable
+                };
+                assert_eq!(
+                    classify(&panel("dash-2"), &checks, &calls, quick, answer).await,
+                    (WorkloadClass::Interactive, Some(expected))
+                );
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert!(!checks.checks.contains_key(&key("dash-2")));
+
+        // A failed lookup is shared by the reads waiting on it.
+        let panels: Vec<_> = (0..10).map(|_| panel("dash-3")).collect();
         let outcomes = futures_util::future::join_all(panels.iter().map(|request| {
             classify(
                 request,
@@ -5100,36 +5096,142 @@ mod tenant_auth_tests {
             )
         }))
         .await;
-        assert!(
-            outcomes
-                .iter()
-                .all(|outcome| *outcome == (WorkloadClass::Interactive, true))
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+        let failed = (WorkloadClass::Interactive, Some(SourceAccess::Unknown));
+        assert!(outcomes.iter().all(|outcome| *outcome == failed));
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
 
-        // The cache stays within its capacity.
+        // Without a session there is no lookup at all.
+        let mut keyed = panel("dash-4");
+        keyed
+            .extensions_mut()
+            .get_mut::<TenantResolution>()
+            .unwrap()
+            .credential = CredentialKind::QueryKey;
+        assert_eq!(
+            classify(&keyed, &checks, &calls, quick, Ok(true)).await,
+            (WorkloadClass::Interactive, None)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+
+        // The cache drops its oldest entries when full, not all of them.
         for id in ["dash-5", "dash-6", "dash-7"] {
             classify(&panel(id), &checks, &calls, quick, Ok(true)).await;
         }
-        assert!(checks.checks.len() <= 2);
+        assert_eq!(checks.checks.len(), 3);
+        assert!(!checks.checks.contains_key(&key("dash-1")));
+        for id in ["dash-5", "dash-6", "dash-7"] {
+            assert!(checks.checks.contains_key(&key(id)), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_lookup_still_answers_later_reads() {
+        use rush_api::query_governor::WorkloadClass;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let checks = Arc::new(DashboardSourceChecks::new(
+            1,
+            8,
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request = with_path_and_source(
+            resolved(CredentialKind::Session, "user-1"),
+            "/api/v1/query/timeseries",
+            "dashboard:dash-slow",
+        );
+        let class = query_workload_for_request(&request).unwrap();
+        let classify = |delay: Duration| {
+            let calls = calls.clone();
+            dashboard_upgrade(
+                class,
+                dashboard_source_candidate(&request, class),
+                &checks,
+                move |_| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    Ok(true)
+                },
+            )
+        };
+        // The lookup takes 250 ms; the first read gives up after 100 ms.
+        assert_eq!(
+            classify(Duration::from_millis(250)).await,
+            (WorkloadClass::Interactive, Some(SourceAccess::Unknown))
+        );
+        // A read arriving while the lookup runs joins it instead of starting
+        // another, and gets the answer when it lands.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            classify(Duration::ZERO).await,
+            (WorkloadClass::Dashboard, Some(SourceAccess::Readable))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reads_waiting_for_a_check_slot_are_busy_not_failed() {
+        use rush_api::query_governor::WorkloadClass;
+        use std::time::Duration;
+
+        let checks = Arc::new(DashboardSourceChecks::new(
+            1,
+            8,
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+        ));
+        let request = with_path_and_source(
+            resolved(CredentialKind::Session, "user-1"),
+            "/api/v1/query/timeseries",
+            "dashboard:dash-queued",
+        );
+        let class = query_workload_for_request(&request).unwrap();
+        let busy = checks.in_flight.try_acquire().unwrap();
+        assert_eq!(
+            dashboard_upgrade(
+                class,
+                dashboard_source_candidate(&request, class),
+                &checks,
+                |_| async { Ok(true) },
+            )
+            .await,
+            (WorkloadClass::Interactive, Some(SourceAccess::Busy))
+        );
+        assert!(checks.last_failure.lock().unwrap().is_none());
+        // Once a slot frees up, the queued lookup runs and is cached.
+        drop(busy);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            dashboard_upgrade(
+                class,
+                dashboard_source_candidate(&request, class),
+                &checks,
+                |_| async { Ok(false) },
+            )
+            .await,
+            (WorkloadClass::Dashboard, Some(SourceAccess::Readable))
+        );
     }
 
     #[test]
-    fn source_check_outage_state_clears_only_after_a_quiet_period() {
+    fn source_check_outages_log_once_and_again_after_a_quiet_period() {
         use std::time::Duration;
         let mut checks =
             DashboardSourceChecks::new(1, 2, Duration::from_secs(60), Duration::from_secs(1));
-        let degraded = |checks: &DashboardSourceChecks| {
-            checks.degraded_since_failure.lock().unwrap().is_some()
-        };
-        checks.note_failure(&"down");
-        // A success right after a failure doesn't end the outage...
+        assert!(checks.note_failure(&"down"));
+        // Further failures during the outage don't log again...
+        assert!(!checks.note_failure(&"down"));
+        // ...and a success right after one doesn't end it.
         checks.note_success();
-        assert!(degraded(&checks));
-        // ...one after the quiet period does.
+        assert!(checks.last_failure.lock().unwrap().is_some());
+        // After the quiet period a failure starts a new outage even without
+        // a success in between, and a success ends it.
         checks.quiet = Duration::ZERO;
+        assert!(checks.note_failure(&"down again"));
         checks.note_success();
-        assert!(!degraded(&checks));
+        assert!(checks.last_failure.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -5142,30 +5244,50 @@ mod tenant_auth_tests {
         let governor =
             QueryGovernor::new(QueryGovernorConfig::default(), Arc::new(SelfMetrics::new()))
                 .unwrap();
-        for (answer, expected_status, expected_class, result) in [
+        for (answer, slots_busy, expected_status, expected_class, result) in [
             (
                 Ok(true),
+                false,
                 StatusCode::OK,
                 Some(WorkloadClass::Dashboard),
                 "readable",
             ),
-            (Ok(false), StatusCode::BAD_REQUEST, None, "not_readable"),
+            (
+                Ok(false),
+                false,
+                StatusCode::BAD_REQUEST,
+                None,
+                "not_readable",
+            ),
             (
                 Err(anyhow::anyhow!("down")),
+                false,
                 StatusCode::SERVICE_UNAVAILABLE,
                 None,
                 "unknown",
             ),
+            (
+                Ok(true),
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                "busy",
+            ),
         ] {
             let metrics = SelfMetrics::new();
-            let checks =
-                DashboardSourceChecks::new(1, 8, Duration::from_secs(60), Duration::from_secs(5));
+            let checks = Arc::new(DashboardSourceChecks::new(
+                1,
+                8,
+                Duration::from_secs(60),
+                Duration::from_millis(200),
+            ));
+            let _held = slots_busy.then(|| checks.in_flight.try_acquire().unwrap());
             let request = with_path_and_source(
                 resolved(CredentialKind::Session, "user-1"),
                 &format!("/api/v1/query/timeseries?from=0&to={month}"),
                 "dashboard:dash-1",
             );
-            let seen_class = std::sync::Mutex::new(None);
+            let seen_window = std::sync::Mutex::new(None);
             let response = run_query_policy(
                 &governor,
                 &metrics,
@@ -5173,7 +5295,7 @@ mod tenant_auth_tests {
                 request,
                 |_| async move { answer },
                 |_| async {
-                    *seen_class.lock().unwrap() = rush_api::query_governor::active_budget()
+                    *seen_window.lock().unwrap() = rush_api::query_governor::active_budget()
                         .map(|budget| budget.max_time_range_secs);
                     StatusCode::OK.into_response()
                 },
@@ -5181,7 +5303,7 @@ mod tenant_auth_tests {
             .await;
             assert_eq!(response.status(), expected_status, "{result}");
             if expected_class == Some(WorkloadClass::Dashboard) {
-                assert_eq!(*seen_class.lock().unwrap(), Some(month));
+                assert_eq!(*seen_window.lock().unwrap(), Some(month));
             }
             assert!(
                 metrics.render_prometheus().contains(&format!(
