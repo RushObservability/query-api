@@ -606,6 +606,15 @@ pub enum PasswordChangeOutcome {
 
 /// Server-owned authorization attached to a hashed API key. The plaintext key
 /// is returned only once at creation and never stored here.
+/// Who may open a dashboard, shared by `get_dashboard` and
+/// `dashboard_readable`. Binds `id`, `user_id`, `tenant_id`.
+const DASHBOARD_READABLE_WHERE: &str = "id = ? AND is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global'))";
+
+/// Who may open a notebook, shared by `get_notebook` and
+/// `notebook_readable`. Binds `id`, `tenant_id`, `user_id`.
+const NOTEBOOK_READABLE_WHERE: &str =
+    "id = ? AND tenant_id = ? AND is_deleted = 0 AND (visibility = 'tenant' OR owner_id = ?)";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiKeyGrant {
     pub id: String,
@@ -7744,7 +7753,7 @@ impl ConfigDb {
             updated_at: String,
         }
         let result = self.client
-            .query("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, defaults, created_at, updated_at FROM config_dashboards FINAL WHERE id = ? AND is_deleted = 0 AND ((visibility = 'private' AND owner_id = ?) OR (visibility = 'tenant' AND tenant_id = ?) OR (visibility = 'global')) LIMIT 1")
+            .query(&format!("SELECT id, name, description, tenant_id, owner_id, visibility, tags, variables, defaults, created_at, updated_at FROM config_dashboards FINAL WHERE {DASHBOARD_READABLE_WHERE} LIMIT 1"))
             .bind(id).bind(user_id).bind(tenant_id)
             .fetch_one::<Row>()
             .await;
@@ -11434,6 +11443,46 @@ impl ConfigDb {
             .await?)
     }
 
+    /// `get_dashboard(..).is_some()` without loading the row.
+    pub async fn dashboard_readable(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .client
+            .query(&format!(
+                "SELECT toUInt8(1) FROM config_dashboards FINAL WHERE {DASHBOARD_READABLE_WHERE} LIMIT 1"
+            ))
+            .bind(id)
+            .bind(user_id)
+            .bind(tenant_id)
+            .fetch_optional::<u8>()
+            .await?
+            .is_some())
+    }
+
+    /// `get_notebook(..).is_some()` without loading the row.
+    pub async fn notebook_readable(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .client
+            .query(&format!(
+                "SELECT toUInt8(1) FROM config_notebooks FINAL WHERE {NOTEBOOK_READABLE_WHERE} LIMIT 1"
+            ))
+            .bind(id)
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_optional::<u8>()
+            .await?
+            .is_some())
+    }
+
     pub async fn get_notebook(
         &self,
         id: &str,
@@ -11441,7 +11490,7 @@ impl ConfigDb {
         user_id: &str,
     ) -> anyhow::Result<Option<crate::models::notebook::Notebook>> {
         Ok(self.client
-            .query("SELECT id, tenant_id, name, description, owner_id, owner_name, visibility, status, incident_start, incident_end, tags, created_at, updated_at FROM config_notebooks FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 AND (visibility = 'tenant' OR owner_id = ?) LIMIT 1")
+            .query(&format!("SELECT id, tenant_id, name, description, owner_id, owner_name, visibility, status, incident_start, incident_end, tags, created_at, updated_at FROM config_notebooks FINAL WHERE {NOTEBOOK_READABLE_WHERE} LIMIT 1"))
             .bind(id)
             .bind(tenant_id)
             .bind(user_id)
