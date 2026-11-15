@@ -45,6 +45,7 @@ pub mod spool;
 pub mod stats_engine;
 pub mod usage_accumulator;
 pub mod usage_tracker;
+pub mod worker_metrics;
 
 use clickhouse::Client;
 use clickhouse::query::Query;

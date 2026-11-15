@@ -1,3 +1,4 @@
+use crate::self_metrics::SelfMetrics;
 /// Crash-safe segmented disk spool for ClickHouse write backpressure.
 ///
 /// Each segment is a flat file of framed records:
@@ -7,13 +8,37 @@
 /// The current (open) segment is rotated once it reaches SEGMENT_MAX_BYTES (32 MiB).
 /// On open, existing `*.spool` files are scanned to restore total_bytes.
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SEGMENT_MAX_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB per segment
+
+pub(crate) fn record_spool_discard(
+    metrics: &SelfMetrics,
+    backend: &'static str,
+    reason: &'static str,
+    unit: &'static str,
+    bytes: u64,
+) {
+    let labels = [("backend", backend), ("reason", reason), ("unit", unit)];
+    metrics.inc_counter("rush_ingest_spool_discarded_total", &labels, 1);
+    metrics.inc_counter("rush_ingest_spool_discarded_bytes_total", &labels, bytes);
+}
+
+pub(crate) fn record_spool_error(
+    metrics: &SelfMetrics,
+    backend: &'static str,
+    operation: &'static str,
+) {
+    metrics.inc_counter(
+        "rush_ingest_spool_errors_total",
+        &[("backend", backend), ("operation", operation)],
+        1,
+    );
+}
 
 /// Returned by `Spool::append` when the byte cap has been reached.
 #[derive(Debug)]
@@ -40,7 +65,13 @@ struct SpoolInner {
     segments: std::collections::BTreeSet<PathBuf>,
 }
 
+struct SegmentRead {
+    records: Vec<(String, Vec<u8>)>,
+    discarded_bytes: u64,
+}
+
 pub struct Spool {
+    metrics: OnceLock<Arc<SelfMetrics>>,
     inner: Mutex<SpoolInner>,
     /// Monotonic count of segments successfully drained (for drain-rate metric).
     committed: AtomicU64,
@@ -98,6 +129,7 @@ impl Spool {
         }
 
         Ok(Spool {
+            metrics: OnceLock::new(),
             inner: Mutex::new(SpoolInner {
                 dir,
                 max_bytes,
@@ -201,6 +233,10 @@ impl Spool {
     /// encountered partway through a frame ends parsing and returns the records
     /// read so far, rather than discarding the whole (otherwise-valid) segment.
     pub fn read_segment(path: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+        Self::read_segment_with_loss(path).map(|read| read.records)
+    }
+
+    fn read_segment_with_loss(path: &Path) -> std::io::Result<SegmentRead> {
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(std::io::Error::new(
@@ -214,38 +250,55 @@ impl Spool {
         let mut file = options.open(path)?;
         let mut records = Vec::new();
 
+        let mut discarded_bytes = 0;
         loop {
-            // Read table name length. A clean EOF here is the normal end.
+            let frame_start = file.stream_position()?;
+            if frame_start == metadata.len() {
+                break;
+            }
             let mut buf4 = [0u8; 4];
-            match file.read_exact(&mut buf4) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
+            if read_exact_or_eof(&mut file, &mut buf4)?.is_none() {
+                discarded_bytes = metadata.len().saturating_sub(frame_start);
+                break;
             }
             let tbl_len = u32::from_le_bytes(buf4) as usize;
+            // Bound corrupt lengths by the actual file before allocating.
+            if tbl_len as u64 > metadata.len().saturating_sub(file.stream_position()?) {
+                discarded_bytes = metadata.len().saturating_sub(frame_start);
+                break;
+            }
             let mut tbl_buf = vec![0u8; tbl_len];
             if read_exact_or_eof(&mut file, &mut tbl_buf)?.is_none() {
-                break; // torn record — stop here
+                discarded_bytes = metadata.len().saturating_sub(frame_start);
+                break;
             }
             let table = match String::from_utf8(tbl_buf) {
                 Ok(t) => t,
-                Err(_) => break, // garbage tail — stop
+                Err(_) => {
+                    discarded_bytes = metadata.len().saturating_sub(frame_start);
+                    break;
+                }
             };
-
-            // Read payload length + payload.
             if read_exact_or_eof(&mut file, &mut buf4)?.is_none() {
+                discarded_bytes = metadata.len().saturating_sub(frame_start);
                 break;
             }
             let pay_len = u32::from_le_bytes(buf4) as usize;
-            let mut payload = vec![0u8; pay_len];
-            if read_exact_or_eof(&mut file, &mut payload)?.is_none() {
+            if pay_len as u64 > metadata.len().saturating_sub(file.stream_position()?) {
+                discarded_bytes = metadata.len().saturating_sub(frame_start);
                 break;
             }
-
+            let mut payload = vec![0u8; pay_len];
+            if read_exact_or_eof(&mut file, &mut payload)?.is_none() {
+                discarded_bytes = metadata.len().saturating_sub(frame_start);
+                break;
+            }
             records.push((table, payload));
         }
-
-        Ok(records)
+        Ok(SegmentRead {
+            records,
+            discarded_bytes,
+        })
     }
 
     /// Seal (close + fsync) the currently open segment so it becomes eligible
@@ -262,13 +315,20 @@ impl Spool {
     }
 
     /// Remove a segment file and update total_bytes + the in-memory index.
-    pub fn remove_segment(&self, path: &Path) {
+    pub fn remove_segment(&self, path: &Path) -> bool {
         let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let _ = fs::remove_file(path);
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            if let Some(metrics) = self.metrics.get() {
+                record_spool_error(metrics, "disk", "delete");
+            }
+            return false;
+        }
         let mut g = self.inner.lock().unwrap();
         g.total_bytes = g.total_bytes.saturating_sub(size);
         g.segments.remove(path);
-        self.committed.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -344,6 +404,7 @@ fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> std::io::Result<Option<
 /// handle used to `commit` (remove/ack) them once successfully written to CH.
 pub struct DrainBatch {
     pub records: Vec<(String, Vec<u8>)>,
+    pub discarded_bytes: u64,
     handle: BatchHandle,
 }
 
@@ -361,6 +422,15 @@ pub enum IngestBuffer {
 }
 
 impl IngestBuffer {
+    pub fn attach_metrics(&self, metrics: Arc<SelfMetrics>) {
+        match self {
+            Self::Disk(spool) => {
+                let _ = spool.metrics.set(metrics);
+            }
+            Self::ObjectStore(spool) => spool.attach_metrics(metrics),
+        }
+    }
+
     /// Append a framed record (failure-path hot call). 429 when over the cap.
     /// Disk appends are blocking file writes serialized by the spool mutex, so
     /// they run on the blocking pool — otherwise, exactly when ClickHouse is
@@ -462,11 +532,17 @@ impl IngestBuffer {
                                 }
                             }
                         };
-                        match Spool::read_segment(&path) {
-                            Ok(records) => return Some(DrainBatch { records, handle: BatchHandle::Disk(path) }),
+                        match Spool::read_segment_with_loss(&path) {
+                            Ok(read) => {
+                                return Some(DrainBatch { records: read.records, discarded_bytes: read.discarded_bytes, handle: BatchHandle::Disk(path) });
+                            },
                             Err(e) => {
                                 tracing::error!(error = %e, segment = %path.display(), "ingest buffer: failed to read segment — discarding");
-                                s.remove_segment(&path);
+                                let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                if !s.remove_segment(&path) { return None; }
+                                if let Some(metrics) = s.metrics.get() {
+                                    record_spool_discard(metrics, "disk", "segment_read", "segment", bytes);
+                                }
                                 continue;
                             }
                         }
@@ -479,6 +555,7 @@ impl IngestBuffer {
             IngestBuffer::ObjectStore(s) => {
                 s.next_batch().await.map(|(key, size, records)| DrainBatch {
                     records,
+                    discarded_bytes: 0,
                     handle: BatchHandle::ObjectStore { key, size },
                 })
             }
@@ -486,14 +563,35 @@ impl IngestBuffer {
     }
 
     /// Commit (remove/ack) a batch that was successfully drained to ClickHouse.
-    pub async fn commit(&self, batch: DrainBatch) {
+    pub async fn commit(&self, batch: DrainBatch) -> bool {
         match (self, batch.handle) {
-            (IngestBuffer::Disk(s), BatchHandle::Disk(path)) => s.remove_segment(&path),
+            (IngestBuffer::Disk(s), BatchHandle::Disk(path)) => {
+                if s.remove_segment(&path) {
+                    if batch.discarded_bytes > 0
+                        && let Some(metrics) = s.metrics.get()
+                    {
+                        record_spool_discard(
+                            metrics,
+                            "disk",
+                            "frame_decode",
+                            "tail",
+                            batch.discarded_bytes,
+                        );
+                    }
+                    s.committed.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            }
             (IngestBuffer::ObjectStore(s), BatchHandle::ObjectStore { key, size }) => {
                 s.commit(&key, size).await
             }
             // Mismatched handle/backend can't happen (handles are minted by the same backend).
-            _ => tracing::error!("ingest buffer: commit handle/backend mismatch"),
+            _ => {
+                tracing::error!("ingest buffer: commit handle/backend mismatch");
+                false
+            }
         }
     }
 }
@@ -525,11 +623,43 @@ fn sync_file(f: &mut File) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Spool;
-    use std::fs;
+    use super::{IngestBuffer, SelfMetrics, Spool};
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::sync::Arc;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("rush-spool-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn torn_tail_is_counted_only_when_committed_not_on_read_retries() {
+        let path = temp_path("torn-tail-metrics");
+        let spool = Spool::open(&path, 1024 * 1024).unwrap();
+        spool.append("logs", b"accepted").unwrap();
+        spool.seal_current();
+        let segment = spool.take_oldest_segment().unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(&[1, 2])
+            .unwrap();
+        let buffer = Arc::new(IngestBuffer::Disk(spool));
+        let metrics = Arc::new(SelfMetrics::new());
+        buffer.attach_metrics(metrics.clone());
+        let first = buffer.next_batch().await.unwrap();
+        assert_eq!(first.records.len(), 1);
+        assert_eq!(first.discarded_bytes, 2);
+        drop(first); // insert failure leaves the segment available
+        let retry = buffer.next_batch().await.unwrap();
+        assert!(!metrics.render_prometheus().contains("discarded_total"));
+        assert!(buffer.commit(retry).await);
+        assert_eq!(buffer.committed_total(), 1);
+        let text = metrics.render_prometheus();
+        assert!(text.contains("rush_ingest_spool_discarded_total{backend=\"disk\",reason=\"frame_decode\",unit=\"tail\"} 1"));
+        assert!(text.contains("rush_ingest_spool_discarded_bytes_total{backend=\"disk\",reason=\"frame_decode\",unit=\"tail\"} 2"));
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
