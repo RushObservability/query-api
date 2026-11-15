@@ -876,6 +876,36 @@ enum StreamKind {
     Json,
 }
 
+const EXPORT_ROWS_BUCKETS: &[f64] = &[
+    0.0,
+    1.0,
+    10.0,
+    100.0,
+    1_000.0,
+    10_000.0,
+    50_000.0,
+    100_000.0,
+    500_000.0,
+    1_000_000.0,
+];
+
+struct SerializedRowsObservation {
+    metrics: Arc<crate::self_metrics::SelfMetrics>,
+    format: &'static str,
+    rows: u64,
+    outcome: &'static str,
+}
+impl Drop for SerializedRowsObservation {
+    fn drop(&mut self) {
+        self.metrics.observe_histogram_with(
+            "rush_export_serialized_rows",
+            &[("format", self.format), ("outcome", self.outcome)],
+            self.rows as f64,
+            EXPORT_ROWS_BUCKETS,
+        );
+    }
+}
+
 /// State for both CSV and JSON streaming. Only a single decoded row and its
 /// serialized chunk are live at a time, so peak API memory is independent of
 /// the requested row count.
@@ -888,6 +918,7 @@ struct ExportStreamState<T> {
     max_bytes: u64,
     progress: ExportProgress,
     on_progress: Option<ProgressCallback>,
+    metrics: SerializedRowsObservation,
     done: bool,
 }
 
@@ -903,6 +934,11 @@ impl<T> ExportStreamState<T> {
             return None;
         }
         self.done = true;
+        self.metrics.outcome = if self.progress.truncated {
+            "truncated"
+        } else {
+            "complete"
+        };
         let suffix = match self.kind {
             StreamKind::Csv if self.progress.truncated => {
                 b"# truncated: export byte limit reached\n".to_vec()
@@ -928,6 +964,7 @@ impl<T> ExportStreamState<T> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_response<T>(
     cursor: RowCursor<T>,
     prelude: Vec<u8>,
@@ -937,6 +974,7 @@ fn stream_response<T>(
     max_rows: u64,
     max_bytes: u64,
     on_progress: Option<ProgressCallback>,
+    metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) -> Response
 where
     T: clickhouse::RowOwned + clickhouse::RowRead + Send + 'static,
@@ -950,6 +988,15 @@ where
         max_bytes,
         progress: ExportProgress::default(),
         on_progress,
+        metrics: SerializedRowsObservation {
+            metrics,
+            format: match kind {
+                StreamKind::Csv => "csv",
+                StreamKind::Json => "json",
+            },
+            rows: 0,
+            outcome: "cancelled",
+        },
         done: false,
     };
 
@@ -960,6 +1007,7 @@ where
         if let Some(prelude) = state.prelude.take() {
             if prelude.len() as u64 + STREAM_SUFFIX_RESERVE > state.max_bytes {
                 state.done = true;
+                state.metrics.outcome = "metadata_limit";
                 return Some((
                     Err::<Bytes, std::io::Error>(std::io::Error::other(
                         "export metadata exceeds the byte limit",
@@ -981,6 +1029,7 @@ where
                     Err(_error) => {
                         tracing::error!(reason = "row_serialization", "export stream failed");
                         state.done = true;
+                        state.metrics.outcome = "serialization_error";
                         return Some((Err(std::io::Error::other("export stream failed")), state));
                     }
                 };
@@ -998,6 +1047,7 @@ where
                     return state.finish_chunk().map(|suffix| (Ok(suffix), state));
                 }
                 state.progress.rows += 1;
+                state.metrics.rows = state.progress.rows;
                 state.progress.bytes += chunk.len() as u64;
                 state.notify();
                 Some((Ok(Bytes::from(chunk)), state))
@@ -1006,6 +1056,7 @@ where
             Err(_error) => {
                 tracing::error!(reason = "cursor_read", "export stream failed");
                 state.done = true;
+                state.metrics.outcome = "cursor_error";
                 Some((Err(std::io::Error::other("export stream failed")), state))
             }
         }
@@ -1043,6 +1094,7 @@ where
 /// Errors mid-stream terminate the body with an `io::Error`; axum surfaces that as a
 /// truncated/aborted response. The initial query has already executed by the time the
 /// first row is pulled, so query-level failures still abort the download cleanly.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_csv_response<T>(
     cursor: RowCursor<T>,
     prelude: String,
@@ -1051,6 +1103,7 @@ pub fn stream_csv_response<T>(
     max_rows: u64,
     max_bytes: u64,
     on_progress: Option<ProgressCallback>,
+    metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) -> Response
 where
     T: clickhouse::RowOwned + clickhouse::RowRead + Send + 'static,
@@ -1064,6 +1117,7 @@ where
         max_rows,
         max_bytes,
         on_progress,
+        metrics,
     )
 }
 
@@ -1083,6 +1137,7 @@ pub fn json_query_preamble(query: serde_json::Value) -> Vec<u8> {
     bytes
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn stream_json_response<T>(
     cursor: RowCursor<T>,
     prelude: Vec<u8>,
@@ -1090,6 +1145,7 @@ pub fn stream_json_response<T>(
     max_rows: u64,
     max_bytes: u64,
     on_progress: Option<ProgressCallback>,
+    metrics: Arc<crate::self_metrics::SelfMetrics>,
 ) -> Response
 where
     T: clickhouse::RowOwned + clickhouse::RowRead + serde::Serialize + Send + 'static,
@@ -1103,12 +1159,52 @@ where
         max_rows,
         max_bytes,
         on_progress,
+        metrics,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn serialized_row_metrics_follow_actual_cursor_output() {
+        #[derive(clickhouse::Row, serde::Deserialize, serde::Serialize)]
+        struct TestRow {
+            value: u64,
+        }
+        let mock = clickhouse::test::Mock::new();
+        mock.add(clickhouse::test::handlers::provide([
+            TestRow { value: 1 },
+            TestRow { value: 2 },
+        ]));
+        let ch = clickhouse::Client::default()
+            .with_url(mock.url())
+            .with_validation(false);
+        let cursor = ch.query("SELECT value").fetch::<TestRow>().unwrap();
+        let metrics = Arc::new(crate::self_metrics::SelfMetrics::new());
+        let response = stream_json_response(
+            cursor,
+            json_query_preamble(serde_json::json!({})),
+            "test.json",
+            10,
+            1024 * 1024,
+            None,
+            metrics.clone(),
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["count"],
+            2
+        );
+        assert!(
+            metrics.render_prometheus().contains(
+                "rush_export_serialized_rows_sum{format=\"json\",outcome=\"complete\"} 2"
+            )
+        );
+    }
 
     #[test]
     fn async_threshold_applies_to_every_large_effective_request() {
