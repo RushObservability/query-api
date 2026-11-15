@@ -1,4 +1,9 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -146,6 +151,57 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             "secure": crate::row_policy_supported() && auth.secure() && audit.ready,
         })),
     )
+}
+
+/// Prometheus text exposition (0.0.4) of the process-global self-metrics registry,
+/// shared by the open `/metrics` scrape route and [`system_metrics`].
+pub fn self_metrics_response(state: &AppState) -> Response {
+    let audit = state.audit.health();
+    state.self_metrics.set_gauge(
+        "rush_audit_degraded",
+        &[],
+        if audit.ready { 0.0 } else { 1.0 },
+    );
+    state
+        .self_metrics
+        .set_gauge("rush_audit_outbox_events", &[], audit.pending_events as f64);
+    state
+        .self_metrics
+        .set_gauge("rush_audit_outbox_bytes", &[], audit.pending_bytes as f64);
+    state
+        .self_metrics
+        .set_gauge("rush_audit_outbox_max_bytes", &[], audit.max_bytes as f64);
+    state.self_metrics.set_gauge(
+        "rush_audit_write_failures_total",
+        &[],
+        audit.write_failures as f64,
+    );
+    let body = state.self_metrics.render_prometheus();
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/system/metrics`: the same self-metrics for the admin Capacity
+/// page, behind an admin browser session (API keys are rejected). The registry
+/// carries no tenant labels. The route stays outside query admission so it
+/// answers while query capacity is saturated. Reads are not audited: the page
+/// polls it.
+pub async fn system_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    crate::handlers::users::require_admin(&state, &headers).await?;
+    let mut response = self_metrics_response(&state);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[cfg(test)]

@@ -474,35 +474,7 @@ async fn http_metrics_middleware(
 /// Open `GET /metrics` handler: renders the self-metrics registry as Prometheus text
 /// exposition (version 0.0.4). No auth — same posture as `/healthz`.
 async fn metrics_handler(State(state): State<AppState>) -> Response {
-    let audit = state.audit.health();
-    state.self_metrics.set_gauge(
-        "rush_audit_degraded",
-        &[],
-        if audit.ready { 0.0 } else { 1.0 },
-    );
-    state
-        .self_metrics
-        .set_gauge("rush_audit_outbox_events", &[], audit.pending_events as f64);
-    state
-        .self_metrics
-        .set_gauge("rush_audit_outbox_bytes", &[], audit.pending_bytes as f64);
-    state
-        .self_metrics
-        .set_gauge("rush_audit_outbox_max_bytes", &[], audit.max_bytes as f64);
-    state.self_metrics.set_gauge(
-        "rush_audit_write_failures_total",
-        &[],
-        audit.write_failures as f64,
-    );
-    let body = state.self_metrics.render_prometheus();
-    (
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        body,
-    )
-        .into_response()
+    handlers::health::self_metrics_response(&state)
 }
 
 /// Middleware that resolves the tenant for every request. Methods checked in
@@ -3719,6 +3691,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/shutdown", post(handlers::shutdown::shutdown))
         // System-health self-metrics (Prometheus exposition). OPEN — no auth, like /healthz.
         .route("/metrics", get(metrics_handler))
+        // The same metrics for the admin Capacity page, admin session required.
+        .route("/api/v1/system/metrics", get(handlers::health::system_metrics))
         // Catch-all for unmatched DD agent paths (debug logging)
         .fallback(|req: axum::http::Request<axum::body::Body>| async move {
             tracing::warn!(
@@ -4439,6 +4413,8 @@ mod tenant_auth_tests {
             (Method::GET, "/healthz"),
             (Method::POST, "/shutdown"),
             (Method::POST, "/api/v1/investigate"),
+            // The Capacity page must load while query capacity is saturated.
+            (Method::GET, "/api/v1/system/metrics"),
         ] {
             let request = Request::builder()
                 .method(method)
@@ -5020,6 +4996,7 @@ mod tenant_auth_tests {
             "/api/v1/audit",
             "/api/v1/parse-query",
             "/api/v1/parse-promql",
+            "/api/v1/system/metrics",
         ] {
             assert!(!allows_unauthenticated_tenant_request(&Method::GET, path));
         }
