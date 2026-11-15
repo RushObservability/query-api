@@ -6995,15 +6995,19 @@ impl ConfigDb {
         }
     }
 
+    /// The version is past every stored one for the key, so the newest save
+    /// wins `FINAL` even when the replica that served it has a slower clock.
     pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let ver = Self::next_version();
         self.client
             .query(
-                "INSERT INTO config_settings (key, value, version, is_deleted) VALUES (?, ?, ?, 0)",
+                "INSERT INTO config_settings (key, value, version, is_deleted)
+                 SELECT ?, ?, greatest(toUInt64(?), (SELECT max(version) FROM config_settings WHERE key = ?) + 1), 0",
             )
             .bind(key)
             .bind(value)
             .bind(ver)
+            .bind(key)
             .execute()
             .await?;
         Ok(())

@@ -89,6 +89,27 @@ impl QueryGovernorConfig {
         }
     }
 
+    /// Decodes the stored `QUERY_LIMITS_SETTING_KEY` value. `None` (never
+    /// saved) means defaults; a value that fails to decode or validate is an
+    /// error, so every caller treats an unusable value the same way.
+    pub fn from_stored(raw: Option<&str>) -> Result<Self, String> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        let config = serde_json::from_str::<Self>(raw).map_err(|error| error.to_string())?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Process startup: unusable stored limits must not stop the process, so
+    /// they fall back to defaults until an admin saves valid ones.
+    pub fn at_startup(raw: Option<&str>) -> Self {
+        Self::from_stored(raw).unwrap_or_else(|error| {
+            tracing::error!(%error, "stored query workload limits are unusable; using safe defaults");
+            Self::default()
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for class in WorkloadClass::ALL {
             validate_budget(class, self.budget(class))?;
@@ -272,6 +293,8 @@ pub struct QueryGovernor {
     state: RwLock<Arc<AdmissionState>>,
     metrics: Arc<SelfMetrics>,
     admission_count: AtomicU64,
+    /// Bumped under the `state` write lock whenever the limits change.
+    generation: AtomicU64,
 }
 
 static GLOBAL_QUERY_GOVERNOR: OnceLock<Arc<QueryGovernor>> = OnceLock::new();
@@ -309,6 +332,7 @@ impl QueryGovernor {
             state: RwLock::new(Arc::new(AdmissionState::new(config))),
             metrics,
             admission_count: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -322,35 +346,35 @@ impl QueryGovernor {
 
     /// Atomically applies new limits to newly admitted work. Existing permits
     /// remain attached to the previous pool until their queries finish.
+    /// Unchanged limits keep the live pools, because a rebuild stops counting
+    /// queries admitted by the old ones.
     pub fn reconfigure(&self, config: QueryGovernorConfig) -> Result<(), String> {
         config.validate()?;
-        *self.state.write().expect("query governor lock poisoned") =
-            Arc::new(AdmissionState::new(config));
+        let mut state = self.state.write().expect("query governor lock poisoned");
+        if state.config != config {
+            *state = Arc::new(AdmissionState::new(config));
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
-    /// Applies the stored limits (`None` = never saved = defaults) when they
-    /// differ from the live ones. Pools are rebuilt only on a real change,
-    /// because a rebuild stops counting queries admitted by the old pools.
-    /// An unusable stored value keeps the live limits. Returns whether it applied.
-    pub fn apply_stored_limits(&self, raw: Option<&str>) -> bool {
-        let config = match raw {
-            None => QueryGovernorConfig::default(),
-            Some(raw) => match serde_json::from_str::<QueryGovernorConfig>(raw)
-                .map_err(|error| error.to_string())
-                .and_then(|config| config.validate().map(|()| config))
-            {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::error!(%error, "stored query workload limits are unusable; keeping live limits");
-                    return false;
-                }
-            },
-        };
-        if config == self.config() {
+    /// Changes each time the live limits change. A reload reads it before
+    /// fetching stored limits and passes it to `apply_reloaded`.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Applies limits read from storage unless the live limits changed since
+    /// `seen_generation` (a save on this replica landed while the read was in
+    /// flight, so the read may be older than it). Returns whether it applied.
+    pub fn apply_reloaded(&self, config: QueryGovernorConfig, seen_generation: u64) -> bool {
+        let mut state = self.state.write().expect("query governor lock poisoned");
+        if self.generation.load(Ordering::SeqCst) != seen_generation || state.config == config {
             return false;
         }
-        self.reconfigure(config).is_ok()
+        *state = Arc::new(AdmissionState::new(config));
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
     pub async fn admit(
@@ -485,16 +509,30 @@ pub fn spawn_limits_reload(
         let mut ticker = tokio::time::interval(QUERY_LIMITS_RELOAD_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+        // Logged once per unusable stored value, not on every tick.
+        let mut last_rejected: Option<String> = None;
         loop {
             ticker.tick().await;
-            match config_db.get_setting(QUERY_LIMITS_SETTING_KEY).await {
-                Ok(raw) => {
-                    if governor.apply_stored_limits(raw.as_deref()) {
+            let seen_generation = governor.generation();
+            let raw = match config_db.get_setting(QUERY_LIMITS_SETTING_KEY).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to reload query workload limits");
+                    continue;
+                }
+            };
+            match QueryGovernorConfig::from_stored(raw.as_deref()) {
+                Ok(config) => {
+                    last_rejected = None;
+                    if governor.apply_reloaded(config, seen_generation) {
                         tracing::info!("applied query workload limits saved by another replica");
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "failed to reload query workload limits");
+                    if last_rejected != raw {
+                        tracing::error!(%error, "stored query workload limits are unusable; keeping live limits");
+                        last_rejected = raw;
+                    }
                 }
             }
         }
@@ -734,28 +772,56 @@ mod tests {
     }
 
     #[test]
-    fn stored_limits_apply_only_when_valid_and_changed() {
-        let governor =
-            QueryGovernor::new(QueryGovernorConfig::default(), Arc::new(SelfMetrics::new()))
-                .unwrap();
-        assert!(!governor.apply_stored_limits(None));
-
+    fn stored_limits_decode_to_defaults_or_an_error() {
+        assert_eq!(
+            QueryGovernorConfig::from_stored(None),
+            Ok(QueryGovernorConfig::default())
+        );
         let mut changed = QueryGovernorConfig::default();
         changed.dashboard.max_time_range_secs = 60 * 24 * 60 * 60;
         let raw = serde_json::to_string(&changed).unwrap();
-        assert!(governor.apply_stored_limits(Some(&raw)));
-        assert_eq!(governor.config(), changed);
-        assert!(!governor.apply_stored_limits(Some(&raw)));
+        assert_eq!(
+            QueryGovernorConfig::from_stored(Some(&raw)),
+            Ok(changed.clone())
+        );
 
-        let mut invalid = changed.clone();
+        let mut invalid = changed;
         invalid.dashboard.per_tenant_concurrency = 0;
         let raw = serde_json::to_string(&invalid).unwrap();
-        assert!(!governor.apply_stored_limits(Some(&raw)));
-        assert!(!governor.apply_stored_limits(Some("{not json")));
+        assert!(QueryGovernorConfig::from_stored(Some(&raw)).is_err());
+        assert!(QueryGovernorConfig::from_stored(Some("{not json")).is_err());
+        // Startup never fails on what a reload would reject.
+        assert_eq!(
+            QueryGovernorConfig::at_startup(Some(&raw)),
+            QueryGovernorConfig::default()
+        );
+    }
+
+    #[test]
+    fn reload_applies_only_real_changes_and_never_undoes_a_newer_save() {
+        let governor =
+            QueryGovernor::new(QueryGovernorConfig::default(), Arc::new(SelfMetrics::new()))
+                .unwrap();
+        let mut changed = QueryGovernorConfig::default();
+        changed.dashboard.max_time_range_secs = 60 * 24 * 60 * 60;
+
+        let seen = governor.generation();
+        assert!(!governor.apply_reloaded(QueryGovernorConfig::default(), seen));
+        assert!(governor.apply_reloaded(changed.clone(), seen));
         assert_eq!(governor.config(), changed);
 
-        assert!(governor.apply_stored_limits(None));
-        assert_eq!(governor.config(), QueryGovernorConfig::default());
+        // Saving the same limits again keeps the live pools.
+        let seen = governor.generation();
+        governor.reconfigure(changed.clone()).unwrap();
+        assert_eq!(governor.generation(), seen);
+
+        // A save on this replica lands while a reload read is in flight: the
+        // (older) read must not replace it.
+        let mut saved = changed.clone();
+        saved.interactive.per_tenant_concurrency = 3;
+        governor.reconfigure(saved.clone()).unwrap();
+        assert!(!governor.apply_reloaded(changed, seen));
+        assert_eq!(governor.config(), saved);
     }
 
     #[tokio::test]
