@@ -465,21 +465,26 @@ pub async fn test_channel(
     };
 
     let http_client = reqwest::Client::new();
-    let result = crate::alert_engine::send_channel_notification(
-        &channel,
-        &test_message,
-        "Test Alert",
-        "TEST",
-        0.0,
-        0.0,
-        "",
-        "",
-        "This is a test notification from Rush Observability.",
-        "",
-        "",
-        &http_client,
-        &smtp_config,
-        &smtp_transport,
+    let result = crate::notification_metrics::observe_delivery(
+        Some(&state.self_metrics),
+        "test",
+        &channel.channel_type,
+        crate::alert_engine::send_channel_notification(
+            &channel,
+            &test_message,
+            "Test Alert",
+            "TEST",
+            0.0,
+            0.0,
+            "",
+            "",
+            "This is a test notification from Rush Observability.",
+            "",
+            "",
+            &http_client,
+            &smtp_config,
+            &smtp_transport,
+        ),
     )
     .await;
 
@@ -501,7 +506,7 @@ pub async fn test_channel(
         )
         .await;
 
-    let _ = state
+    let logged = state
         .config_db
         .create_notification_log(
             &id,
@@ -513,6 +518,11 @@ pub async fn test_channel(
             &error_msg,
         )
         .await;
+    crate::notification_metrics::record_log_write(
+        Some(&state.self_metrics),
+        "test",
+        logged.is_ok(),
+    );
 
     match result {
         Ok(()) => Ok(Json(
