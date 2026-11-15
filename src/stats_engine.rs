@@ -5,7 +5,7 @@ use futures_util::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::time::Instant;
 
-#[derive(clickhouse::Row, serde::Deserialize)]
+#[derive(clickhouse::Row, serde::Deserialize, serde::Serialize)]
 struct CountRow {
     count: u64,
 }
@@ -15,7 +15,7 @@ struct BytesRow {
     total: u64,
 }
 
-#[derive(clickhouse::Row, serde::Deserialize)]
+#[derive(clickhouse::Row, serde::Deserialize, serde::Serialize)]
 struct F64Row {
     v: f64,
 }
@@ -101,26 +101,34 @@ async fn collect_and_write(
         disk_local_total_bytes,
         buf_oldest,
     ) = tokio::join!(
-        query_count(ch, &q_spans),
+        query_count(ch, &q_spans, self_metrics, "spans"),
         query_bytes(
             ch,
-            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans' AND active"
+            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans' AND active",
+            self_metrics,
+            "span_bytes"
         ),
-        query_count(ch, &q_logs),
-        query_count(ch, &q_gauge),
-        query_count(ch, &q_sum),
-        query_count(ch, &q_hist),
+        query_count(ch, &q_logs, self_metrics, "logs"),
+        query_count(ch, &q_gauge, self_metrics, "metric_gauge"),
+        query_count(ch, &q_sum, self_metrics, "metric_sum"),
+        query_count(ch, &q_hist, self_metrics, "metric_histogram"),
         query_count(
             ch,
-            "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR"
+            "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR",
+            self_metrics,
+            "unique_series"
         ),
         query_bytes(
             ch,
-            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND active"
+            "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND active",
+            self_metrics,
+            "storage_bytes"
         ),
         query_count(
             ch,
-            "SELECT sum(rows) as count FROM system.parts WHERE database = 'observability' AND active"
+            "SELECT sum(rows) as count FROM system.parts WHERE database = 'observability' AND active",
+            self_metrics,
+            "storage_rows"
         ),
         // Tiered storage breakdown: data bytes on local disk vs object store.
         // Classified by joining each part's disk to system.disks.type, matching
@@ -129,71 +137,105 @@ async fn collect_and_write(
             ch,
             "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
              LEFT JOIN system.disks d ON p.disk_name = d.name \
-             WHERE p.database = 'observability' AND p.active AND d.type = 'Local'"
+             WHERE p.database = 'observability' AND p.active AND d.type = 'Local'",
+            self_metrics,
+            "storage_local_bytes"
         ),
         query_bytes(
             ch,
             "SELECT sum(p.bytes_on_disk) as total FROM system.parts p \
              LEFT JOIN system.disks d ON p.disk_name = d.name \
-             WHERE p.database = 'observability' AND p.active AND d.type != 'Local'"
+             WHERE p.database = 'observability' AND p.active AND d.type != 'Local'",
+            self_metrics,
+            "storage_object_store_bytes"
         ),
         // Local disk capacity (headroom) from system.disks.
         query_bytes(
             ch,
-            "SELECT sum(free_space) as total FROM system.disks WHERE type = 'Local'"
+            "SELECT sum(free_space) as total FROM system.disks WHERE type = 'Local'",
+            self_metrics,
+            "disk_local_free_bytes"
         ),
         query_bytes(
             ch,
-            "SELECT sum(total_space) as total FROM system.disks WHERE type = 'Local'"
+            "SELECT sum(total_space) as total FROM system.disks WHERE type = 'Local'",
+            self_metrics,
+            "disk_local_total_bytes"
         ),
         // Ingest buffer (durable spool) replay lag.
         buffer.oldest_age_secs(),
     );
-    let metric_total = metric_gauge + metric_sum + metric_hist;
+    let metric_total = metric_gauge
+        .zip(metric_sum)
+        .zip(metric_hist)
+        .map(|((a, b), c)| a + b + c);
+    let mut healthy = [
+        span_total,
+        span_bytes,
+        log_total,
+        metric_gauge,
+        metric_sum,
+        metric_hist,
+        unique_series,
+        storage_bytes,
+        storage_rows,
+        storage_local_bytes,
+        storage_object_store_bytes,
+        disk_local_free_bytes,
+        disk_local_total_bytes,
+    ]
+    .iter()
+    .all(Option::is_some);
     let buf_oldest = buf_oldest.unwrap_or(0);
 
     // ── Write all metrics ──
     let metrics: Vec<(&str, f64)> = vec![
         (
             "rush_stats_ingest_buffer_pending_bytes",
-            buffer.total_bytes() as f64,
+            Some(buffer.total_bytes() as f64),
         ),
         (
             "rush_stats_ingest_buffer_pending_count",
-            buffer.segment_count() as f64,
+            Some(buffer.segment_count() as f64),
         ),
         (
             "rush_stats_ingest_buffer_oldest_age_secs",
-            buf_oldest as f64,
+            Some(buf_oldest as f64),
         ),
         // Cumulative counter — drain rate = rate(rush_stats_ingest_buffer_committed_total).
         (
             "rush_stats_ingest_buffer_committed_total",
-            buffer.committed_total() as f64,
+            Some(buffer.committed_total() as f64),
         ),
-        ("rush_stats_span_events_total", span_total as f64),
-        ("rush_stats_span_events_bytes", span_bytes as f64),
-        ("rush_stats_logs_total", log_total as f64),
-        ("rush_stats_metrics_total", metric_total as f64),
-        ("rush_stats_unique_series", unique_series as f64),
-        ("rush_stats_storage_bytes", storage_bytes as f64),
-        ("rush_stats_storage_rows", storage_rows as f64),
+        ("rush_stats_span_events_total", span_total.map(|v| v as f64)),
+        ("rush_stats_span_events_bytes", span_bytes.map(|v| v as f64)),
+        ("rush_stats_logs_total", log_total.map(|v| v as f64)),
+        ("rush_stats_metrics_total", metric_total.map(|v| v as f64)),
+        ("rush_stats_unique_series", unique_series.map(|v| v as f64)),
+        ("rush_stats_storage_bytes", storage_bytes.map(|v| v as f64)),
+        ("rush_stats_storage_rows", storage_rows.map(|v| v as f64)),
         // Tiered storage: where the data physically lives.
-        ("rush_stats_storage_local_bytes", storage_local_bytes as f64),
+        (
+            "rush_stats_storage_local_bytes",
+            storage_local_bytes.map(|v| v as f64),
+        ),
         (
             "rush_stats_storage_object_store_bytes",
-            storage_object_store_bytes as f64,
+            storage_object_store_bytes.map(|v| v as f64),
         ),
         // Local disk capacity, for headroom / move-pressure monitoring.
         (
             "rush_stats_disk_local_free_bytes",
-            disk_local_free_bytes as f64,
+            disk_local_free_bytes.map(|v| v as f64),
         ),
         (
             "rush_stats_disk_local_total_bytes",
-            disk_local_total_bytes as f64,
+            disk_local_total_bytes.map(|v| v as f64),
         ),
-    ];
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| (name, value)))
+    .collect();
 
     let instance_attrs = labels_to_ch_map(&[("instance", instance_id.to_string())]);
     let values: Vec<String> = metrics
@@ -216,9 +258,7 @@ async fn collect_and_write(
         values.join(", ")
     );
 
-    if let Err(e) = ch.query(&sql).execute().await {
-        tracing::warn!("stats engine: metric write failed: {e}");
-    }
+    healthy &= write_self_metrics(ch, self_metrics, &sql, "stats", "metrics_gauge").await;
 
     tracing::debug!("stats engine: wrote {} metrics", metrics.len());
 
@@ -243,18 +283,18 @@ async fn collect_and_write(
     // Storage capacity gauges are process-global and intentionally have no
     // tenant labels. They power the admin capacity view and keep disk headroom
     // visible even when no recent stats snapshot has been written yet.
-    self_metrics.set_gauge(
-        "rush_stats_disk_local_free_bytes",
-        &[],
-        disk_local_free_bytes as f64,
-    );
-    self_metrics.set_gauge(
-        "rush_stats_disk_local_total_bytes",
-        &[],
-        disk_local_total_bytes as f64,
-    );
-    self_metrics.set_gauge("rush_stats_storage_bytes", &[], storage_bytes as f64);
-    self_metrics.set_gauge("rush_stats_storage_rows", &[], storage_rows as f64);
+    if let Some(value) = disk_local_free_bytes {
+        self_metrics.set_gauge("rush_stats_disk_local_free_bytes", &[], value as f64);
+    }
+    if let Some(value) = disk_local_total_bytes {
+        self_metrics.set_gauge("rush_stats_disk_local_total_bytes", &[], value as f64);
+    }
+    if let Some(value) = storage_bytes {
+        self_metrics.set_gauge("rush_stats_storage_bytes", &[], value as f64);
+    }
+    if let Some(value) = storage_rows {
+        self_metrics.set_gauge("rush_stats_storage_rows", &[], value as f64);
+    }
 
     // ── ClickHouse health gauges (group D) into both SelfMetrics and metrics_gauge ──
     collect_ch_health(ch, self_metrics).await;
@@ -262,8 +302,11 @@ async fn collect_and_write(
     // ── Self-ingest: write the SelfMetrics snapshot into our own metrics tables so the
     // same rush_http_*/rush_ingest_*/rush_engine_*/rush_ch_* series are queryable via
     // the in-product PromQL API (/prom/api/v1/*). ──
-    self_ingest_snapshot(ch, self_metrics, now_nanos, instance_id).await;
-
+    healthy &= self_ingest_snapshot(ch, self_metrics, now_nanos, instance_id).await;
+    anyhow::ensure!(
+        healthy,
+        "stats collection or self-metrics persistence was degraded"
+    );
     Ok(())
 }
 
@@ -501,6 +544,19 @@ async fn run_ch_probe(
 }
 
 fn record_ch_probe(self_metrics: &SelfMetrics, probe: &'static str, start: Instant, ok: bool) {
+    let labels = [("probe", probe)];
+    self_metrics.set_gauge(
+        "rush_ch_health_probe_valid",
+        &labels,
+        if ok { 1.0 } else { 0.0 },
+    );
+    if ok {
+        self_metrics.set_gauge(
+            "rush_ch_health_probe_last_success_timestamp_seconds",
+            &labels,
+            chrono::Utc::now().timestamp() as f64,
+        );
+    }
     let outcome = if ok { "ok" } else { "error" };
     self_metrics.inc_counter(
         "rush_ch_health_probes_total",
@@ -524,16 +580,17 @@ fn spool_utilization_ratio(bytes: u64, max_bytes: u64) -> f64 {
 
 /// Insert the SelfMetrics snapshot into `metrics_gauge` / `metrics_sum` (by kind). Labels
 /// become the ClickHouse `Attributes` map. Reuses the same raw-SQL insert path the
-/// rush_stats_* gauges use. Best-effort: a failed insert is logged, not fatal to the tick.
+/// rush_stats_* gauges use. Both table writes are attempted; a failed insert degrades the tick.
 async fn self_ingest_snapshot(
     ch: &Client,
     self_metrics: &SelfMetrics,
     now_nanos: i64,
     instance_id: &str,
-) {
+) -> bool {
+    let mut healthy = true;
     let points = self_metrics.snapshot_series();
     if points.is_empty() {
-        return;
+        return true;
     }
 
     let mut gauge_rows: Vec<String> = Vec::new();
@@ -569,9 +626,7 @@ async fn self_ingest_snapshot(
               Exemplars.SpanId, Exemplars.TraceId) VALUES {}",
             gauge_rows.join(", ")
         );
-        if let Err(e) = ch.query(&sql).execute().await {
-            tracing::warn!("stats engine: self-metrics gauge ingest failed: {e}");
-        }
+        healthy &= write_self_metrics(ch, self_metrics, &sql, "snapshot", "metrics_gauge").await;
     }
 
     if !sum_rows.is_empty() {
@@ -584,10 +639,9 @@ async fn self_ingest_snapshot(
               Exemplars.SpanId, Exemplars.TraceId, AggregationTemporality, IsMonotonic) VALUES {}",
             sum_rows.join(", ")
         );
-        if let Err(e) = ch.query(&sql).execute().await {
-            tracing::warn!("stats engine: self-metrics sum ingest failed: {e}");
-        }
+        healthy &= write_self_metrics(ch, self_metrics, &sql, "snapshot", "metrics_sum").await;
     }
+    healthy
 }
 
 /// Add the deployment's stable identity to every self-ingested series. The in-process
@@ -640,25 +694,131 @@ fn escape_sql(s: &str) -> String {
     crate::query_builder::escape_string_literal(s)
 }
 
-async fn query_count(ch: &Client, sql: &str) -> u64 {
-    ch.query(sql)
-        .fetch_one::<CountRow>()
-        .await
-        .map(|r| r.count)
-        .unwrap_or(0)
+async fn write_self_metrics(
+    ch: &Client,
+    metrics: &SelfMetrics,
+    sql: &str,
+    stage: &'static str,
+    table: &'static str,
+) -> bool {
+    let started = Instant::now();
+    let result = ch.query(sql).execute().await;
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    let labels = [("stage", stage), ("table", table), ("outcome", outcome)];
+    metrics.inc_counter("rush_self_metrics_writes_total", &labels, 1);
+    metrics.observe_histogram(
+        "rush_self_metrics_write_duration_ms",
+        &[("stage", stage), ("table", table)],
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    if let Err(error) = result {
+        tracing::warn!(%error, stage, table, "stats engine: metrics persistence failed");
+        false
+    } else {
+        metrics.set_gauge(
+            "rush_self_metrics_last_success_timestamp_seconds",
+            &[("stage", stage), ("table", table)],
+            chrono::Utc::now().timestamp() as f64,
+        );
+        true
+    }
 }
 
-async fn query_bytes(ch: &Client, sql: &str) -> u64 {
-    ch.query(sql)
+async fn query_count(
+    ch: &Client,
+    sql: &str,
+    metrics: &SelfMetrics,
+    probe: &'static str,
+) -> Option<u64> {
+    let started = Instant::now();
+    let value = ch
+        .query(sql)
+        .fetch_one::<CountRow>()
+        .await
+        .ok()
+        .map(|r| r.count);
+    record_ch_probe(metrics, probe, started, value.is_some());
+    value
+}
+
+async fn query_bytes(
+    ch: &Client,
+    sql: &str,
+    metrics: &SelfMetrics,
+    probe: &'static str,
+) -> Option<u64> {
+    let started = Instant::now();
+    let value = ch
+        .query(sql)
         .fetch_one::<BytesRow>()
         .await
-        .map(|r| r.total)
-        .unwrap_or(0)
+        .ok()
+        .map(|r| r.total);
+    record_ch_probe(metrics, probe, started, value.is_some());
+    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_probe_is_invalid_not_zero_and_preserves_last_valid_health_value() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let ch = Client::default()
+            .with_url(mock.url())
+            .with_validation(false);
+        let metrics = SelfMetrics::new();
+        mock.add(handlers::failure(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+        assert_eq!(
+            query_count(&ch, "SELECT count() AS count", &metrics, "logs").await,
+            None
+        );
+        assert!(
+            metrics
+                .render_prometheus()
+                .contains("rush_ch_health_probe_valid{probe=\"logs\"} 0")
+        );
+        mock.add(handlers::provide([F64Row { v: 42.0 }]));
+        run_ch_probe(&ch, &metrics, "rush_ch_active_queries", "SELECT 42.0 AS v").await;
+        mock.add(handlers::failure(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+        run_ch_probe(&ch, &metrics, "rush_ch_active_queries", "SELECT 42.0 AS v").await;
+        let text = metrics.render_prometheus();
+        assert!(text.contains("rush_ch_active_queries 42"));
+        assert!(text.contains("rush_ch_health_probe_valid{probe=\"rush_ch_active_queries\"} 0"));
+        assert!(text.contains(
+            "rush_ch_health_probe_last_success_timestamp_seconds{probe=\"rush_ch_active_queries\"}"
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_partial_persistence_failure_and_still_attempts_other_table() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let ch = Client::default()
+            .with_url(mock.url())
+            .with_validation(false);
+        let metrics = SelfMetrics::new();
+        metrics.set_gauge("test_gauge", &[], 1.0);
+        metrics.inc_counter("test_counter", &[], 1);
+        mock.add(handlers::failure(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+        let sum_write = mock.add(handlers::record_ddl());
+        assert!(!self_ingest_snapshot(&ch, &metrics, 1, "test-replica").await);
+        assert!(sum_write.query().await.contains("INSERT INTO metrics_sum"));
+        let text = metrics.render_prometheus();
+        assert!(text.contains("rush_self_metrics_writes_total{outcome=\"error\",stage=\"snapshot\",table=\"metrics_gauge\"} 1"));
+        assert!(text.contains("rush_self_metrics_writes_total{outcome=\"ok\",stage=\"snapshot\",table=\"metrics_sum\"} 1"));
+        assert!(!text.contains(
+            "last_success_timestamp_seconds{stage=\"snapshot\",table=\"metrics_gauge\"}"
+        ));
+    }
 
     #[test]
     fn ch_map_literal_render() {
