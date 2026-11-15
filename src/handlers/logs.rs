@@ -1025,6 +1025,8 @@ pub async fn export_logs(
                 }
             };
             let budget = guard.budget().clone();
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(budget.request_timeout_secs);
             let progress = background_state
                 .export_jobs
                 .progress_callback(&background_job_id);
@@ -1049,6 +1051,7 @@ pub async fn export_logs(
                         limit,
                         max_bytes,
                         Some(progress),
+                        background_state.self_metrics.clone(),
                     ),
                     export::ExportFormat::Json => export::stream_json_response(
                         cursor,
@@ -1057,8 +1060,12 @@ pub async fn export_logs(
                         limit,
                         max_bytes,
                         Some(progress),
+                        background_state.self_metrics.clone(),
                     ),
                 };
+                let response = crate::query_governor::retain_artifact_until_body_deadline(
+                    response, guard, deadline,
+                );
                 background_state
                     .export_jobs
                     .write_response(&background_job_id, response)
@@ -1066,13 +1073,9 @@ pub async fn export_logs(
             };
             let result = crate::query_governor::with_budget(
                 budget.clone(),
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(budget.request_timeout_secs),
-                    work,
-                ),
+                tokio::time::timeout_at(deadline, work),
             )
             .await;
-            drop(guard);
             match result {
                 Ok(Ok(())) => {}
                 _ if background_state
@@ -1138,6 +1141,7 @@ pub async fn export_logs(
                 limit,
                 max_bytes,
                 None,
+                state.self_metrics.clone(),
             ))
         }
         export::ExportFormat::Json => {
@@ -1168,6 +1172,7 @@ pub async fn export_logs(
                 limit,
                 max_bytes,
                 None,
+                state.self_metrics.clone(),
             ))
         }
     }

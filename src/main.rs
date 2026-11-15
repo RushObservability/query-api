@@ -434,7 +434,7 @@ async fn http_metrics_middleware(
         return next.run(req).await;
     }
 
-    let method = req.method().as_str().to_string();
+    let method = http_method_label(req.method()).to_string();
     let sm = state.self_metrics.clone();
 
     // In-flight gauge: inc on entry, dec on exit (even on panic-free early returns).
@@ -468,7 +468,27 @@ async fn http_metrics_middleware(
         elapsed_ms,
     );
 
+    sm.observe_histogram(
+        "rush_http_response_headers_duration_ms",
+        &[("route", route.as_str()), ("method", method.as_str())],
+        elapsed_ms,
+    );
     resp
+}
+
+fn http_method_label(method: &axum::http::Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "CONNECT" => "CONNECT",
+        "OPTIONS" => "OPTIONS",
+        "TRACE" => "TRACE",
+        "PATCH" => "PATCH",
+        _ => "OTHER",
+    }
 }
 
 /// Open `GET /metrics` handler: renders the self-metrics registry as Prometheus text
@@ -1452,6 +1472,11 @@ where
     .await;
     match result {
         Ok((response, outcome)) => {
+            let outcome = if class == WorkloadClass::Export && outcome == "completed" {
+                "response_ready"
+            } else {
+                outcome
+            };
             metrics.inc_counter(
                 "rush_query_requests_total",
                 &[("workload", label), ("outcome", outcome)],
@@ -4469,6 +4494,17 @@ mod tenant_auth_tests {
     use rush_api::cors::CorsPolicy;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+
+    #[test]
+    fn arbitrary_http_methods_do_not_create_unbounded_metric_labels() {
+        assert_eq!(super::http_method_label(&axum::http::Method::GET), "GET");
+        assert_eq!(
+            super::http_method_label(
+                &axum::http::Method::from_bytes(b"CUSTOM-TENANT-SECRET").unwrap()
+            ),
+            "OTHER"
+        );
+    }
 
     #[test]
     fn startup_validates_api_key_secret_before_running_migrations() {
