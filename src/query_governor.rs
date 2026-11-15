@@ -329,6 +329,30 @@ impl QueryGovernor {
         Ok(())
     }
 
+    /// Applies the stored limits (`None` = never saved = defaults) when they
+    /// differ from the live ones. Pools are rebuilt only on a real change,
+    /// because a rebuild stops counting queries admitted by the old pools.
+    /// An unusable stored value keeps the live limits. Returns whether it applied.
+    pub fn apply_stored_limits(&self, raw: Option<&str>) -> bool {
+        let config = match raw {
+            None => QueryGovernorConfig::default(),
+            Some(raw) => match serde_json::from_str::<QueryGovernorConfig>(raw)
+                .map_err(|error| error.to_string())
+                .and_then(|config| config.validate().map(|()| config))
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::error!(%error, "stored query workload limits are unusable; keeping live limits");
+                    return false;
+                }
+            },
+        };
+        if config == self.config() {
+            return false;
+        }
+        self.reconfigure(config).is_ok()
+    }
+
     pub async fn admit(
         &self,
         class: WorkloadClass,
@@ -445,6 +469,36 @@ impl Drop for QueryQueueGuard {
             -1.0,
         );
     }
+}
+
+/// How often every API replica and engine process re-reads the stored limits.
+pub const QUERY_LIMITS_RELOAD_INTERVAL: Duration = Duration::from_secs(15);
+
+/// `PUT /api/v1/settings/query-limits` reconfigures only the replica that
+/// served it; this brings every other process to the stored limits within
+/// one interval.
+pub fn spawn_limits_reload(
+    governor: Arc<QueryGovernor>,
+    config_db: Arc<crate::clickhouse_config::ConfigDb>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(QUERY_LIMITS_RELOAD_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match config_db.get_setting(QUERY_LIMITS_SETTING_KEY).await {
+                Ok(raw) => {
+                    if governor.apply_stored_limits(raw.as_deref()) {
+                        tracing::info!("applied query workload limits saved by another replica");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to reload query workload limits");
+                }
+            }
+        }
+    });
 }
 
 pub struct QueryAdmissionGuard {
@@ -677,6 +731,31 @@ mod tests {
             Err(TimeRangeError::TooLarge { max_seconds: 60 })
         );
         assert!(ValidatedTimeRange::parse("1786320000", "1786320030", 60).is_ok());
+    }
+
+    #[test]
+    fn stored_limits_apply_only_when_valid_and_changed() {
+        let governor =
+            QueryGovernor::new(QueryGovernorConfig::default(), Arc::new(SelfMetrics::new()))
+                .unwrap();
+        assert!(!governor.apply_stored_limits(None));
+
+        let mut changed = QueryGovernorConfig::default();
+        changed.dashboard.max_time_range_secs = 60 * 24 * 60 * 60;
+        let raw = serde_json::to_string(&changed).unwrap();
+        assert!(governor.apply_stored_limits(Some(&raw)));
+        assert_eq!(governor.config(), changed);
+        assert!(!governor.apply_stored_limits(Some(&raw)));
+
+        let mut invalid = changed.clone();
+        invalid.dashboard.per_tenant_concurrency = 0;
+        let raw = serde_json::to_string(&invalid).unwrap();
+        assert!(!governor.apply_stored_limits(Some(&raw)));
+        assert!(!governor.apply_stored_limits(Some("{not json")));
+        assert_eq!(governor.config(), changed);
+
+        assert!(governor.apply_stored_limits(None));
+        assert_eq!(governor.config(), QueryGovernorConfig::default());
     }
 
     #[tokio::test]

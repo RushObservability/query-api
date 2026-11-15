@@ -87,7 +87,8 @@ async fn main() -> anyhow::Result<()> {
         rush_api::query_governor::QueryGovernor::new(query_limits, self_metrics.clone())
             .map_err(anyhow::Error::msg)?,
     );
-    rush_api::query_governor::install_global(query_governor);
+    rush_api::query_governor::install_global(query_governor.clone());
+    rush_api::query_governor::spawn_limits_reload(query_governor, config_db.clone());
 
     // Takes the same lease as the in-process engine, so this deployment and any
     // API replica can never both evaluate rules.
