@@ -62,10 +62,14 @@ fn with_internal_token(request: reqwest::RequestBuilder, token: String) -> reqwe
 }
 
 /// Tool scopes forwarded to the agent. API keys get telemetry tools only:
-/// repository contents and cluster access stay with interactive users.
+/// repository contents, Kubernetes/GitOps, and cluster access stay with
+/// interactive users. The agent treats "all" as including Kubernetes, so keys
+/// get the telemetry signals by name instead.
+const API_KEY_SCOPES: [&str; 4] = ["logs", "traces", "metrics", "profiles"];
+
 fn scopes_for_caller(caller: &AuthenticatedCaller) -> serde_json::Value {
     if is_api_key_principal(&caller.0) {
-        serde_json::json!(["all"])
+        serde_json::json!(API_KEY_SCOPES)
     } else {
         scopes_for_role(&caller.4)
     }
@@ -281,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn api_keys_never_receive_code_or_cluster_scopes() {
+    fn api_keys_receive_telemetry_scopes_only() {
         let caller = |id: &str, role: &str| {
             (
                 id.to_string(),
@@ -291,10 +295,19 @@ mod tests {
                 role.to_string(),
             )
         };
-        assert_eq!(
-            scopes_for_caller(&caller("apikey:k1", "write")),
-            serde_json::json!(["all"])
-        );
+        for role in ["read", "write", "admin"] {
+            let scopes = scopes_for_caller(&caller("apikey:k1", role));
+            assert_eq!(
+                scopes,
+                serde_json::json!(["logs", "traces", "metrics", "profiles"])
+            );
+            for denied in ["all", "kubernetes", "code", "kube_cluster"] {
+                assert!(
+                    !scopes.as_array().unwrap().iter().any(|s| s == denied),
+                    "{role} key got {denied}"
+                );
+            }
+        }
         assert_eq!(
             scopes_for_caller(&caller("user-1", "write")),
             serde_json::json!(["all", "code"])
