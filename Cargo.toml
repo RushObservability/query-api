@@ -53,7 +53,7 @@ sha2 = "0.10"
 hmac = "0.12"
 rand = "0.10"
 argon2 = { version = "0.5", features = ["password-hash", "std"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto", "use_pem"] }
 lettre = { version = "0.11.22", features = ["tokio1-native-tls", "smtp-transport", "builder", "hostname"] }
 promql-parser = "0.7"
 regex = "1"
@@ -80,7 +80,7 @@ openssl = "0.10"
 # Pure-Rust SAML signature verification (XML-DSig + exclusive C14N via bergshamra).
 # No native/xmlsec deps; works on macOS dev and Linux prod. Verifies the signed
 # SAML Response (signature + reference digest) and guards against XSW / dup-ID.
-opensaml = "0.3.0"
+opensaml = "0.8.0"
 dashmap = "6"
 opentelemetry-proto = { version = "0.33", features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
 hex = "0.4"
@@ -94,7 +94,7 @@ sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [dev-dependencies]
 clickhouse = { version = "0.15", features = ["test-util"] }
-bergshamra = "0.7.0"
+bergshamra = "0.12.0"
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 
