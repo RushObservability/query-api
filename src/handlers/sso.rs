@@ -3804,7 +3804,8 @@ mod tests {
         let hmac_token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"attacker-controlled-secret"),
+            &jsonwebtoken::EncodingKey::from_secret(b"attacker-controlled-secret")
+                .expect("HMAC key"),
         )
         .unwrap();
         assert!(
