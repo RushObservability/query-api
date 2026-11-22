@@ -2,6 +2,9 @@ use clickhouse::Client;
 
 use crate::config::RushConfig;
 
+mod span_service_projection;
+pub use span_service_projection::spawn_span_service_projection_maintenance;
+
 #[cfg(test)]
 mod profile_storage_tests {
     use super::*;
@@ -240,6 +243,11 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     `event_attributes` Array(String),
     `link_trace_ids` Array(String),
     `link_span_ids` Array(String),
+    PROJECTION idx_spans_by_service (
+        SELECT tenant_id, service_name, timestamp, duration_ns, kind, status,
+            http_status_code, http_method, http_path, span_name
+        ORDER BY (tenant_id, service_name, timestamp)
+    ),
     INDEX idx_trace_id trace_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_span_id span_id TYPE bloom_filter(0.001) GRANULARITY 1,
     INDEX idx_parent_span_id parent_span_id TYPE bloom_filter(0.001) GRANULARITY 1,

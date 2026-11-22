@@ -17,6 +17,18 @@ const LATENCY_PERCENTILES_SQL: &str = "(quantiles(0.5, 0.95, 0.99)(duration_ns) 
      duration_quantiles[2] / 1000000.0 AS p95_ms, \
      duration_quantiles[3] / 1000000.0 AS p99_ms";
 
+fn time_breakdown_query(
+    ch: &clickhouse::Client,
+    sql: &str,
+    tenant_id: &str,
+) -> clickhouse::query::Query {
+    // These reads need raw JSON attributes absent from the service projection.
+    // Benchmarks found extra planning cost without any read savings.
+    crate::tenant_query(ch, sql, tenant_id)
+        .with_setting("optimize_use_projections", "0")
+        .with_setting("optimize_use_projection_filtering", "0")
+}
+
 #[cfg(test)]
 mod aggregation_tests;
 
@@ -433,8 +445,8 @@ pub async fn service_time_breakdown(
     );
 
     let (totals_result, databases_result) = tokio::join!(
-        crate::tenant_query(&state.ch, &totals_sql, tenant_id).fetch_one::<TimeBreakdownTotals>(),
-        crate::tenant_query(&state.ch, &databases_sql, tenant_id).fetch_all::<DatabaseTimeRow>(),
+        time_breakdown_query(&state.ch, &totals_sql, tenant_id).fetch_one::<TimeBreakdownTotals>(),
+        time_breakdown_query(&state.ch, &databases_sql, tenant_id).fetch_all::<DatabaseTimeRow>(),
     );
 
     let totals = totals_result.map_err(|e| {
@@ -499,7 +511,7 @@ pub async fn service_time_breakdown_timeseries(
     let (interval, bucket_secs) = breakdown_interval(minutes, &params.interval);
     let sql = time_breakdown_timeseries_sql(tenant_id, &params.service, minutes, bucket_secs);
 
-    let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
+    let buckets = time_breakdown_query(&state.ch, &sql, tenant_id)
         .fetch_all::<ServiceTimeBreakdownAggregateBucket>()
         .await
         .map_err(|e| {

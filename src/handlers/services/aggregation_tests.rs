@@ -74,13 +74,16 @@ async fn check_aggregates(client: &clickhouse::Client) -> anyhow::Result<()> {
         .execute()
         .await?;
 
-    let buckets = client
-        .query(&time_breakdown_timeseries_sql("a", "checkout", 120, 60))
-        .fetch_all::<ServiceTimeBreakdownAggregateBucket>()
-        .await?
-        .into_iter()
-        .map(ServiceTimeBreakdownBucket::from)
-        .collect::<Vec<_>>();
+    let buckets = time_breakdown_query(
+        client,
+        &time_breakdown_timeseries_sql("a", "checkout", 120, 60),
+        "a",
+    )
+    .fetch_all::<ServiceTimeBreakdownAggregateBucket>()
+    .await?
+    .into_iter()
+    .map(ServiceTimeBreakdownBucket::from)
+    .collect::<Vec<_>>();
     let actual = buckets
         .iter()
         .map(|bucket| {
@@ -113,12 +116,13 @@ async fn check_aggregates(client: &clickhouse::Client) -> anyhow::Result<()> {
             .all(|pair| pair[0].bucket < pair[1].bucket),
         "buckets must be ordered"
     );
-    let empty = client
-        .query(&time_breakdown_timeseries_sql(
-            "missing", "checkout", 120, 60,
-        ))
-        .fetch_all::<ServiceTimeBreakdownAggregateBucket>()
-        .await?;
+    let empty = time_breakdown_query(
+        client,
+        &time_breakdown_timeseries_sql("missing", "checkout", 120, 60),
+        "missing",
+    )
+    .fetch_all::<ServiceTimeBreakdownAggregateBucket>()
+    .await?;
     anyhow::ensure!(empty.is_empty(), "empty windows must have no buckets");
 
     // Below the reservoir limit, the shared and independent percentile states

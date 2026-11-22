@@ -2731,6 +2731,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
     }
+    migrations::spawn_span_service_projection_maintenance(
+        admin_ch.clone(),
+        clickhouse_db.clone(),
+        audit.clone(),
+    );
     let export_jobs = Arc::new(handlers::export::ExportJobs::from_env()?);
     export_jobs.spawn_janitor(audit.clone());
     let invalidated_sessions = config_db.invalidate_legacy_session_tokens().await?;
