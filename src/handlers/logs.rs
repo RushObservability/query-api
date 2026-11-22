@@ -9,7 +9,7 @@ use crate::AppState;
 use crate::TenantContext;
 use crate::models::log::{LogListRecord, LogRecord};
 use crate::models::query::{CountBucket, CountQueryRequest, Filter, FilterOp, TimeRange};
-use crate::query_builder::{QueryClauses, build_log_search_sql, format_value, sanitize_datetime};
+use crate::query_builder::{QueryClauses, build_log_search_sql, format_value, query_time_bounds};
 
 /// HTTP response status for a log row. Logs have no status column (spans keep it
 /// in `http_status_code`); OpenTelemetry HTTP semantic conventions put it in a log
@@ -111,22 +111,34 @@ pub(crate) fn build_log_where(
     tenant_id: &str,
 ) -> Result<QueryClauses, (StatusCode, String)> {
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
-    let from = sanitize_datetime(from);
-    let to = sanitize_datetime(to);
+    let (from, to) = query_time_bounds(filters, from, to);
     // Bound the partition column `TimestampDate` (PARTITION BY TimestampDate) in addition
     // to the precise `Timestamp` filter: a predicate on raw `Timestamp` alone does not
     // reliably drive partition pruning, so add the date range to prune partitions first.
     let time_tenant = format!(
         "tenant_id = '{escaped_tenant}' \
-         AND TimestampDate >= toDate(parseDateTimeBestEffort('{from}')) \
-         AND TimestampDate <= toDate(parseDateTimeBestEffort('{to}')) \
-         AND Timestamp >= parseDateTimeBestEffort('{from}') \
-         AND Timestamp <= parseDateTimeBestEffort('{to}')"
+         AND TimestampDate >= toDate({from}) \
+         AND TimestampDate <= toDate({to}) \
+         AND Timestamp >= {from} \
+         AND Timestamp <= {to}"
     );
 
     let mut conditions = Vec::new();
+    let mut has_search = false;
 
     for filter in filters {
+        if filter.field == crate::models::monitor::MONITOR_SCOPE_FIELD {
+            let scope =
+                crate::monitor_engine::alert_scope_condition(filter, true).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid log alert scope".to_string(),
+                    )
+                })?;
+            conditions.push(scope);
+            has_search = true;
+            continue;
+        }
         validate_log_filter_field(&filter.field)?;
         let field = resolve_log_field(&filter.field);
         // `?` in field names/values is encoded by `escape_string_literal`, so the
@@ -134,7 +146,6 @@ pub(crate) fn build_log_where(
         conditions.push(log_filter_condition(&field, filter));
     }
 
-    let mut has_search = false;
     if let Some(term) = search {
         if let Some(sql) = build_log_search_sql(term) {
             conditions.push(sql);

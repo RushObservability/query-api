@@ -2404,6 +2404,7 @@ pub struct MonitorRow {
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+    pub rule_version: u64,
 }
 
 const SLO_INSERT_SQL: &str = "INSERT INTO config_slos (id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)";
@@ -3371,6 +3372,7 @@ impl ConfigDb {
                 is_deleted            UInt8 DEFAULT 0
             ) ENGINE = ReplacingMergeTree(version)
             ORDER BY (id)",
+            "ALTER TABLE config_monitors ADD COLUMN IF NOT EXISTS rule_version UInt64 DEFAULT 0",
             // ── Monitor events ────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_monitor_events (
                 id         String,
@@ -3385,6 +3387,7 @@ impl ConfigDb {
                 created_at String DEFAULT toString(now())
             ) ENGINE = MergeTree()
             ORDER BY (monitor_id, created_at)",
+            "ALTER TABLE config_monitor_events ADD COLUMN IF NOT EXISTS evidence String DEFAULT ''",
             // ── SLOs ──────────────────────────────────────────────────────────────
             "CREATE TABLE IF NOT EXISTS config_slos (
                 id                       String,
@@ -10569,10 +10572,11 @@ impl ConfigDb {
             created_by: r.created_by,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            rule_version: r.rule_version,
         }
     }
 
-    const MONITOR_SELECT: &'static str = "SELECT id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at FROM config_monitors FINAL WHERE is_deleted = 0";
+    const MONITOR_SELECT: &'static str = "SELECT id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, rule_version FROM config_monitors FINAL WHERE is_deleted = 0";
 
     pub async fn list_monitors(
         &self,
@@ -10602,23 +10606,6 @@ impl ConfigDb {
             .bind(id)
             .bind(tenant_id);
         let result = q.fetch_one::<MonitorRow>().await;
-        match result {
-            Ok(r) => Ok(Some(Self::map_monitor_row(r))),
-            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub async fn get_monitor_by_id(
-        &self,
-        id: &str,
-    ) -> anyhow::Result<Option<crate::models::monitor::Monitor>> {
-        let result = self
-            .client
-            .query(&format!("{} AND id = ? LIMIT 1", Self::MONITOR_SELECT))
-            .bind(id)
-            .fetch_one::<MonitorRow>()
-            .await;
         match result {
             Ok(r) => Ok(Some(Self::map_monitor_row(r))),
             Err(clickhouse::error::Error::RowNotFound) => Ok(None),
@@ -10658,7 +10645,7 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, rule_version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(tenant_id).bind(name).bind(monitor_type).bind(query_config)
             .bind(critical).bind(critical_recovery).bind(warning).bind(warning_recovery)
             .bind(comparator).bind(eval_window_secs).bind(eval_interval_secs).bind(group_by)
@@ -10666,7 +10653,7 @@ impl ConfigDb {
             .bind(message).bind(notification_channels).bind(renotify_interval)
             .bind(tags).bind(priority).bind(if enabled { 1u8 } else { 0u8 })
             .bind(composite_formula).bind(composite_monitor_ids)
-            .bind(created_by).bind(&now).bind(&now).bind(ver)
+            .bind(created_by).bind(&now).bind(&now).bind(ver).bind(ver)
             .execute().await?;
         Ok(())
     }
@@ -10706,7 +10693,7 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, rule_version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(tenant_id).bind(name).bind(monitor_type).bind(query_config)
             .bind(critical).bind(critical_recovery).bind(warning).bind(warning_recovery)
             .bind(comparator).bind(eval_window_secs).bind(eval_interval_secs).bind(group_by)
@@ -10717,7 +10704,7 @@ impl ConfigDb {
             .bind(composite_formula).bind(composite_monitor_ids)
             .bind(existing.last_eval_at.unwrap_or_default())
             .bind(existing.last_triggered_at.unwrap_or_default())
-            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver)
+            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver).bind(ver)
             .execute().await?;
         Ok(true)
     }
@@ -10730,7 +10717,7 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
+            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, rule_version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)")
             .bind(id).bind(tenant_id).bind(&existing.name).bind(&existing.monitor_type).bind(&existing.query_config)
             .bind(existing.critical).bind(existing.critical_recovery).bind(existing.warning).bind(existing.warning_recovery)
             .bind(&existing.comparator).bind(existing.eval_window_secs).bind(existing.eval_interval_secs).bind(&existing.group_by)
@@ -10740,7 +10727,7 @@ impl ConfigDb {
             .bind(&existing.tags).bind(existing.priority).bind(if existing.enabled { 1u8 } else { 0u8 })
             .bind(&existing.composite_formula).bind(&existing.composite_monitor_ids)
             .bind(existing.last_eval_at.unwrap_or_default()).bind(existing.last_triggered_at.unwrap_or_default())
-            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver)
+            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver).bind(existing.rule_version)
             .execute().await?;
         Ok(true)
     }
@@ -10754,114 +10741,105 @@ impl ConfigDb {
 
     pub async fn update_monitor_state(
         &self,
-        id: &str,
+        monitor: &crate::models::monitor::Monitor,
         state: &str,
         group_states: &str,
         last_eval_at: &str,
+        triggered: bool,
     ) -> anyhow::Result<()> {
         crate::leader::ensure_leader()?;
-        let existing = match self.get_monitor_by_id(id).await? {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        let now = Self::now_str();
-        let ver = Self::next_version();
+        let version = Self::next_version();
+        // Reuse the configuration in the current row. If the rule was edited
+        // during evaluation, its new definition must not inherit this result.
         self.client
-            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(&existing.tenant_id).bind(&existing.name).bind(&existing.monitor_type).bind(&existing.query_config)
-            .bind(existing.critical).bind(existing.critical_recovery).bind(existing.warning).bind(existing.warning_recovery)
-            .bind(&existing.comparator).bind(existing.eval_window_secs).bind(existing.eval_interval_secs).bind(&existing.group_by)
-            .bind(state).bind(group_states)
-            .bind(&existing.no_data_action).bind(existing.no_data_timeframe).bind(existing.auto_resolve_hours)
-            .bind(&existing.message).bind(&existing.notification_channels).bind(existing.renotify_interval)
-            .bind(&existing.tags).bind(existing.priority).bind(if existing.enabled { 1u8 } else { 0u8 })
-            .bind(&existing.composite_formula).bind(&existing.composite_monitor_ids)
-            .bind(last_eval_at).bind(existing.last_triggered_at.unwrap_or_default())
-            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver)
-            .execute().await?;
+            .query(
+                "INSERT INTO config_monitors
+                    SELECT * REPLACE (? AS state, ? AS group_states, ? AS last_eval_at,
+                      if(?, ?, last_triggered_at) AS last_triggered_at,
+                      ? AS updated_at, toUInt64(?) AS version)
+                    FROM config_monitors FINAL
+                    WHERE id = ? AND tenant_id = ? AND is_deleted = 0
+                      AND enabled = 1 AND rule_version = ? AND config_monitors.version < ?",
+            )
+            .bind(state)
+            .bind(group_states)
+            .bind(last_eval_at)
+            .bind(u8::from(triggered))
+            .bind(last_eval_at)
+            .bind(Self::now_str())
+            .bind(version)
+            .bind(&monitor.id)
+            .bind(&monitor.tenant_id)
+            .bind(monitor.rule_version)
+            .bind(version)
+            .execute()
+            .await?;
         Ok(())
     }
 
-    /// Narrow `last_eval_at` flush for the monitor engine: re-inserts the monitor row
-    /// the engine already fetched this tick (state/group_states unchanged), avoiding
-    /// the SELECT…FINAL read-modify-write of `update_monitor_state`. Only call when no
-    /// state transition occurred — transitions must go through `update_monitor_state`.
     pub async fn persist_monitor_eval(
         &self,
         monitor: &crate::models::monitor::Monitor,
         last_eval_at: &str,
     ) -> anyhow::Result<()> {
         crate::leader::ensure_leader()?;
-        let now = Self::now_str();
-        let ver = Self::next_version();
+        let version = Self::next_version();
         self.client
-            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(&monitor.id).bind(&monitor.tenant_id).bind(&monitor.name).bind(&monitor.monitor_type).bind(&monitor.query_config)
-            .bind(monitor.critical).bind(monitor.critical_recovery).bind(monitor.warning).bind(monitor.warning_recovery)
-            .bind(&monitor.comparator).bind(monitor.eval_window_secs).bind(monitor.eval_interval_secs).bind(&monitor.group_by)
-            .bind(&monitor.state).bind(&monitor.group_states)
-            .bind(&monitor.no_data_action).bind(monitor.no_data_timeframe).bind(monitor.auto_resolve_hours)
-            .bind(&monitor.message).bind(&monitor.notification_channels).bind(monitor.renotify_interval)
-            .bind(&monitor.tags).bind(monitor.priority).bind(if monitor.enabled { 1u8 } else { 0u8 })
-            .bind(&monitor.composite_formula).bind(&monitor.composite_monitor_ids)
-            .bind(last_eval_at).bind(monitor.last_triggered_at.clone().unwrap_or_default())
-            .bind(&monitor.created_by).bind(&monitor.created_at).bind(&now).bind(ver)
-            .execute().await?;
-        Ok(())
-    }
-
-    pub async fn update_monitor_triggered(
-        &self,
-        id: &str,
-        last_triggered_at: &str,
-    ) -> anyhow::Result<()> {
-        crate::leader::ensure_leader()?;
-        let existing = match self.get_monitor_by_id(id).await? {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        let now = Self::now_str();
-        let ver = Self::next_version();
-        self.client
-            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(&existing.tenant_id).bind(&existing.name).bind(&existing.monitor_type).bind(&existing.query_config)
-            .bind(existing.critical).bind(existing.critical_recovery).bind(existing.warning).bind(existing.warning_recovery)
-            .bind(&existing.comparator).bind(existing.eval_window_secs).bind(existing.eval_interval_secs).bind(&existing.group_by)
-            .bind(&existing.state).bind(&existing.group_states)
-            .bind(&existing.no_data_action).bind(existing.no_data_timeframe).bind(existing.auto_resolve_hours)
-            .bind(&existing.message).bind(&existing.notification_channels).bind(existing.renotify_interval)
-            .bind(&existing.tags).bind(existing.priority).bind(if existing.enabled { 1u8 } else { 0u8 })
-            .bind(&existing.composite_formula).bind(&existing.composite_monitor_ids)
-            .bind(existing.last_eval_at.unwrap_or_default()).bind(last_triggered_at)
-            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver)
-            .execute().await?;
+            .query(
+                "INSERT INTO config_monitors
+                    SELECT * REPLACE (? AS last_eval_at, ? AS updated_at, toUInt64(?) AS version)
+                    FROM config_monitors FINAL
+                    WHERE id = ? AND tenant_id = ? AND is_deleted = 0
+                      AND enabled = 1 AND rule_version = ? AND config_monitors.version < ?",
+            )
+            .bind(last_eval_at)
+            .bind(Self::now_str())
+            .bind(version)
+            .bind(&monitor.id)
+            .bind(&monitor.tenant_id)
+            .bind(monitor.rule_version)
+            .bind(version)
+            .execute()
+            .await?;
         Ok(())
     }
 
     pub async fn create_monitor_event(
         &self,
-        id: &str,
-        monitor_id: &str,
-        tenant_id: &str,
-        group_key: &str,
-        prev_state: &str,
-        new_state: &str,
-        value: Option<f64>,
-        threshold: Option<f64>,
-        message: &str,
+        event: &crate::models::monitor::MonitorEvent,
     ) -> anyhow::Result<()> {
         crate::leader::ensure_leader()?;
-        let now = Self::now_str();
+        let evidence = match &event.evidence {
+            Some(evidence) => serde_json::to_string(evidence)?,
+            None => String::new(),
+        };
         self.client
-            .query("INSERT INTO config_monitor_events (id, monitor_id, tenant_id, group_key, prev_state, new_state, value, threshold, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(id).bind(monitor_id).bind(tenant_id).bind(group_key).bind(prev_state).bind(new_state).bind(value).bind(threshold).bind(message).bind(&now)
-            .execute().await?;
+            .query(
+                "INSERT INTO config_monitor_events
+                    (id, monitor_id, tenant_id, group_key, prev_state, new_state, value,
+                     threshold, message, created_at, evidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&event.id)
+            .bind(&event.monitor_id)
+            .bind(&event.tenant_id)
+            .bind(&event.group_key)
+            .bind(&event.prev_state)
+            .bind(&event.new_state)
+            .bind(event.value)
+            .bind(event.threshold)
+            .bind(&event.message)
+            .bind(&event.created_at)
+            .bind(evidence)
+            .execute()
+            .await?;
         Ok(())
     }
 
     pub async fn list_monitor_events(
         &self,
         monitor_id: &str,
+        tenant_id: &str,
         limit: i64,
     ) -> anyhow::Result<Vec<crate::models::monitor::MonitorEvent>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
@@ -10876,10 +10854,19 @@ impl ConfigDb {
             threshold: Option<f64>,
             message: String,
             created_at: String,
+            evidence: String,
         }
-        let rows = self.client
-            .query("SELECT id, monitor_id, tenant_id, group_key, prev_state, new_state, value, threshold, message, created_at FROM config_monitor_events WHERE monitor_id = ? ORDER BY created_at DESC LIMIT ?")
-            .bind(monitor_id).bind(limit as u64)
+        let rows = self
+            .client
+            .query(
+                "SELECT id, monitor_id, tenant_id, group_key, prev_state, new_state, value,
+                           threshold, message, created_at, evidence FROM config_monitor_events
+                    WHERE monitor_id = ? AND tenant_id = ?
+                    ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(monitor_id)
+            .bind(tenant_id)
+            .bind(limit.clamp(0, 200) as u64)
             .fetch_all::<Row>()
             .await?;
         Ok(rows
@@ -10895,6 +10882,9 @@ impl ConfigDb {
                 threshold: r.threshold,
                 message: r.message,
                 created_at: r.created_at,
+                // Older rows have no snapshot. Also keep event history readable
+                // during a rollback if a newer snapshot format is encountered.
+                evidence: serde_json::from_str(&r.evidence).ok(),
             })
             .collect())
     }
@@ -10925,7 +10915,7 @@ impl ConfigDb {
         let now = Self::now_str();
         let ver = Self::next_version();
         self.client
-            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
+            .query("INSERT INTO config_monitors (id, tenant_id, name, monitor_type, query_config, critical, critical_recovery, warning, warning_recovery, comparator, eval_window_secs, eval_interval_secs, group_by, state, group_states, no_data_action, no_data_timeframe, auto_resolve_hours, message, notification_channels, renotify_interval, tags, priority, enabled, composite_formula, composite_monitor_ids, last_eval_at, last_triggered_at, created_by, created_at, updated_at, version, rule_version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(id).bind(tenant_id).bind(&existing.name).bind(&existing.monitor_type).bind(&existing.query_config)
             .bind(existing.critical).bind(existing.critical_recovery).bind(existing.warning).bind(existing.warning_recovery)
             .bind(&existing.comparator).bind(existing.eval_window_secs).bind(existing.eval_interval_secs).bind(&existing.group_by)
@@ -10935,7 +10925,7 @@ impl ConfigDb {
             .bind(&existing.tags).bind(existing.priority).bind(if enabled { 1u8 } else { 0u8 })
             .bind(&existing.composite_formula).bind(&existing.composite_monitor_ids)
             .bind(existing.last_eval_at.unwrap_or_default()).bind(existing.last_triggered_at.unwrap_or_default())
-            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver)
+            .bind(&existing.created_by).bind(&existing.created_at).bind(&now).bind(ver).bind(existing.rule_version)
             .execute().await?;
         Ok(true)
     }

@@ -8,7 +8,11 @@ use clickhouse::Client;
 use crate::alert_engine;
 use crate::clickhouse_config::ConfigDb;
 use crate::models::alert::AlertRoute;
-use crate::models::monitor::{ApmQueryConfig, LogQueryConfig, MetricQueryConfig, Monitor};
+use crate::models::monitor::{
+    ApmQueryConfig, LogQueryConfig, MetricQueryConfig, Monitor, MonitorEvent, MonitorEvidence,
+    MonitorEvidenceQuery, MonitorExploreScope,
+};
+use crate::models::query::{Filter, FilterOp};
 use crate::promql;
 
 /// A single value row returned by ClickHouse aggregation queries.
@@ -310,9 +314,9 @@ async fn run_evaluation_cycle(
     // (Members may be evaluated concurrently this same cycle; composites see the
     // cycle-start states, which matches the prior racy read-at-eval behavior to
     // within one cycle.)
-    let monitor_states: HashMap<String, String> = monitors
+    let monitor_states: HashMap<String, (String, String)> = monitors
         .iter()
-        .map(|m| (m.id.clone(), m.state.clone()))
+        .map(|m| (m.id.clone(), (m.tenant_id.clone(), m.state.clone())))
         .collect();
 
     // Due = DB-side last_eval_at check (coarse: flushed 1-in-N) AND in-memory
@@ -348,6 +352,10 @@ async fn run_evaluation_cycle(
         futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
             let mut observation =
                 EvaluationObservation::new(config_db.self_metrics(), "monitor_engine");
+            let window = EvaluationWindow::new(
+                chrono::Utc::now().timestamp_millis(),
+                monitor.eval_window_secs,
+            );
             let result = match crate::query_governor::run_background(
                 &monitor.tenant_id,
                 evaluate_monitor(
@@ -355,6 +363,7 @@ async fn run_evaluation_cycle(
                     config_db,
                     &monitor,
                     now_str_ref,
+                    window,
                     http_client,
                     smtp_config,
                     smtp_transport,
@@ -394,6 +403,7 @@ async fn run_evaluation_cycle(
                         config_db,
                         &monitor,
                         now_str_ref,
+                        window,
                         http_client,
                         smtp_config,
                         smtp_transport,
@@ -428,40 +438,32 @@ async fn evaluate_monitor(
     config_db: &ConfigDb,
     monitor: &Monitor,
     now_str: &str,
+    window: EvaluationWindow,
     http_client: &reqwest::Client,
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
-    monitor_states: &HashMap<String, String>,
+    monitor_states: &HashMap<String, (String, String)>,
     should_flush: bool,
     policy: &NotifyPolicy,
 ) -> anyhow::Result<(u64, bool)> {
     let group_by: Vec<String> = serde_json::from_str(&monitor.group_by).unwrap_or_default();
     let has_groups = !group_by.is_empty();
-    // Build and execute query
-    let results = match monitor.monitor_type.as_str() {
-        "metric" => query_metric(ch, monitor, &group_by).await?,
-        "log" => query_log(ch, monitor, &group_by).await?,
-        "apm" => query_apm(ch, monitor, &group_by).await?,
-        "composite" => {
-            // Composite monitors combine other monitor states, not queries
-            return evaluate_composite(
-                config_db,
-                monitor,
-                now_str,
-                http_client,
-                smtp_config,
-                smtp_transport,
-                monitor_states,
-                should_flush,
-                policy,
-            )
-            .await;
-        }
-        other => {
-            tracing::warn!(engine = "monitors", monitor_id = %monitor.id, "unknown monitor type: {other}");
-            return Ok((0, false));
-        }
-    };
+    if monitor.monitor_type == "composite" {
+        return evaluate_composite(
+            config_db,
+            monitor,
+            now_str,
+            http_client,
+            smtp_config,
+            smtp_transport,
+            monitor_states,
+            should_flush,
+            policy,
+        )
+        .await;
+    }
+    let query = parse_monitor_query(monitor)?;
+    let results = run_monitor_query(ch, monitor, &query, &group_by, window).await?;
 
     if results.is_empty() {
         // No data returned
@@ -469,6 +471,7 @@ async fn evaluate_monitor(
             config_db,
             monitor,
             now_str,
+            window,
             http_client,
             smtp_config,
             smtp_transport,
@@ -482,8 +485,14 @@ async fn evaluate_monitor(
     let mut group_states: HashMap<String, String> =
         serde_json::from_str(&monitor.group_states).unwrap_or_default();
     let mut changes: u64 = 0;
+    let mut triggered = false;
 
-    for (group_key, value) in &results {
+    for MonitorReading {
+        group_key,
+        value,
+        series,
+    } in &results
+    {
         let current_state = group_states
             .get(group_key)
             .map(|s| s.as_str())
@@ -508,7 +517,9 @@ async fn evaluate_monitor(
             let threshold = match new_state {
                 "alert" => monitor.critical,
                 "warn" => monitor.warning,
-                _ => monitor.critical_recovery.or(monitor.critical),
+                _ if current_state == "warn" => monitor.warning_recovery.or(monitor.warning),
+                _ if current_state == "alert" => monitor.critical_recovery.or(monitor.critical),
+                _ => None,
             };
 
             let alert_name = render_monitor_template(
@@ -542,26 +553,28 @@ async fn evaluate_monitor(
                     ),
                     None => event_msg.clone(),
                 };
-                let event_id = uuid::Uuid::new_v4().to_string();
-                let _ = config_db
-                    .create_monitor_event(
-                        &event_id,
-                        &monitor.id,
-                        &monitor.tenant_id,
-                        group_key,
-                        current_state,
-                        new_state,
-                        Some(*value),
-                        threshold,
-                        &event_msg,
-                    )
-                    .await;
-
-                if new_state == "alert" || new_state == "warn" {
-                    let _ = config_db
-                        .update_monitor_triggered(&monitor.id, now_str)
-                        .await;
-                }
+                let evidence_query = match &query {
+                    MonitorEvidenceQuery::Promql { expression, .. } => {
+                        MonitorEvidenceQuery::Promql {
+                            expression: expression.clone(),
+                            series: series.clone(),
+                        }
+                    }
+                    _ => query.clone(),
+                };
+                record_transition(
+                    config_db,
+                    monitor,
+                    group_key,
+                    current_state,
+                    new_state,
+                    Some(*value),
+                    threshold,
+                    event_msg,
+                    Some(window.evidence(monitor, group_by.clone(), evidence_query)),
+                )
+                .await;
+                triggered |= matches!(new_state, "alert" | "warn");
             }
 
             if sends {
@@ -626,7 +639,12 @@ async fn evaluate_monitor(
     } else {
         results
             .first()
-            .map(|(gk, _)| group_states.get(gk).map(|s| s.as_str()).unwrap_or("ok"))
+            .map(|row| {
+                group_states
+                    .get(&row.group_key)
+                    .map(|s| s.as_str())
+                    .unwrap_or("ok")
+            })
             .unwrap_or("ok")
     };
 
@@ -637,7 +655,7 @@ async fn evaluate_monitor(
         let group_states_json =
             serde_json::to_string(&group_states).unwrap_or_else(|_| "{}".to_string());
         config_db
-            .update_monitor_state(&monitor.id, overall, &group_states_json, now_str)
+            .update_monitor_state(monitor, overall, &group_states_json, now_str, triggered)
             .await?;
         Ok((changes, true))
     } else if should_flush {
@@ -753,6 +771,7 @@ async fn handle_no_data(
     config_db: &ConfigDb,
     monitor: &Monitor,
     now_str: &str,
+    window: EvaluationWindow,
     http_client: &reqwest::Client,
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
@@ -781,20 +800,13 @@ async fn handle_no_data(
             }
             None => event_msg.clone(),
         };
-        let event_id = uuid::Uuid::new_v4().to_string();
-        let _ = config_db
-            .create_monitor_event(
-                &event_id,
-                &monitor.id,
-                &monitor.tenant_id,
-                "",
-                old_state,
-                new_state,
-                None,
-                None,
-                &event_msg,
-            )
-            .await;
+        let evidence = parse_monitor_query(monitor)
+            .ok()
+            .map(|query| window.evidence(monitor, Vec::new(), query));
+        record_transition(
+            config_db, monitor, "", old_state, new_state, None, None, event_msg, evidence,
+        )
+        .await;
     }
 
     if matches!(decision, Notify::Change | Notify::Renotify) {
@@ -825,7 +837,7 @@ async fn handle_no_data(
     if changed {
         // Transition persists immediately, exactly as before.
         let _ = config_db
-            .update_monitor_state(&monitor.id, new_state, &monitor.group_states, now_str)
+            .update_monitor_state(monitor, new_state, &monitor.group_states, now_str, false)
             .await;
         (1, true)
     } else if should_flush {
@@ -958,7 +970,7 @@ async fn evaluate_composite(
     http_client: &reqwest::Client,
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
-    monitor_states: &HashMap<String, String>,
+    monitor_states: &HashMap<String, (String, String)>,
     should_flush: bool,
     policy: &NotifyPolicy,
 ) -> anyhow::Result<(u64, bool)> {
@@ -969,7 +981,7 @@ async fn evaluate_composite(
     if monitor_ids.is_empty() || formula.is_empty() {
         if monitor.state != "no_data" {
             let _ = config_db
-                .update_monitor_state(&monitor.id, "no_data", "{}", now_str)
+                .update_monitor_state(monitor, "no_data", "{}", now_str, false)
                 .await;
             return Ok((0, true));
         }
@@ -987,8 +999,10 @@ async fn evaluate_composite(
     for (i, mid) in monitor_ids.iter().enumerate() {
         let letter = (b'A' + i as u8) as char;
         let is_alerting = match monitor_states.get(mid) {
-            Some(state) => state == "alert" || state == "warn",
-            None => match config_db.get_monitor_by_id(mid).await {
+            Some((tenant, state)) => {
+                tenant == &monitor.tenant_id && (state == "alert" || state == "warn")
+            }
+            None => match config_db.get_monitor(mid, &monitor.tenant_id).await {
                 Ok(Some(m)) => m.state == "alert" || m.state == "warn",
                 _ => false,
             },
@@ -1015,26 +1029,30 @@ async fn evaluate_composite(
             }
             None => event_msg.clone(),
         };
-        let event_id = uuid::Uuid::new_v4().to_string();
-        let _ = config_db
-            .create_monitor_event(
-                &event_id,
-                &monitor.id,
-                &monitor.tenant_id,
-                "",
-                old_state,
-                new_state,
-                None,
-                None,
-                &event_msg,
-            )
-            .await;
-
-        if new_state == "alert" {
-            let _ = config_db
-                .update_monitor_triggered(&monitor.id, now_str)
-                .await;
-        }
+        let evidence = MonitorEvidence {
+            rule_version: monitor.rule_version,
+            rule_name: monitor.name.clone(),
+            comparator: monitor.comparator.clone(),
+            window_start: None,
+            evaluated_at: now_str.to_string(),
+            group_by: Vec::new(),
+            query: MonitorEvidenceQuery::Composite {
+                formula: formula.clone(),
+                members: letter_states.into_iter().collect(),
+            },
+        };
+        record_transition(
+            config_db,
+            monitor,
+            "",
+            old_state,
+            new_state,
+            None,
+            None,
+            event_msg,
+            Some(evidence),
+        )
+        .await;
     }
 
     if matches!(decision, Notify::Change | Notify::Renotify) {
@@ -1068,7 +1086,7 @@ async fn evaluate_composite(
     if changes > 0 {
         // Transition persists immediately, exactly as before.
         let _ = config_db
-            .update_monitor_state(&monitor.id, new_state, "{}", now_str)
+            .update_monitor_state(monitor, new_state, "{}", now_str, new_state == "alert")
             .await;
         Ok((changes, true))
     } else if should_flush {
@@ -1314,161 +1332,114 @@ pub(crate) fn validate_query_fields(
     Ok(())
 }
 
-async fn query_metric(
-    ch: &Client,
-    monitor: &Monitor,
-    group_by: &[String],
-) -> anyhow::Result<Vec<(String, f64)>> {
-    // Check if this is a PromQL-style expression
-    let config_value: serde_json::Value = serde_json::from_str(&monitor.query_config)?;
-    let is_promql = config_value
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|t| t == "promql")
-        .unwrap_or(false);
-
-    // Also treat it as PromQL if the "expression" field is present and non-empty
-    let has_expression = config_value
-        .get("expression")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-
-    if is_promql || has_expression {
-        return query_metric_promql(ch, monitor, &config_value).await;
-    }
-
-    let cfg: MetricQueryConfig = serde_json::from_str(&monitor.query_config)?;
-
-    let agg = match cfg.aggregation.as_str() {
-        "sum" => "sum(Value)",
-        "max" => "max(Value)",
-        "min" => "min(Value)",
-        "count" => "count()",
-        _ => "avg(Value)", // default: avg
-    };
-
-    let mut conditions = vec![
-        format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
-        format!("MetricName = '{}'", escape_ch(&cfg.metric_name)),
-        format!(
-            "TimeUnix >= now() - INTERVAL {} SECOND",
-            monitor.eval_window_secs
-        ),
-    ];
-
-    for f in &cfg.filters {
-        conditions.push(format!(
-            "ResourceAttributes['{}'] = '{}'",
-            escape_ch(&f.key),
-            escape_ch(&f.value),
-        ));
-    }
-
-    let where_clause = conditions.join(" AND ");
-
-    if !group_by.is_empty() {
-        let group_by_cols: Vec<String> = group_by
-            .iter()
-            .map(|g| format!("ResourceAttributes['{}']", escape_ch(g)))
-            .collect();
-        let group_expr = if group_by_cols.is_empty() {
-            "'*'".to_string()
-        } else {
-            group_by_cols.join(" || ':' || ")
-        };
-
-        let sql = format!(
-            "SELECT ({group_expr}) AS group_key, toFloat64({agg}) AS value \
-             FROM metrics_gauge WHERE {where_clause} \
-             GROUP BY group_key"
-        );
-        let rows = crate::tenant_query(ch, &sql, &monitor.tenant_id)
-            .with_setting("max_execution_time", "30")
-            .fetch_all::<GroupedRow>()
-            .await?;
-        Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
-    } else {
-        let sql =
-            format!("SELECT toFloat64({agg}) AS value FROM metrics_gauge WHERE {where_clause}");
-        let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
-            .with_setting("max_execution_time", "30")
-            .fetch_one::<ValueRow>()
-            .await?;
-        Ok(vec![("".to_string(), row.value)])
-    }
+#[derive(Clone, Copy)]
+struct EvaluationWindow {
+    from: i64,
+    to: i64,
 }
 
-/// Evaluate a PromQL expression for a metric monitor.
-/// Uses the existing promql::evaluate_instant_query engine and maps the result
-/// to the (group_key, value) pairs that the monitor threshold evaluator expects.
-async fn query_metric_promql(
-    ch: &Client,
-    monitor: &Monitor,
-    config: &serde_json::Value,
-) -> anyhow::Result<Vec<(String, f64)>> {
-    let expr = config
-        .get("expr")
-        .or_else(|| config.get("expression"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("promql query_config missing 'expr' or 'expression'"))?;
-
-    let now = chrono::Utc::now().timestamp() as f64;
-    let lookback = monitor.eval_window_secs as f64;
-
-    let series = promql::evaluate_instant_query(ch, expr, now, lookback, &monitor.tenant_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("promql evaluation failed: {}", e))?;
-
-    let mut results: Vec<(String, f64)> = Vec::new();
-    for ts in &series {
-        // The last sample value is the "current" value for threshold evaluation
-        let value = ts.samples.last().map(|(_t, v)| *v).unwrap_or(f64::NAN);
-
-        if value.is_nan() {
-            continue;
+impl EvaluationWindow {
+    fn new(to: i64, seconds: i64) -> Self {
+        Self {
+            from: to.saturating_sub(seconds.saturating_mul(1000)),
+            to,
         }
-
-        // Build the group key from labels (excluding __name__)
-        let group_key: String = ts
-            .labels
-            .iter()
-            .filter(|(k, _)| k.as_str() != "__name__")
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        results.push((group_key, value));
     }
 
-    // If no series returned meaningful results, return empty (triggers no_data handling)
-    if results.is_empty() {
-        return Ok(vec![]);
+    fn condition(self, column: &str) -> String {
+        format!(
+            "{column} >= fromUnixTimestamp64Milli({}, 'UTC') AND {column} <= fromUnixTimestamp64Milli({}, 'UTC')",
+            self.from, self.to
+        )
     }
 
-    // If there is only one group and its key is empty, treat as ungrouped
-    if results.len() == 1 && results[0].0.is_empty() {
-        results[0].0 = String::new();
+    fn evidence(
+        self,
+        monitor: &Monitor,
+        group_by: Vec<String>,
+        query: MonitorEvidenceQuery,
+    ) -> MonitorEvidence {
+        let time = |ms| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        };
+        MonitorEvidence {
+            rule_version: monitor.rule_version,
+            rule_name: monitor.name.clone(),
+            comparator: monitor.comparator.clone(),
+            window_start: time(self.from),
+            evaluated_at: time(self.to).expect("current evaluation time is representable"),
+            group_by,
+            query,
+        }
     }
-
-    Ok(results)
 }
 
-async fn query_log(
-    ch: &Client,
+#[allow(clippy::too_many_arguments)]
+async fn record_transition(
+    config_db: &ConfigDb,
     monitor: &Monitor,
-    group_by: &[String],
-) -> anyhow::Result<Vec<(String, f64)>> {
-    let cfg: LogQueryConfig = serde_json::from_str(&monitor.query_config)?;
+    group_key: &str,
+    prev_state: &str,
+    new_state: &str,
+    value: Option<f64>,
+    threshold: Option<f64>,
+    message: String,
+    evidence: Option<MonitorEvidence>,
+) {
+    let event = MonitorEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        monitor_id: monitor.id.clone(),
+        tenant_id: monitor.tenant_id.clone(),
+        group_key: group_key.to_string(),
+        prev_state: prev_state.to_string(),
+        new_state: new_state.to_string(),
+        value: value.filter(|value| value.is_finite()),
+        threshold,
+        message,
+        created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        evidence,
+    };
+    if let Err(error) = config_db.create_monitor_event(&event).await {
+        tracing::warn!(engine = "monitors", monitor_id = %monitor.id, %error, "failed to record monitor transition");
+    }
+}
 
-    let mut conditions = vec![
-        format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
-        format!(
-            "Timestamp >= now() - INTERVAL {} SECOND",
-            monitor.eval_window_secs
-        ),
-    ];
+fn parse_monitor_query(monitor: &Monitor) -> anyhow::Result<MonitorEvidenceQuery> {
+    let config = &monitor.query_config;
+    match monitor.monitor_type.as_str() {
+        "metric" => {
+            let config: serde_json::Value = serde_json::from_str(config)?;
+            let is_promql = config["type"] == "promql"
+                || config["expression"]
+                    .as_str()
+                    .is_some_and(|expr| !expr.trim().is_empty());
+            if is_promql {
+                let expression = config
+                    .get("expr")
+                    .or_else(|| config.get("expression"))
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("promql query_config missing 'expr' or 'expression'")
+                    })?;
+                Ok(MonitorEvidenceQuery::Promql {
+                    expression: expression.to_string(),
+                    series: None,
+                })
+            } else {
+                Ok(MonitorEvidenceQuery::Metric(serde_json::from_value(
+                    config,
+                )?))
+            }
+        }
+        "log" => Ok(MonitorEvidenceQuery::Log(serde_json::from_str(config)?)),
+        "apm" => Ok(MonitorEvidenceQuery::Apm(serde_json::from_str(config)?)),
+        other => anyhow::bail!("unsupported monitor type '{other}'"),
+    }
+}
 
+fn log_conditions(cfg: &LogQueryConfig) -> anyhow::Result<Vec<String>> {
+    let mut conditions = Vec::new();
     // Full-text search via `lower(Body) LIKE` — matches the `idx_body_text`
     // text(ngrams(4)) index char-for-char. (hasToken uses token semantics the
     // ngram index can't serve, forcing a full Body scan every eval interval.)
@@ -1510,80 +1481,187 @@ async fn query_log(
         }
     }
 
-    let where_clause = conditions.join(" AND ");
-
-    if !group_by.is_empty() {
-        let group_expr = group_expression(group_by, log_field_expr)?;
-
-        let sql = format!(
-            "SELECT ({group_expr}) AS group_key, toFloat64(count()) AS value \
-             FROM logs WHERE {where_clause} \
-             GROUP BY group_key"
-        );
-        let rows = crate::tenant_query(ch, &sql, &monitor.tenant_id)
-            .with_setting("max_execution_time", "30")
-            .fetch_all::<GroupedRow>()
-            .await?;
-        Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
-    } else {
-        let sql = format!("SELECT toFloat64(count()) AS value FROM logs WHERE {where_clause}");
-        let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
-            .with_setting("max_execution_time", "30")
-            .fetch_one::<ValueRow>()
-            .await?;
-        Ok(vec![("".to_string(), row.value)])
-    }
+    Ok(conditions)
 }
 
-async fn query_apm(
-    ch: &Client,
-    monitor: &Monitor,
-    group_by: &[String],
-) -> anyhow::Result<Vec<(String, f64)>> {
-    let cfg: ApmQueryConfig = serde_json::from_str(&monitor.query_config)?;
-
-    let mut conditions = vec![
-        format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
-        format!(
-            "timestamp >= now() - INTERVAL {} SECOND",
-            monitor.eval_window_secs
-        ),
-    ];
-
+fn apm_conditions(cfg: &ApmQueryConfig) -> Vec<String> {
+    let mut conditions = Vec::new();
     if let Some(condition) = apm_match_condition("service_name", &cfg.service) {
         conditions.push(condition);
     }
 
-    if let Some(ref ep) = cfg.endpoint_filter {
-        if let Some(condition) = apm_match_condition("http_path", ep) {
-            conditions.push(condition);
-        }
+    if let Some(condition) = cfg
+        .endpoint_filter
+        .as_deref()
+        .and_then(|endpoint| apm_match_condition("http_path", endpoint))
+    {
+        conditions.push(condition);
     }
 
+    conditions
+}
+
+/// Replay the original monitor predicates, including its actual grouping
+/// expression. A group key is opaque and can contain the grouping separator.
+pub(crate) fn alert_scope_condition(filter: &Filter, logs: bool) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        matches!(filter.op, FilterOp::Eq),
+        "invalid alert scope operator"
+    );
+    let scope: MonitorExploreScope = serde_json::from_str(
+        filter
+            .value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid alert scope"))?,
+    )?;
+    let (mut predicates, group_resolver) = match scope.query {
+        MonitorEvidenceQuery::Log(cfg) if logs => (
+            log_conditions(&cfg)?,
+            log_field_expr as fn(&str) -> Option<&'static str>,
+        ),
+        MonitorEvidenceQuery::Apm(cfg) if !logs => (
+            apm_conditions(&cfg),
+            apm_group_expr as fn(&str) -> Option<&'static str>,
+        ),
+        _ => anyhow::bail!("alert scope does not match the selected signal"),
+    };
+    if let Some(group_key) = scope.group_key.filter(|_| !scope.group_by.is_empty()) {
+        let group = group_expression(&scope.group_by, group_resolver)?;
+        predicates.push(format!("({group}) = '{}'", escape_ch(&group_key)));
+    }
+    if predicates.is_empty() {
+        return Ok("1".into());
+    }
+    Ok(format!("({})", predicates.join(" AND ")))
+}
+
+struct MonitorReading {
+    group_key: String,
+    value: f64,
+    series: Option<BTreeMap<String, String>>,
+}
+
+async fn run_monitor_query(
+    ch: &Client,
+    monitor: &Monitor,
+    query: &MonitorEvidenceQuery,
+    group_by: &[String],
+    window: EvaluationWindow,
+) -> anyhow::Result<Vec<MonitorReading>> {
+    let tenant_id = &monitor.tenant_id;
+    let (table, time_column, aggregation, group, mut conditions) = match query {
+        MonitorEvidenceQuery::Metric(cfg) => {
+            let agg = match cfg.aggregation.as_str() {
+                "sum" => "sum(Value)",
+                "max" => "max(Value)",
+                "min" => "min(Value)",
+                "count" => "count()",
+                _ => "avg(Value)",
+            };
+            let group = group_by
+                .iter()
+                .map(|label| format!("ResourceAttributes['{}']", escape_ch(label)))
+                .collect::<Vec<_>>()
+                .join(" || ':' || ");
+            let mut conditions = vec![format!("MetricName = '{}'", escape_ch(&cfg.metric_name))];
+            conditions.extend(cfg.filters.iter().map(|f| {
+                format!(
+                    "ResourceAttributes['{}'] = '{}'",
+                    escape_ch(&f.key),
+                    escape_ch(&f.value),
+                )
+            }));
+            (
+                "metrics_gauge",
+                "TimeUnix",
+                agg.to_string(),
+                group,
+                conditions,
+            )
+        }
+        MonitorEvidenceQuery::Log(cfg) => (
+            "logs",
+            "Timestamp",
+            "count()".to_string(),
+            group_expression(group_by, log_field_expr)?,
+            log_conditions(cfg)?,
+        ),
+        MonitorEvidenceQuery::Apm(cfg) => (
+            "spans",
+            "timestamp",
+            apm_aggregation(&cfg.metric, monitor.eval_window_secs),
+            group_expression(group_by, apm_group_expr)?,
+            apm_conditions(cfg),
+        ),
+        MonitorEvidenceQuery::Promql { expression, .. } => {
+            let series = promql::evaluate_instant_query(
+                ch,
+                expression,
+                window.to as f64 / 1000.0,
+                monitor.eval_window_secs as f64,
+                tenant_id,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("promql evaluation failed: {error}"))?;
+            return Ok(series
+                .into_iter()
+                .filter_map(|series| {
+                    let value = series.samples.last()?.1;
+                    if value.is_nan() {
+                        return None;
+                    }
+                    let group_key = series
+                        .labels
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != "__name__")
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    Some(MonitorReading {
+                        group_key,
+                        value,
+                        series: Some(series.labels),
+                    })
+                })
+                .collect());
+        }
+        MonitorEvidenceQuery::Composite { .. } => {
+            anyhow::bail!("composite monitors do not query telemetry")
+        }
+    };
+
+    conditions.insert(0, window.condition(time_column));
+    conditions.insert(0, format!("tenant_id = '{}'", escape_ch(tenant_id)));
     let where_clause = conditions.join(" AND ");
-
-    let agg = apm_aggregation(&cfg.metric, monitor.eval_window_secs);
-
-    if !group_by.is_empty() {
-        let group_expr = group_expression(group_by, apm_group_expr)?;
-
-        let sql = format!(
-            "SELECT ({group_expr}) AS group_key, toFloat64({agg}) AS value \
-             FROM spans WHERE {where_clause} \
-             GROUP BY group_key"
-        );
-        let rows = crate::tenant_query(ch, &sql, &monitor.tenant_id)
-            .with_setting("max_execution_time", "30")
-            .fetch_all::<GroupedRow>()
-            .await?;
-        Ok(rows.into_iter().map(|r| (r.group_key, r.value)).collect())
-    } else {
-        let sql = format!("SELECT toFloat64({agg}) AS value FROM spans WHERE {where_clause}");
-        let row = crate::tenant_query(ch, &sql, &monitor.tenant_id)
+    if group_by.is_empty() {
+        let sql =
+            format!("SELECT toFloat64({aggregation}) AS value FROM {table} WHERE {where_clause}");
+        let row = crate::tenant_query(ch, &sql, tenant_id)
             .with_setting("max_execution_time", "30")
             .fetch_one::<ValueRow>()
             .await?;
-        Ok(vec![("".to_string(), row.value)])
+        Ok(vec![MonitorReading {
+            group_key: String::new(),
+            value: row.value,
+            series: None,
+        }])
+    } else {
+        let sql = format!(
+            "SELECT ({group}) AS group_key, toFloat64({aggregation}) AS value \
+             FROM {table} WHERE {where_clause} GROUP BY group_key"
+        );
+        let rows = crate::tenant_query(ch, &sql, tenant_id)
+            .with_setting("max_execution_time", "30")
+            .fetch_all::<GroupedRow>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MonitorReading {
+                group_key: row.group_key,
+                value: row.value,
+                series: None,
+            })
+            .collect())
     }
 }
 
@@ -1650,13 +1728,19 @@ pub async fn preview_query(
         created_by: String::new(),
         created_at: String::new(),
         updated_at: String::new(),
+        rule_version: 0,
     };
 
-    let results = match monitor_type {
-        "metric" => query_metric(ch, &temp_monitor, group_by).await?,
-        "log" => query_log(ch, &temp_monitor, group_by).await?,
-        "apm" => query_apm(ch, &temp_monitor, group_by).await?,
-        _ => vec![],
+    let results: Vec<_> = if matches!(monitor_type, "metric" | "log" | "apm") {
+        let query = parse_monitor_query(&temp_monitor)?;
+        let window = EvaluationWindow::new(chrono::Utc::now().timestamp_millis(), eval_window_secs);
+        run_monitor_query(ch, &temp_monitor, &query, group_by, window)
+            .await?
+            .into_iter()
+            .map(|row| (row.group_key, row.value))
+            .collect()
+    } else {
+        Vec::new()
     };
 
     let current_value = results.first().map(|(_, v)| *v);
@@ -1849,52 +1933,13 @@ async fn build_preview_series(
                 Ok(c) => c,
                 Err(_) => return (vec![], bucket_secs),
             };
-            let mut conds = vec![format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id))];
-            if !cfg.search.is_empty() {
-                for term in cfg.search.split_whitespace() {
-                    // lower(Body) LIKE matches the idx_body_text ngrams(4) index;
-                    // hasToken would force a full Body scan in the preview path.
-                    let escaped = escape_ch(&term.to_lowercase());
-                    let inner = escaped.replace('%', "\\%").replace('_', "\\_");
-                    conds.push(format!("lower(Body) LIKE '%{inner}%'"));
-                }
-            }
-            if !cfg.service.is_empty() {
-                conds.push(format!("ServiceName = '{}'", escape_ch(&cfg.service)));
-            }
-            if !cfg.severities.is_empty() {
-                let severities = cfg
-                    .severities
-                    .iter()
-                    .map(|severity| format!("'{}'", escape_ch(severity)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                conds.push(format!("SeverityText IN ({severities})"));
-            }
-            for f in &cfg.filters {
-                let Some(field) = log_field_expr(&f.field) else {
-                    tracing::warn!(
-                        engine = "monitors",
-                        field = %f.field,
-                        "rejecting unsupported log filter field in preview"
-                    );
-                    return (vec![], bucket_secs);
-                };
-                let value = escape_ch(&f.value);
-                match f.op.as_str() {
-                    "=" => conds.push(format!("{field} = '{value}'")),
-                    "!=" => conds.push(format!("{field} != '{value}'")),
-                    "LIKE" | "like" => conds.push(format!("{field} LIKE '%{value}%'")),
-                    _ => {
-                        tracing::warn!(
-                            engine = "monitors",
-                            operator = %f.op,
-                            "rejecting unsupported log filter operator in preview"
-                        );
-                        return (vec![], bucket_secs);
-                    }
-                }
-            }
+            let Ok(mut conds) = log_conditions(&cfg) else {
+                return (vec![], bucket_secs);
+            };
+            conds.insert(
+                0,
+                format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
+            );
             (
                 "logs".to_string(),
                 "count()".to_string(),
@@ -1906,15 +1951,11 @@ async fn build_preview_series(
                 Ok(c) => c,
                 Err(_) => return (vec![], bucket_secs),
             };
-            let mut conds = vec![format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id))];
-            if let Some(condition) = apm_match_condition("service_name", &cfg.service) {
-                conds.push(condition);
-            }
-            if let Some(ref ep) = cfg.endpoint_filter {
-                if let Some(condition) = apm_match_condition("http_path", ep) {
-                    conds.push(condition);
-                }
-            }
+            let mut conds = apm_conditions(&cfg);
+            conds.insert(
+                0,
+                format!("tenant_id = '{}'", escape_ch(&monitor.tenant_id)),
+            );
             let agg = apm_aggregation(&cfg.metric, bucket_secs);
             ("spans".to_string(), agg, conds.join(" AND "))
         }
@@ -2375,6 +2416,62 @@ mod tests {
             group_expression(&groups, log_field_expr).unwrap(),
             "toString(ServiceName) || ':' || toString(SeverityText)"
         );
+    }
+
+    #[test]
+    fn explore_replays_alert_predicates_group_and_precise_bounds() {
+        let scope = Filter {
+            field: crate::models::monitor::MONITOR_SCOPE_FIELD.into(),
+            op: FilterOp::Eq,
+            value: serde_json::json!(
+                serde_json::json!({
+                    "query": {
+                        "kind": "log", "search": "Timeout Gone", "service": "checkout worker",
+                        "severities": ["ERROR", "WARN"],
+                        "filters": [{"field": "body", "op": "LIKE", "value": "retry required"}],
+                    },
+                    "group_by": ["service_name", "scope_name"],
+                    "group_key": "checkout worker:scope:one",
+                })
+                .to_string()
+            ),
+        };
+        let from = "2026-11-22T09:09:00.124Z";
+        let to = "2026-11-22T09:14:00.124Z";
+        let sql = crate::handlers::logs::build_log_where(
+            std::slice::from_ref(&scope),
+            from,
+            to,
+            None,
+            "default",
+        )
+        .unwrap()
+        .to_sql();
+        assert!(sql.contains(
+            "Timestamp >= parseDateTime64BestEffort('2026-11-22T09:09:00.124Z', 3, 'UTC')"
+        ));
+        assert!(sql.contains(
+            "Timestamp <= parseDateTime64BestEffort('2026-11-22T09:14:00.124Z', 3, 'UTC')"
+        ));
+        assert!(sql.contains("lower(Body) LIKE '%timeout%' AND lower(Body) LIKE '%gone%'"));
+        assert!(sql.contains("SeverityText IN ('ERROR', 'WARN')"));
+        assert!(sql.contains("Body LIKE '%retry required%'"));
+        assert!(sql.contains(
+            "(toString(ServiceName) || ':' || toString(ScopeName)) = 'checkout worker:scope:one'"
+        ));
+        assert!(alert_scope_condition(&scope, false).is_err());
+
+        let apm = Filter {
+            value: serde_json::json!(serde_json::json!({
+                "query": {"kind": "apm", "service": "checkout-*", "endpoint_filter": "/checkout/*", "metric": "error_rate"},
+                "group_by": ["endpoint"],
+                "group_key": "/checkout/confirm",
+            }).to_string()),
+            ..scope
+        };
+        let sql = crate::query_builder::build_where_clause(&[apm], from, to).to_sql();
+        assert!(sql.contains("service_name LIKE 'checkout-%' AND http_path LIKE '/checkout/%'"));
+        assert!(sql.contains("(toString(http_path)) = '/checkout/confirm'"));
     }
 
     #[test]
