@@ -34,6 +34,8 @@ pub struct PreviewInput {
 #[serde(deny_unknown_fields)]
 struct Sample {
     metric_name: String,
+    // Separately stored service metadata, such as the remote-write job. A
+    // literal service_name metric label belongs in labels and reaches the matcher.
     #[serde(default)]
     service_name: String,
     #[serde(default)]
@@ -304,6 +306,51 @@ mod tests {
         let existing_collision = evaluate(samples(), &proposed, &proposed);
         assert_eq!(existing_collision.changed, 0);
         assert!(!existing_collision.collisions[0].introduced);
+    }
+
+    #[test]
+    fn preview_matches_the_remote_write_service_name_label() {
+        let samples = serde_json::from_value(json!([
+            {
+                "metric_name": "http_requests_total",
+                "service_name": "scrape-job",
+                "labels": {"service_name": "payments", "route": "/charge"}
+            },
+            {
+                "metric_name": "http_requests_total",
+                "service_name": "payments",
+                "labels": {"route": "/charge"}
+            }
+        ]))
+        .unwrap();
+        let strip_service = parse_rule(json!({
+            "name": "strip payments label",
+            "action": "drop_label",
+            "match_label_key": "service_name",
+            "match_label_value": "payments",
+            "drop_label_pattern": "service_name",
+        }));
+        let proposed = draft_policy(&[], None, &strip_service).unwrap();
+        let result = evaluate(samples, &[], &proposed);
+        let payments = &result.rows[0];
+        assert_eq!(result.changed, 1);
+        assert_eq!(
+            payments.current.identity.as_ref().unwrap()["service_name"],
+            "payments"
+        );
+        assert!(
+            !payments
+                .proposed
+                .labels
+                .as_ref()
+                .unwrap()
+                .contains_key("service_name")
+        );
+        assert_eq!(
+            payments.proposed.identity.as_ref().unwrap()["service_name"],
+            "scrape-job"
+        );
+        assert!(result.rows[1].proposed.matched_rules.is_empty());
     }
 
     #[test]
