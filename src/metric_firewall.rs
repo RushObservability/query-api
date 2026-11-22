@@ -73,6 +73,7 @@ enum CompiledAction {
 
 #[derive(Clone)]
 struct CompiledRule {
+    source_index: usize,
     action: CompiledAction,
     /// Metric-name match (Any = any metric).
     metric: Matcher,
@@ -122,13 +123,13 @@ impl RuleSet {
         }
     }
 
-    fn matches(&self, name: &str, attrs: &[(String, String)]) -> bool {
-        if let Some(rules) = self.by_literal.get(name) {
-            if rules.iter().any(|r| r.predicate_matches(name, attrs)) {
-                return true;
-            }
-        }
-        self.scan.iter().any(|r| r.predicate_matches(name, attrs))
+    fn matching(&self, name: &str, attrs: &[(String, String)]) -> Option<&CompiledRule> {
+        self.by_literal
+            .get(name)
+            .into_iter()
+            .flatten()
+            .chain(&self.scan)
+            .find(|rule| rule.predicate_matches(name, attrs))
     }
 }
 
@@ -159,7 +160,7 @@ impl MetricFirewall {
     /// failing the whole set.
     pub fn compile(raw: &[RawRule]) -> Self {
         let mut fw = MetricFirewall::default();
-        for r in raw {
+        for (source_index, r) in raw.iter().enumerate() {
             if !r.enabled {
                 continue;
             }
@@ -208,6 +209,7 @@ impl MetricFirewall {
             };
 
             let rule = CompiledRule {
+                source_index,
                 action,
                 metric,
                 label_key,
@@ -235,32 +237,40 @@ impl MetricFirewall {
             return 0;
         }
         let before = rows.len();
-        rows.retain_mut(|row| {
-            // Allow rules take precedence over block rules: a series matching any
-            // allow rule cannot be blocked (labels may still be stripped below).
-            if !self.block.is_empty() {
-                let allowed = !self.allow.is_empty()
-                    && self
-                        .allow
-                        .matches(row.fw_metric_name(), row.fw_attributes());
-                if !allowed
-                    && self
-                        .block
-                        .matches(row.fw_metric_name(), row.fw_attributes())
-                {
-                    return false; // drop the whole datapoint
-                }
-            }
-            for rule in &self.drop {
-                if rule.predicate_matches(row.fw_metric_name(), row.fw_attributes()) {
-                    if let CompiledAction::DropLabel(dl) = &rule.action {
-                        row.fw_attributes_mut().retain(|(k, _)| !dl.matches(k));
-                    }
-                }
-            }
-            true
-        });
+        rows.retain_mut(|row| self.apply_row(row, |_| {}));
         before - rows.len()
+    }
+
+    /// Evaluate a single row and report the indices of rules that affected it.
+    /// Ingestion supplies a no-op callback.
+    pub(crate) fn apply_row<T: MetricRow>(
+        &self,
+        row: &mut T,
+        mut on_rule: impl FnMut(usize),
+    ) -> bool {
+        if !self.block.is_empty() {
+            let name = row.fw_metric_name();
+            let attrs = row.fw_attributes();
+            if let Some(allow) = self.allow.matching(name, attrs) {
+                on_rule(allow.source_index);
+            } else if let Some(block) = self.block.matching(name, attrs) {
+                on_rule(block.source_index);
+                return false;
+            }
+        }
+        for rule in &self.drop {
+            if let CompiledAction::DropLabel(matcher) = &rule.action
+                && rule.predicate_matches(row.fw_metric_name(), row.fw_attributes())
+            {
+                let labels = row.fw_attributes_mut();
+                let before = labels.len();
+                labels.retain(|(key, _)| !matcher.matches(key));
+                if labels.len() < before {
+                    on_rule(rule.source_index);
+                }
+            }
+        }
+        true
     }
 }
 

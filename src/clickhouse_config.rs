@@ -2524,6 +2524,22 @@ pub struct MetricFirewallRule {
     pub created_at: String,
 }
 
+impl From<&MetricFirewallRule> for crate::metric_firewall::RawRule {
+    fn from(rule: &MetricFirewallRule) -> Self {
+        Self {
+            enabled: rule.enabled != 0,
+            action: rule.action.clone(),
+            metric_pattern: rule.metric_pattern.clone(),
+            metric_regex: rule.metric_regex != 0,
+            match_label_key: rule.match_label_key.clone(),
+            match_label_value: rule.match_label_value.clone(),
+            match_label_value_regex: rule.match_label_value_regex != 0,
+            drop_label_pattern: rule.drop_label_pattern.clone(),
+            drop_label_regex: rule.drop_label_regex != 0,
+        }
+    }
+}
+
 /// Global retention caps. Per-signal values of 0 mean "inherit `default_days`".
 /// These are the maximum retention per signal (logs / metrics / apm), used as
 /// the table-level TTL and as the ceiling for tenant overrides. `apm` covers
@@ -4532,7 +4548,7 @@ impl ConfigDb {
 
     pub async fn list_metric_firewall(&self) -> anyhow::Result<Vec<MetricFirewallRule>> {
         let rows = self.client
-            .query("SELECT id, name, enabled, action, metric_pattern, metric_regex, match_label_key, match_label_value, match_label_value_regex, drop_label_pattern, drop_label_regex, created_at FROM config_metric_firewall FINAL WHERE is_deleted = 0 ORDER BY created_at")
+            .query("SELECT id, name, enabled, action, metric_pattern, metric_regex, match_label_key, match_label_value, match_label_value_regex, drop_label_pattern, drop_label_regex, created_at FROM config_metric_firewall FINAL WHERE is_deleted = 0 ORDER BY created_at, id")
             .fetch_all::<MetricFirewallRule>()
             .await?;
         Ok(rows)
@@ -4579,17 +4595,7 @@ impl ConfigDb {
         let rows = self.list_metric_firewall().await?;
         let raw: Vec<crate::metric_firewall::RawRule> = rows
             .iter()
-            .map(|r| crate::metric_firewall::RawRule {
-                enabled: r.enabled != 0,
-                action: r.action.clone(),
-                metric_pattern: r.metric_pattern.clone(),
-                metric_regex: r.metric_regex != 0,
-                match_label_key: r.match_label_key.clone(),
-                match_label_value: r.match_label_value.clone(),
-                match_label_value_regex: r.match_label_value_regex != 0,
-                drop_label_pattern: r.drop_label_pattern.clone(),
-                drop_label_regex: r.drop_label_regex != 0,
-            })
+            .map(crate::metric_firewall::RawRule::from)
             .collect();
         Ok(crate::metric_firewall::MetricFirewall::compile(&raw))
     }
