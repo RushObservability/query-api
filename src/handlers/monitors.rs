@@ -156,7 +156,7 @@ pub async fn create_monitor(
             .actor(caller.0.clone(), caller.1.clone())
             .tenant(tenant.tenant_id.clone())
             .resource("monitor", id.clone())
-            .changes(serde_json::json!({ "name": req.name, "monitor_type": req.monitor_type, "enabled": req.enabled }).to_string())
+            .changes(serde_json::json!({ "name": req.name, "monitor_type": req.monitor_type, "enabled": req.enabled, "rule_version": monitor.rule_version }).to_string())
             .description("monitor created")
             .context(crate::audit::actor_context_from_headers(&headers)),
     ).await;
@@ -181,7 +181,7 @@ pub async fn get_monitor(
 
     let events = state
         .config_db
-        .list_monitor_events(&id, 20)
+        .list_monitor_events(&id, &tenant.tenant_id, 20)
         .await
         .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
 
@@ -308,7 +308,7 @@ pub async fn update_monitor(
             .actor(caller.0.clone(), caller.1.clone())
             .tenant(tenant.tenant_id.clone())
             .resource("monitor", id.clone())
-            .changes(serde_json::json!({ "name": req.name, "monitor_type": req.monitor_type, "enabled": req.enabled }).to_string())
+            .changes(serde_json::json!({ "name": req.name, "monitor_type": req.monitor_type, "enabled": req.enabled, "rule_version": monitor.rule_version }).to_string())
             .description("monitor updated")
             .context(crate::audit::actor_context_from_headers(&headers)),
     ).await;
@@ -353,13 +353,14 @@ pub async fn delete_monitor(
 pub async fn list_monitor_events(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
     Path(id): Path<String>,
     Query(params): Query<EventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_principal(&state, &headers).await?;
     let events = state
         .config_db
-        .list_monitor_events(&id, params.limit)
+        .list_monitor_events(&id, &tenant.tenant_id, params.limit)
         .await
         .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
     Ok(Json(serde_json::json!({ "events": events })))

@@ -35,6 +35,8 @@ pub struct Monitor {
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub rule_version: u64,
 }
 
 // ── API response (JSON fields parsed from TEXT) ──
@@ -73,6 +75,8 @@ pub struct MonitorResponse {
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub rule_version: u64,
 }
 
 impl From<Monitor> for MonitorResponse {
@@ -113,6 +117,7 @@ impl From<Monitor> for MonitorResponse {
             created_by: m.created_by,
             created_at: m.created_at,
             updated_at: m.updated_at,
+            rule_version: m.rule_version,
         }
     }
 }
@@ -131,7 +136,49 @@ pub struct MonitorEvent {
     pub threshold: Option<f64>,
     pub message: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<MonitorEvidence>,
 }
+
+/// The rule and data scope used by this evaluation. Stored on the event so it
+/// remains independent of later configuration edits and telemetry retention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorEvidence {
+    pub rule_version: u64,
+    pub rule_name: String,
+    pub comparator: String,
+    pub window_start: Option<String>,
+    pub evaluated_at: String,
+    pub group_by: Vec<String>,
+    pub query: MonitorEvidenceQuery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MonitorEvidenceQuery {
+    Log(LogQueryConfig),
+    Apm(ApmQueryConfig),
+    Metric(MetricQueryConfig),
+    Promql {
+        expression: String,
+        series: Option<std::collections::BTreeMap<String, String>>,
+    },
+    Composite {
+        formula: String,
+        members: std::collections::BTreeMap<char, bool>,
+    },
+}
+
+/// The pinned log/span filter used by Explore. The evaluator and replay both
+/// build their predicates from the same typed query config and grouping fields.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MonitorExploreScope {
+    pub query: MonitorEvidenceQuery,
+    pub group_by: Vec<String>,
+    pub group_key: Option<String>,
+}
+
+pub const MONITOR_SCOPE_FIELD: &str = "rush.alert_scope";
 
 // ── API request types ──
 
@@ -252,7 +299,7 @@ pub struct PreviewMonitorRequest {
 
 // ── Query config structs (deserialized from the JSON blob) ──
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricQueryConfig {
     pub metric_name: String,
     #[serde(default = "default_aggregation")]
@@ -263,13 +310,13 @@ pub struct MetricQueryConfig {
     pub group_by: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricFilter {
     pub key: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogQueryConfig {
     #[serde(default)]
     pub search: String,
@@ -281,7 +328,7 @@ pub struct LogQueryConfig {
     pub filters: Vec<LogFilter>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogFilter {
     pub field: String,
     #[serde(default = "default_eq_op")]
@@ -289,7 +336,7 @@ pub struct LogFilter {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApmQueryConfig {
     pub service: String,
     pub metric: String,

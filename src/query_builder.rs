@@ -15,6 +15,23 @@ pub(crate) fn sanitize_datetime(s: &str) -> String {
         .collect()
 }
 
+/// Alert windows are recorded at millisecond precision. Keep both bounds
+/// identical to the evaluator's bounds on any Explore replay.
+pub(crate) fn query_time_bounds(filters: &[Filter], from: &str, to: &str) -> (String, String) {
+    let alert_scope = filters
+        .iter()
+        .any(|filter| filter.field == crate::models::monitor::MONITOR_SCOPE_FIELD);
+    let bound = |timestamp| {
+        let timestamp = sanitize_datetime(timestamp);
+        if alert_scope {
+            format!("parseDateTime64BestEffort('{timestamp}', 3, 'UTC')")
+        } else {
+            format!("parseDateTimeBestEffort('{timestamp}')")
+        }
+    };
+    (bound(from), bound(to))
+}
+
 /// Escape a string value for safe embedding inside a SQL single-quoted literal.
 /// Escapes backslashes first (to prevent them from being interpreted as escape
 /// characters when ClickHouse's allow_backslashes_escaping_in_strings is ON),
@@ -323,11 +340,8 @@ fn build_span_clauses(
     search: Option<&str>,
     traces_mode: bool,
 ) -> QueryClauses {
-    let from = sanitize_datetime(from);
-    let to = sanitize_datetime(to);
-    let time_range = format!(
-        "timestamp >= parseDateTimeBestEffort('{from}') AND timestamp <= parseDateTimeBestEffort('{to}')"
-    );
+    let (from, to) = query_time_bounds(filters, from, to);
+    let time_range = format!("timestamp >= {from} AND timestamp <= {to}");
 
     // Whether the query carries a predicate backed by a skip index — a free-text
     // search (spans `idx_search_text` text index, or a trace/span-id bloom) or a
@@ -343,6 +357,15 @@ fn build_span_clauses(
     let mut trace_conditions = Vec::new();
 
     for filter in filters {
+        if filter.field == crate::models::monitor::MONITOR_SCOPE_FIELD {
+            // This is a typed, fixed-field scope, never SQL supplied by the caller.
+            conditions.push(
+                crate::monitor_engine::alert_scope_condition(filter, false)
+                    .unwrap_or_else(|_| "0".to_string()),
+            );
+            uses_index_predicate = true;
+            continue;
+        }
         // Normalized span-status conditions still go through the traces-only
         // routing below, so "Errors only" is matched across the whole trace.
         let condition = match span_status_condition(filter) {
