@@ -6,11 +6,19 @@ use axum::{
 };
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 use crate::AppState;
 use crate::TenantContext;
 use crate::query_builder::ERROR_SPAN;
+
+// Share one reservoir across all three percentiles without adding an array
+// column to the response's RowBinary schema.
+const LATENCY_PERCENTILES_SQL: &str = "(quantiles(0.5, 0.95, 0.99)(duration_ns) AS duration_quantiles)[1] / 1000000.0 AS p50_ms, \
+     duration_quantiles[2] / 1000000.0 AS p95_ms, \
+     duration_quantiles[3] / 1000000.0 AS p99_ms";
+
+#[cfg(test)]
+mod aggregation_tests;
 
 #[derive(Debug, Serialize, Deserialize, Row)]
 pub struct ServiceEntry {
@@ -119,9 +127,7 @@ pub async fn service_graph(
             count() as request_count, \
             countIf({ERROR_SPAN}) as error_count, \
             avg(duration_ns) / 1000000.0 as avg_duration_ms, \
-            quantile(0.5)(duration_ns) / 1000000.0 as p50_ms, \
-            quantile(0.95)(duration_ns) / 1000000.0 as p95_ms, \
-            quantile(0.99)(duration_ns) / 1000000.0 as p99_ms \
+            {LATENCY_PERCENTILES_SQL} \
          FROM spans \
          PREWHERE tenant_id = '{escaped_tenant}' \
             AND timestamp >= now() - INTERVAL {minutes} MINUTE \
@@ -246,17 +252,30 @@ pub struct ServiceTimeBreakdownBucket {
 }
 
 #[derive(Debug, Deserialize, Row)]
-struct ServiceTimeBreakdownServerBucket {
+struct ServiceTimeBreakdownAggregateBucket {
     pub bucket: String,
     pub request_count: u64,
     pub wall_time_ms: f64,
-}
-
-#[derive(Debug, Deserialize, Row)]
-struct ServiceTimeBreakdownDatabaseBucket {
-    pub bucket: String,
     pub database_call_time_ms: f64,
     pub database_calls: u64,
+}
+
+impl From<ServiceTimeBreakdownAggregateBucket> for ServiceTimeBreakdownBucket {
+    fn from(bucket: ServiceTimeBreakdownAggregateBucket) -> Self {
+        let database_time_ms = database_impact_per_request(
+            bucket.database_call_time_ms,
+            bucket.request_count,
+            bucket.wall_time_ms,
+        );
+        Self {
+            bucket: bucket.bucket,
+            request_count: bucket.request_count,
+            wall_time_ms: bucket.wall_time_ms,
+            application_time_ms: (bucket.wall_time_ms - database_time_ms).max(0.0),
+            database_time_ms,
+            database_calls: bucket.database_calls,
+        }
+    }
 }
 
 fn database_impact_per_request(raw_database_ms: f64, requests: u64, average_wall_ms: f64) -> f64 {
@@ -440,89 +459,55 @@ pub async fn service_time_breakdown(
     }))
 }
 
+fn time_breakdown_timeseries_sql(
+    tenant_id: &str,
+    service: &str,
+    minutes: u64,
+    bucket_secs: u64,
+) -> String {
+    let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
+    let escaped_service = crate::query_builder::escape_string_literal(service);
+    let db_predicate = database_span_predicate();
+
+    format!(
+        "WITH kind = 'SPAN_KIND_SERVER' AS is_server, \
+            {db_predicate} AS is_database \
+         SELECT \
+            toString(toStartOfInterval(timestamp, INTERVAL {bucket_secs} SECOND)) AS bucket, \
+            countIf(is_server) AS request_count, \
+            avgIf(duration_ns, is_server) / 1000000.0 AS wall_time_ms, \
+            sumIf(duration_ns, is_database) / 1000000.0 AS database_call_time_ms, \
+            countIf(is_database) AS database_calls \
+         FROM spans \
+         PREWHERE tenant_id = '{escaped_tenant}' \
+            AND service_name = '{escaped_service}' \
+            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+         WHERE is_server OR is_database \
+         GROUP BY bucket \
+         HAVING request_count > 0 \
+         ORDER BY bucket"
+    )
+}
+
 pub async fn service_time_breakdown_timeseries(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
     Query(params): Query<TimeBreakdownParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
-    let escaped_service = crate::query_builder::escape_string_literal(&params.service);
     let minutes = params.minutes.min(10080); // max 7d
     let (interval, bucket_secs) = breakdown_interval(minutes, &params.interval);
-    let db_predicate = database_span_predicate();
+    let sql = time_breakdown_timeseries_sql(tenant_id, &params.service, minutes, bucket_secs);
 
-    let server_sql = format!(
-        "SELECT \
-            toString(toStartOfInterval(timestamp, INTERVAL {bucket_secs} SECOND)) AS bucket, \
-            count() AS request_count, \
-            avg(duration_ns) / 1000000.0 AS wall_time_ms \
-         FROM spans \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-            AND service_name = '{escaped_service}' \
-            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
-         WHERE kind = 'SPAN_KIND_SERVER' \
-         GROUP BY bucket \
-         ORDER BY bucket"
-    );
-
-    let database_sql = format!(
-        "SELECT \
-            toString(toStartOfInterval(timestamp, INTERVAL {bucket_secs} SECOND)) AS bucket, \
-            sum(duration_ns) / 1000000.0 AS database_call_time_ms, \
-            count() AS database_calls \
-         FROM spans \
-         PREWHERE tenant_id = '{escaped_tenant}' \
-            AND service_name = '{escaped_service}' \
-            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
-         WHERE {db_predicate} \
-         GROUP BY bucket \
-         ORDER BY bucket"
-    );
-
-    let (server_result, database_result) = tokio::join!(
-        crate::tenant_query(&state.ch, &server_sql, tenant_id)
-            .fetch_all::<ServiceTimeBreakdownServerBucket>(),
-        crate::tenant_query(&state.ch, &database_sql, tenant_id)
-            .fetch_all::<ServiceTimeBreakdownDatabaseBucket>(),
-    );
-
-    let server_buckets = server_result.map_err(|e| {
-        tracing::error!(error = %e, handler = "service_time_breakdown_timeseries", query = "server", "query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-    })?;
-    let database_buckets = database_result.map_err(|e| {
-        tracing::error!(error = %e, handler = "service_time_breakdown_timeseries", query = "database", "query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-    })?;
-
-    let database_by_bucket: BTreeMap<_, _> = database_buckets
+    let buckets = crate::tenant_query(&state.ch, &sql, tenant_id)
+        .fetch_all::<ServiceTimeBreakdownAggregateBucket>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, handler = "service_time_breakdown_timeseries", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?
         .into_iter()
-        .map(|bucket| (bucket.bucket.clone(), bucket))
-        .collect();
-
-    let buckets = server_buckets
-        .into_iter()
-        .map(|server| {
-            let database = database_by_bucket.get(&server.bucket);
-            let database_time_ms = database
-                .map(|bucket| {
-                    database_impact_per_request(
-                        bucket.database_call_time_ms,
-                        server.request_count,
-                        server.wall_time_ms,
-                    )
-                })
-                .unwrap_or(0.0);
-            ServiceTimeBreakdownBucket {
-                bucket: server.bucket,
-                request_count: server.request_count,
-                wall_time_ms: server.wall_time_ms,
-                application_time_ms: (server.wall_time_ms - database_time_ms).max(0.0),
-                database_time_ms,
-                database_calls: database.map(|bucket| bucket.database_calls).unwrap_or(0),
-            }
-        })
+        .map(ServiceTimeBreakdownBucket::from)
         .collect();
 
     Ok(Json(ServiceTimeBreakdownTimeseriesResponse {
@@ -596,12 +581,10 @@ pub async fn service_latency_histogram(
          ORDER BY exp"
     );
 
-    // Exact percentiles over the same window, drawn as markers on the histogram.
+    // Approximate percentiles over the same window, drawn as histogram markers.
     let pct_sql = format!(
         "SELECT \
-            quantile(0.5)(duration_ns) / 1000000.0 AS p50_ms, \
-            quantile(0.95)(duration_ns) / 1000000.0 AS p95_ms, \
-            quantile(0.99)(duration_ns) / 1000000.0 AS p99_ms, \
+            {LATENCY_PERCENTILES_SQL}, \
             count() AS total \
          FROM spans \
          PREWHERE tenant_id = '{escaped_tenant}' \
@@ -690,9 +673,7 @@ pub async fn service_endpoints(
 
     // Common RED aggregates; only the grouping key + filter differ by mode.
     let err_expr = format!("countIf({ERROR_SPAN}) AS errors");
-    let pct = "quantile(0.5)(duration_ns)/1000000.0 AS p50_ms, \
-               quantile(0.95)(duration_ns)/1000000.0 AS p95_ms, \
-               quantile(0.99)(duration_ns)/1000000.0 AS p99_ms";
+    let pct = LATENCY_PERCENTILES_SQL;
 
     let sql = if operation_mode {
         format!(
