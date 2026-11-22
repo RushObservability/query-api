@@ -82,7 +82,7 @@ fn check_policy_revision(
 fn validate(
     input: &FirewallRuleInput,
     id: String,
-    created_at: String,
+    previous: Option<&MetricFirewallRule>,
 ) -> Result<MetricFirewallRule, (StatusCode, String)> {
     if input.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name is required".into()));
@@ -93,27 +93,38 @@ fn validate(
             "action must be 'allow', 'block' or 'drop_label'".into(),
         ));
     }
-    // Validate any regexes so the user gets immediate feedback.
-    let check = |pat: &str, is_re: bool, label: &str| -> Result<(), (StatusCode, String)> {
-        if is_re && !pat.is_empty() {
-            regex::Regex::new(pat).map_err(|e| {
+    // Existing regexes can stay in place when a rule is renamed or disabled.
+    let check = |pat: &str,
+                 is_re: bool,
+                 old: Option<(&str, u8)>,
+                 label: &str|
+     -> Result<(), (StatusCode, String)> {
+        if is_re && !pat.is_empty() && old != Some((pat, 1)) {
+            crate::metric_firewall::validate_new_regex(pat).map_err(|reason| {
                 (
                     StatusCode::BAD_REQUEST,
-                    format!("invalid {label} regex: {e}"),
+                    format!("invalid {label} regex: {reason}"),
                 )
             })?;
         }
         Ok(())
     };
-    check(&input.metric_pattern, input.metric_regex, "metric")?;
+    check(
+        &input.metric_pattern,
+        input.metric_regex,
+        previous.map(|r| (r.metric_pattern.as_str(), r.metric_regex)),
+        "metric",
+    )?;
     check(
         &input.match_label_value,
         input.match_label_value_regex,
+        previous.map(|r| (r.match_label_value.as_str(), r.match_label_value_regex)),
         "label value",
     )?;
     check(
         &input.drop_label_pattern,
         input.drop_label_regex,
+        previous.map(|r| (r.drop_label_pattern.as_str(), r.drop_label_regex)),
         "drop label",
     )?;
 
@@ -144,7 +155,7 @@ fn validate(
         match_label_value_regex: b(input.match_label_value_regex),
         drop_label_pattern: input.drop_label_pattern.clone(),
         drop_label_regex: b(input.drop_label_regex),
-        created_at,
+        created_at: previous.map_or_else(creation_time, |rule| rule.created_at.clone()),
     })
 }
 
@@ -209,7 +220,7 @@ pub async fn create(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
     let id = uuid::Uuid::new_v4().to_string();
-    let rule = validate(&input, id, creation_time())?;
+    let rule = validate(&input, id, None)?;
     let mut after = state
         .config_db
         .list_metric_firewall()
@@ -253,13 +264,8 @@ pub async fn update(
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
     check_policy_revision(input.expected_policy_revision.as_deref(), &existing)?;
-    // Preserve the original created_at if the rule exists.
-    let created_at = existing
-        .iter()
-        .find(|r| r.id == id)
-        .map(|r| r.created_at.clone())
-        .unwrap_or_else(creation_time);
-    let rule = validate(&input, id.clone(), created_at)?;
+    let previous = existing.iter().find(|r| r.id == id);
+    let rule = validate(&input, id.clone(), previous)?;
     // Check the invariant against the post-update rule set (the old version of
     // this rule replaced by the new one), so e.g. disabling the last allow rule
     // while a catch-all block exists is rejected.

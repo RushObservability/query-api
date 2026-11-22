@@ -169,9 +169,9 @@ fn draft_policy(
             .iter_mut()
             .find(|entry| entry.id == id)
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Firewall rule not found.".into()))?;
-        *entry = validate(rule, id.to_owned(), entry.created_at.clone())?;
+        *entry = validate(rule, id.to_owned(), Some(entry))?;
     } else {
-        proposed.push(validate(rule, String::new(), String::new())?);
+        proposed.push(validate(rule, String::new(), None)?);
     }
     forbid_block_everything(&proposed)?;
     Ok(proposed)
@@ -368,9 +368,9 @@ mod tests {
             "drop_label_regex": true,
         }));
         let current = vec![
-            validate(&allow, "allow".into(), "1".into()).unwrap(),
-            validate(&block, "block".into(), "2".into()).unwrap(),
-            validate(&strip, "strip".into(), "3".into()).unwrap(),
+            validate(&allow, "allow".into(), None).unwrap(),
+            validate(&block, "block".into(), None).unwrap(),
+            validate(&strip, "strip".into(), None).unwrap(),
         ];
         let narrowed_allow = parse_rule(json!({
             "name": "allow one pod",
@@ -440,6 +440,39 @@ mod tests {
         };
         assert_eq!(
             validate_preview(&input).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn new_regex_limits_allow_disabling_an_unchanged_legacy_rule() {
+        let mut input = parse_rule(json!({
+            "name": "legacy block",
+            "action": "block",
+            "metric_pattern": "old_metric",
+            "metric_regex": true,
+        }));
+        let mut stored = validate(&input, "legacy".into(), None).unwrap();
+        stored.metric_pattern = "a".repeat(2049);
+        input.metric_pattern = stored.metric_pattern.clone();
+        input.enabled = false;
+
+        assert_eq!(
+            validate(&input, "legacy".into(), Some(&stored))
+                .unwrap()
+                .enabled,
+            0
+        );
+        assert_eq!(
+            validate(&input, "new".into(), None).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        input.metric_pattern.push('b');
+        assert_eq!(
+            validate(&input, "legacy".into(), Some(&stored))
+                .unwrap_err()
+                .0,
             StatusCode::BAD_REQUEST
         );
     }

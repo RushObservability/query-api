@@ -17,7 +17,29 @@
 //! and are hot-swapped by a background refresher / on config change, so the
 //! ingest hot path only takes a brief read lock + cheap Arc clone.
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
+
+const MAX_NEW_PATTERN_BYTES: usize = 2048;
+const NEW_REGEX_SIZE_LIMIT: usize = 1024 * 1024;
+// This was the regex crate's default when older rules were saved.
+const STORED_REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+
+fn compile_regex(pattern: &str, size_limit: usize) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern).size_limit(size_limit).build()
+}
+
+/// Limit source text and compiled size when an API caller adds or changes a regex.
+pub(crate) fn validate_new_regex(pattern: &str) -> Result<(), &'static str> {
+    if pattern.len() > MAX_NEW_PATTERN_BYTES {
+        return Err("pattern exceeds 2048 bytes");
+    }
+    compile_regex(pattern, NEW_REGEX_SIZE_LIMIT)
+        .map(drop)
+        .map_err(|error| match error {
+            regex::Error::CompiledTooBig(_) => "compiled pattern exceeds the firewall size limit",
+            _ => "invalid pattern syntax",
+        })
+}
 
 /// A metric row the firewall can inspect/mutate. Implemented by the metric
 /// insert row structs in `models::ingest`.
@@ -41,10 +63,10 @@ impl Matcher {
             return Some(Matcher::Any);
         }
         if is_regex {
-            match Regex::new(pattern) {
+            match compile_regex(pattern, STORED_REGEX_SIZE_LIMIT) {
                 Ok(re) => Some(Matcher::Regex(re)),
-                Err(e) => {
-                    tracing::warn!(pattern = %pattern, error = %e, "metric firewall: invalid regex, rule disabled");
+                Err(_) => {
+                    tracing::warn!("metric firewall: invalid regex, rule disabled");
                     None
                 }
             }
@@ -323,6 +345,19 @@ mod tests {
             drop_label_pattern: dl.into(),
             drop_label_regex: dlre,
         }
+    }
+
+    #[test]
+    fn regex_compilation_enforces_the_configured_budget() {
+        assert!(validate_new_regex(r"^http_(requests|errors)_total$").is_ok());
+        assert_eq!(
+            validate_new_regex(&"a".repeat(MAX_NEW_PATTERN_BYTES + 1)),
+            Err("pattern exceeds 2048 bytes")
+        );
+        assert!(matches!(
+            compile_regex(r"^http_[a-z]+_total$", 1),
+            Err(regex::Error::CompiledTooBig(_))
+        ));
     }
 
     #[test]
