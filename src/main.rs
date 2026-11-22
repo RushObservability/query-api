@@ -3910,6 +3910,12 @@ async fn main() -> anyhow::Result<()> {
             put(handlers::metric_firewall::update)
                 .delete(handlers::metric_firewall::delete),
         )
+        .route(
+            "/api/v1/metric-firewall/preview",
+            post(handlers::metric_firewall::preview).layer(DefaultBodyLimit::max(
+                handlers::metric_firewall::MAX_PREVIEW_BODY_BYTES,
+            )),
+        )
         // Tenant retention overrides
         .route(
             "/api/v1/tenants/{id}/retention",

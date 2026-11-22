@@ -7,11 +7,15 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::AppState;
 use crate::clickhouse_config::MetricFirewallRule;
 use crate::handlers::users::require_admin;
+
+mod preview;
+pub use preview::{MAX_PREVIEW_BODY_BYTES, preview};
 
 #[derive(serde::Deserialize)]
 pub struct FirewallRuleInput {
@@ -34,6 +38,7 @@ pub struct FirewallRuleInput {
     pub drop_label_pattern: String,
     #[serde(default)]
     pub drop_label_regex: bool,
+    pub expected_policy_revision: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -44,11 +49,40 @@ fn b(v: bool) -> u8 {
     if v { 1 } else { 0 }
 }
 
+fn creation_time() -> String {
+    // Keep new rules ordered after rules created in the same second. Drop-label
+    // rules run in creation order, and the preview appends a new draft.
+    chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S%.9f")
+        .to_string()
+}
+
+fn policy_revision(rules: &[MetricFirewallRule]) -> String {
+    let bytes =
+        serde_json::to_vec(rules).expect("firewall rules contain only strings and integers");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn check_policy_revision(
+    expected: Option<&str>,
+    rules: &[MetricFirewallRule],
+) -> Result<(), (StatusCode, String)> {
+    if let Some(expected) = expected
+        && expected != policy_revision(rules)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Firewall rules changed. Test the draft again before saving.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate an input and (on success) return a storage row with the given id/created_at.
 fn validate(
     input: &FirewallRuleInput,
     id: String,
-    created_at: String,
+    previous: Option<&MetricFirewallRule>,
 ) -> Result<MetricFirewallRule, (StatusCode, String)> {
     if input.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name is required".into()));
@@ -59,27 +93,38 @@ fn validate(
             "action must be 'allow', 'block' or 'drop_label'".into(),
         ));
     }
-    // Validate any regexes so the user gets immediate feedback.
-    let check = |pat: &str, is_re: bool, label: &str| -> Result<(), (StatusCode, String)> {
-        if is_re && !pat.is_empty() {
-            regex::Regex::new(pat).map_err(|e| {
+    // Existing regexes can stay in place when a rule is renamed or disabled.
+    let check = |pat: &str,
+                 is_re: bool,
+                 old: Option<(&str, u8)>,
+                 label: &str|
+     -> Result<(), (StatusCode, String)> {
+        if is_re && !pat.is_empty() && old != Some((pat, 1)) {
+            crate::metric_firewall::validate_new_regex(pat).map_err(|reason| {
                 (
                     StatusCode::BAD_REQUEST,
-                    format!("invalid {label} regex: {e}"),
+                    format!("invalid {label} regex: {reason}"),
                 )
             })?;
         }
         Ok(())
     };
-    check(&input.metric_pattern, input.metric_regex, "metric")?;
+    check(
+        &input.metric_pattern,
+        input.metric_regex,
+        previous.map(|r| (r.metric_pattern.as_str(), r.metric_regex)),
+        "metric",
+    )?;
     check(
         &input.match_label_value,
         input.match_label_value_regex,
+        previous.map(|r| (r.match_label_value.as_str(), r.match_label_value_regex)),
         "label value",
     )?;
     check(
         &input.drop_label_pattern,
         input.drop_label_regex,
+        previous.map(|r| (r.drop_label_pattern.as_str(), r.drop_label_regex)),
         "drop label",
     )?;
 
@@ -110,7 +155,7 @@ fn validate(
         match_label_value_regex: b(input.match_label_value_regex),
         drop_label_pattern: input.drop_label_pattern.clone(),
         drop_label_regex: b(input.drop_label_regex),
-        created_at,
+        created_at: previous.map_or_else(creation_time, |rule| rule.created_at.clone()),
     })
 }
 
@@ -175,13 +220,13 @@ pub async fn create(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
     let id = uuid::Uuid::new_v4().to_string();
-    let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let rule = validate(&input, id, created_at)?;
+    let rule = validate(&input, id, None)?;
     let mut after = state
         .config_db
         .list_metric_firewall()
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
+    check_policy_revision(input.expected_policy_revision.as_deref(), &after)?;
     after.push(rule.clone());
     forbid_block_everything(&after)?;
     state
@@ -218,13 +263,9 @@ pub async fn update(
         .list_metric_firewall()
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))?;
-    // Preserve the original created_at if the rule exists.
-    let created_at = existing
-        .iter()
-        .find(|r| r.id == id)
-        .map(|r| r.created_at.clone())
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string());
-    let rule = validate(&input, id.clone(), created_at)?;
+    check_policy_revision(input.expected_policy_revision.as_deref(), &existing)?;
+    let previous = existing.iter().find(|r| r.id == id);
+    let rule = validate(&input, id.clone(), previous)?;
     // Check the invariant against the post-update rule set (the old version of
     // this rule replaced by the new one), so e.g. disabling the last allow rule
     // while a catch-all block exists is rejected.
