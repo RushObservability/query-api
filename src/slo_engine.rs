@@ -1,6 +1,10 @@
 use crate::clickhouse_config::ConfigDb;
 use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use crate::models::query::{Filter, FilterOp};
+use crate::models::slo::{Slo, SloEvaluation};
+use crate::models::slo_maintenance::{
+    MaintenanceRange, SloMaintenanceEvaluation, exclusion_ranges,
+};
 use crate::query_builder::{QueryClauses, build_metrics_where_clause, build_where_clause};
 use clickhouse::Client;
 use std::sync::Arc;
@@ -13,24 +17,45 @@ const EVAL_FLUSH_EVERY: u32 = 10;
 const MAX_EXECUTION_TIME: &str = "30";
 
 #[derive(clickhouse::Row, serde::Deserialize)]
-struct BadTotalRow {
-    bad: u64,
-    total: u64,
-}
-
-#[derive(clickhouse::Row, serde::Deserialize)]
-struct SumBadTotalRow {
+struct BudgetCounts {
     bad: f64,
     total: f64,
+    excluded_bad: f64,
+    excluded_total: f64,
 }
 
-#[derive(clickhouse::Row, serde::Deserialize)]
-struct HistTotalFastRow {
-    total: f64,
-    fast: f64,
+struct EvaluationWindow<'a> {
+    from: &'a str,
+    to: &'a str,
+    exclusions: &'a [MaintenanceRange],
 }
 
-/// Render QueryClauses as a single boolean predicate usable inside countIf/sumIf.
+impl EvaluationWindow<'_> {
+    fn trace(&self, filters: &[Filter]) -> QueryClauses {
+        build_where_clause(filters, self.from, self.to)
+    }
+
+    fn metric(&self, filters: &[Filter]) -> QueryClauses {
+        build_metrics_where_clause(filters, self.from, self.to)
+    }
+
+    fn exclusion_predicate(&self, column: &str) -> String {
+        if self.exclusions.is_empty() {
+            return "0".to_string();
+        }
+        self.exclusions
+            .iter()
+            .map(|range| format!(
+                "({column} >= fromUnixTimestamp64Milli({}, 'UTC') AND {column} < fromUnixTimestamp64Milli({}, 'UTC'))",
+                range.start * 1000,
+                range.end * 1000
+            ))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+}
+
+/// Render QueryClauses as one predicate inside countIf/sumIf.
 fn clauses_predicate(c: &QueryClauses) -> String {
     match (c.prewhere.is_empty(), c.where_clause.is_empty()) {
         (true, true) => "1".to_string(),
@@ -40,188 +65,136 @@ fn clauses_predicate(c: &QueryClauses) -> String {
     }
 }
 
-/// trace + availability: COUNT errors / COUNT total on spans — ONE scan.
-///
-/// The scan is pruned by the conditions common to both sides (time range + the
-/// injected service_name filter); the error/total filter sets become countIf
-/// predicates. Each predicate re-states the time range (redundant inside the
-/// pruned scan, but keeps each count exactly equal to its former standalone query).
+async fn query_budget_counts(ch: &Client, tenant: &str, sql: &str) -> anyhow::Result<BudgetCounts> {
+    Ok(crate::tenant_query(ch, sql, tenant)
+        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
+        .fetch_one::<BudgetCounts>()
+        .await?)
+}
+
+/// The same scan compares good/bad traffic, with and without maintenance.
+/// Evaluating a single predicate for both sets includes each row at most once.
 async fn eval_trace_availability(
     ch: &Client,
     tenant_id: &str,
     common_filters: &[Filter],
     error_filters: &[Filter],
     total_filters: &[Filter],
-    from: &str,
-    to: &str,
-) -> anyhow::Result<(f64, f64)> {
-    let base = build_where_clause(common_filters, from, to);
-    let error_clauses = build_where_clause(error_filters, from, to);
-    let total_clauses = build_where_clause(total_filters, from, to);
+    window: &EvaluationWindow<'_>,
+) -> anyhow::Result<BudgetCounts> {
+    let excluded = window.exclusion_predicate("timestamp");
+    let bad = clauses_predicate(&window.trace(error_filters));
+    let total = clauses_predicate(&window.trace(total_filters));
+    let base = window.trace(common_filters).to_sql();
     let sql = format!(
-        "SELECT countIf({}) as bad, countIf({}) as total FROM spans {}",
-        clauses_predicate(&error_clauses),
-        clauses_predicate(&total_clauses),
-        base.to_sql(),
+        "WITH ({excluded}) AS in_maintenance
+         SELECT toFloat64(countIf({bad} AND NOT in_maintenance)) AS bad,
+                toFloat64(countIf({total} AND NOT in_maintenance)) AS total,
+                toFloat64(countIf({bad} AND in_maintenance)) AS excluded_bad,
+                toFloat64(countIf({total} AND in_maintenance)) AS excluded_total
+         FROM spans {base}"
     );
-    let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<BadTotalRow>()
-        .await?;
-    Ok((row.bad as f64, row.total as f64))
+    query_budget_counts(ch, tenant_id, &sql).await
 }
 
-/// trace + latency: COUNT(duration_ns > threshold) / COUNT total on spans — ONE scan.
-/// The slow set is a subset of the total set by construction, so a single
-/// countIf over the total WHERE is exactly the former two counts.
 async fn eval_trace_latency(
     ch: &Client,
     tenant_id: &str,
     total_filters: &[Filter],
     threshold_ns: i64,
-    from: &str,
-    to: &str,
-) -> anyhow::Result<(f64, f64)> {
-    let total_clauses = build_where_clause(total_filters, from, to);
+    window: &EvaluationWindow<'_>,
+) -> anyhow::Result<BudgetCounts> {
+    let excluded = window.exclusion_predicate("timestamp");
+    let base = window.trace(total_filters).to_sql();
     let sql = format!(
-        "SELECT countIf(duration_ns > {threshold_ns}) as bad, count() as total FROM spans {}",
-        total_clauses.to_sql(),
+        "WITH ({excluded}) AS in_maintenance
+         SELECT toFloat64(countIf(duration_ns > {threshold_ns} AND NOT in_maintenance)) AS bad,
+                toFloat64(countIf(NOT in_maintenance)) AS total,
+                toFloat64(countIf(duration_ns > {threshold_ns} AND in_maintenance)) AS excluded_bad,
+                toFloat64(countIf(in_maintenance)) AS excluded_total
+         FROM spans {base}"
     );
-    let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<BadTotalRow>()
-        .await?;
-    Ok((row.bad as f64, row.total as f64))
+    query_budget_counts(ch, tenant_id, &sql).await
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Metric SLO evaluators: ALL stay on RAW (no rollup), deliberately.
-//
-// The 1m/1h metric rollups store per-bucket avg/min/max/last/count (gauge) and
-// last/min/max/count (sum). The three metric SLO evaluators below each need something
-// the rollups cannot reproduce without approximation, so per the correctness mandate
-// they are NOT rolled up:
-//
-//   * eval_metric_availability — `sumIf(Value, pred)` over metrics_sum: the arithmetic
-//     SUM of all sample Values in the window. The sum rollup intentionally stores
-//     last/min/max/count (a counter's instant value), NOT sum-of-values, so a windowed
-//     sumIf is unrecoverable. (Storing sum-of-values for a monotonic counter would also
-//     be meaningless.)
-//   * eval_metric_latency — histogram-bucket math on metrics_histogram. Histograms are
-//     not rolled up at all (only gauge + sum are), and per-bucket counts can't be
-//     derived from scalar aggregates.
-//   * eval_metric_threshold — `countIf(Value <op> threshold)` over metrics_gauge: the
-//     number of individual samples crossing a threshold. avg/min/max/last/count per
-//     bucket cannot tell you how many of the underlying samples exceeded a value
-//     (that's a per-sample predicate), so this is unrecoverable from the rollup.
-//
-// These are long rolling-window scans (up to 30d), so they are the queries that would
-// benefit most — but a wrong availability ratio is far worse than a slow one. They read
-// raw, scoped by tenant + service_name + the SLO filters, with max_execution_time capped.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// metric + availability: SUM(Value) error / SUM(Value) total on metrics_sum — ONE scan,
-/// same predicate-pushdown shape as trace availability but with sumIf.
-///
-/// Stays on RAW (see the block comment above): a windowed sumIf(Value) is not derivable
-/// from the sum rollup's last/min/max/count aggregates.
+// Metric budgets use raw samples. The minute/hour rollups cannot reconstruct a
+// windowed SUM(Value), per-row histogram buckets, or gauge sample counts.
 async fn eval_metric_availability(
     ch: &Client,
     tenant_id: &str,
     common_filters: &[Filter],
     error_filters: &[Filter],
     total_filters: &[Filter],
-    from: &str,
-    to: &str,
-) -> anyhow::Result<(f64, f64)> {
-    let base = build_metrics_where_clause(common_filters, from, to);
-    let error_clauses = build_metrics_where_clause(error_filters, from, to);
-    let total_clauses = build_metrics_where_clause(total_filters, from, to);
+    window: &EvaluationWindow<'_>,
+) -> anyhow::Result<BudgetCounts> {
+    let excluded = window.exclusion_predicate("TimeUnix");
+    let bad = clauses_predicate(&window.metric(error_filters));
+    let total = clauses_predicate(&window.metric(total_filters));
+    let base = window.metric(common_filters).to_sql();
     let sql = format!(
-        "SELECT sumIf(Value, {}) as bad, sumIf(Value, {}) as total FROM metrics_sum {}",
-        clauses_predicate(&error_clauses),
-        clauses_predicate(&total_clauses),
-        base.to_sql(),
+        "WITH ({excluded}) AS in_maintenance
+         SELECT sumIf(Value, {bad} AND NOT in_maintenance) AS bad,
+                sumIf(Value, {total} AND NOT in_maintenance) AS total,
+                sumIf(Value, {bad} AND in_maintenance) AS excluded_bad,
+                sumIf(Value, {total} AND in_maintenance) AS excluded_total
+         FROM metrics_sum {base}"
     );
-    let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<SumBadTotalRow>()
-        .await?;
-    Ok((row.bad, row.total))
+    query_budget_counts(ch, tenant_id, &sql).await
 }
 
-/// metric + latency: histogram bucket query on metrics_histogram — ONE scan.
-///
-/// The former second scan (`… ARRAY JOIN ExplicitBounds AS eb WHERE eb <= T`)
-/// is replaced by an arrayFilter/arrayMap expression evaluated per row in the
-/// same scan: for each bound element <= threshold, add BucketCounts at that
-/// bound's (first) index — element-for-element identical to the ARRAY JOIN
-/// + indexOf evaluation, including the duplicate-bound edge case.
 async fn eval_metric_latency(
     ch: &Client,
     tenant_id: &str,
     total_filters: &[Filter],
     threshold_ms: f64,
-    from: &str,
-    to: &str,
-) -> anyhow::Result<(f64, f64)> {
-    let clauses = build_metrics_where_clause(total_filters, from, to);
-
-    // Histogram ExplicitBounds are in the metric's unit; we pass threshold_ms directly.
-    // toFloat64 keeps the wire types stable (Count/BucketCounts are UInt64).
+    window: &EvaluationWindow<'_>,
+) -> anyhow::Result<BudgetCounts> {
+    let excluded = window.exclusion_predicate("TimeUnix");
+    let base = window.metric(total_filters).to_sql();
+    // Preserve the original histogram bucket interpretation. Subtract in
+    // Float64, so an inconsistent histogram can't underflow an unsigned sum.
     let sql = format!(
-        "SELECT toFloat64(sum(Count)) as total, \
-         toFloat64(sum(arraySum(arrayMap(eb -> BucketCounts[indexOf(ExplicitBounds, eb)], \
-         arrayFilter(eb -> eb <= {threshold_ms}, ExplicitBounds))))) as fast \
-         FROM metrics_histogram {}",
-        clauses.to_sql(),
+        "WITH ({excluded}) AS in_maintenance,
+              arraySum(arrayMap(eb -> BucketCounts[indexOf(ExplicitBounds, eb)],
+                  arrayFilter(eb -> eb <= {threshold_ms}, ExplicitBounds))) AS fast_count
+         SELECT greatest(0., toFloat64(sumIf(Count, NOT in_maintenance)) -
+                             toFloat64(sumIf(fast_count, NOT in_maintenance))) AS bad,
+                toFloat64(sumIf(Count, NOT in_maintenance)) AS total,
+                greatest(0., toFloat64(sumIf(Count, in_maintenance)) -
+                             toFloat64(sumIf(fast_count, in_maintenance))) AS excluded_bad,
+                toFloat64(sumIf(Count, in_maintenance)) AS excluded_total
+         FROM metrics_histogram {base}"
     );
-    let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<HistTotalFastRow>()
-        .await?;
-
-    let total_count = row.total;
-    let fast_count = row.fast;
-
-    // slow_count = total - fast (error count for budget)
-    let slow_count = total_count - fast_count;
-    Ok((slow_count.max(0.0), total_count))
+    query_budget_counts(ch, tenant_id, &sql).await
 }
 
-/// metric + threshold: COUNT violating / COUNT total on metrics_gauge — ONE scan.
-/// Both former scans used the exact same clauses, so countIf over them is identical.
-/// threshold_op defines what "good" means, so violating = NOT good.
 async fn eval_metric_threshold(
     ch: &Client,
     tenant_id: &str,
     total_filters: &[Filter],
     threshold_value: f64,
     threshold_op: &str,
-    from: &str,
-    to: &str,
-) -> anyhow::Result<(f64, f64)> {
-    let clauses = build_metrics_where_clause(total_filters, from, to);
-
-    // "good" condition based on threshold_op (what good means)
-    // Violating = NOT good
+    window: &EvaluationWindow<'_>,
+) -> anyhow::Result<BudgetCounts> {
+    let excluded = window.exclusion_predicate("TimeUnix");
+    let base = window.metric(total_filters).to_sql();
+    // threshold_op defines what counts as good.
     let violating_op = match threshold_op {
-        "lt" => format!("Value >= {threshold_value}"), // good = Value < threshold
-        "lte" => format!("Value > {threshold_value}"), // good = Value <= threshold
-        "gt" => format!("Value <= {threshold_value}"), // good = Value > threshold
-        "gte" => format!("Value < {threshold_value}"), // good = Value >= threshold
-        _ => format!("Value >= {threshold_value}"),
+        "lte" => ">",
+        "gt" => "<=",
+        "gte" => "<",
+        _ => ">=",
     };
-
     let sql = format!(
-        "SELECT countIf({violating_op}) as bad, count() as total FROM metrics_gauge {}",
-        clauses.to_sql(),
+        "WITH ({excluded}) AS in_maintenance,
+              (Value {violating_op} {threshold_value}) AS violating
+         SELECT toFloat64(countIf(violating AND NOT in_maintenance)) AS bad,
+                toFloat64(countIf(NOT in_maintenance)) AS total,
+                toFloat64(countIf(violating AND in_maintenance)) AS excluded_bad,
+                toFloat64(countIf(in_maintenance)) AS excluded_total
+         FROM metrics_gauge {base}"
     );
-    let row = crate::tenant_query(ch, &sql, tenant_id)
-        .with_setting("max_execution_time", MAX_EXECUTION_TIME)
-        .fetch_one::<BadTotalRow>()
-        .await?;
-    Ok((row.bad as f64, row.total as f64))
+    query_budget_counts(ch, tenant_id, &sql).await
 }
 
 async fn eval_metric_promql_pair(
@@ -231,7 +204,7 @@ async fn eval_metric_promql_pair(
     total_promql: &str,
     now: &chrono::DateTime<chrono::Utc>,
     lookback_secs: f64,
-) -> anyhow::Result<(f64, f64)> {
+) -> anyhow::Result<BudgetCounts> {
     let eval_time = now.timestamp_millis() as f64 / 1_000.0;
     let (error_result, total_result) = tokio::join!(
         crate::promql::evaluate_instant_query(
@@ -268,7 +241,12 @@ async fn eval_metric_promql_pair(
         );
     }
 
-    Ok((error_value, total_value))
+    Ok(BudgetCounts {
+        bad: error_value,
+        total: total_value,
+        excluded_bad: 0.0,
+        excluded_total: 0.0,
+    })
 }
 
 fn sum_latest(series: &[crate::promql::types::TimeSeries]) -> f64 {
@@ -397,7 +375,7 @@ async fn eval_slos(
     // DB-side due filter (coarse: last_eval_at is only flushed 1-in-N) combined
     // with the in-memory check ⇒ max(db, mem) + interval <= now semantics.
     let due_slos = config_db.get_due_slos(&now_str).await?;
-    let jobs: Vec<(crate::models::slo::Slo, bool)> = due_slos
+    let jobs: Vec<(Slo, bool)> = due_slos
         .into_iter()
         .filter(|s| eval_state.is_due(&s.id, now, s.eval_interval_secs))
         .map(|s| {
@@ -466,30 +444,24 @@ async fn eval_slos(
 /// (exactly as before), otherwise only on the coarse flush cadence.
 async fn persist_no_data(
     config_db: &ConfigDb,
-    slo: &crate::models::slo::Slo,
+    slo: &Slo,
     now_str: &str,
     should_flush: bool,
 ) -> anyhow::Result<bool> {
-    if slo.state != "no_data" {
-        config_db
-            .update_slo_state(
-                &slo.id,
-                &slo.tenant_id,
-                "no_data",
-                0.0,
-                0.0,
-                0.0,
+    if slo.state != "no_data" || should_flush {
+        return config_db
+            .persist_slo_eval(
+                slo,
+                &SloEvaluation {
+                    state: "no_data",
+                    error_budget_remaining: 0.0,
+                    error_count: 0.0,
+                    total_count: 0.0,
+                    maintenance: None,
+                },
                 now_str,
-                None,
             )
-            .await?;
-        return Ok(true);
-    }
-    if should_flush {
-        config_db
-            .persist_slo_eval(slo, "no_data", 0.0, 0.0, 0.0, now_str)
-            .await?;
-        return Ok(true);
+            .await;
     }
     Ok(false)
 }
@@ -501,15 +473,28 @@ async fn eval_one_slo(
     read_ch: &Client,
     write_ch: &Client,
     notifier: &crate::alert_engine::Notifier,
-    slo: &crate::models::slo::Slo,
+    slo: &Slo,
     now: chrono::DateTime<chrono::Utc>,
     now_str: &str,
     should_flush: bool,
 ) -> anyhow::Result<bool> {
     let minutes = window_minutes(&slo.window_type);
-    let from = (now - chrono::Duration::minutes(minutes))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let start = now - chrono::Duration::minutes(minutes);
+    let from = crate::models::maintenance::format_time(start);
+    let ranges = exclusion_ranges(&slo.maintenance_windows, start.timestamp(), now.timestamp());
+    let window = EvaluationWindow {
+        from: &from,
+        to: now_str,
+        exclusions: &ranges,
+    };
+    // Publish the latest breakdown with its budget on each opt-in evaluation.
+    // When a schedule is cleared, publish once before resuming coarse flushes.
+    let schedule_pending = slo
+        .maintenance_evaluation
+        .as_ref()
+        .map_or(0, |m| m.revision)
+        != slo.maintenance_revision;
+    let should_flush = should_flush || !slo.maintenance_windows.is_empty() || schedule_pending;
 
     let metric_promql_pair = if slo.slo_type == "metric"
         && matches!(slo.indicator_type.as_str(), "availability" | "latency")
@@ -588,8 +573,7 @@ async fn eval_one_slo(
                 &common_filters,
                 &error_filters,
                 &total_filters,
-                &from,
-                now_str,
+                &window,
             )
             .await
         }
@@ -600,8 +584,7 @@ async fn eval_one_slo(
                 &slo.tenant_id,
                 &total_filters,
                 threshold_ns,
-                &from,
-                now_str,
+                &window,
             )
             .await
         }
@@ -623,8 +606,7 @@ async fn eval_one_slo(
                     &common_filters,
                     &error_filters,
                     &total_filters,
-                    &from,
-                    now_str,
+                    &window,
                 )
                 .await
             }
@@ -647,13 +629,19 @@ async fn eval_one_slo(
                     &slo.tenant_id,
                     &total_filters,
                     threshold_ms,
-                    &from,
-                    now_str,
+                    &window,
                 )
                 .await
             }
         }
         ("metric", "threshold") => {
+            if !slo.metric_name.is_empty() {
+                total_filters.push(Filter {
+                    field: "metric_name".into(),
+                    op: FilterOp::Eq,
+                    value: serde_json::Value::String(slo.metric_name.clone()),
+                });
+            }
             let threshold_value = slo.threshold_value.unwrap_or(0.0);
             let threshold_op = slo.threshold_op.as_deref().unwrap_or("lt");
             eval_metric_threshold(
@@ -662,8 +650,7 @@ async fn eval_one_slo(
                 &total_filters,
                 threshold_value,
                 threshold_op,
-                &from,
-                now_str,
+                &window,
             )
             .await
         }
@@ -678,13 +665,25 @@ async fn eval_one_slo(
         }
     };
 
-    let (error_count, total_count) = match eval_result {
+    let counts = match eval_result {
         Ok(counts) => counts,
         Err(e) => {
             tracing::warn!("slo {}: evaluation failed: {e}", slo.id);
             return persist_no_data(config_db, slo, now_str, should_flush).await;
         }
     };
+
+    let error_count = counts.bad;
+    let total_count = counts.total;
+    let maintenance = (slo.maintenance_revision != 0).then(|| {
+        SloMaintenanceEvaluation::new(
+            slo.maintenance_revision,
+            &ranges,
+            now.timestamp(),
+            counts.excluded_total,
+            counts.excluded_bad,
+        )
+    });
 
     // Calculate error budget
     // error_budget = 1 - target/100 (allowed error rate)
@@ -710,6 +709,13 @@ async fn eval_one_slo(
     };
 
     let old_state = slo.state.as_str();
+    let evaluation = SloEvaluation {
+        state: new_state,
+        error_budget_remaining,
+        error_count,
+        total_count,
+        maintenance,
+    };
     let persisted;
 
     if new_state != old_state {
@@ -741,6 +747,13 @@ async fn eval_one_slo(
         });
 
         if let Some(message) = &message {
+            if !config_db
+                .get_slo(&slo.id, &slo.tenant_id)
+                .await?
+                .is_some_and(|current| current.version == slo.version)
+            {
+                return Ok(false);
+            }
             config_db
                 .create_slo_event(
                     &uuid::Uuid::new_v4().to_string(),
@@ -755,23 +768,12 @@ async fn eval_one_slo(
                 .await?;
         }
 
-        let breached_at = if new_state == "breaching" {
-            Some(now_str)
-        } else {
-            None
-        };
-        config_db
-            .update_slo_state(
-                &slo.id,
-                &slo.tenant_id,
-                new_state,
-                error_budget_remaining,
-                error_count,
-                total_count,
-                now_str,
-                breached_at,
-            )
-            .await?;
+        if !config_db
+            .persist_slo_eval(slo, &evaluation, now_str)
+            .await?
+        {
+            return Ok(false);
+        }
 
         // Notifications follow the same incident lifecycle as history.
         if let Some(message) = &message {
@@ -817,22 +819,10 @@ async fn eval_one_slo(
         tracing::info!("slo '{}' state: {} -> {}", slo.name, old_state, new_state);
         persisted = true;
     } else if should_flush {
-        // No transition: coarse flush of last_eval_at + freshest budget numbers
-        // from the row we already hold (no SELECT…FINAL re-read). Between
-        // flushes the persisted budget/counts lag by up to EVAL_FLUSH_EVERY
-        // evals; the gauge metrics below are still written every eval, so
-        // graphs stay fresh.
-        config_db
-            .persist_slo_eval(
-                slo,
-                new_state,
-                error_budget_remaining,
-                error_count,
-                total_count,
-                now_str,
-            )
+        // Publish the result and exclusion breakdown together.
+        persisted = config_db
+            .persist_slo_eval(slo, &evaluation, now_str)
             .await?;
-        persisted = true;
     } else {
         persisted = false;
     }
@@ -887,6 +877,56 @@ mod tests {
             op: FilterOp::Eq,
             value: serde_json::Value::String(val.to_string()),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ClickHouse at RUSH_TEST_CLICKHOUSE_URL with rush_ custom settings"]
+    async fn maintenance_removes_overlapping_requests_once_from_both_counts() -> anyhow::Result<()>
+    {
+        let url = std::env::var("RUSH_TEST_CLICKHOUSE_URL")?;
+        let database = format!("slo_maintenance_{}", uuid::Uuid::new_v4().simple());
+        let client = Client::default().with_url(url).with_validation(false);
+        client
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let ch = client.clone().with_database(&database);
+        let result = async {
+            ch.query("CREATE TABLE spans (
+                tenant_id String, timestamp DateTime64(9, 'UTC'), service_name String,
+                status String, http_status_code UInt16
+            ) ENGINE = MergeTree ORDER BY (tenant_id, timestamp)").execute().await?;
+            ch.query("INSERT INTO spans (tenant_id, timestamp, service_name, status) VALUES
+                ('default', '2026-11-22 09:01:29.999', 'checkout', 'STATUS_CODE_OK'),
+                ('default', '2026-11-22 09:01:30.000', 'checkout', 'STATUS_CODE_ERROR'),
+                ('default', '2026-11-22 09:01:45.000', 'checkout', 'STATUS_CODE_ERROR'),
+                ('default', '2026-11-22 09:03:29.999', 'checkout', 'STATUS_CODE_OK'),
+                ('default', '2026-11-22 09:03:30.000', 'checkout', 'STATUS_CODE_ERROR'),
+                ('default', '2026-11-22 09:04:01.000', 'checkout', 'STATUS_CODE_OK'),
+                ('other', '2026-11-22 09:02:00.000', 'checkout', 'STATUS_CODE_ERROR')
+            ").execute().await?;
+            let from = "2026-11-22T09:00:00Z";
+            let to = "2026-11-22T09:05:00Z";
+            let windows = serde_json::from_value::<Vec<_>>(serde_json::json!([
+                {"name":"First","starts_at":"2026-11-22T09:01:30Z","ends_at":"2026-11-22T09:02:20Z"},
+                {"name":"Second","starts_at":"2026-11-22T09:01:40Z","ends_at":"2026-11-22T09:03:30Z"}
+            ]))?;
+            let parse = |utc| crate::models::maintenance::normalize_time(utc).map(|t| t.timestamp()).unwrap();
+            let ranges = exclusion_ranges(&windows, parse(from), parse(to));
+            let window = EvaluationWindow { from, to, exclusions: &ranges };
+            let total = [f("tenant_id", "default"), f("service_name", "checkout")];
+            let mut errors = total.to_vec();
+            errors.push(f("status", "STATUS_CODE_ERROR"));
+            let counts = eval_trace_availability(&ch, "default", &total, &errors, &total, &window).await?;
+            assert_eq!((counts.bad, counts.total), (1.0, 3.0));
+            assert_eq!((counts.excluded_bad, counts.excluded_total), (2.0, 3.0));
+            anyhow::Ok(())
+        }.await;
+        client
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await?;
+        result
     }
 
     #[test]

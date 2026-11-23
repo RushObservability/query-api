@@ -9,6 +9,7 @@ use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::users::{require_principal, require_principal_write};
 use crate::models::slo::*;
+use crate::models::slo_maintenance::{SloMaintenanceWindow, validate_windows};
 
 const VALID_WINDOWS: [&str; 4] = ["rolling_1h", "rolling_24h", "rolling_7d", "rolling_30d"];
 const VALID_SLO_TYPES: [&str; 2] = ["trace", "metric"];
@@ -363,21 +364,22 @@ pub async fn update_slo(
         )
         .await
         .map_err(|e| crate::api_error::internal_legacy("slos", e))?;
-    if !updated {
-        return Err((StatusCode::NOT_FOUND, "slo not found".to_string()));
-    }
-
     let slo = state
         .config_db
         .get_slo(&id, &tenant.tenant_id)
         .await
         .map_err(|e| crate::api_error::internal_legacy("slos", e))?
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to read slo".to_string(),
-            )
-        })?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "slo not found".to_string()))?;
+    if !updated {
+        let message = if uses_metric_promql_pair(&req.slo_type, &req.indicator_type)
+            && !slo.maintenance_windows.is_empty()
+        {
+            "Remove maintenance exclusions before switching this SLO to PromQL."
+        } else {
+            "This SLO changed while you were saving. Reload and try again."
+        };
+        return Err((StatusCode::CONFLICT, message.to_string()));
+    }
 
     // AUDIT: SLO updated.
     state.audit.log(
@@ -391,6 +393,70 @@ pub async fn update_slo(
     ).await;
 
     Ok(Json(SloResponse::from(slo)))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReplaceMaintenanceExclusions {
+    revision: u64,
+    windows: Vec<SloMaintenanceWindow>,
+}
+
+pub async fn replace_maintenance_exclusions(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(mut req): Json<ReplaceMaintenanceExclusions>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = require_principal_write(&state, &headers).await?;
+    validate_windows(&mut req.windows).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let slo = state
+        .config_db
+        .get_slo(&id, &tenant.tenant_id)
+        .await
+        .map_err(|error| crate::api_error::internal_legacy("slos", error))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "slo not found".to_string()))?;
+    if slo.maintenance_windows == req.windows {
+        return Ok(Json(SloResponse::from(slo)));
+    }
+    let conflict = || {
+        (
+            StatusCode::CONFLICT,
+            "This SLO changed while you were editing exclusions. Reload and try again.".to_string(),
+        )
+    };
+    if slo.maintenance_revision != req.revision {
+        return Err(conflict());
+    }
+    if !req.windows.is_empty() && !slo.supports_maintenance_exclusions() {
+        return Err((StatusCode::BAD_REQUEST, "Maintenance exclusions require request or sample counts. This SLO uses PromQL expressions.".to_string()));
+    }
+    let updated = state
+        .config_db
+        .replace_slo_maintenance(&slo, &req.windows)
+        .await
+        .map_err(|error| crate::api_error::internal_legacy("slos", error))?
+        .ok_or_else(conflict)?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("slo.maintenance_update", "user")
+                .actor(caller.0, caller.1)
+                .tenant(tenant.tenant_id)
+                .resource("slo", id)
+                .changes(
+                    serde_json::json!({
+                        "before": slo.maintenance_windows,
+                        "after": updated.maintenance_windows,
+                        "revision": updated.maintenance_revision,
+                    })
+                    .to_string(),
+                )
+                .description("SLO maintenance exclusions updated")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    Ok(Json(SloResponse::from(updated)))
 }
 
 pub async fn delete_slo(

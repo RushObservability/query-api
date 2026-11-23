@@ -3694,6 +3694,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/slos/{id}/events",
             get(handlers::slos::list_slo_events),
         )
+        .route(
+            "/api/v1/slos/{id}/maintenance-exclusions",
+            put(handlers::slos::replace_maintenance_exclusions),
+        )
         // Anomaly rules
         .route(
             "/api/v1/anomaly-rules",
