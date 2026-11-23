@@ -9,7 +9,7 @@ use crate::AppState;
 use crate::TenantContext;
 use crate::handlers::users::{require_principal, require_principal_write};
 use crate::models::monitor::*;
-use crate::monitor_engine;
+use crate::{monitor_engine, monitor_forecast};
 
 #[derive(Debug, serde::Deserialize)]
 pub struct EventsQuery {
@@ -46,7 +46,7 @@ pub async fn create_monitor(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_principal_write(&state, &headers).await?;
     // Validate monitor type
-    let valid_types = ["metric", "log", "apm", "composite"];
+    let valid_types = ["metric", "log", "apm", "composite", "forecast"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -86,6 +86,12 @@ pub async fn create_monitor(
 
     // Validate query_config and every field that can influence query construction.
     validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
+    validate_forecast_conditions(
+        &req.monitor_type,
+        &req.comparator,
+        req.critical,
+        [req.warning, req.warning_recovery, req.critical_recovery],
+    )?;
 
     validate_threshold_order(
         &req.monitor_type,
@@ -119,7 +125,11 @@ pub async fn create_monitor(
             req.warning,
             req.warning_recovery,
             &req.comparator,
-            req.eval_window_secs,
+            if req.monitor_type == "forecast" {
+                monitor_forecast::HISTORY_SECS
+            } else {
+                req.eval_window_secs
+            },
             req.eval_interval_secs,
             &group_by,
             &req.no_data_action,
@@ -201,7 +211,7 @@ pub async fn update_monitor(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_principal_write(&state, &headers).await?;
     // Validate monitor type
-    let valid_types = ["metric", "log", "apm", "composite"];
+    let valid_types = ["metric", "log", "apm", "composite", "forecast"];
     if !valid_types.contains(&req.monitor_type.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -236,6 +246,12 @@ pub async fn update_monitor(
     let mut group_by = parse_group_by(&req.group_by)?;
     normalize_apm_groups(&req.monitor_type, &req.query_config, &mut group_by);
     validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
+    validate_forecast_conditions(
+        &req.monitor_type,
+        &req.comparator,
+        req.critical,
+        [req.warning, req.warning_recovery, req.critical_recovery],
+    )?;
 
     validate_threshold_order(
         &req.monitor_type,
@@ -268,7 +284,11 @@ pub async fn update_monitor(
             req.warning,
             req.warning_recovery,
             &req.comparator,
-            req.eval_window_secs,
+            if req.monitor_type == "forecast" {
+                monitor_forecast::HISTORY_SECS
+            } else {
+                req.eval_window_secs
+            },
             req.eval_interval_secs,
             &group_by,
             &req.no_data_action,
@@ -396,6 +416,12 @@ pub async fn preview_monitor(
     let mut group_by = parse_group_by(&req.group_by)?;
     normalize_apm_groups(&req.monitor_type, &req.query_config, &mut group_by);
     validate_query_config(&req.monitor_type, &req.query_config, &group_by)?;
+    validate_forecast_conditions(
+        &req.monitor_type,
+        &req.comparator,
+        req.critical,
+        [req.warning, req.warning_recovery, req.critical_recovery],
+    )?;
 
     let result = monitor_engine::preview_query(
         &state.ch,
@@ -416,14 +442,58 @@ pub async fn preview_monitor(
     .await
     .map_err(|e| crate::api_error::internal_legacy("monitors", e))?;
 
-    Ok(Json(serde_json::json!({
-        "current_value": result.current_value,
-        "groups": result.groups,
-        "timeseries": result.timeseries,
-        "series": result.series,
-        "simulated_events": result.simulated_events,
-        "bucket_secs": result.bucket_secs,
-    })))
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ForecastSeriesParams {
+    metric: String,
+    #[serde(default)]
+    filter: String,
+}
+
+pub async fn forecast_series(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantContext>,
+    Query(params): Query<ForecastSeriesParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_principal_write(&state, &headers).await?;
+    if !monitor_forecast::valid_metric(&params.metric) || params.filter.len() > 256 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid gauge metric or resource filter.".into(),
+        ));
+    }
+    let choices = monitor_forecast::resources(
+        &state.ch,
+        &tenant.tenant_id,
+        &params.metric,
+        params.filter.trim(),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await
+    .map_err(|error| crate::api_error::internal_legacy("monitors", error))?;
+    Ok(Json(choices))
+}
+
+fn validate_forecast_conditions(
+    monitor_type: &str,
+    comparator: &str,
+    critical: Option<f64>,
+    other_thresholds: [Option<f64>; 3],
+) -> Result<(), (StatusCode, String)> {
+    if monitor_type != "forecast" {
+        return Ok(());
+    }
+    if comparator != "above_or_equal"
+        || !critical.is_some_and(|value| value > 0.0 && value <= 100.0)
+        || other_thresholds.iter().any(Option::is_some)
+    {
+        return Err((StatusCode::BAD_REQUEST,
+            "Capacity forecasts require a single threshold above 0% and at most 100%, with the above_or_equal comparator.".into()));
+    }
+    Ok(())
 }
 
 /// POST /api/v1/monitors/{id}/mute — mute (disable) a monitor
@@ -656,6 +726,7 @@ fn validate_query_config(
                 }
             }
         }
+        "forecast" => {}
         "composite" => {
             // Composite monitors need a formula and monitor IDs
             // (optional at creation, required for evaluation)
@@ -749,11 +820,14 @@ pub async fn autocomplete(
     let tenant_id = escape_ch(&tenant.tenant_id);
 
     let suggestions: Vec<String> = match params.ac_type.as_str() {
-        "metric" => {
-            // Search across gauge, sum, and histogram tables
-            let tables = ["metrics_gauge", "metrics_sum", "metrics_histogram"];
+        "metric" | "forecast_metric" => {
+            let tables: &[&str] = if params.ac_type == "forecast_metric" {
+                &["metrics_gauge"]
+            } else {
+                &["metrics_gauge", "metrics_sum", "metrics_histogram"]
+            };
             let mut all: Vec<String> = Vec::new();
-            for table in &tables {
+            for table in tables {
                 let sql = format!(
                     "SELECT DISTINCT MetricName AS value FROM {table} \
                      WHERE tenant_id = '{tenant_id}' AND MetricName LIKE '{prefix}%' \
