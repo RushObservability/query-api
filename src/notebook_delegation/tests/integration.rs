@@ -41,11 +41,17 @@ fn headers(token: &str) -> HeaderMap {
 #[ignore = "requires a disposable ClickHouse and test-only config/session secrets"]
 async fn delegated_access_rechecks_sessions_roles_keys_and_private_ownership() -> anyhow::Result<()>
 {
-    let db = ConfigDb::open(&std::env::var("RUSH_TEST_CLICKHOUSE_URL")?, "default", "").await?;
+    let db_password = std::env::var("RUSH_TEST_CLICKHOUSE_PASSWORD").unwrap_or_default();
+    let db = ConfigDb::open(
+        &std::env::var("RUSH_TEST_CLICKHOUSE_URL")?,
+        "default",
+        &db_password,
+    )
+    .await?;
     let suffix = uuid::Uuid::new_v4().to_string();
     let name = format!("notebook-writer-{suffix}");
-    let password = "Notebook-Test-Password-2026!";
-    let user = db.create_user(&name, password, "Notebook Writer").await?;
+    let password = uuid::Uuid::new_v4().to_string();
+    let user = db.create_user(&name, &password, "Notebook Writer").await?;
     let group = db
         .create_group(
             &format!("notebook-writers-{suffix}"),
@@ -56,7 +62,7 @@ async fn delegated_access_rechecks_sessions_roles_keys_and_private_ownership() -
         .await?;
     db.set_user_groups(&user, std::slice::from_ref(&group))
         .await?;
-    let (_, caller, token) = session(&db, &name, password).await?;
+    let (_, caller, token) = session(&db, &name, &password).await?;
     let delegated = headers(&token);
     let mut missing_internal = delegated.clone();
     missing_internal.remove(crate::internal_auth::INTERNAL_TOKEN_HEADER);
@@ -83,7 +89,7 @@ async fn delegated_access_rechecks_sessions_roles_keys_and_private_ownership() -
     );
     db.set_user_groups(&user, std::slice::from_ref(&group))
         .await?;
-    let (raw, _, token) = session(&db, &name, password).await?;
+    let (raw, _, token) = session(&db, &name, &password).await?;
     let delegated = headers(&token);
     assert!(authorize(&db, &delegated, "default", true).await.is_ok());
     db.delete_session(&raw).await?;
@@ -93,9 +99,9 @@ async fn delegated_access_rechecks_sessions_roles_keys_and_private_ownership() -
     );
 
     let viewer_name = format!("notebook-viewer-{suffix}");
-    db.create_user(&viewer_name, password, "Notebook Viewer")
+    db.create_user(&viewer_name, &password, "Notebook Viewer")
         .await?;
-    let (_, viewer, token) = session(&db, &viewer_name, password).await?;
+    let (_, viewer, token) = session(&db, &viewer_name, &password).await?;
     let delegated = headers(&token);
     assert!(authorize(&db, &delegated, "default", false).await.is_ok());
     assert!(authorize(&db, &delegated, "default", true).await.is_err());
