@@ -2344,6 +2344,10 @@ pub struct SloRow {
     pub last_breached_at: String,
     pub created_at: String,
     pub updated_at: String,
+    pub version: u64,
+    pub maintenance_revision: u64,
+    pub maintenance_windows: String,
+    pub maintenance_evaluation: String,
 }
 
 #[derive(clickhouse::Row, serde::Deserialize)]
@@ -2407,8 +2411,6 @@ pub struct MonitorRow {
     pub rule_version: u64,
 }
 
-const SLO_INSERT_SQL: &str = "INSERT INTO config_slos (id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)";
-
 #[cfg(test)]
 mod default_detection_rule_tests {
     use super::default_detection_rules;
@@ -2439,16 +2441,6 @@ mod default_detection_rule_tests {
                 );
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod sql_shape_tests {
-    use super::SLO_INSERT_SQL;
-
-    #[test]
-    fn slo_insert_has_one_placeholder_for_every_bound_column() {
-        assert_eq!(SLO_INSERT_SQL.matches('?').count(), 27);
     }
 }
 
@@ -3443,6 +3435,9 @@ impl ConfigDb {
             "ALTER TABLE config_slo_events ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
             "ALTER TABLE config_slos MODIFY COLUMN IF EXISTS error_count Nullable(Float64)",
             "ALTER TABLE config_slos MODIFY COLUMN IF EXISTS total_count Nullable(Float64)",
+            "ALTER TABLE config_slos ADD COLUMN IF NOT EXISTS maintenance_revision UInt64 DEFAULT 0",
+            "ALTER TABLE config_slos ADD COLUMN IF NOT EXISTS maintenance_windows String DEFAULT '[]'",
+            "ALTER TABLE config_slos ADD COLUMN IF NOT EXISTS maintenance_evaluation String DEFAULT ''",
             "ALTER TABLE config_slo_events MODIFY COLUMN IF EXISTS error_count Float64",
             "ALTER TABLE config_slo_events MODIFY COLUMN IF EXISTS total_count Float64",
             // ── Deploy markers ────────────────────────────────────────────────────
@@ -9383,12 +9378,16 @@ impl ConfigDb {
             },
             created_at: r.created_at,
             updated_at: r.updated_at,
+            version: r.version,
+            maintenance_revision: r.maintenance_revision,
+            maintenance_windows: serde_json::from_str(&r.maintenance_windows).unwrap_or_default(),
+            maintenance_evaluation: serde_json::from_str(&r.maintenance_evaluation).ok(),
         }
     }
 
     pub async fn list_slos(&self, tenant_id: &str) -> anyhow::Result<Vec<crate::models::slo::Slo>> {
         let rows = self.client
-            .query("SELECT id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at FROM config_slos FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY created_at DESC")
+            .query("SELECT id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, maintenance_revision, maintenance_windows, maintenance_evaluation FROM config_slos FINAL WHERE tenant_id = ? AND is_deleted = 0 ORDER BY created_at DESC")
             .bind(tenant_id)
             .fetch_all::<SloRow>()
             .await?;
@@ -9401,7 +9400,7 @@ impl ConfigDb {
         tenant_id: &str,
     ) -> anyhow::Result<Option<crate::models::slo::Slo>> {
         let result = self.client
-            .query("SELECT id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at FROM config_slos FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
+            .query("SELECT id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, maintenance_revision, maintenance_windows, maintenance_evaluation FROM config_slos FINAL WHERE id = ? AND tenant_id = ? AND is_deleted = 0 LIMIT 1")
             .bind(id)
             .bind(tenant_id)
             .fetch_one::<SloRow>()
@@ -9471,19 +9470,29 @@ impl ConfigDb {
         eval_interval_secs: i64,
         notification_channel_ids: &str,
     ) -> anyhow::Result<bool> {
-        let existing = match self.get_slo(id, tenant_id).await? {
-            Some(r) => r,
-            None => return Ok(false),
-        };
-        let now = Self::now_str();
-        let ver = Self::next_version();
+        let version = Self::next_version();
+        let uses_promql =
+            slo_type == "metric" && matches!(indicator_type, "availability" | "latency");
         self.client
-            .query(SLO_INSERT_SQL)
-            .bind(id)
-            .bind(&existing.tenant_id)
+            .query(
+                "INSERT INTO config_slos
+                    SELECT * REPLACE (? AS name, ? AS description, toUInt8(?) AS enabled,
+                      ? AS slo_type, ? AS indicator_type, ? AS service_name, ? AS metric_name,
+                      ? AS window_type, toFloat64(?) AS target_percentage,
+                      CAST(?, 'Nullable(Float64)') AS threshold_ms,
+                      CAST(?, 'Nullable(Float64)') AS threshold_value, ? AS threshold_op,
+                      ? AS error_filters, ? AS total_filters, toInt64(?) AS eval_interval_secs,
+                      ? AS notification_channel_ids, ? AS updated_at,
+                      if(maintenance_windows = '[]', maintenance_revision, toUInt64(?)) AS maintenance_revision,
+                      toUInt64(?) AS version)
+                    FROM config_slos FINAL
+                    WHERE id = ? AND tenant_id = ? AND is_deleted = 0
+                      AND (NOT toUInt8(?) OR maintenance_windows = '[]')
+                      AND config_slos.version < ?",
+            )
             .bind(name)
             .bind(description)
-            .bind(if enabled { 1u8 } else { 0u8 })
+            .bind(u8::from(enabled))
             .bind(slo_type)
             .bind(indicator_type)
             .bind(service_name)
@@ -9497,18 +9506,54 @@ impl ConfigDb {
             .bind(total_filters)
             .bind(eval_interval_secs)
             .bind(notification_channel_ids)
-            .bind(&existing.state)
-            .bind(existing.error_budget_remaining)
-            .bind(existing.error_count)
-            .bind(existing.total_count)
-            .bind(existing.last_eval_at.unwrap_or_default())
-            .bind(existing.last_breached_at.unwrap_or_default())
-            .bind(&existing.created_at)
-            .bind(&now)
-            .bind(ver)
+            .bind(Self::now_str())
+            .bind(version)
+            .bind(version)
+            .bind(id)
+            .bind(tenant_id)
+            .bind(u8::from(uses_promql))
+            .bind(version)
             .execute()
             .await?;
-        Ok(true)
+        Ok(self
+            .get_slo(id, tenant_id)
+            .await?
+            .is_some_and(|slo| slo.version == version))
+    }
+
+    pub async fn replace_slo_maintenance(
+        &self,
+        slo: &crate::models::slo::Slo,
+        windows: &[crate::models::slo_maintenance::SloMaintenanceWindow],
+    ) -> anyhow::Result<Option<crate::models::slo::Slo>> {
+        let version = Self::next_version();
+        // Preserve the last budget and its evidence until the next evaluation.
+        self.client
+            .query("INSERT INTO config_slos
+                    SELECT * REPLACE (? AS maintenance_windows,
+                      toUInt64(?) AS maintenance_revision, ? AS updated_at, toUInt64(?) AS version)
+                    FROM config_slos FINAL
+                    WHERE id = ? AND tenant_id = ? AND is_deleted = 0
+                      AND config_slos.maintenance_revision = ?
+                      AND slo_type = ? AND indicator_type = ? AND error_filters = ? AND total_filters = ?
+                      AND config_slos.version < ?")
+            .bind(serde_json::to_string(windows)?)
+            .bind(version)
+            .bind(Self::now_str())
+            .bind(version)
+            .bind(&slo.id)
+            .bind(&slo.tenant_id)
+            .bind(slo.maintenance_revision)
+            .bind(&slo.slo_type)
+            .bind(&slo.indicator_type)
+            .bind(&slo.error_filters)
+            .bind(&slo.total_filters)
+            .bind(version)
+            .execute().await?;
+        Ok(self
+            .get_slo(&slo.id, &slo.tenant_id)
+            .await?
+            .filter(|updated| updated.maintenance_revision == version))
     }
 
     pub async fn delete_slo(&self, id: &str, tenant_id: &str) -> anyhow::Result<bool> {
@@ -9534,97 +9579,56 @@ impl ConfigDb {
 
     pub async fn get_due_slos(&self, now: &str) -> anyhow::Result<Vec<crate::models::slo::Slo>> {
         let rows = self.client
-            .query("SELECT id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at FROM config_slos FINAL WHERE enabled = 1 AND is_deleted = 0 AND (last_eval_at = '' OR toUnixTimestamp(parseDateTimeBestEffort(?)) - toUnixTimestamp(parseDateTimeBestEffort(last_eval_at)) >= eval_interval_secs)")
+            .query("SELECT id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, maintenance_revision, maintenance_windows, maintenance_evaluation FROM config_slos FINAL WHERE enabled = 1 AND is_deleted = 0 AND (last_eval_at = '' OR toUnixTimestamp(parseDateTimeBestEffort(?)) - toUnixTimestamp(parseDateTimeBestEffort(last_eval_at)) >= eval_interval_secs)")
             .bind(now)
             .fetch_all::<SloRow>()
             .await?;
         Ok(rows.into_iter().map(Self::map_slo_row).collect())
     }
 
-    pub async fn update_slo_state(
-        &self,
-        id: &str,
-        tenant_id: &str,
-        state: &str,
-        error_budget_remaining: f64,
-        error_count: f64,
-        total_count: f64,
-        last_eval_at: &str,
-        last_breached_at: Option<&str>,
-    ) -> anyhow::Result<()> {
-        crate::leader::ensure_leader()?;
-        let existing = match self.get_slo(id, tenant_id).await? {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        let now = Self::now_str();
-        let ver = Self::next_version();
-        let lba = last_breached_at
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| existing.last_breached_at.clone().unwrap_or_default());
-        self.client
-            .query("INSERT INTO config_slos (id, tenant_id, name, description, enabled, slo_type, indicator_type, service_name, metric_name, window_type, target_percentage, threshold_ms, threshold_value, threshold_op, error_filters, total_filters, eval_interval_secs, notification_channel_ids, state, error_budget_remaining, error_count, total_count, last_eval_at, last_breached_at, created_at, updated_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(&existing.tenant_id).bind(&existing.name).bind(&existing.description).bind(if existing.enabled { 1u8 } else { 0u8 })
-            .bind(&existing.slo_type).bind(&existing.indicator_type).bind(&existing.service_name).bind(&existing.metric_name)
-            .bind(&existing.window_type).bind(existing.target_percentage).bind(existing.threshold_ms).bind(existing.threshold_value)
-            .bind(existing.threshold_op.unwrap_or_default()).bind(&existing.error_filters).bind(&existing.total_filters)
-            .bind(existing.eval_interval_secs).bind(&existing.notification_channel_ids)
-            .bind(state).bind(error_budget_remaining).bind(error_count).bind(total_count)
-            .bind(last_eval_at).bind(&lba)
-            .bind(&existing.created_at).bind(&now).bind(ver)
-            .execute().await?;
-        Ok(())
-    }
-
-    /// Narrow eval flush for the SLO engine: re-inserts the SLO row the engine already
-    /// fetched this tick with the freshly computed budget/count values, avoiding the
-    /// SELECT…FINAL read-modify-write of `update_slo_state`. Only call when no state
-    /// transition occurred — transitions must go through `update_slo_state`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn persist_slo_eval(
         &self,
         slo: &crate::models::slo::Slo,
-        state: &str,
-        error_budget_remaining: f64,
-        error_count: f64,
-        total_count: f64,
+        evaluation: &crate::models::slo::SloEvaluation<'_>,
         last_eval_at: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         crate::leader::ensure_leader()?;
-        let now = Self::now_str();
-        let ver = Self::next_version();
+        let version = Self::next_version();
+        let state_changed = evaluation.state != slo.state;
+        let breached = state_changed && evaluation.state == "breaching";
         self.client
-            .query(SLO_INSERT_SQL)
+            .query("INSERT INTO config_slos
+                    SELECT * REPLACE (? AS state,
+                      CAST(?, 'Nullable(Float64)') AS error_budget_remaining,
+                      CAST(?, 'Nullable(Float64)') AS error_count, CAST(?, 'Nullable(Float64)') AS total_count,
+                      ? AS maintenance_evaluation, ? AS last_eval_at,
+                      if(toUInt8(?), ?, last_breached_at) AS last_breached_at,
+                      ? AS updated_at, toUInt64(?) AS version)
+                    FROM config_slos FINAL
+                    WHERE id = ? AND tenant_id = ? AND is_deleted = 0 AND enabled = 1
+                      AND config_slos.version = ? AND config_slos.version < ?")
+            .bind(evaluation.state)
+            .bind(evaluation.error_budget_remaining)
+            .bind(evaluation.error_count)
+            .bind(evaluation.total_count)
+            .bind(evaluation.maintenance.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_default())
+            .bind(last_eval_at)
+            .bind(u8::from(breached))
+            .bind(last_eval_at)
+            .bind(Self::now_str())
+            .bind(version)
             .bind(&slo.id)
             .bind(&slo.tenant_id)
-            .bind(&slo.name)
-            .bind(&slo.description)
-            .bind(if slo.enabled { 1u8 } else { 0u8 })
-            .bind(&slo.slo_type)
-            .bind(&slo.indicator_type)
-            .bind(&slo.service_name)
-            .bind(&slo.metric_name)
-            .bind(&slo.window_type)
-            .bind(slo.target_percentage)
-            .bind(slo.threshold_ms)
-            .bind(slo.threshold_value)
-            .bind(slo.threshold_op.clone().unwrap_or_default())
-            .bind(&slo.error_filters)
-            .bind(&slo.total_filters)
-            .bind(slo.eval_interval_secs)
-            .bind(&slo.notification_channel_ids)
-            .bind(state)
-            .bind(error_budget_remaining)
-            .bind(error_count)
-            .bind(total_count)
-            .bind(last_eval_at)
-            .bind(slo.last_breached_at.clone().unwrap_or_default())
-            .bind(&slo.created_at)
-            .bind(&now)
-            .bind(ver)
-            .execute()
-            .await?;
-        Ok(())
+            .bind(slo.version)
+            .bind(version)
+            .execute().await?;
+        if !state_changed {
+            return Ok(true);
+        }
+        Ok(self
+            .get_slo(&slo.id, &slo.tenant_id)
+            .await?
+            .is_some_and(|row| row.version == version))
     }
 
     pub async fn create_slo_event(

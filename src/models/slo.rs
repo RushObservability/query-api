@@ -1,3 +1,4 @@
+use super::slo_maintenance::{SloMaintenanceEvaluation, SloMaintenanceWindow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,31 @@ pub struct Slo {
     pub last_breached_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub maintenance_revision: u64,
+    #[serde(default)]
+    pub maintenance_windows: Vec<SloMaintenanceWindow>,
+    #[serde(default)]
+    pub maintenance_evaluation: Option<SloMaintenanceEvaluation>,
+}
+
+impl Slo {
+    pub fn supports_maintenance_exclusions(&self) -> bool {
+        self.slo_type != "metric"
+            || !matches!(self.indicator_type.as_str(), "availability" | "latency")
+            || (stored_promql(&self.error_filters).is_none()
+                && stored_promql(&self.total_filters).is_none())
+    }
+}
+
+pub struct SloEvaluation<'a> {
+    pub state: &'a str,
+    pub error_budget_remaining: f64,
+    pub error_count: f64,
+    pub total_count: f64,
+    pub maintenance: Option<SloMaintenanceEvaluation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,10 +85,15 @@ pub struct SloResponse {
     pub last_breached_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub maintenance_supported: bool,
+    pub maintenance_revision: u64,
+    pub maintenance_windows: Vec<SloMaintenanceWindow>,
+    pub maintenance_evaluation: Option<SloMaintenanceEvaluation>,
 }
 
 impl From<Slo> for SloResponse {
     fn from(s: Slo) -> Self {
+        let maintenance_supported = s.supports_maintenance_exclusions();
         let error_promql = stored_promql(&s.error_filters).unwrap_or_default();
         let total_promql = stored_promql(&s.total_filters).unwrap_or_default();
         let error_filters = if error_promql.is_empty() {
@@ -104,6 +135,10 @@ impl From<Slo> for SloResponse {
             last_breached_at: s.last_breached_at,
             created_at: s.created_at,
             updated_at: s.updated_at,
+            maintenance_supported,
+            maintenance_revision: s.maintenance_revision,
+            maintenance_windows: s.maintenance_windows,
+            maintenance_evaluation: s.maintenance_evaluation,
         }
     }
 }
