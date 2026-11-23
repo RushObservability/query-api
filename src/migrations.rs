@@ -888,7 +888,7 @@ fn validate_clickhouse_identifier(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn quote_table_identifier(value: &str) -> anyhow::Result<String> {
+pub(crate) fn quote_table_identifier(value: &str) -> anyhow::Result<String> {
     if value.is_empty()
         || !value
             .bytes()

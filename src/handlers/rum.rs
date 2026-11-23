@@ -16,7 +16,7 @@ use crate::query_builder::{QueryClauses, format_array_value, format_value, sanit
 
 // ── Field resolver ──
 
-fn resolve_rum_field(field: &str) -> String {
+pub(crate) fn resolve_rum_field(field: &str) -> String {
     match field {
         "app_name" | "AppName" => "AppName".to_string(),
         "app_version" | "AppVersion" => "AppVersion".to_string(),
@@ -50,7 +50,12 @@ fn resolve_rum_field(field: &str) -> String {
 /// Build PREWHERE-optimized clauses for rum.
 /// PREWHERE: tenant_id + TimestampTime (both in PRIMARY KEY) — evaluated at granule level.
 /// WHERE: precise nanosecond Timestamp bounds + column filters.
-fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) -> QueryClauses {
+pub(crate) fn build_rum_where(
+    filters: &[Filter],
+    from: &str,
+    to: &str,
+    tenant_id: &str,
+) -> QueryClauses {
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
@@ -72,19 +77,7 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) ->
     // (optimize_move_to_prewhere re-derives the prewhere). Else keep explicit PREWHERE.
     let mut uses_index_predicate = false;
     for filter in filters {
-        let field = resolve_rum_field(&filter.field);
-        let condition = match &filter.op {
-            FilterOp::Eq => format!("{field} = {}", format_value(&filter.value)),
-            FilterOp::Ne => format!("{field} != {}", format_value(&filter.value)),
-            FilterOp::Gt => format!("{field} > {}", format_value(&filter.value)),
-            FilterOp::Gte => format!("{field} >= {}", format_value(&filter.value)),
-            FilterOp::Lt => format!("{field} < {}", format_value(&filter.value)),
-            FilterOp::Lte => format!("{field} <= {}", format_value(&filter.value)),
-            FilterOp::Like => format!("{field} LIKE {}", format_value(&filter.value)),
-            FilterOp::NotLike => format!("{field} NOT LIKE {}", format_value(&filter.value)),
-            FilterOp::In => format!("{field} IN {}", format_array_value(&filter.value)),
-            FilterOp::NotIn => format!("{field} NOT IN {}", format_array_value(&filter.value)),
-        };
+        let condition = rum_filter_condition(filter);
         if matches!(filter.op, FilterOp::Like | FilterOp::NotLike) {
             uses_index_predicate = true;
         }
@@ -104,6 +97,22 @@ fn build_rum_where(filters: &[Filter], from: &str, to: &str, tenant_id: &str) ->
             prewhere: scope,
             where_clause: conditions.join(" AND "),
         }
+    }
+}
+
+pub(crate) fn rum_filter_condition(filter: &Filter) -> String {
+    let field = resolve_rum_field(&filter.field);
+    match &filter.op {
+        FilterOp::Eq => format!("{field} = {}", format_value(&filter.value)),
+        FilterOp::Ne => format!("{field} != {}", format_value(&filter.value)),
+        FilterOp::Gt => format!("{field} > {}", format_value(&filter.value)),
+        FilterOp::Gte => format!("{field} >= {}", format_value(&filter.value)),
+        FilterOp::Lt => format!("{field} < {}", format_value(&filter.value)),
+        FilterOp::Lte => format!("{field} <= {}", format_value(&filter.value)),
+        FilterOp::Like => format!("{field} LIKE {}", format_value(&filter.value)),
+        FilterOp::NotLike => format!("{field} NOT LIKE {}", format_value(&filter.value)),
+        FilterOp::In => format!("{field} IN {}", format_array_value(&filter.value)),
+        FilterOp::NotIn => format!("{field} NOT IN {}", format_array_value(&filter.value)),
     }
 }
 
@@ -527,35 +536,9 @@ pub async fn vitals(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let mut filters = req.filters.clone();
-    filters.push(Filter {
-        field: "EventType".to_string(),
-        op: FilterOp::Eq,
-        value: serde_json::Value::String("web_vital".to_string()),
-    });
-    let clauses = build_rum_where(
-        &filters,
-        &req.time_range.from,
-        &req.time_range.to,
-        tenant_id,
-    );
-
-    let sql = format!(
-        "SELECT \
-           VitalName, \
-           quantile(0.75)(VitalValue) as p75, \
-           countIf(VitalRating = 'good') * 100.0 / count() as good_pct, \
-           countIf(VitalRating = 'needs-improvement') * 100.0 / count() as needs_improvement_pct, \
-           countIf(VitalRating = 'poor') * 100.0 / count() as poor_pct \
-         FROM rum \
-         {} \
-         GROUP BY VitalName \
-         ORDER BY VitalName",
-        clauses.to_sql(),
-    );
-
-    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-        .fetch_all::<RumVitalRow>()
+    let rows = state
+        .rum_rollups
+        .fetch_all::<RumVitalRow>(crate::rum_rollup::Kind::Vitals, &req, tenant_id, &state.ch)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "vitals", "query failed");
@@ -572,31 +555,9 @@ pub async fn pages(
     Json(req): Json<RumQueryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
-    let clauses = build_rum_where(
-        &req.filters,
-        &req.time_range.from,
-        &req.time_range.to,
-        tenant_id,
-    );
-
-    let sql = format!(
-        "SELECT \
-           PagePath, \
-           countIf(EventType = 'pageview') as views, \
-           uniqExact(SessionId) as unique_sessions, \
-           avgIf(DurationMs, DurationMs > 0) as avg_load_ms, \
-           countIf(EventType = 'error') as error_count \
-         FROM rum \
-         {} \
-         GROUP BY PagePath \
-         ORDER BY views DESC \
-         LIMIT {}",
-        clauses.with_where_extra("PagePath != ''").to_sql(),
-        req.limit.min(100),
-    );
-
-    let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
-        .fetch_all::<RumPageRow>()
+    let rows = state
+        .rum_rollups
+        .fetch_all::<RumPageRow>(crate::rum_rollup::Kind::Pages, &req, tenant_id, &state.ch)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, signal = "rum", handler = "pages", "query failed");

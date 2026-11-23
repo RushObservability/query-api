@@ -2736,6 +2736,13 @@ async fn main() -> anyhow::Result<()> {
         clickhouse_db.clone(),
         audit.clone(),
     );
+    let rum_rollups = Arc::new(rush_api::rum_rollup::RumRollups::default());
+    rush_api::rum_rollup::spawn_maintenance(
+        admin_ch.clone(),
+        clickhouse_db.clone(),
+        audit.clone(),
+        rum_rollups.clone(),
+    );
     let export_jobs = Arc::new(handlers::export::ExportJobs::from_env()?);
     export_jobs.spawn_janitor(audit.clone());
     let invalidated_sessions = config_db.invalidate_legacy_session_tokens().await?;
@@ -3391,6 +3398,7 @@ async fn main() -> anyhow::Result<()> {
         export_jobs,
         quality_cache: Arc::new(rush_api::quality_engine::QualityCache::new()),
         waste_cache: Arc::new(rush_api::quality_engine::AnalysisCache::new()),
+        rum_rollups,
         ingest_limits: ingest_limits.clone(),
         llm_gateway,
         collectors,
