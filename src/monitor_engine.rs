@@ -1,4 +1,5 @@
 use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
+use crate::monitor_forecast;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -491,6 +492,7 @@ async fn evaluate_monitor(
         group_key,
         value,
         series,
+        crossing_at,
     } in &results
     {
         let current_state = group_states
@@ -536,11 +538,17 @@ async fn evaluate_monitor(
             } else {
                 format!(" [{group_key}]")
             };
-            let reading = format!(
-                "(value={:.4}, threshold={:.4})",
-                value,
-                threshold.unwrap_or(0.0)
-            );
+            let reading = match &query {
+                MonitorEvidenceQuery::Forecast { .. } => match crossing_at {
+                    Some(at) => format!("(forecast peak {value:.1}%; threshold crossing at {at})"),
+                    None => format!("(forecast peak {value:.1}%)"),
+                },
+                _ => format!(
+                    "(value={:.4}, threshold={:.4})",
+                    value,
+                    threshold.unwrap_or(0.0)
+                ),
+            };
             let event_msg = format!(
                 "Monitor '{alert_name}'{group_label}: {current_state} -> {new_state} {reading}"
             );
@@ -558,6 +566,12 @@ async fn evaluate_monitor(
                         MonitorEvidenceQuery::Promql {
                             expression: expression.clone(),
                             series: series.clone(),
+                        }
+                    }
+                    MonitorEvidenceQuery::Forecast { config, .. } => {
+                        MonitorEvidenceQuery::Forecast {
+                            config: config.clone(),
+                            crossing_at: crossing_at.clone(),
                         }
                     }
                     _ => query.clone(),
@@ -835,9 +849,15 @@ async fn handle_no_data(
         .await;
 
     if changed {
-        // Transition persists immediately, exactly as before.
+        // A forecast has one series. Its old reading must not mask the
+        // no-data state when samples return and the engine records recovery.
+        let group_states = if monitor.monitor_type == "forecast" {
+            "{}"
+        } else {
+            &monitor.group_states
+        };
         let _ = config_db
-            .update_monitor_state(monitor, new_state, &monitor.group_states, now_str, false)
+            .update_monitor_state(monitor, new_state, group_states, now_str, false)
             .await;
         (1, true)
     } else if should_flush {
@@ -1325,6 +1345,12 @@ pub(crate) fn validate_query_fields(
                 }
             }
         }
+        "forecast" => {
+            if !group_by.is_empty() {
+                return Err("Capacity forecasts require a single resource series.".into());
+            }
+            monitor_forecast::ForecastConfig::from_query(config)?;
+        }
         "composite" => {}
         _ => return Err(format!("invalid monitor type: {monitor_type}")),
     }
@@ -1434,6 +1460,10 @@ fn parse_monitor_query(monitor: &Monitor) -> anyhow::Result<MonitorEvidenceQuery
         }
         "log" => Ok(MonitorEvidenceQuery::Log(serde_json::from_str(config)?)),
         "apm" => Ok(MonitorEvidenceQuery::Apm(serde_json::from_str(config)?)),
+        "forecast" => Ok(MonitorEvidenceQuery::Forecast {
+            config: serde_json::from_str(config)?,
+            crossing_at: None,
+        }),
         other => anyhow::bail!("unsupported monitor type '{other}'"),
     }
 }
@@ -1539,6 +1569,7 @@ struct MonitorReading {
     group_key: String,
     value: f64,
     series: Option<BTreeMap<String, String>>,
+    crossing_at: Option<String>,
 }
 
 async fn run_monitor_query(
@@ -1621,8 +1652,26 @@ async fn run_monitor_query(
                         group_key,
                         value,
                         series: Some(series.labels),
+                        crossing_at: None,
                     })
                 })
+                .collect());
+        }
+        MonitorEvidenceQuery::Forecast { config, .. } => {
+            let threshold = monitor
+                .critical
+                .ok_or_else(|| anyhow::anyhow!("forecast threshold missing"))?;
+            let forecast =
+                monitor_forecast::evaluate(ch, tenant_id, config, threshold, window.to).await?;
+            return Ok(forecast
+                .reading()
+                .map(|value| MonitorReading {
+                    group_key: String::new(),
+                    value,
+                    series: None,
+                    crossing_at: forecast.crossing_at,
+                })
+                .into_iter()
                 .collect());
         }
         MonitorEvidenceQuery::Composite { .. } => {
@@ -1644,6 +1693,7 @@ async fn run_monitor_query(
             group_key: String::new(),
             value: row.value,
             series: None,
+            crossing_at: None,
         }])
     } else {
         let sql = format!(
@@ -1660,6 +1710,7 @@ async fn run_monitor_query(
                 group_key: row.group_key,
                 value: row.value,
                 series: None,
+                crossing_at: None,
             })
             .collect())
     }
@@ -1695,6 +1746,31 @@ pub async fn preview_query(
     group_by: &[String],
     conditions: PreviewConditions,
 ) -> anyhow::Result<PreviewResult> {
+    if monitor_type == "forecast" {
+        let config = monitor_forecast::ForecastConfig::from_query(query_config)
+            .map_err(anyhow::Error::msg)?;
+        let threshold = conditions
+            .critical
+            .ok_or_else(|| anyhow::anyhow!("forecast threshold missing"))?;
+        let forecast = monitor_forecast::evaluate(
+            ch,
+            tenant_id,
+            &config,
+            threshold,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await?;
+        return Ok(PreviewResult {
+            current_value: forecast.reading(),
+            groups: vec![],
+            timeseries: vec![],
+            series: vec![],
+            simulated_events: vec![],
+            bucket_secs: 3600,
+            forecast: Some(forecast),
+        });
+    }
+
     // Build a temporary Monitor struct for the query functions
     let temp_monitor = Monitor {
         id: String::new(),
@@ -1760,6 +1836,7 @@ pub async fn preview_query(
         series,
         simulated_events,
         bucket_secs,
+        forecast: None,
     })
 }
 
@@ -1780,6 +1857,8 @@ pub struct PreviewResult {
     pub series: Vec<PreviewSeries>,
     pub simulated_events: Vec<SimulatedMonitorEvent>,
     pub bucket_secs: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<monitor_forecast::ForecastPreview>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
