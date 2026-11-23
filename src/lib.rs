@@ -38,6 +38,7 @@ pub mod query_governor;
 pub mod request_auth;
 pub mod retention_enforcer;
 pub mod rollup;
+pub mod rum_rollup;
 pub mod saml;
 pub mod self_metrics;
 pub mod shutdown;
@@ -287,6 +288,7 @@ pub struct AppState {
     pub export_jobs: Arc<handlers::export::ExportJobs>,
     pub quality_cache: Arc<quality_engine::QualityCache>,
     pub waste_cache: Arc<quality_engine::AnalysisCache<handlers::noise_waste::WasteResponse>>,
+    pub rum_rollups: Arc<rum_rollup::RumRollups>,
     /// Startup-validated byte/entity limits and bounded blocking decode admission.
     pub ingest_limits: ingest_limits::IngestLimits,
     /// Startup-validated, rate-limited outbound LLM client. Handlers never
