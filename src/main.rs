@@ -819,6 +819,7 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
         || path.starts_with("/prom/api/v1/labels")
         || path.starts_with("/prom/api/v1/label/")
         || path.starts_with("/api/v1/monitors/") && path.ends_with("/preview")
+        || path == "/api/v1/monitors/forecast/series"
         || path.starts_with("/api/v1/detection-rules/") && path.ends_with("/test");
     if !managed {
         return None;
@@ -3675,6 +3676,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/monitors/preview",
             post(handlers::monitors::preview_monitor),
+        )
+        .route(
+            "/api/v1/monitors/forecast/series",
+            get(handlers::monitors::forecast_series),
         )
         .route(
             "/api/v1/monitors/{id}",

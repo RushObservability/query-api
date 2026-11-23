@@ -163,6 +163,12 @@ pub enum MonitorEvidenceQuery {
         expression: String,
         series: Option<std::collections::BTreeMap<String, String>>,
     },
+    Forecast {
+        #[serde(flatten)]
+        config: crate::monitor_forecast::ForecastConfig,
+        #[serde(default)]
+        crossing_at: Option<String>,
+    },
     Composite {
         formula: String,
         members: std::collections::BTreeMap<char, bool>,
