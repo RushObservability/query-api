@@ -595,7 +595,7 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         )
         .await
     };
-    let request_identity = match (&resolution.credential, resolution.api_key.as_ref()) {
+    let mut request_identity = match (&resolution.credential, resolution.api_key.as_ref()) {
         (CredentialKind::Session, _) => {
             // Tenant resolution cached this lookup in the request scope.
             let user = match session_token.as_deref() {
@@ -645,6 +645,43 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
         if let Some(grant) = resolution.api_key.clone() {
             // Lets principal-aware handlers act as this key (see users::require_principal).
             rush_api::request_auth::set_api_key_grant(grant);
+        }
+    }
+    if rush_api::notebook_delegation::route_allowed(req.method(), req.uri().path()) {
+        match rush_api::notebook_delegation::authorize(
+            &state.config_db,
+            req.headers(),
+            &resolution.tenant_id,
+            req.method() == Method::POST,
+        )
+        .await
+        {
+            Ok((principal, identity)) => {
+                rush_api::request_auth::set_notebook_principal(principal);
+                request_identity = identity;
+            }
+            Err(error) => {
+                let event = if resolution.credential == CredentialKind::InternalSre {
+                    rush_api::audit::AuditEvent::new("notebook.delegation_denied", "system")
+                        .actor_name("sre-agent")
+                } else {
+                    rush_api::audit::AuditEvent::for_request(
+                        "notebook.delegation_denied",
+                        &request_identity,
+                    )
+                };
+                state
+                    .audit
+                    .log(
+                        event
+                            .tenant(resolution.tenant_id.clone())
+                            .resource("http_route", req.uri().path())
+                            .outcome("failure")
+                            .context(rush_api::audit::actor_context_from_headers(req.headers())),
+                    )
+                    .await;
+                return error.into_response();
+            }
         }
     }
     req.extensions_mut().insert(TenantContext {
@@ -1784,6 +1821,9 @@ fn credential_route_denial(
 }
 
 fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
+    if rush_api::notebook_delegation::route_allowed(method, path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -3504,6 +3544,9 @@ async fn main() -> anyhow::Result<()> {
         // Private SRE-agent data plane. The outer middleware accepts the shared
         // internal credential only for this route set and the normal query APIs.
         .route("/api/v1/internal/sre/context", post(handlers::sre_internal::context))
+        .route("/api/v1/internal/sre/notebooks", get(handlers::notebooks::list_notebooks).post(handlers::notebooks::create_notebook))
+        .route("/api/v1/internal/sre/notebooks/{id}", get(handlers::notebooks::get_notebook))
+        .route("/api/v1/internal/sre/notebooks/{id}/cells", post(handlers::notebooks::create_cell))
         .route(
             "/api/v1/internal/sre/llm/chat",
             post(handlers::llm_providers::internal_chat),

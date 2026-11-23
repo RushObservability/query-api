@@ -94,6 +94,9 @@ pub(crate) async fn require_principal(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, String, String, String), (StatusCode, String)> {
+    if let Some(principal) = crate::request_auth::notebook_principal() {
+        return Ok(principal);
+    }
     if let Some(grant) = crate::request_auth::api_key_grant() {
         return api_key_principal(&grant).ok_or_else(|| {
             (
@@ -190,7 +193,7 @@ fn role_allows_admin(role: &str) -> bool {
     role == "admin"
 }
 
-fn role_allows_write(role: &str) -> bool {
+pub(crate) fn role_allows_write(role: &str) -> bool {
     matches!(role, "admin" | "write")
 }
 

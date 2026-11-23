@@ -3906,6 +3906,23 @@ impl ConfigDb {
         &self,
         key_hash: &str,
     ) -> anyhow::Result<Option<ApiKeyGrant>> {
+        self.resolve_api_key_lookup(API_KEY_RESOLVE_SQL, key_hash)
+            .await
+    }
+
+    pub(crate) async fn resolve_agent_key_by_id(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<ApiKeyGrant>> {
+        let sql = API_KEY_RESOLVE_SQL.replace("h.key_hash = ?", "h.id = ?");
+        self.resolve_api_key_lookup(&sql, id).await
+    }
+
+    async fn resolve_api_key_lookup(
+        &self,
+        sql: &str,
+        lookup: &str,
+    ) -> anyhow::Result<Option<ApiKeyGrant>> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             id: String,
@@ -3919,12 +3936,7 @@ impl ConfigDb {
             role: String,
             agent: u8,
         }
-        let result = self
-            .client
-            .query(API_KEY_RESOLVE_SQL)
-            .bind(key_hash)
-            .fetch_one::<Row>()
-            .await;
+        let result = self.client.query(sql).bind(lookup).fetch_one::<Row>().await;
         match result {
             Ok(row) if row.is_deleted == 0 => Ok(Some(ApiKeyGrant {
                 id: row.id,
@@ -4881,7 +4893,7 @@ impl ConfigDb {
         &self,
         token: &str,
     ) -> Option<(String, String, String, String, String)> {
-        self.get_session_user_inner(token, None).await
+        self.get_session_user_inner(token, None, None).await
     }
 
     /// Session validation with bounded self-metrics for the constituent user
@@ -4891,13 +4903,20 @@ impl ConfigDb {
         token: &str,
         metrics: &crate::self_metrics::SelfMetrics,
     ) -> Option<SessionUser> {
-        self.get_session_user_inner(token, Some(metrics)).await
+        self.get_session_user_inner(token, Some(metrics), None)
+            .await
+    }
+
+    pub(crate) async fn delegated_session_user(&self, storage_key: &str) -> Option<SessionUser> {
+        self.get_session_user_inner("", None, Some(storage_key))
+            .await
     }
 
     async fn get_session_user_inner(
         &self,
         token: &str,
         metrics: Option<&crate::self_metrics::SelfMetrics>,
+        delegated_storage_key: Option<&str>,
     ) -> Option<SessionUser> {
         // Fail closed on a policy-store error. Lowering the global timeout
         // applies to existing sessions too, without reviving expired bearers.
@@ -4906,7 +4925,9 @@ impl ConfigDb {
             - chrono::Duration::seconds(policy.idle_timeout_secs))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
-        let stored_token = session_storage_key(&self.session_hmac_secret, token);
+        let stored_token = delegated_storage_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| session_storage_key(&self.session_hmac_secret, token));
         // Session authorization is deliberately not cached. Password changes,
         // user disables, and logout must become visible to every API replica
         // without a per-process cache grace period.

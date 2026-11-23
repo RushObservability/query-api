@@ -174,6 +174,14 @@ pub async fn investigate(
         // Code is a separate sensitive-read scope. Existing `all` access means
         // all telemetry/infrastructure tools, not repository contents.
         obj.insert("scopes".into(), scopes_for_caller(&caller));
+        obj.insert(
+            "notebook_access".into(),
+            serde_json::json!(crate::notebook_delegation::issue(
+                &state.config_db,
+                &headers,
+                &caller
+            )?),
+        );
     }
 
     let url = format!("{}/api/v1/investigate", sre_base());

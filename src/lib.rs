@@ -27,6 +27,7 @@ pub mod metric_firewall;
 pub mod migrations;
 pub mod models;
 pub mod monitor_engine;
+pub mod notebook_delegation;
 pub mod notification_metrics;
 pub mod object_store_spool;
 pub mod outbound;
