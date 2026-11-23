@@ -16,10 +16,24 @@ use crate::clickhouse_config::{ApiKeyGrant, SessionUser};
 
 #[derive(Default)]
 struct RequestSessionCache {
+    notebook_principal: Option<SessionUser>,
     /// HMAC-derived storage key; never the raw bearer token.
     entry: Option<(String, Option<SessionUser>)>,
     /// Query API key that tenant middleware resolved for this request, if any.
     api_key: Option<ApiKeyGrant>,
+}
+
+/// Set only after a signed notebook delegation is revalidated for this request.
+pub fn set_notebook_principal(principal: SessionUser) {
+    let _ = REQUEST_SESSION_CACHE
+        .try_with(|cache| cache.borrow_mut().notebook_principal = Some(principal));
+}
+
+pub fn notebook_principal() -> Option<SessionUser> {
+    REQUEST_SESSION_CACHE
+        .try_with(|cache| cache.borrow().notebook_principal.clone())
+        .ok()
+        .flatten()
 }
 
 tokio::task_local! {
