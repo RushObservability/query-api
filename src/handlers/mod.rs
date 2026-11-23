@@ -64,6 +64,7 @@ pub mod stats;
 pub mod suggest;
 pub mod telemetry_quality;
 pub mod tenants;
+pub mod trace_sampling;
 pub mod traces;
 pub mod usage;
 pub mod usage_metering;

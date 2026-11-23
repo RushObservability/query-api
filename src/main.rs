@@ -3419,6 +3419,18 @@ async fn main() -> anyhow::Result<()> {
     let inner = Router::new()
         // Trace endpoints
         .route("/api/v1/traces/{trace_id}", get(handlers::traces::get_trace))
+        .route(
+            "/api/v1/traces/sampling-preview",
+            post(handlers::trace_sampling::preview)
+                .layer(DefaultBodyLimit::max(handlers::trace_sampling::MAX_BODY_BYTES)),
+        )
+        .route("/api/v1/traces/sampling-options", get(handlers::trace_sampling::options))
+        .route(
+            "/api/v1/settings/trace-sampling",
+            get(handlers::trace_sampling::get_draft)
+                .put(handlers::trace_sampling::put_draft)
+                .layer(DefaultBodyLimit::max(handlers::trace_sampling::MAX_BODY_BYTES)),
+        )
         // Jaeger-compatible query API (for Grafana's built-in Jaeger data source).
         // Mount behind /t/{tenant}/jaeger; auth via tenant-scoped API key.
         .route("/jaeger/api/services", get(handlers::jaeger::services))
