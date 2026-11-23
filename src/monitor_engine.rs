@@ -1349,9 +1349,7 @@ pub(crate) fn validate_query_fields(
             if !group_by.is_empty() {
                 return Err("Capacity forecasts require a single resource series.".into());
             }
-            serde_json::from_value::<monitor_forecast::ForecastConfig>(config.clone())
-                .map_err(|error| format!("invalid forecast query_config: {error}"))?
-                .validate()?;
+            monitor_forecast::ForecastConfig::from_query(config)?;
         }
         "composite" => {}
         _ => return Err(format!("invalid monitor type: {monitor_type}")),
@@ -1749,7 +1747,8 @@ pub async fn preview_query(
     conditions: PreviewConditions,
 ) -> anyhow::Result<PreviewResult> {
     if monitor_type == "forecast" {
-        let config = serde_json::from_value(query_config.clone())?;
+        let config = monitor_forecast::ForecastConfig::from_query(query_config)
+            .map_err(anyhow::Error::msg)?;
         let threshold = conditions
             .critical
             .ok_or_else(|| anyhow::anyhow!("forecast threshold missing"))?;

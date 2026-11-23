@@ -20,6 +20,45 @@ fn config() -> ForecastConfig {
 }
 
 #[test]
+fn validates_forecast_requests_before_building_series_config() {
+    use serde_json::json;
+
+    let expected = config();
+    let mut valid = serde_json::to_value(&expected).unwrap();
+    valid["type"] = json!("forecast");
+    let parsed = ForecastConfig::from_query(&valid).unwrap();
+    assert_eq!(parsed.metric_name, expected.metric_name);
+    assert_eq!(parsed.resource, expected.resource);
+    assert_eq!(parsed.horizon_secs, expected.horizon_secs);
+    assert!(matches!(parsed.input_unit, InputUnit::Ratio));
+
+    for (field, value) in [
+        ("/metric_name", json!("")),
+        ("/input_unit", json!("bytes")),
+        ("/horizon_secs", json!(604800)),
+        ("/resource/service", json!(null)),
+        (
+            "/resource/attributes",
+            json!({"mountpoint": ["not a string"]}),
+        ),
+        (
+            "/resource/attributes",
+            json!({"mountpoint": "a".repeat(2049)}),
+        ),
+        ("/resource/resource_attributes", json!({"": "empty key"})),
+        (
+            "/resource/attributes",
+            json!({"a":"x".repeat(2048),"b":"x".repeat(2048),
+            "c":"x".repeat(2048),"d":"x".repeat(2048)}),
+        ),
+    ] {
+        let mut invalid = valid.clone();
+        *invalid.pointer_mut(field).unwrap() = value;
+        assert!(ForecastConfig::from_query(&invalid).is_err(), "{field}");
+    }
+}
+
+#[test]
 fn linear_forecast_projects_crossing_and_handles_no_data_and_recovery() {
     let mut cfg = config();
     let samples = || {

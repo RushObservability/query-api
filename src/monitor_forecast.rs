@@ -11,6 +11,8 @@ const BUCKET_SECS: i64 = 3600;
 const MIN_SAMPLES: usize = 12;
 const MIN_COVERAGE_SECS: i64 = 12 * 3600;
 const SERIES_LIMIT: usize = 100;
+const MAX_LABELS_PER_MAP: usize = 128;
+const RESOURCE_ERROR: &str = "Choose a gauge metric and a valid resource series.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForecastConfig {
@@ -39,15 +41,58 @@ pub(crate) fn valid_metric(name: &str) -> bool {
 }
 
 impl ForecastConfig {
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if !valid_metric(&self.metric_name) || !valid_resource(&self.resource) {
-            return Err("Choose a gauge metric and a valid resource series.".into());
+    pub(crate) fn from_query(query: &serde_json::Value) -> Result<Self, String> {
+        let metric_name = query["metric_name"]
+            .as_str()
+            .filter(|name| valid_metric(name))
+            .ok_or(RESOURCE_ERROR)?;
+        let resource = &query["resource"];
+        let service = resource["service"]
+            .as_str()
+            .filter(|service| service.len() <= 1024)
+            .ok_or(RESOURCE_ERROR)?;
+        let resource = ForecastResource {
+            service: service.to_owned(),
+            attributes: query_labels(&resource["attributes"]).ok_or(RESOURCE_ERROR)?,
+            resource_attributes: query_labels(&resource["resource_attributes"])
+                .ok_or(RESOURCE_ERROR)?,
+        };
+        if !valid_resource(&resource) {
+            return Err(RESOURCE_ERROR.into());
         }
-        if ![21_600, 43_200, 86_400, 172_800].contains(&self.horizon_secs) {
-            return Err("Forecast window must be 6, 12, 24, or 48 hours.".into());
-        }
-        Ok(())
+        let input_unit = match query["input_unit"].as_str() {
+            Some("ratio") => InputUnit::Ratio,
+            Some("percent") => InputUnit::Percent,
+            _ => return Err("Sample unit must be ratio or percent.".into()),
+        };
+        let horizon_secs = query["horizon_secs"]
+            .as_i64()
+            .filter(|seconds| [21_600, 43_200, 86_400, 172_800].contains(seconds))
+            .ok_or("Forecast window must be 6, 12, 24, or 48 hours.")?;
+        Ok(Self {
+            metric_name: metric_name.to_owned(),
+            resource,
+            input_unit,
+            horizon_secs,
+        })
     }
+}
+
+fn query_labels(value: &serde_json::Value) -> Option<BTreeMap<String, String>> {
+    let labels = value
+        .as_object()
+        .filter(|labels| labels.len() <= MAX_LABELS_PER_MAP)?;
+    labels
+        .iter()
+        .map(|(key, value)| {
+            let value = value.as_str()?;
+            valid_label(key, value).then(|| (key.clone(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn valid_label(key: &str, value: &str) -> bool {
+    !key.is_empty() && key.len() <= 512 && value.len() <= 2048
 }
 
 fn valid_resource(resource: &ForecastResource) -> bool {
@@ -62,10 +107,8 @@ fn valid_resource(resource: &ForecastResource) -> bool {
         && [&resource.attributes, &resource.resource_attributes]
             .iter()
             .all(|labels| {
-                labels.len() <= 128
-                    && labels.iter().all(|(key, value)| {
-                        !key.is_empty() && key.len() <= 512 && value.len() <= 2048
-                    })
+                labels.len() <= MAX_LABELS_PER_MAP
+                    && labels.iter().all(|(key, value)| valid_label(key, value))
             })
 }
 
