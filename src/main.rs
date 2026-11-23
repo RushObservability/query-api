@@ -1495,6 +1495,7 @@ where
     Fut: std::future::Future<Output = Response>,
 {
     let budget = guard.budget().clone();
+    req.extensions_mut().insert(class);
     // Body collection holds the same admission permits as execution, so it
     // must be inside the deadline too. Keep one deadline through streaming.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(budget.request_timeout_secs);
@@ -3399,6 +3400,7 @@ async fn main() -> anyhow::Result<()> {
         quality_cache: Arc::new(rush_api::quality_engine::QualityCache::new()),
         waste_cache: Arc::new(rush_api::quality_engine::AnalysisCache::new()),
         rum_rollups,
+        dashboard_cache: Arc::new(rush_api::dashboard_cache::DashboardCache::default()),
         ingest_limits: ingest_limits.clone(),
         llm_gateway,
         collectors,
@@ -4149,6 +4151,10 @@ async fn main() -> anyhow::Result<()> {
     // Edition routes receive the same auth, tenant, CSRF, CORS, limits, and
     // observability layers as core routes.
     let inner = rush_api::edition::routes(inner)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rush_api::dashboard_cache::middleware,
+        ))
         // The outer tenant middleware resolves credentials and rewrites
         // `/t/{tenant}` before routing. Enforce the resulting tenant policy here
         // so the CORS/security/metrics layers below still wrap rejected requests.

@@ -8,6 +8,7 @@ pub mod ch_writer;
 pub mod clickhouse_config;
 pub mod config;
 pub mod cors;
+pub mod dashboard_cache;
 pub mod detection_query;
 pub mod edition;
 pub mod engine_metrics;
@@ -289,6 +290,7 @@ pub struct AppState {
     pub quality_cache: Arc<quality_engine::QualityCache>,
     pub waste_cache: Arc<quality_engine::AnalysisCache<handlers::noise_waste::WasteResponse>>,
     pub rum_rollups: Arc<rum_rollup::RumRollups>,
+    pub dashboard_cache: Arc<dashboard_cache::DashboardCache>,
     /// Startup-validated byte/entity limits and bounded blocking decode admission.
     pub ingest_limits: ingest_limits::IngestLimits,
     /// Startup-validated, rate-limited outbound LLM client. Handlers never
