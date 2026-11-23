@@ -15,15 +15,17 @@ pub(crate) fn sanitize_datetime(s: &str) -> String {
         .collect()
 }
 
-/// Alert windows are recorded at millisecond precision. Keep both bounds
-/// identical to the evaluator's bounds on any Explore replay.
+/// Scoped drilldowns preserve the exact millisecond bounds of the source query.
 pub(crate) fn query_time_bounds(filters: &[Filter], from: &str, to: &str) -> (String, String) {
-    let alert_scope = filters
-        .iter()
-        .any(|filter| filter.field == crate::models::monitor::MONITOR_SCOPE_FIELD);
+    let precise_scope = filters.iter().any(|filter| {
+        matches!(
+            filter.field.as_str(),
+            crate::models::monitor::MONITOR_SCOPE_FIELD | crate::service_tags::SCOPE_FIELD
+        )
+    });
     let bound = |timestamp| {
         let timestamp = sanitize_datetime(timestamp);
-        if alert_scope {
+        if precise_scope {
             format!("parseDateTime64BestEffort('{timestamp}', 3, 'UTC')")
         } else {
             format!("parseDateTimeBestEffort('{timestamp}')")
@@ -157,29 +159,30 @@ impl QueryClauses {
     }
 }
 
+/// Extract a string from flat OTel attributes or their legacy nested equivalent.
+pub(crate) fn json_attribute(column: &str, path: &str) -> String {
+    let flat = format!(
+        "JSONExtractString({column}, '{}')",
+        escape_string_literal(path)
+    );
+    if !path.contains('.') {
+        return flat;
+    }
+    let nested_path = path
+        .split('.')
+        .map(|part| format!("'{}'", escape_string_literal(part)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let nested = format!("JSONExtractString({column}, {nested_path})");
+    format!("if({flat} != '', {flat}, {nested})")
+}
+
 /// Map a user-facing field name to the ClickHouse column expression.
 /// OTel attributes use flat dotted keys (e.g. "gateway.route", "http.status_code"),
 /// so we try the flat key first, falling back to nested path extraction.
 pub fn resolve_field(field: &str) -> String {
     if let Some(attr_path) = field.strip_prefix("attributes.") {
-        // Escape single quotes in every path segment to prevent SQL injection
-        let flat_key = escape_string_literal(attr_path);
-        let flat = format!("JSONExtractString(attributes, '{flat_key}')");
-        let parts: Vec<String> = attr_path
-            .split('.')
-            .map(|p| escape_string_literal(p))
-            .collect();
-        if parts.len() == 1 {
-            return flat;
-        }
-        // COALESCE: flat key first, nested path as fallback
-        let nested_args = parts
-            .iter()
-            .map(|p| format!("'{p}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let nested = format!("JSONExtractString(attributes, {nested_args})");
-        format!("if({flat} != '', {flat}, {nested})")
+        json_attribute("attributes", attr_path)
     } else {
         match field {
             // `level` is a logs concept; in spans the equivalent is `status`,
@@ -353,6 +356,7 @@ fn build_span_clauses(
     // `timestamp` (leading PK column) is the efficient path.
     let mut uses_index_predicate = false;
     let mut conditions = Vec::new();
+    let traces_only = traces_mode && is_traces_only(filters);
     let trace_scoped = traces_mode && trace_outcome_filters_apply(filters);
     let mut trace_conditions = Vec::new();
 
@@ -364,6 +368,25 @@ fn build_span_clauses(
                     .unwrap_or_else(|_| "0".to_string()),
             );
             uses_index_predicate = true;
+            continue;
+        }
+        if filter.field == crate::service_tags::SCOPE_FIELD {
+            let condition = crate::service_tags::request_condition(filter)
+                .map(|condition| {
+                    if traces_only {
+                        // Match the server span even when the trace started in a different service.
+                        // Keep tenant in the match key even under the local row-policy override.
+                        uses_index_predicate = true;
+                        format!(
+                            "(tenant_id, trace_id) IN (SELECT tenant_id, trace_id FROM spans \
+                             WHERE {time_range} AND {condition})"
+                        )
+                    } else {
+                        condition
+                    }
+                })
+                .unwrap_or_else(|| "0".to_string());
+            conditions.push(condition);
             continue;
         }
         // Normalized span-status conditions still go through the traces-only

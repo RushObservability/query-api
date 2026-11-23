@@ -32,6 +32,9 @@ fn time_breakdown_query(
 #[cfg(test)]
 mod aggregation_tests;
 
+mod tag_breakdown;
+pub use tag_breakdown::service_tag_breakdown;
+
 #[derive(Debug, Serialize, Deserialize, Row)]
 pub struct ServiceEntry {
     pub service_name: String,

@@ -42,6 +42,7 @@ pub mod rollup;
 pub mod rum_rollup;
 pub mod saml;
 pub mod self_metrics;
+mod service_tags;
 pub mod shutdown;
 pub mod siem_engine;
 pub mod slo_engine;
