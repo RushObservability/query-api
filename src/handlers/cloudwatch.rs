@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Json,
     body::Bytes,
@@ -158,7 +159,7 @@ async fn cloudwatch_enabled(state: &AppState) -> bool {
 /// echoed requestId and a current timestamp; `error` adds an errorMessage and is
 /// treated by Firehose as a delivery failure (it retries).
 fn firehose_response(request_id: &str, error: Option<&str>) -> Json<serde_json::Value> {
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = time::OffsetDateTime::now_utc().unix_millis();
     match error {
         Some(msg) => Json(serde_json::json!({
             "requestId": request_id,
@@ -271,7 +272,7 @@ async fn ingest_firehose_inner(
         request_id
     };
 
-    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc-share the constant fields across all rows in this request.
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();

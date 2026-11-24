@@ -226,7 +226,7 @@ pub async fn create_notebook(
     check_visibility(&req.visibility)?;
     let (incident_start, incident_end) =
         validate_incident_window(&req.incident_start, &req.incident_end).map_err(bad)?;
-    let now = stamp(chrono::Utc::now());
+    let now = stamp(time::OffsetDateTime::now_utc());
     let nb = Notebook {
         id: uuid::Uuid::new_v4().to_string(),
         tenant_id: tenant.tenant_id.clone(),
@@ -344,7 +344,7 @@ pub async fn update_notebook(
     if let Some(tags) = req.tags {
         nb.tags = tags_json(&tags)?;
     }
-    nb.updated_at = stamp(chrono::Utc::now());
+    nb.updated_at = stamp(time::OffsetDateTime::now_utc());
     state
         .config_db
         .write_notebook(&nb, false)
@@ -463,7 +463,7 @@ pub async fn create_cell(
             .unwrap_or(0)
             .saturating_add(POSITION_STEP)
     });
-    let now = stamp(chrono::Utc::now());
+    let now = stamp(time::OffsetDateTime::now_utc());
     let cell = NotebookCell {
         id: uuid::Uuid::new_v4().to_string(),
         notebook_id: nb.id.clone(),
@@ -571,7 +571,7 @@ pub async fn update_cell(
             changed.push(field);
         }
     }
-    cell.updated_at = stamp(chrono::Utc::now());
+    cell.updated_at = stamp(time::OffsetDateTime::now_utc());
     state
         .config_db
         .write_notebook_cell(&cell, false)
@@ -675,7 +675,7 @@ pub async fn reorder_cells(
     let nb = load_notebook(&state, &id, &tenant, &caller.0).await?;
     let mut cells = load_cells(&state, &nb.id, &tenant).await?;
     let moves = reorder_positions(&cells, &req.cell_ids).map_err(bad)?;
-    let now = stamp(chrono::Utc::now());
+    let now = stamp(time::OffsetDateTime::now_utc());
     for (index, position) in moves {
         let cell = &mut cells[index];
         cell.position = position;

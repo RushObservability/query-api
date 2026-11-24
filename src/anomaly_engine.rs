@@ -3,7 +3,7 @@ use crate::clickhouse_config::ConfigDb;
 use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use crate::models::anomaly::AnomalyRule;
 use crate::query_builder::ERROR_SPAN;
-use chrono::DurationRound;
+use crate::timestamps::TimestampExt;
 use clickhouse::Client;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
@@ -190,8 +190,8 @@ async fn eval_anomaly_rules(
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
     prom_base_url: &str,
 ) -> anyhow::Result<()> {
-    let now = chrono::Utc::now();
-    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let now_str = now.utc_seconds();
     let due_rules = config_db.get_due_anomaly_rules(&now_str).await?;
     crate::engine_metrics::due(config_db.self_metrics(), "anomaly_engine", due_rules.len());
 
@@ -444,17 +444,15 @@ const LATE_SPAN_GRACE_SECS: i64 = 30;
 async fn fetch_apm_data(
     ch: &Client,
     rule: &AnomalyRule,
-    now: &chrono::DateTime<chrono::Utc>,
+    now: &time::OffsetDateTime,
 ) -> anyhow::Result<Vec<(Vec<f64>, String)>> {
     // Only whole minutes that ended at least LATE_SPAN_GRACE_SECS ago. Scoring the
     // minute still filling up read as a sudden drop (and fed that low value
     // into the EWMA baseline), so steady traffic raised false anomalies.
-    let complete_before = (*now - chrono::Duration::seconds(LATE_SPAN_GRACE_SECS))
-        .duration_trunc(chrono::Duration::minutes(1))?;
-    let from = (complete_before - chrono::Duration::seconds(rule.window_secs))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
-    let until = complete_before.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let cutoff = now.unix_timestamp() - LATE_SPAN_GRACE_SECS;
+    let complete_before = time::OffsetDateTime::from_unix_timestamp(cutoff.div_euclid(60) * 60)?;
+    let from = (complete_before - time::Duration::seconds(rule.window_secs)).utc_seconds();
+    let until = complete_before.utc_seconds();
 
     let escaped_tenant = crate::query_builder::escape_string_literal(&rule.tenant_id);
     let sql = format!(
@@ -501,9 +499,9 @@ async fn fetch_prom_data(
     http_client: &reqwest::Client,
     prom_base_url: &str,
     rule: &AnomalyRule,
-    now: &chrono::DateTime<chrono::Utc>,
+    now: &time::OffsetDateTime,
 ) -> anyhow::Result<Vec<(Vec<f64>, String)>> {
-    let end = now.timestamp();
+    let end = now.unix_timestamp();
     let start = end - rule.window_secs;
     let step = if rule.window_secs <= 3600 {
         15
@@ -595,7 +593,7 @@ async fn fetch_prom_data(
 /// Build one VALUES tuple for a per-series eval log row. Rows are accumulated
 /// across the whole tick and flushed in a single batch INSERT.
 fn anomaly_log_tuple(
-    now: &chrono::DateTime<chrono::Utc>,
+    now: &time::OffsetDateTime,
     rule: &AnomalyRule,
     state: &str,
     metric: &str,
@@ -604,8 +602,8 @@ fn anomaly_log_tuple(
     deviation: f64,
 ) -> String {
     let ts_nanos = now
-        .timestamp_nanos_opt()
-        .unwrap_or(now.timestamp() * 1_000_000_000);
+        .unix_nanos()
+        .unwrap_or(now.unix_timestamp() * 1_000_000_000);
     let severity_text = if state == "anomalous" { "WARN" } else { "INFO" };
     let severity_number: u8 = if state == "anomalous" { 13 } else { 9 }; // WARN=13, INFO=9
 
@@ -706,9 +704,10 @@ mod tests {
                 .replace("observability.", &format!("{database}."));
             admin.query(&ddl).execute().await?;
             // 10s into minute M: M-1 closed under LATE_SPAN_GRACE_SECS ago, M is filling.
-            let minute = chrono::Utc::now().duration_trunc(chrono::Duration::minutes(1))?;
-            let now = minute + chrono::Duration::seconds(10);
-            let m = minute.format("%Y-%m-%d %H:%M:%S");
+            let seconds = time::OffsetDateTime::now_utc().unix_timestamp();
+            let minute = time::OffsetDateTime::from_unix_timestamp(seconds.div_euclid(60) * 60)?;
+            let now = minute + time::Duration::seconds(10);
+            let m = minute.clickhouse_seconds();
             for (offset_minutes, spans) in [(-1, 20), (0, 20)] {
                 ch.query(&format!(
                     "INSERT INTO spans (tenant_id, timestamp, service_name, status) \

@@ -10,7 +10,7 @@ async fn keeper_claims_survive_api_restart_and_coordinate_replicas() -> anyhow::
         "test must exercise production auto mode"
     );
     let suffix = uuid::Uuid::new_v4();
-    let expiry = chrono::Utc::now().timestamp() + 600;
+    let expiry = time::OffsetDateTime::now_utc().unix_timestamp() + 600;
     let keys = [
         format!("saml-assertion:{suffix}"),
         format!("saml-request:{suffix}"),
@@ -45,7 +45,10 @@ async fn keeper_claims_survive_api_restart_and_coordinate_replicas() -> anyhow::
     }
     assert!(
         !restarted
-            .claim_sso_key_once("already-expired", chrono::Utc::now().timestamp() - 1)
+            .claim_sso_key_once(
+                "already-expired",
+                time::OffsetDateTime::now_utc().unix_timestamp() - 1
+            )
             .await?
     );
     Ok(())

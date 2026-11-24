@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Json,
     extract::{ConnectInfo, Path, State},
@@ -286,9 +287,8 @@ pub async fn login(
             "authentication temporarily unavailable".to_string(),
         ));
     }
-    let since = (chrono::Utc::now() - chrono::Duration::seconds(60))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let since =
+        (time::OffsetDateTime::now_utc() - time::Duration::seconds(60)).clickhouse_seconds();
     let ip_attempts = match state
         .config_db
         .login_ip_attempt_count(&ip_hash, &since)

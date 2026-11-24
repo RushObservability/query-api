@@ -34,7 +34,7 @@ pub struct MaintenanceWindowResponse {
 }
 
 impl MaintenanceWindowResponse {
-    fn from_window(window: MaintenanceWindow, now: chrono::DateTime<chrono::Utc>) -> Self {
+    fn from_window(window: MaintenanceWindow, now: time::OffsetDateTime) -> Self {
         let status = window.status(now);
         Self {
             id: window.id,
@@ -56,7 +56,7 @@ pub async fn list_windows(
     Extension(tenant): Extension<TenantContext>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers).await?;
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let windows: Vec<MaintenanceWindowResponse> = state
         .config_db
         .list_maintenance_windows(&tenant.tenant_id)
@@ -86,7 +86,7 @@ pub async fn create_window(
             "name must not exceed 255 characters".to_string(),
         ));
     }
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let (starts_at, ends_at) = validate_window(&req.starts_at, &req.ends_at, now)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let scope = Scope::parse(req.scope.as_deref().unwrap_or("all"))

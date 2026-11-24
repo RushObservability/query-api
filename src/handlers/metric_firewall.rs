@@ -1,6 +1,7 @@
 //! Metric firewall CRUD. Admin-only. Mutations reload the compiled firewall in
 //! the live writer immediately (a background task also refreshes periodically).
 
+use crate::timestamps::TimestampExt;
 use axum::{
     Json,
     extract::{Path, State},
@@ -52,9 +53,7 @@ fn b(v: bool) -> u8 {
 fn creation_time() -> String {
     // Keep new rules ordered after rules created in the same second. Drop-label
     // rules run in creation order, and the preview appends a new draft.
-    chrono::Utc::now()
-        .format("%Y-%m-%d %H:%M:%S%.9f")
-        .to_string()
+    time::OffsetDateTime::now_utc().clickhouse_nanos()
 }
 
 fn policy_revision(rules: &[MetricFirewallRule]) -> String {

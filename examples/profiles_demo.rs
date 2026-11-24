@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
         "Sending synthetic profiles for rush-profiles-demo every 10s. Ctrl-C stops the sender."
     );
     loop {
-        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64;
+        let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos())?;
         let d = Dictionary {
             string_table: [
                 "",

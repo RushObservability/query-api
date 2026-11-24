@@ -3,6 +3,7 @@
 //! before spending tokens on a deeper investigation. Defaults to the last few
 //! minutes; `from`/`to` describe an earlier incident window instead.
 
+use crate::timestamps::{TimestampExt, UTC_NANOS};
 use axum::{
     Json,
     extract::{Extension, Query, State},
@@ -11,7 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 use crate::AppState;
 use crate::TenantContext;
@@ -138,15 +139,15 @@ fn anomalies_in_window(
 }
 
 /// `YYYY-MM-DD HH:MM:SS`, the format of config `created_at` columns.
-fn config_time(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%d %H:%M:%S").to_string()
+fn config_time(t: OffsetDateTime) -> String {
+    t.clickhouse_seconds()
 }
 
-fn log_patterns_sql(escaped_tenant: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> String {
+fn log_patterns_sql(escaped_tenant: &str, from: OffsetDateTime, to: OffsetDateTime) -> String {
     // Formatted from parsed times, so safe to inline.
     let (from, to) = (
-        from.format("%Y-%m-%dT%H:%M:%S%.9fZ"),
-        to.format("%Y-%m-%dT%H:%M:%S%.9fZ"),
+        from.format(UTC_NANOS).expect("valid timestamp format"),
+        to.format(UTC_NANOS).expect("valid timestamp format"),
     );
     format!(
         "SELECT ServiceName AS service, SeverityText AS severity, \
@@ -187,14 +188,14 @@ pub(crate) async fn compute_insights(
     tenant_id: &str,
     params: &InsightsParams,
 ) -> Result<Insights, (StatusCode, String)> {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let (from, to, explicit_window) = match (params.from.as_deref(), params.to.as_deref()) {
         (None, None) => {
             let minutes = params
                 .minutes
                 .unwrap_or(DEFAULT_MINUTES)
                 .clamp(1, MAX_MINUTES);
-            (now - chrono::Duration::minutes(minutes as i64), now, false)
+            (now - time::Duration::minutes(minutes as i64), now, false)
         }
         (Some(from), Some(to)) => {
             let range =
@@ -221,7 +222,7 @@ pub(crate) async fn compute_insights(
             ));
         }
     };
-    let minutes = (to - from).num_minutes().max(0) as u64;
+    let minutes = (to - from).whole_minutes().max(0) as u64;
 
     let rules = state
         .config_db
@@ -309,6 +310,7 @@ pub(crate) async fn compute_insights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timestamps::parse_rfc3339;
 
     fn anomaly(deviation: f64) -> FiringAnomaly {
         FiringAnomaly {
@@ -357,10 +359,8 @@ mod tests {
 
     #[test]
     fn log_patterns_sql_is_tenant_scoped_and_has_no_bind_placeholders() {
-        let to = DateTime::parse_from_rfc3339("2026-11-07T04:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let sql = log_patterns_sql("acme", to - chrono::Duration::minutes(15), to);
+        let to = parse_rfc3339("2026-11-07T04:30:00Z").unwrap();
+        let sql = log_patterns_sql("acme", to - time::Duration::minutes(15), to);
         assert!(sql.contains("PREWHERE tenant_id = 'acme'"));
         assert!(sql.contains(
             "Timestamp >= parseDateTime64BestEffort('2026-11-07T04:15:00.000000000Z', 9)"

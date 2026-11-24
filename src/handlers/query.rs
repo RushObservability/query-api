@@ -348,7 +348,7 @@ pub async fn export_query(
         clauses.to_sql(),
     );
 
-    let unix = chrono::Utc::now().timestamp();
+    let unix = time::OffsetDateTime::now_utc().unix_timestamp();
     if export::requires_async(req.limit, limit) {
         let filename = format!(
             "rush-spans-{unix}.{}",

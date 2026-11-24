@@ -14,7 +14,8 @@ async fn the_newest_setting_save_wins_even_after_a_future_version() -> anyhow::R
     assert_eq!(db.get_setting(&key).await?.as_deref(), Some("second"));
 
     // A save from a replica whose clock ran an hour ahead.
-    let ahead = (chrono::Utc::now().timestamp_micros() + 3_600_000_000) as u64;
+    let now_micros = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000;
+    let ahead = (now_micros + 3_600_000_000) as u64;
     db.client
         .query("INSERT INTO config_settings (key, value, version, is_deleted) VALUES (?, 'skewed', ?, 0)")
         .bind(&key)

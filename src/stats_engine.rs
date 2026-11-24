@@ -1,5 +1,6 @@
 use crate::self_metrics::{MetricKind, SelfMetrics};
 use crate::spool::IngestBuffer;
+use crate::timestamps::TimestampExt;
 use clickhouse::Client;
 use futures_util::stream::{self, StreamExt};
 use std::sync::Arc;
@@ -61,12 +62,10 @@ async fn collect_and_write(
     if let Err(e) = buffer.refresh_counts().await {
         tracing::warn!(error = %e, "stats engine: failed to refresh ingest buffer counters");
     }
-    let now = chrono::Utc::now();
-    let now_nanos = now.timestamp_nanos_opt().unwrap_or(0);
-    let one_hour_ago = (now - chrono::Duration::hours(1))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
-    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let now_nanos = now.unix_nanos().unwrap_or(0);
+    let one_hour_ago = (now - time::Duration::hours(1)).utc_seconds();
+    let now_str = now.utc_seconds();
 
     // All of these queries are independent — run them concurrently so the tick's
     // wall time is the slowest query, not the sum of all of them (~14 round trips).
@@ -554,7 +553,7 @@ fn record_ch_probe(self_metrics: &SelfMetrics, probe: &'static str, start: Insta
         self_metrics.set_gauge(
             "rush_ch_health_probe_last_success_timestamp_seconds",
             &labels,
-            chrono::Utc::now().timestamp() as f64,
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64,
         );
     }
     let outcome = if ok { "ok" } else { "error" };
@@ -718,7 +717,7 @@ async fn write_self_metrics(
         metrics.set_gauge(
             "rush_self_metrics_last_success_timestamp_seconds",
             &[("stage", stage), ("table", table)],
-            chrono::Utc::now().timestamp() as f64,
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64,
         );
         true
     }

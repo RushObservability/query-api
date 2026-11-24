@@ -1,6 +1,6 @@
+use crate::timestamps::{UTC_MILLIS, from_unix_millis};
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
 
@@ -213,9 +213,10 @@ impl ForecastPreview {
 }
 
 fn iso(ms: i64) -> String {
-    DateTime::<Utc>::from_timestamp_millis(ms)
+    from_unix_millis(ms)
         .expect("forecast time derived from current evaluation time")
-        .to_rfc3339_opts(SecondsFormat::Millis, true)
+        .format(UTC_MILLIS)
+        .expect("valid timestamp format")
 }
 
 pub async fn evaluate(

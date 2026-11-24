@@ -46,7 +46,7 @@ class ReleaseVersionTests(unittest.TestCase):
         return subprocess.run(
             ["bash", "scripts/release.sh"], cwd=work, capture_output=True, text=True,
             env={**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}", "DOCKER_LOG": str(tmp / "docker.log"),
-                 "VERSION": "", "RC": "0", "PLATFORMS": "", **env},
+                 "VERSION": "", "RC": "0", "DRY_RUN": "0", "PLATFORMS": "", **env},
         )
 
     def plan(self, tags=(), **env):
@@ -91,6 +91,16 @@ class ReleaseVersionTests(unittest.TestCase):
             head = git(tmp / "work", "rev-parse", "HEAD").strip()
             self.assertEqual(git(tmp / "origin.git", "rev-parse", "v0.1.9-rc.2").strip(), head)
             self.assertEqual(git(tmp / "origin.git", "branch", "--list", "release/*"), "")
+
+    def test_dry_run_scans_without_publishing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run = self.run_release(tmp, ["v0.1.8"], publish=True, RC="1", DRY_RUN="1")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            calls = (tmp / "docker.log").read_text()
+            self.assertIn("docker build --tag rush-api-release-scan:0.1.9-rc.1", calls)
+            self.assertNotIn("docker buildx build", calls)
+            self.assertEqual(git(tmp / "origin.git", "tag", "--list"), "v0.1.8\n")
 
 
 if __name__ == "__main__":

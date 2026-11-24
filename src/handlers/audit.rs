@@ -8,6 +8,7 @@
 //! user-supplied filter values are escaped via `escape_string_literal` before
 //! being inlined into SQL.
 
+use crate::timestamps::TimestampExt;
 use axum::{
     Json,
     extract::{Query, State},
@@ -217,7 +218,8 @@ pub(crate) fn verify_rows<'a>(
 /// Render an `AuditRow` as JSON with the timestamp as an RFC3339 string instead
 /// of raw nanoseconds (and without re-exposing the chain internals confusingly).
 fn audit_row_json(row: &AuditRow) -> serde_json::Value {
-    let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(row.timestamp);
+    let ts = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(row.timestamp))
+        .expect("i64 nanoseconds are in range");
     serde_json::json!({
         "id": row.id,
         "seq": row.seq,

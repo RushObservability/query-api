@@ -24,7 +24,7 @@ use std::collections::HashMap;
 /// Per-rule in-memory evaluation state for one engine loop.
 pub struct EvalState {
     /// rule_id → (last in-memory evaluation time, evals since last DB flush)
-    map: HashMap<String, (chrono::DateTime<chrono::Utc>, u32)>,
+    map: HashMap<String, (time::OffsetDateTime, u32)>,
     /// Flush `last_eval_at` to the DB once per this many evaluations.
     flush_every: u32,
 }
@@ -41,15 +41,10 @@ impl EvalState {
     /// this yields `max(db, mem) + interval <= now` semantics: a rule is due
     /// only when BOTH the (coarse) DB value and the (exact) in-memory value say
     /// the interval has elapsed. Unknown rules (fresh start) are due.
-    pub fn is_due(
-        &self,
-        rule_id: &str,
-        now: chrono::DateTime<chrono::Utc>,
-        interval_secs: i64,
-    ) -> bool {
+    pub fn is_due(&self, rule_id: &str, now: time::OffsetDateTime, interval_secs: i64) -> bool {
         match self.map.get(rule_id) {
             None => true,
-            Some((last, _)) => (now - *last).num_seconds() >= interval_secs,
+            Some((last, _)) => (now - *last).whole_seconds() >= interval_secs,
         }
     }
 
@@ -67,7 +62,7 @@ impl EvalState {
     /// Record an evaluation outcome. `persisted` = the rule row was written to
     /// the DB this evaluation (state transition or cadence flush), which resets
     /// the flush counter.
-    pub fn record(&mut self, rule_id: String, now: chrono::DateTime<chrono::Utc>, persisted: bool) {
+    pub fn record(&mut self, rule_id: String, now: time::OffsetDateTime, persisted: bool) {
         let entry = self.map.entry(rule_id).or_insert((now, 0));
         entry.0 = now;
         entry.1 = if persisted {
@@ -81,19 +76,19 @@ impl EvalState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
+    use time::{Duration, OffsetDateTime};
 
     #[test]
     fn unknown_rule_is_due_and_flushes() {
         let st = EvalState::new(10);
-        assert!(st.is_due("r1", Utc::now(), 60));
+        assert!(st.is_due("r1", OffsetDateTime::now_utc(), 60));
         assert!(st.should_flush("r1"), "first eval after restart must flush");
     }
 
     #[test]
     fn due_respects_interval() {
         let mut st = EvalState::new(10);
-        let t0 = Utc::now();
+        let t0 = OffsetDateTime::now_utc();
         st.record("r1".into(), t0, true);
         assert!(!st.is_due("r1", t0 + Duration::seconds(30), 60));
         assert!(st.is_due("r1", t0 + Duration::seconds(60), 60));
@@ -102,7 +97,7 @@ mod tests {
     #[test]
     fn flush_cadence_is_one_in_n() {
         let mut st = EvalState::new(3);
-        let t0 = Utc::now();
+        let t0 = OffsetDateTime::now_utc();
         // First eval flushes (restart bound) → counter resets.
         assert!(st.should_flush("r1"));
         st.record("r1".into(), t0, true);
@@ -119,7 +114,7 @@ mod tests {
     #[test]
     fn transition_persist_resets_counter() {
         let mut st = EvalState::new(3);
-        let t0 = Utc::now();
+        let t0 = OffsetDateTime::now_utc();
         st.record("r1".into(), t0, true);
         st.record("r1".into(), t0, false);
         // State transition mid-cadence persists the row → counter resets:
@@ -135,7 +130,7 @@ mod tests {
     #[test]
     fn flush_every_zero_is_clamped() {
         let mut st = EvalState::new(0);
-        let t0 = Utc::now();
+        let t0 = OffsetDateTime::now_utc();
         st.record("r1".into(), t0, false);
         assert!(
             st.should_flush("r1"),

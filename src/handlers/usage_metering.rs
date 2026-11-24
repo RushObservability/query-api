@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension, Json,
     extract::{Query, State},
@@ -201,11 +202,11 @@ pub async fn usage_summary(
     }
     let escaped_tenant = escape_string_literal(&scope.tenant_id);
 
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let from = sanitize_datetime(
         &params
             .from
-            .unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()),
+            .unwrap_or_else(|| (now - time::Duration::hours(24)).to_rfc3339()),
     );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
 
@@ -283,11 +284,11 @@ pub async fn usage_breakdown(
     }
     let escaped_tenant = escape_string_literal(&scope.tenant_id);
 
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let from = sanitize_datetime(
         &params
             .from
-            .unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339()),
+            .unwrap_or_else(|| (now - time::Duration::days(7)).to_rfc3339()),
     );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
     let interval = params.interval.as_deref().unwrap_or("hour");
@@ -387,11 +388,11 @@ pub async fn usage_tenant_breakdown(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let from = sanitize_datetime(
         &params
             .from
-            .unwrap_or_else(|| (now - chrono::Duration::days(7)).to_rfc3339()),
+            .unwrap_or_else(|| (now - time::Duration::days(7)).to_rfc3339()),
     );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
     let interval = params.interval.as_deref().unwrap_or("hour");
@@ -436,11 +437,11 @@ pub async fn usage_tenants(
     Query(params): Query<TenantsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
-    let now = chrono::Utc::now();
+    let now = time::OffsetDateTime::now_utc();
     let from = sanitize_datetime(
         &params
             .from
-            .unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339()),
+            .unwrap_or_else(|| (now - time::Duration::hours(24)).to_rfc3339()),
     );
     let to = sanitize_datetime(&params.to.unwrap_or_else(|| now.to_rfc3339()));
     let limit = params.limit.unwrap_or(50).min(500);

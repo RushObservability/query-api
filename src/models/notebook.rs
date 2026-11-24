@@ -2,8 +2,9 @@
 //! incident. Each query cell carries its own time setting, resolved by the
 //! client against the notebook's incident window.
 
-use chrono::{DateTime, Duration, Utc};
+use crate::timestamps::UTC_MICROS;
 use serde::{Deserialize, Serialize};
+use time::{Duration, OffsetDateTime};
 
 use crate::models::maintenance::{format_time, normalize_time};
 
@@ -126,7 +127,7 @@ impl CellTime {
     }
 }
 
-fn check_span(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(), String> {
+fn check_span(from: OffsetDateTime, to: OffsetDateTime) -> Result<(), String> {
     if to <= from {
         return Err("the end must be after the start".into());
     }
@@ -138,8 +139,8 @@ fn check_span(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<(), String> {
 
 /// Edit stamp, precise enough that two saves in one second still differ for
 /// the stale-write check.
-pub fn stamp(now: DateTime<Utc>) -> String {
-    now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+pub fn stamp(now: OffsetDateTime) -> String {
+    now.format(UTC_MICROS).expect("valid timestamp format")
 }
 
 /// Check an incident window. Returns normalized (start, end); an empty end

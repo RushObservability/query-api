@@ -1,4 +1,5 @@
 //! Versioned query boundary. Existing handlers remain the only query executors.
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use axum::{
     Extension, Json,
     extract::{Query, State, rejection::JsonRejection},
@@ -51,11 +52,7 @@ static REGISTRY: LazyLock<Value> = LazyLock::new(|| {
 });
 
 fn unix_seconds(value: &str) -> String {
-    (chrono::DateTime::parse_from_rfc3339(value)
-        .expect("validated time")
-        .timestamp_millis() as f64
-        / 1000.0)
-        .to_string()
+    (parse_rfc3339(value).expect("validated time").unix_millis() as f64 / 1000.0).to_string()
 }
 
 /// The same registry ships in each client repository. No checkout-relative runtime dependency.
@@ -96,8 +93,8 @@ impl Request {
         let budget =
             crate::query_governor::active_budget().map_or(30 * 86400, |b| b.max_time_range_secs);
         // All callers send absolute RFC3339. Relative lookbacks are resolved exactly once by clients.
-        if chrono::DateTime::parse_from_rfc3339(&self.time_range.from).is_err()
-            || chrono::DateTime::parse_from_rfc3339(&self.time_range.to).is_err()
+        if parse_rfc3339(&self.time_range.from).is_err()
+            || parse_rfc3339(&self.time_range.to).is_err()
         {
             return Err(invalid());
         }

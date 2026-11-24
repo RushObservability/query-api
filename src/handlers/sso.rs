@@ -237,7 +237,7 @@ fn extract_setup_session(headers: &HeaderMap) -> Result<SsoSetupSession, String>
     decode_setup_session_with_secret(
         encoded,
         &sso_transaction_secret()?,
-        chrono::Utc::now().timestamp(),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
     )
 }
 
@@ -290,7 +290,7 @@ fn extract_sso_transaction(headers: &HeaderMap) -> Result<SsoTransaction, String
     decode_sso_transaction_with_secret(
         encoded,
         &sso_transaction_secret()?,
-        chrono::Utc::now().timestamp(),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
     )
 }
 
@@ -852,7 +852,11 @@ fn validate_oidc_client_binding_at(
 }
 
 fn validate_oidc_client_binding(claims: &serde_json::Value, client_id: &str) -> anyhow::Result<()> {
-    validate_oidc_client_binding_at(claims, client_id, chrono::Utc::now().timestamp())
+    validate_oidc_client_binding_at(
+        claims,
+        client_id,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
 }
 
 fn extract_oidc_profile(
@@ -992,7 +996,7 @@ pub async fn sso_login(
                 pkce_verifier: String::new(),
                 saml_request_id: login_request.request_id,
                 redirect_path: redirect_path.clone(),
-                issued_at: chrono::Utc::now().timestamp(),
+                issued_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             };
             let encoded = encode_sso_transaction(&transaction).map_err(|error| {
                 public_sso_internal_error(
@@ -1081,7 +1085,7 @@ pub async fn sso_login(
                 pkce_verifier,
                 saml_request_id: String::new(),
                 redirect_path: redirect_path.clone(),
-                issued_at: chrono::Utc::now().timestamp(),
+                issued_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             };
             let encoded = encode_sso_transaction(&transaction).map_err(|error| {
                 public_sso_internal_error(
@@ -2712,7 +2716,7 @@ async fn sso_acs_inner(
         &acs_url,
         &_saml_entity,
         &issuer_url,
-        chrono::Utc::now().timestamp(),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
     )
     .map_err(|e| {
         tracing::warn!(reason = %e, "SAML assertion rejected");
@@ -3183,7 +3187,7 @@ pub async fn exchange_setup_token(
     if !claim_sso_key_once(
         &state,
         format!("sso-setup-link:{token_hash}"),
-        chrono::Utc::now().timestamp() + SSO_SETUP_TTL_SECS,
+        time::OffsetDateTime::now_utc().unix_timestamp() + SSO_SETUP_TTL_SECS,
     )
     .await?
     {
@@ -3197,7 +3201,7 @@ pub async fn exchange_setup_token(
         provider: provider.clone(),
         created_by,
         session_id: random_urlsafe::<24>(),
-        issued_at: chrono::Utc::now().timestamp(),
+        issued_at: time::OffsetDateTime::now_utc().unix_timestamp(),
     };
     let setup_secret = sso_transaction_secret().map_err(|error| {
         public_sso_internal_error(
@@ -3730,7 +3734,7 @@ mod tests {
     #[test]
     fn oidc_signed_token_contract_validates_signature_issuer_audience_and_expiry() {
         let (private_pem, jwks) = oidc_signing_fixture("current-key");
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let claims = serde_json::json!({
             "iss": "https://idp.example.com",
             "aud": "rush-client",
@@ -3782,7 +3786,7 @@ mod tests {
     fn oidc_signed_token_contract_rejects_wrong_keys_and_symmetric_algorithms() {
         let (private_pem, _) = oidc_signing_fixture("current-key");
         let (_, attacker_jwks) = oidc_signing_fixture("current-key");
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let claims = serde_json::json!({
             "iss": "https://idp.example.com",
             "aud": "rush-client",

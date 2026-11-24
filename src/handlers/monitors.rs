@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -470,7 +471,7 @@ pub async fn forecast_series(
         &tenant.tenant_id,
         &params.metric,
         params.filter.trim(),
-        chrono::Utc::now().timestamp_millis(),
+        time::OffsetDateTime::now_utc().unix_millis(),
     )
     .await
     .map_err(|error| crate::api_error::internal_legacy("monitors", error))?;

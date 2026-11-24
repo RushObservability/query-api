@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
@@ -13,6 +12,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 
 use super::export::{ExportFormat, ExportJobState};
 
@@ -24,8 +24,10 @@ pub(super) struct JobRecord {
     pub format: ExportFormat,
     pub filename: String,
     pub requested_rows: u64,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
     pub state: ExportJobState,
     pub rows_written: u64,
     pub bytes_written: u64,
@@ -33,7 +35,8 @@ pub(super) struct JobRecord {
     pub truncated: bool,
     pub error: Option<String>,
     pub owner: String,
-    pub lease_until: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub lease_until: OffsetDateTime,
     pub revision: u64,
 }
 

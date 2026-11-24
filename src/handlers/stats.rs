@@ -1,3 +1,4 @@
+use crate::timestamps::{DATE, TimestampExt, parse_rfc3339};
 use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
 use clickhouse::Row;
 use dashmap::DashMap;
@@ -119,9 +120,9 @@ struct UsageRow {
 /// map to the same key within the cache TTL. Unparsable strings pass through
 /// unchanged (the key just won't benefit from bucketing).
 fn bucket_ts_15s(ts: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(ts) {
+    match parse_rfc3339(ts) {
         Ok(dt) => {
-            let secs = dt.timestamp();
+            let secs = dt.unix_timestamp();
             (secs - secs.rem_euclid(15)).to_string()
         }
         Err(_) => ts.to_string(),
@@ -161,14 +162,11 @@ fn metric_count_source(
     );
 
     // Parse window edges; bail to raw on any parse failure.
-    let (Ok(from_dt), Ok(to_dt)) = (
-        chrono::DateTime::parse_from_rfc3339(from),
-        chrono::DateTime::parse_from_rfc3339(to),
-    ) else {
+    let (Ok(from_dt), Ok(to_dt)) = (parse_rfc3339(from), parse_rfc3339(to)) else {
         return raw;
     };
-    let from_s = from_dt.timestamp() as f64;
-    let to_s = to_dt.timestamp() as f64;
+    let from_s = from_dt.unix_timestamp() as f64;
+    let to_s = to_dt.unix_timestamp() as f64;
 
     let source = crate::rollup::select_window_source(from_s, to_s);
     let interval = match source.interval_secs() {
@@ -178,8 +176,8 @@ fn metric_count_source(
 
     // Alignment guard: both edges must sit on a rollup bucket boundary so whole-bucket
     // counts equal the raw windowed count exactly.
-    let from_i = from_dt.timestamp();
-    let to_i = to_dt.timestamp();
+    let from_i = from_dt.unix_timestamp();
+    let to_i = to_dt.unix_timestamp();
     if from_i % interval != 0 || to_i % interval != 0 {
         return raw;
     }
@@ -232,12 +230,12 @@ pub async fn get_stats(
     let (from, to) = if let Some(tr) = &req.time_range {
         (tr.from.clone(), tr.to.clone())
     } else {
-        let to = chrono::Utc::now();
-        let from = to - chrono::Duration::hours(1);
+        let to = time::OffsetDateTime::now_utc();
+        let from = to - time::Duration::hours(1);
         (from.to_rfc3339(), to.to_rfc3339())
     };
 
-    let today_start = chrono::Utc::now().date_naive().to_string();
+    let today_start = time::OffsetDateTime::now_utc().date().to_string();
     let range_secs = format!(
         "greatest(1, dateDiff('second', parseDateTimeBestEffort('{from}'), parseDateTimeBestEffort('{to}')))"
     );
@@ -630,7 +628,7 @@ pub async fn get_storage_partitions(
 
     let tiering = &state.config.storage.tiering;
     let ret = &state.config.retention.defaults;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
     let partitions = rows
         .into_iter()
@@ -659,11 +657,10 @@ pub async fn get_storage_partitions(
             };
             // Estimate the move only while there's still hot data and tiering is on.
             let move_at_estimate = if r.bytes_local > 0 && move_days > 0 {
-                chrono::NaiveDate::parse_from_str(&r.partition, "%Y-%m-%d")
+                time::Date::parse(&r.partition, DATE)
                     .ok()
-                    .and_then(|d| d.checked_add_days(chrono::Days::new(move_days as u64)))
-                    .and_then(|d| d.and_hms_opt(0, 0, 0))
-                    .map(|dt| dt.and_utc().timestamp())
+                    .and_then(|d| d.checked_add(time::Duration::days(i64::from(move_days))))
+                    .map(|date| date.midnight().assume_utc().unix_timestamp())
             } else {
                 None
             };

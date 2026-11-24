@@ -3,6 +3,7 @@ use crate::models::query::Filter;
 use crate::query_builder::{
     build_logs_where_clause, build_metrics_where_clause, build_where_clause,
 };
+use crate::timestamps::TimestampExt;
 use clickhouse::Client;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
@@ -154,7 +155,7 @@ fn build_slack_payload(
         format!("{condition_op} {threshold_str}")
     };
 
-    let ts = chrono::Utc::now().timestamp();
+    let ts = time::OffsetDateTime::now_utc().unix_timestamp();
     let fallback =
         format!("[{status_label}] {alert_name} — {value_str} {condition_op} {threshold_str}");
 
@@ -716,7 +717,8 @@ async fn send_channel_notification_with_fields(
             }]);
             // Alertmanager's POST schema uses endsAt for recovery, not status.
             if is_resolved(alert_state) {
-                payload[0]["endsAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+                payload[0]["endsAt"] =
+                    serde_json::json!(time::OffsetDateTime::now_utc().to_rfc3339());
             }
             delivery::send_json(
                 delivery::request(reqwest::Method::POST, &api_url, false).await?,
@@ -777,8 +779,8 @@ async fn eval_alerts(
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
-    let now = chrono::Utc::now();
-    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let now_str = now.utc_seconds();
 
     // DB-side due filter (coarse: last_eval_at is only flushed 1-in-N) combined
     // with the in-memory check ⇒ max(db, mem) + interval <= now semantics.
@@ -837,7 +839,7 @@ async fn eval_alert_rule(
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
     rule: &crate::models::alert::AlertRule,
-    now: chrono::DateTime<chrono::Utc>,
+    now: time::OffsetDateTime,
     now_str: &str,
     should_flush: bool,
 ) -> anyhow::Result<bool> {
@@ -849,9 +851,7 @@ async fn eval_alert_rule(
         }
     };
 
-    let from = (now - chrono::Duration::minutes(query_config.time_range_minutes))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let from = (now - time::Duration::minutes(query_config.time_range_minutes)).utc_seconds();
 
     let sql = build_alert_count_sql(&rule.signal_type, &query_config, &from, now_str);
 

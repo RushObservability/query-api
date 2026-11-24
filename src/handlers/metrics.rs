@@ -1,3 +1,4 @@
+use crate::timestamps::parse_rfc3339;
 use axum::{
     Extension, Form, Json,
     extract::{Path, Query, State},
@@ -671,8 +672,8 @@ fn parse_timestamp(s: &str) -> Result<f64, (StatusCode, String)> {
         .parse::<f64>()
         .map_err(|_| {
             // Try ISO 8601
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.timestamp() as f64)
+            parse_rfc3339(s)
+                .map(|dt| dt.unix_timestamp() as f64)
                 .map_err(|e| {
                     (
                         StatusCode::BAD_REQUEST,

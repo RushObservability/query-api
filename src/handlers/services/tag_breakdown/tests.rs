@@ -2,6 +2,7 @@ use super::*;
 use crate::models::query::{Filter, FilterOp};
 use crate::query_builder::build_where_clause_with_search;
 use crate::service_tags::SCOPE_FIELD;
+use crate::timestamps::parse_rfc3339;
 use serde_json::json;
 
 fn tag_scope(selection: serde_json::Value) -> Filter {
@@ -66,8 +67,8 @@ async fn check_tag_breakdown(client: &clickhouse::Client) -> anyhow::Result<()> 
 
     let from = "2026-01-02T09:00:00.123Z";
     let to = "2026-01-02T09:02:00.123Z";
-    let from_ms = DateTime::parse_from_rfc3339(from)?.timestamp_millis();
-    let to_ms = DateTime::parse_from_rfc3339(to)?.timestamp_millis();
+    let from_ms = parse_rfc3339(from)?.unix_millis();
+    let to_ms = parse_rfc3339(to)?.unix_millis();
     client
         .query(&format!(
             r#"INSERT INTO spans

@@ -5,10 +5,11 @@
 //! window ends, any group whose state differs from its last notification is
 //! notified once.
 
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// Longest window accepted, so a typo can't silence alerts for years.
 pub const MAX_WINDOW_DAYS: i64 = 90;
@@ -91,22 +92,22 @@ impl Scope {
 
 /// Parse any RFC 3339 timestamp and store it as UTC with second precision,
 /// so stored times compare correctly as text.
-pub fn normalize_time(raw: &str) -> Result<DateTime<Utc>, String> {
-    DateTime::parse_from_rfc3339(raw.trim())
-        .map(|t| t.with_timezone(&Utc))
+pub fn normalize_time(raw: &str) -> Result<OffsetDateTime, String> {
+    parse_rfc3339(raw.trim())
+        .map(|value| value.to_offset(time::UtcOffset::UTC))
         .map_err(|_| format!("{raw:?} is not an RFC 3339 timestamp, such as 2026-10-01T02:00:00Z"))
 }
 
-pub fn format_time(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+pub fn format_time(t: OffsetDateTime) -> String {
+    t.utc_seconds()
 }
 
 /// Check a requested window. Returns normalized (start, end).
 pub fn validate_window(
     starts_at: &str,
     ends_at: &str,
-    now: DateTime<Utc>,
-) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    now: OffsetDateTime,
+) -> Result<(OffsetDateTime, OffsetDateTime), String> {
     let start = normalize_time(starts_at)?;
     let end = normalize_time(ends_at)?;
     if end <= start {
@@ -115,7 +116,7 @@ pub fn validate_window(
     if end <= now {
         return Err("ends_at is in the past".into());
     }
-    if end - start > chrono::Duration::days(MAX_WINDOW_DAYS) {
+    if end - start > time::Duration::days(MAX_WINDOW_DAYS) {
         return Err(format!("a window can last at most {MAX_WINDOW_DAYS} days"));
     }
     Ok((start, end))
@@ -123,7 +124,7 @@ pub fn validate_window(
 
 impl MaintenanceWindow {
     /// `scheduled`, `active`, or `ended` at `now`. Unparseable rows count as ended.
-    pub fn status(&self, now: DateTime<Utc>) -> &'static str {
+    pub fn status(&self, now: OffsetDateTime) -> &'static str {
         match (
             normalize_time(&self.starts_at),
             normalize_time(&self.ends_at),
@@ -134,7 +135,7 @@ impl MaintenanceWindow {
         }
     }
 
-    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_active(&self, now: OffsetDateTime) -> bool {
         self.status(now) == "active"
     }
 }
@@ -153,7 +154,7 @@ pub struct MonitorNotification {
 mod tests {
     use super::*;
 
-    fn at(s: &str) -> DateTime<Utc> {
+    fn at(s: &str) -> OffsetDateTime {
         normalize_time(s).unwrap()
     }
 

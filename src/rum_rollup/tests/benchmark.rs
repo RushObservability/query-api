@@ -91,7 +91,7 @@ async fn benchmark_rollups() -> anyhow::Result<()> {
         .execute()
         .await?;
     let result: anyhow::Result<serde_json::Value> = async {
-        let anchor = chrono::Utc::now().timestamp() / 300 * 300;
+        let anchor = time::OffsetDateTime::now_utc().unix_timestamp() / 300 * 300;
         admin.query(&raw_ddl(&database, "rum")?).execute().await?;
         let populate_ms = insert(&admin, &database, "rum", rows, 0, anchor).await?;
         let base_bytes = admin.query("SELECT sum(bytes_on_disk) FROM system.parts WHERE active AND database = ? AND table = 'rum'")

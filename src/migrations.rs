@@ -8,6 +8,7 @@ pub use span_service_projection::spawn_span_service_projection_maintenance;
 #[cfg(test)]
 mod profile_storage_tests {
     use super::*;
+    use crate::timestamps::TimestampExt;
     use crate::{
         ch_writer::{SpoolBatch, try_insert},
         models::profile::ProfileRow,
@@ -95,7 +96,7 @@ mod profile_storage_tests {
             .await?;
         admin.query(&format!("CREATE ROW POLICY tenant_isolation ON {database}.profile_samples USING tenant_id = getSetting('rush_tenant_id') TO {user}")).execute().await?;
         let writer = admin.clone().with_database(&database);
-        let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let timestamp = time::OffsetDateTime::now_utc().unix_nanos().unwrap();
         let row = ProfileRow {
             tenant_id: "tenant_a".into(),
             timestamp,
