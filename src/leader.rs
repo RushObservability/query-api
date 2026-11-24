@@ -26,6 +26,7 @@
 //! `/healthz`. Lease renewals are coordination traffic rather than user changes;
 //! application mutations continue to write audit events.
 
+use crate::timestamps::TimestampExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -469,7 +470,7 @@ impl Renewer {
                     self.metrics.set_gauge(
                         "rush_engine_lease_last_renewal_timestamp_seconds",
                         &labels,
-                        chrono::Utc::now().timestamp_millis() as f64 / 1_000.0,
+                        time::OffsetDateTime::now_utc().unix_millis() as f64 / 1_000.0,
                     );
                     if !self.lease.leader.swap(true, Ordering::AcqRel) {
                         self.changed(true, previous);

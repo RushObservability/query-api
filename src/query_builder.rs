@@ -1,4 +1,5 @@
 use crate::models::query::{Filter, FilterOp};
+use crate::timestamps::parse_rfc3339;
 
 /// SQL condition for a span that failed. OpenTelemetry and Datadog ingest store
 /// the status as `STATUS_CODE_ERROR`; `ERROR` covers rows written by older
@@ -1130,22 +1131,10 @@ const BUCKET_INTERVALS: &[(&str, u64)] = &[
 /// without an explicit offset, or a plain `YYYY-MM-DD HH:MM:SS`).
 fn parse_datetime_secs(s: &str) -> Option<i64> {
     let s = s.trim();
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp());
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&format!("{s}Z")) {
-        return Some(dt.timestamp());
-    }
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-    ] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(naive.and_utc().timestamp());
-        }
-    }
-    None
+    parse_rfc3339(s)
+        .or_else(|_| parse_rfc3339(&format!("{s}Z")))
+        .ok()
+        .map(time::OffsetDateTime::unix_timestamp)
 }
 
 /// Clamp a client-supplied bucket interval so the expected bucket count

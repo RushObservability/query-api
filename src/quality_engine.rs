@@ -1,17 +1,18 @@
 //! Scheduled tenant-isolated quality scans, bounded request cache and finding history.
+use crate::timestamps::TimestampExt;
 use crate::{
     audit::{AuditEvent, AuditLogger},
     clickhouse_config::ConfigDb,
     handlers::telemetry_quality::{QualityFinding, QualityResponse},
 };
 use axum::http::StatusCode;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
+use time::OffsetDateTime;
 use tokio::sync::{Mutex, Semaphore};
 
 const HISTORY_LIMIT: usize = 500;
@@ -185,7 +186,7 @@ impl AnalysisCache<QualityResponse> {
 
 async fn fresh_snapshot(db: &ConfigDb, tenant: &str) -> Option<QualityResponse> {
     let read = db.client.query("SELECT payload FROM config_quality_snapshots FINAL WHERE tenant_id = ? AND ruleset = ? AND updated_at >= ? LIMIT 1")
-        .bind(tenant).bind(RULESET).bind((Utc::now().timestamp_millis() - SCAN_SECONDS as i64 * 1000).max(0) as u64)
+        .bind(tenant).bind(RULESET).bind((OffsetDateTime::now_utc().unix_millis() - SCAN_SECONDS as i64 * 1000).max(0) as u64)
         .fetch_optional::<Payload>();
     let row = tokio::time::timeout(Duration::from_secs(2), read)
         .await
@@ -352,7 +353,7 @@ async fn persist(
         .collect::<Result<Vec<_>, _>>()?;
     let updates = reconcile(&report, previous);
     crate::leader::ensure_leader()?;
-    let updated_at = Utc::now().timestamp_millis().max(0) as u64;
+    let updated_at = OffsetDateTime::now_utc().unix_millis().max(0) as u64;
     if !updates.is_empty() {
         let mut insert = db
             .client

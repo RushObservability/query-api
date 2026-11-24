@@ -512,7 +512,7 @@ pub async fn check_run(
         .ingest_limits
         .check_entities("datadog", checks.len())?;
 
-    let now_s = chrono::Utc::now().timestamp();
+    let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
 
     let rows: Vec<GaugeRow> = checks
         .iter()

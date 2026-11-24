@@ -17,6 +17,7 @@
 //! a local ordered outbox. ClickHouse outages therefore retain events for later
 //! replay while readiness and metrics expose the degraded state.
 
+use crate::timestamps::TimestampExt;
 use clickhouse::Client;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -937,7 +938,7 @@ impl AuditLogger {
             id: uuid::Uuid::new_v4().to_string(),
             seq,
             chain_id: self.chain_id.clone(),
-            timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            timestamp: time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0),
             tenant_id: ev.tenant_id,
             actor_id: ev.actor_id,
             actor_name: ev.actor_name,
@@ -1877,7 +1878,7 @@ mod tests {
         let result: anyhow::Result<()> = async {
             crate::migrations::create_audit_table(&ch).await?;
             let mut legacy = sample_row(1, "");
-            legacy.timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+            legacy.timestamp = time::OffsetDateTime::now_utc().unix_nanos().unwrap();
             legacy.hash = compute_hash(TEST_SECRET, &legacy);
             let durable = ch.clone().with_setting("async_insert", "0");
             let mut insert = durable.insert::<AuditRow>("audit_events").await?;
@@ -1949,7 +1950,7 @@ mod tests {
             let legacy = |id: &str, seq: u64, prev: &str| {
                 let mut row = sample_row(seq, prev);
                 row.id = id.into();
-                row.timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+                row.timestamp = time::OffsetDateTime::now_utc().unix_nanos().unwrap();
                 row.hash = compute_hash(TEST_SECRET, &row);
                 row
             };

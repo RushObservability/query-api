@@ -67,7 +67,7 @@ pub fn issue(
         session_key,
         key_id,
         key_network_policy,
-        expires: chrono::Utc::now().timestamp() + TTL,
+        expires: time::OffsetDateTime::now_utc().unix_timestamp() + TTL,
     };
     Ok(encode(db.cursor_hmac_secret(), &claims))
 }
@@ -145,7 +145,7 @@ pub async fn authorize(
         db.cursor_hmac_secret(),
         token,
         tenant,
-        chrono::Utc::now().timestamp(),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
     )?;
     let (caller, actor_type, actor_id) = if let Some(key_id) = claims.key_id {
         let grant = db

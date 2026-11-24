@@ -1,5 +1,6 @@
 use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use crate::monitor_forecast;
+use crate::timestamps::{TimestampExt, UTC_MILLIS, UTC_SECONDS, from_unix_millis};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -171,7 +172,7 @@ struct NotifyPolicy {
 }
 
 impl NotifyPolicy {
-    async fn load(config_db: &ConfigDb, now: chrono::DateTime<chrono::Utc>) -> Self {
+    async fn load(config_db: &ConfigDb, now: time::OffsetDateTime) -> Self {
         let now_text = crate::models::maintenance::format_time(now);
         let windows = match config_db
             .list_unfinished_maintenance_windows(&now_text)
@@ -208,7 +209,7 @@ impl NotifyPolicy {
             }
         };
         Self {
-            now_ms: now.timestamp_millis(),
+            now_ms: now.unix_millis(),
             windows,
             last,
         }
@@ -303,8 +304,8 @@ async fn run_evaluation_cycle(
 ) -> anyhow::Result<(u64, u64)> {
     use futures_util::StreamExt;
 
-    let now = chrono::Utc::now();
-    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let now_str = now.utc_seconds();
 
     let monitors = config_db.list_enabled_monitors().await?;
     let policy = NotifyPolicy::load(config_db, now).await;
@@ -326,11 +327,9 @@ async fn run_evaluation_cycle(
         .into_iter()
         .filter(|monitor| {
             if let Some(ref last_eval) = monitor.last_eval_at {
-                if let Ok(last) =
-                    chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%SZ")
-                {
-                    let last_utc = last.and_utc();
-                    let elapsed = (now - last_utc).num_seconds();
+                if let Ok(last) = time::PrimitiveDateTime::parse(last_eval, UTC_SECONDS) {
+                    let last_utc = last.assume_utc();
+                    let elapsed = (now - last_utc).whole_seconds();
                     if elapsed < monitor.eval_interval_secs {
                         return false;
                     }
@@ -354,7 +353,7 @@ async fn run_evaluation_cycle(
             let mut observation =
                 EvaluationObservation::new(config_db.self_metrics(), "monitor_engine");
             let window = EvaluationWindow::new(
-                chrono::Utc::now().timestamp_millis(),
+                time::OffsetDateTime::now_utc().unix_millis(),
                 monitor.eval_window_secs,
             );
             let result = match crate::query_governor::run_background(
@@ -1386,8 +1385,7 @@ impl EvaluationWindow {
         query: MonitorEvidenceQuery,
     ) -> MonitorEvidence {
         let time = |ms| {
-            chrono::DateTime::from_timestamp_millis(ms)
-                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            from_unix_millis(ms).map(|dt| dt.format(UTC_MILLIS).expect("valid timestamp format"))
         };
         MonitorEvidence {
             rule_version: monitor.rule_version,
@@ -1423,7 +1421,7 @@ async fn record_transition(
         value: value.filter(|value| value.is_finite()),
         threshold,
         message,
-        created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        created_at: time::OffsetDateTime::now_utc().clickhouse_seconds(),
         evidence,
     };
     if let Err(error) = config_db.create_monitor_event(&event).await {
@@ -1757,7 +1755,7 @@ pub async fn preview_query(
             tenant_id,
             &config,
             threshold,
-            chrono::Utc::now().timestamp_millis(),
+            time::OffsetDateTime::now_utc().unix_millis(),
         )
         .await?;
         return Ok(PreviewResult {
@@ -1809,7 +1807,10 @@ pub async fn preview_query(
 
     let results: Vec<_> = if matches!(monitor_type, "metric" | "log" | "apm") {
         let query = parse_monitor_query(&temp_monitor)?;
-        let window = EvaluationWindow::new(chrono::Utc::now().timestamp_millis(), eval_window_secs);
+        let window = EvaluationWindow::new(
+            time::OffsetDateTime::now_utc().unix_millis(),
+            eval_window_secs,
+        );
         run_monitor_query(ch, &temp_monitor, &query, group_by, window)
             .await?
             .into_iter()
@@ -2130,7 +2131,7 @@ async fn build_preview_series_promql(
     lookback_secs: i64,
     bucket_secs: i64,
 ) -> Vec<PreviewSeries> {
-    let now = chrono::Utc::now().timestamp() as f64;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
     let start = now - lookback_secs as f64;
     let step = bucket_secs as f64;
 
@@ -2150,10 +2151,10 @@ async fn build_preview_series_promql(
                     .samples
                     .into_iter()
                     .map(|(timestamp, value)| {
-                        let datetime = chrono::DateTime::from_timestamp(timestamp as i64, 0)
-                            .unwrap_or_default();
+                        let datetime = time::OffsetDateTime::from_unix_timestamp(timestamp as i64)
+                            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
                         TimeseriesPoint {
-                            timestamp: datetime.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            timestamp: datetime.clickhouse_seconds(),
                             value,
                         }
                     })

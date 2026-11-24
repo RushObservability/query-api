@@ -1,13 +1,14 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension, Json,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
-use chrono::{DateTime, Utc};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 
 use crate::query_builder::{ERROR_SPAN, escape_string_literal};
 use crate::service_tags::{REQUEST_SPAN, ServiceTag, TOP_TAGS};
@@ -17,8 +18,8 @@ use crate::{AppState, TenantContext};
 pub struct TagBreakdownParams {
     service: String,
     dimension: ServiceTag,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
 }
 
 #[derive(Debug, Deserialize, Row)]
@@ -67,12 +68,12 @@ pub async fn service_tag_breakdown(
     Extension(tenant): Extension<TenantContext>,
     Query(params): Query<TagBreakdownParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let from = params.from.timestamp_millis();
-    let to = params.to.timestamp_millis();
+    let from = params.from.unix_millis();
+    let to = params.to.unix_millis();
     if from < 0
         || to <= from
         || to - from > MAX_RANGE_MS
-        || params.to.timestamp_nanos_opt().is_none()
+        || params.to.unix_nanos().is_none()
         || params.service.is_empty()
         || params.service.len() > 1024
     {

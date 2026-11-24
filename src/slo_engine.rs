@@ -6,6 +6,7 @@ use crate::models::slo_maintenance::{
     MaintenanceRange, SloMaintenanceEvaluation, exclusion_ranges,
 };
 use crate::query_builder::{QueryClauses, build_metrics_where_clause, build_where_clause};
+use crate::timestamps::TimestampExt;
 use clickhouse::Client;
 use std::sync::Arc;
 
@@ -202,10 +203,10 @@ async fn eval_metric_promql_pair(
     tenant_id: &str,
     error_promql: &str,
     total_promql: &str,
-    now: &chrono::DateTime<chrono::Utc>,
+    now: &time::OffsetDateTime,
     lookback_secs: f64,
 ) -> anyhow::Result<BudgetCounts> {
-    let eval_time = now.timestamp_millis() as f64 / 1_000.0;
+    let eval_time = now.unix_millis() as f64 / 1_000.0;
     let (error_result, total_result) = tokio::join!(
         crate::promql::evaluate_instant_query(
             ch,
@@ -369,8 +370,8 @@ async fn eval_slos(
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
-    let now = chrono::Utc::now();
-    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let now_str = now.utc_seconds();
 
     // DB-side due filter (coarse: last_eval_at is only flushed 1-in-N) combined
     // with the in-memory check ⇒ max(db, mem) + interval <= now semantics.
@@ -474,14 +475,18 @@ async fn eval_one_slo(
     write_ch: &Client,
     notifier: &crate::alert_engine::Notifier,
     slo: &Slo,
-    now: chrono::DateTime<chrono::Utc>,
+    now: time::OffsetDateTime,
     now_str: &str,
     should_flush: bool,
 ) -> anyhow::Result<bool> {
     let minutes = window_minutes(&slo.window_type);
-    let start = now - chrono::Duration::minutes(minutes);
+    let start = now - time::Duration::minutes(minutes);
     let from = crate::models::maintenance::format_time(start);
-    let ranges = exclusion_ranges(&slo.maintenance_windows, start.timestamp(), now.timestamp());
+    let ranges = exclusion_ranges(
+        &slo.maintenance_windows,
+        start.unix_timestamp(),
+        now.unix_timestamp(),
+    );
     let window = EvaluationWindow {
         from: &from,
         to: now_str,
@@ -679,7 +684,7 @@ async fn eval_one_slo(
         SloMaintenanceEvaluation::new(
             slo.maintenance_revision,
             &ranges,
-            now.timestamp(),
+            now.unix_timestamp(),
             counts.excluded_total,
             counts.excluded_bad,
         )
@@ -833,7 +838,7 @@ async fn eval_one_slo(
     } else {
         0.0
     };
-    let now_nanos = now.timestamp_nanos_opt().unwrap_or(0);
+    let now_nanos = now.unix_nanos().unwrap_or(0);
     write_slo_metrics(
         write_ch,
         &slo.id,
@@ -911,7 +916,7 @@ mod tests {
                 {"name":"First","starts_at":"2026-11-22T09:01:30Z","ends_at":"2026-11-22T09:02:20Z"},
                 {"name":"Second","starts_at":"2026-11-22T09:01:40Z","ends_at":"2026-11-22T09:03:30Z"}
             ]))?;
-            let parse = |utc| crate::models::maintenance::normalize_time(utc).map(|t| t.timestamp()).unwrap();
+            let parse = |utc| crate::models::maintenance::normalize_time(utc).map(|t| t.unix_timestamp()).unwrap();
             let ranges = exclusion_ranges(&windows, parse(from), parse(to));
             let window = EvaluationWindow { from, to, exclusions: &ranges };
             let total = [f("tenant_id", "default"), f("service_name", "checkout")];

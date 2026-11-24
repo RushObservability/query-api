@@ -1,3 +1,4 @@
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use axum::{
     Extension, Json,
     extract::State,
@@ -478,16 +479,16 @@ pub async fn query_logs(
         // fill the page we fall through to the full requested range, so results are
         // never missed — the miss case just pays one cheap probe before the full scan.
         let narrow_to = &req.time_range.to;
-        let to_dt = chrono::DateTime::parse_from_rfc3339(narrow_to)
-            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&format!("{narrow_to}Z")))
-            .unwrap_or_else(|_| chrono::Utc::now().into());
-        let from_dt = chrono::DateTime::parse_from_rfc3339(&req.time_range.from)
-            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&format!("{}Z", req.time_range.from)))
+        let to_dt = parse_rfc3339(narrow_to)
+            .or_else(|_| parse_rfc3339(&format!("{narrow_to}Z")))
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let from_dt = parse_rfc3339(&req.time_range.from)
+            .or_else(|_| parse_rfc3339(&format!("{}Z", req.time_range.from)))
             .ok();
         // Only probe when the requested range is wider than the probe window — for an
         // already-narrow range (e.g. a 5-minute zoom) the probe == full range, so skip
         // straight to the single query and avoid a redundant round-trip.
-        let probe_from_dt = to_dt - chrono::Duration::hours(1);
+        let probe_from_dt = to_dt - time::Duration::hours(1);
         let worth_probing = from_dt.map(|f| f < probe_from_dt).unwrap_or(true);
 
         let narrow_rows = if worth_probing {
@@ -964,7 +965,7 @@ pub async fn export_logs(
         clauses.to_sql(),
     );
 
-    let unix = chrono::Utc::now().timestamp();
+    let unix = time::OffsetDateTime::now_utc().unix_timestamp();
     if export::requires_async(req.limit, limit) {
         let filename = format!(
             "rush-logs-{unix}.{}",
@@ -1293,14 +1294,11 @@ pub async fn log_histogram(
 
     // Parse from/to (RFC3339, tolerating a missing 'Z' like query_logs does) to
     // size the bucket. Fall back to a 1s bucket if the range can't be parsed.
-    let parse_ts = |s: &str| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&format!("{s}Z")))
-    };
+    let parse_ts = |s: &str| parse_rfc3339(s).or_else(|_| parse_rfc3339(&format!("{s}Z")));
     let from_dt = parse_ts(&req.time_range.from);
     let to_dt = parse_ts(&req.time_range.to);
     let span_secs = match (&from_dt, &to_dt) {
-        (Ok(f), Ok(t)) => (t.timestamp() - f.timestamp()).max(1) as u64,
+        (Ok(f), Ok(t)) => (t.unix_timestamp() - f.unix_timestamp()).max(1) as u64,
         _ => 1,
     };
     // Aim for ~120 buckets, then snap up to the smallest "nice" interval.

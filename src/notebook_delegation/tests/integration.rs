@@ -105,7 +105,7 @@ async fn delegated_access_rechecks_sessions_roles_keys_and_private_ownership() -
     let delegated = headers(&token);
     assert!(authorize(&db, &delegated, "default", false).await.is_ok());
     assert!(authorize(&db, &delegated, "default", true).await.is_err());
-    let now = crate::models::notebook::stamp(chrono::Utc::now());
+    let now = crate::models::notebook::stamp(time::OffsetDateTime::now_utc());
     let notebook = crate::models::notebook::Notebook {
         id: uuid::Uuid::new_v4().to_string(),
         tenant_id: "default".into(),

@@ -1,5 +1,6 @@
 //! Generate an unsaved dashboard from a tenant-visible investigation.
 //! The model selects observed telemetry; it cannot write dashboards or emit SQL.
+use crate::timestamps::TimestampExt;
 use axum::{
     Json,
     extract::{Path, State},
@@ -326,7 +327,7 @@ fn proposal_to_export(
     }
     Ok(DashboardExport {
         format_version: "v1".into(),
-        exported_at: chrono::Utc::now().to_rfc3339(),
+        exported_at: time::OffsetDateTime::now_utc().to_rfc3339(),
         dashboard: DashboardExportMeta {
             defaults: DashboardDefaults {
                 time_range_minutes: minutes,
@@ -533,8 +534,8 @@ pub async fn create_draft(
         .map(|turn| turn.content.chars().take(1000).collect())
         .take(10)
         .collect();
-    let to = chrono::Utc::now();
-    let from = to - chrono::Duration::minutes(i64::from(req.time_range_minutes));
+    let to = time::OffsetDateTime::now_utc();
+    let from = to - time::Duration::minutes(i64::from(req.time_range_minutes));
     let catalog = tokio::time::timeout(
         Duration::from_secs(6),
         discover(&state, &caller.3, &from.to_rfc3339(), &to.to_rfc3339()),

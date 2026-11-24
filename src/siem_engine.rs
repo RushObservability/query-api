@@ -1,6 +1,7 @@
 use crate::clickhouse_config::ConfigDb;
 use crate::engine_metrics::{EvaluationObservation, EvaluationOutcome};
 use crate::models::detection::DetectionRule;
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use clickhouse::Client;
 use std::sync::Arc;
 
@@ -55,8 +56,8 @@ async fn run_detection_cycle(
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
-    let now = chrono::Utc::now();
-    let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let now_str = now.utc_seconds();
 
     let rules = config_db.list_enabled_detection_rules().await?;
     if rules.is_empty() {
@@ -160,18 +161,14 @@ async fn run_detection_cycle(
     Ok(())
 }
 
-fn is_rule_due(rule: &DetectionRule, now: &chrono::DateTime<chrono::Utc>) -> bool {
+fn is_rule_due(rule: &DetectionRule, now: &time::OffsetDateTime) -> bool {
     match &rule.last_eval_at {
         None => true, // never evaluated
         Some(last_eval) => {
-            let parsed = chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%SZ")
-                .or_else(|_| {
-                    chrono::NaiveDateTime::parse_from_str(last_eval, "%Y-%m-%dT%H:%M:%S%.fZ")
-                });
+            let parsed = parse_rfc3339(last_eval);
             match parsed {
                 Ok(dt) => {
-                    let last_eval_utc = dt.and_utc();
-                    let elapsed = (*now - last_eval_utc).num_seconds();
+                    let elapsed = (*now - dt).whole_seconds();
                     elapsed >= rule.interval_secs
                 }
                 Err(_) => true, // can't parse, run it
@@ -186,15 +183,15 @@ async fn evaluate_rule(
     config_db: &ConfigDb,
     notifier: &crate::alert_engine::Notifier,
     rule: &DetectionRule,
-    now: &chrono::DateTime<chrono::Utc>,
+    now: &time::OffsetDateTime,
     now_str: &str,
     should_flush: bool,
 ) -> anyhow::Result<(bool, bool)> {
     let window_end = *now;
-    let window_start = window_end - chrono::Duration::seconds(rule.window_secs);
+    let window_start = window_end - time::Duration::seconds(rule.window_secs);
 
-    let window_start_str = window_start.format("%Y-%m-%d %H:%M:%S").to_string();
-    let window_end_str = window_end.format("%Y-%m-%d %H:%M:%S").to_string();
+    let window_start_str = window_start.clickhouse_seconds();
+    let window_end_str = window_end.clickhouse_seconds();
 
     let compiled = crate::detection_query::compile_count_query(
         &rule.query_sql,
@@ -323,11 +320,9 @@ pub async fn test_detection_query(
     tenant_id: &str,
     window_secs: i64,
 ) -> Result<(u64, String), crate::detection_query::DetectionQueryError> {
-    let now = chrono::Utc::now();
-    let window_start = (now - chrono::Duration::seconds(window_secs))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-    let window_end = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let window_start = (now - time::Duration::seconds(window_secs)).clickhouse_seconds();
+    let window_end = now.clickhouse_seconds();
 
     let compiled = crate::detection_query::compile_count_query(
         query_sql,

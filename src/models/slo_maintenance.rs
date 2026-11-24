@@ -1,5 +1,5 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// Bounds the size of the timestamp predicate in each rolling budget query.
 pub const MAX_SLO_MAINTENANCE_WINDOWS: usize = 16;
@@ -26,8 +26,10 @@ impl MaintenanceRepeat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SloMaintenanceWindow {
     pub name: String,
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ends_at: OffsetDateTime,
     #[serde(default)]
     pub repeat: MaintenanceRepeat,
 }
@@ -44,11 +46,14 @@ pub fn validate_windows(windows: &mut [SloMaintenanceWindow]) -> Result<(), Stri
             return Err("Give each maintenance window a name of up to 255 bytes.".into());
         }
         // SLO window bounds and recurrence are evaluated at UTC second precision.
-        window.starts_at = DateTime::from_timestamp(window.starts_at.timestamp(), 0)
-            .ok_or("Invalid maintenance start time.")?;
-        window.ends_at = DateTime::from_timestamp(window.ends_at.timestamp(), 0)
+        window.starts_at =
+            time::OffsetDateTime::from_unix_timestamp(window.starts_at.unix_timestamp())
+                .ok()
+                .ok_or("Invalid maintenance start time.")?;
+        window.ends_at = time::OffsetDateTime::from_unix_timestamp(window.ends_at.unix_timestamp())
+            .ok()
             .ok_or("Invalid maintenance end time.")?;
-        let duration = (window.ends_at - window.starts_at).num_seconds();
+        let duration = (window.ends_at - window.starts_at).whole_seconds();
         let limit = window
             .repeat
             .period_seconds()
@@ -88,8 +93,10 @@ pub struct SloMaintenanceEvaluation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedMaintenancePeriod {
-    pub starts_at: DateTime<Utc>,
-    pub ends_at: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ends_at: OffsetDateTime,
 }
 
 /// Produce the union of half-open intervals overlapping a rolling evaluation.
@@ -102,8 +109,8 @@ pub fn exclusion_ranges(
 ) -> Vec<MaintenanceRange> {
     let mut overlaps = Vec::new();
     for window in windows {
-        let anchor = window.starts_at.timestamp();
-        let duration = window.ends_at.timestamp() - anchor;
+        let anchor = window.starts_at.unix_timestamp();
+        let duration = window.ends_at.unix_timestamp() - anchor;
         if duration <= 0 {
             continue;
         }
@@ -149,8 +156,8 @@ impl SloMaintenanceEvaluation {
             .iter()
             .filter_map(|range| {
                 Some(AppliedMaintenancePeriod {
-                    starts_at: DateTime::from_timestamp(range.start, 0)?,
-                    ends_at: DateTime::from_timestamp(range.end.min(to), 0)?,
+                    starts_at: time::OffsetDateTime::from_unix_timestamp(range.start).ok()?,
+                    ends_at: time::OffsetDateTime::from_unix_timestamp(range.end.min(to)).ok()?,
                 })
             })
             .collect();
@@ -174,8 +181,10 @@ mod tests {
     fn window(start: i64, end: i64, repeat: MaintenanceRepeat) -> SloMaintenanceWindow {
         SloMaintenanceWindow {
             name: "Planned maintenance".into(),
-            starts_at: DateTime::from_timestamp(start, 0).unwrap(),
-            ends_at: DateTime::from_timestamp(end, 0).unwrap(),
+            starts_at: time::OffsetDateTime::from_unix_timestamp(start)
+                .ok()
+                .unwrap(),
+            ends_at: time::OffsetDateTime::from_unix_timestamp(end).ok().unwrap(),
             repeat,
         }
     }
@@ -201,7 +210,7 @@ mod tests {
         );
         let used = SloMaintenanceEvaluation::new(2, &ranges, 30, 9.0, 2.0);
         assert_eq!(used.excluded_seconds, 19);
-        assert_eq!(used.periods[1].ends_at.timestamp(), 30);
+        assert_eq!(used.periods[1].ends_at.unix_timestamp(), 30);
     }
 
     #[test]

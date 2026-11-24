@@ -1,5 +1,6 @@
 //! Read-only review candidates from bounded telemetry samples. Never return log
 //! bodies, URLs, trace IDs, metric attribute values, or fingerprints to clients.
+use crate::timestamps::{TimestampExt, from_unix_millis};
 use crate::{
     AppState, TenantContext,
     handlers::{
@@ -13,11 +14,11 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+use time::OffsetDateTime;
 
 const LIMIT: usize = 1_000;
 const MAX_FINDINGS: usize = 200;
@@ -133,7 +134,7 @@ fn signal(table: &str) -> &'static str {
     }
 }
 
-fn sample_sql(table: &str, tenant: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> String {
+fn sample_sql(table: &str, tenant: &str, from: OffsetDateTime, to: OffsetDateTime) -> String {
     assert!(SOURCES.contains(&table));
     let (fields, time, order) = match table {
         "logs" => ("ServiceName AS service, '' AS metric, toUnixTimestamp64Milli(Timestamp) AS observed_at, toUInt8(if(SeverityNumber BETWEEN 1 AND 24, SeverityNumber, transform(upperUTF8(trimBoth(SeverityText)), ['TRACE','DEBUG','INFO','INFORMATION','NOTICE','WARN','WARNING','ERROR','ERR','FATAL','CRITICAL'], [1,5,9,9,9,13,13,17,17,21,21], 0))) AS severity, cityHash64(Body) AS body_hash, toUInt64(length(Body)) AS body_bytes, toUInt8(0) AS health, toUInt8(0) AS static_asset, toUInt8(0) AS short_internal, toUInt8(0) AS span_identity, toUInt64(0) AS record_hash, toUInt64(0) AS series_hash, CAST([], 'Array(String)') AS label_keys, CAST([], 'Array(UInt64)') AS label_hashes, toUInt8(0) AS labels_capped".to_string(), "Timestamp", ""),
@@ -152,8 +153,8 @@ fn sample_sql(table: &str, tenant: &str, from: DateTime<Utc>, to: DateTime<Utc>)
         }
     };
     let tenant = escape_string_literal(tenant);
-    let from = from.format("%Y-%m-%d %H:%M:%S%.9f");
-    let to = to.format("%Y-%m-%d %H:%M:%S%.9f");
+    let from = from.clickhouse_nanos();
+    let to = to.clickhouse_nanos();
     format!(
         "SELECT {fields} FROM {table} PREWHERE tenant_id = '{tenant}' AND {time} >= toDateTime64('{from}',9,'UTC') AND {time} <= toDateTime64('{to}',9,'UTC'){order} LIMIT {}",
         LIMIT + 1
@@ -188,8 +189,8 @@ pub async fn get_advisor(
     Ok(Json(report))
 }
 async fn analyze(ch: &clickhouse::Client, tenant: &str, minutes: u32) -> WasteResponse {
-    let to = Utc::now();
-    let from = to - chrono::Duration::minutes(i64::from(minutes));
+    let to = OffsetDateTime::now_utc();
+    let from = to - time::Duration::minutes(i64::from(minutes));
     let mut records = Vec::new();
     let mut sources = Vec::new();
     for table in SOURCES {
@@ -224,7 +225,7 @@ async fn analyze(ch: &clickhouse::Client, tenant: &str, minutes: u32) -> WasteRe
 }
 
 fn timestamp(ms: i64) -> String {
-    DateTime::from_timestamp_millis(ms)
+    from_unix_millis(ms)
         .map(|v| v.to_rfc3339())
         .unwrap_or_default()
 }
@@ -311,8 +312,8 @@ fn check(checks: &mut BTreeMap<String, WasteCheck>, rule: &str, enough: bool, fo
 fn evaluate(
     records: Vec<(&str, Sample)>,
     sources: Vec<QualitySource>,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
     minutes: u32,
 ) -> WasteResponse {
     let mut groups: BTreeMap<(&str, &str), Vec<&Sample>> = BTreeMap::new();
@@ -612,7 +613,7 @@ fn evaluate(
             findings: 0,
         });
     }
-    WasteResponse { evaluated_at:Utc::now().to_rfc3339(), from:from.to_rfc3339(), to:to.to_rfc3339(),minutes,sample_limit_per_source:LIMIT,cache_hit:false,cache_ttl_seconds:60,
+    WasteResponse { evaluated_at:OffsetDateTime::now_utc().to_rfc3339(), from:from.to_rfc3339(), to:to.to_rfc3339(),minutes,sample_limit_per_source:LIMIT,cache_hit:false,cache_ttl_seconds:60,
         partial:sources.iter().any(|s|s.status!="available") || omitted_findings>0 || omitted_services>0,
         sources,rules,checks:checks.into_values().collect(),findings,finding_count,omitted_findings,services,omitted_services,
         sampled_records:records.len(),sampled_log_body_bytes:records.iter().filter(|(s,_)|*s=="logs").map(|(_,r)|r.body_bytes).sum(),
@@ -638,7 +639,7 @@ mod tests {
         }
     }
     fn run(table: &'static str, rows: Vec<Sample>) -> WasteResponse {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         evaluate(
             rows.into_iter().map(|r| (table, r)).collect(),
             SOURCES
@@ -651,7 +652,7 @@ mod tests {
                     capped: false,
                 })
                 .collect(),
-            now - chrono::Duration::hours(1),
+            now - time::Duration::hours(1),
             now,
             60,
         )
@@ -905,7 +906,7 @@ mod tests {
     }
     #[test]
     fn unavailable_sources_and_sparse_data_are_never_a_clean_assessment() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let report = evaluate(
             vec![],
             vec![QualitySource {
@@ -925,7 +926,7 @@ mod tests {
     }
     #[test]
     fn queries_are_bounded_scoped_and_return_metadata_instead_of_messages() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         for table in SOURCES {
             let sql = sample_sql(table, "tenant' OR 1", now, now);
             assert!(sql.contains("tenant_id = 'tenant'' OR 1'"));
@@ -955,11 +956,11 @@ mod tests {
             .with_user(std::env::var("RUSH_TEST_CLICKHOUSE_USER").unwrap_or("default".into()))
             .with_password(std::env::var("RUSH_TEST_CLICKHOUSE_PASSWORD").unwrap_or_default());
         let tenant = std::env::var("RUSH_TEST_TENANT").unwrap_or("default".into());
-        let to = Utc::now();
+        let to = OffsetDateTime::now_utc();
         for table in SOURCES {
             let rows = read_bounded::<Sample>(
                 &client,
-                &sample_sql(table, &tenant, to - chrono::Duration::hours(24), to),
+                &sample_sql(table, &tenant, to - time::Duration::hours(24), to),
                 &tenant,
             )
             .await

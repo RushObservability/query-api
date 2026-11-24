@@ -1,16 +1,17 @@
+use crate::timestamps::{DATE, TimestampExt};
 use axum::{
     Extension, Json,
     extract::{Query, State},
     http::StatusCode,
 };
-use chrono::{DateTime, Days, NaiveDate, Utc};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use time::{Date, Duration, OffsetDateTime};
 
 use crate::{AppState, TenantContext, api_error::internal_legacy, tenant_query};
 
-const COHORT_WEEKS: u64 = 6;
+const COHORT_WEEKS: i64 = 6;
 const FOLLOW_UP_WEEKS: usize = 5;
 const MAX_ACTION_BYTES: usize = 256;
 
@@ -69,29 +70,30 @@ pub struct CohortRequest {
 
 #[derive(Clone, Copy)]
 struct ReportWindow {
-    now: DateTime<Utc>,
-    history_start: DateTime<Utc>,
-    coverage_start: DateTime<Utc>,
-    cohort_start: NaiveDate,
-    cohort_end: NaiveDate,
+    now: OffsetDateTime,
+    history_start: OffsetDateTime,
+    coverage_start: OffsetDateTime,
+    cohort_start: Date,
+    cohort_end: Date,
+}
+
+fn week_start(day: Date) -> Date {
+    day - Duration::days(i64::from(day.weekday().number_days_from_monday()))
 }
 
 impl ReportWindow {
-    fn new(now: DateTime<Utc>, retention_days: u32) -> Self {
-        let history_start = now - Days::new(retention_days.into());
-        let cohort_end = now.date_naive().week(chrono::Weekday::Mon).first_day();
-        let earliest_week = cohort_end - Days::new(7 * COHORT_WEEKS);
-        let earliest_start = earliest_week.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    fn new(now: OffsetDateTime, retention_days: u32) -> Self {
+        let history_start = now - Duration::days(i64::from(retention_days));
+        let cohort_end = week_start(now.date());
+        let earliest_week = cohort_end - Duration::weeks(COHORT_WEEKS);
+        let earliest_start = earliest_week.midnight().assume_utc();
         let coverage_start = history_start.max(earliest_start);
-        let retained_week = coverage_start
-            .date_naive()
-            .week(chrono::Weekday::Mon)
-            .first_day();
-        let retained_week_start = retained_week.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let retained_week = week_start(coverage_start.date());
+        let retained_week_start = retained_week.midnight().assume_utc();
         let first_complete_week = if retained_week_start == coverage_start {
             retained_week
         } else {
-            retained_week + Days::new(7)
+            retained_week + Duration::WEEK
         };
         Self {
             now,
@@ -117,19 +119,26 @@ struct IdentityCoverage {
     missing_user_id_sessions: u64,
 }
 
+time::serde::format_description!(serde_date, Date, DATE);
+
 #[derive(Debug, Serialize)]
 struct Cohort {
-    week_start: NaiveDate,
+    #[serde(with = "serde_date")]
+    week_start: Date,
     new_users: u64,
     returned: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CohortReport {
-    as_of: DateTime<Utc>,
-    cohort_start: NaiveDate,
-    cohort_end: NaiveDate,
-    coverage_start: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    as_of: OffsetDateTime,
+    #[serde(with = "serde_date")]
+    cohort_start: Date,
+    #[serde(with = "serde_date")]
+    cohort_end: Date,
+    #[serde(with = "time::serde::rfc3339")]
+    coverage_start: OffsetDateTime,
     coverage: IdentityCoverage,
     first_actions: BTreeSet<String>,
     cohorts: Vec<Cohort>,
@@ -161,7 +170,7 @@ pub async fn returning_users(
         .find(|(signal, days)| signal == "traces" && *days > 0)
         .map_or(global_days, |(_, days)| global_days.min(*days as u32))
         .max(1);
-    let window = ReportWindow::new(Utc::now(), retention_days);
+    let window = ReportWindow::new(OffsetDateTime::now_utc(), retention_days);
     let query = |sql| tenant_query(&state.ch, sql, tenant_id);
     fetch_report(
         query(COHORT_SQL),
@@ -187,7 +196,7 @@ async fn fetch_report(
             return Ok(Vec::new());
         }
         cohort_query
-            .bind(window.history_start.timestamp_millis())
+            .bind(window.history_start.unix_millis())
             .bind(window.cohort_start.to_string())
             .bind(window.cohort_end.to_string())
             .bind(&req.first_action)
@@ -199,8 +208,8 @@ async fn fetch_report(
             .await
     };
     let coverage = coverage_query
-        .bind(window.coverage_start.timestamp_millis())
-        .bind(window.now.timestamp_millis())
+        .bind(window.coverage_start.unix_millis())
+        .bind(window.now.unix_millis())
         .bind(tenant)
         .bind(&req.app_name)
         .fetch_one::<IdentityCoverage>();
@@ -213,13 +222,13 @@ async fn fetch_report(
         if row.new_users == 0 {
             continue;
         }
-        let week_start = row.week_start.parse::<NaiveDate>()?;
+        let week_start = Date::parse(&row.week_start, DATE)?;
         let returned = row
             .returned
             .into_iter()
-            .zip(1..=FOLLOW_UP_WEEKS as u64)
+            .zip(1..=FOLLOW_UP_WEEKS as i64)
             .map(|(count, week)| {
-                (week_start + Days::new(7 * week) < window.cohort_end).then_some(count)
+                (week_start + Duration::weeks(week) < window.cohort_end).then_some(count)
             })
             .collect();
         cohorts.push(Cohort {
@@ -242,10 +251,11 @@ async fn fetch_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timestamps::parse_rfc3339;
     use clickhouse::Client;
 
-    fn report_time() -> DateTime<Utc> {
-        "2026-11-23T12:00:00Z".parse().unwrap()
+    fn report_time() -> OffsetDateTime {
+        parse_rfc3339("2026-11-23T12:00:00Z").unwrap()
     }
 
     #[test]
@@ -261,7 +271,7 @@ mod tests {
         assert_eq!(standard.cohort_start.to_string(), "2026-10-26");
         let short = ReportWindow::new(report_time(), 3);
         assert_eq!(short.cohort_start, short.cohort_end);
-        let monday = ReportWindow::new("2026-11-23T00:00:00Z".parse().unwrap(), 28);
+        let monday = ReportWindow::new(parse_rfc3339("2026-11-23T00:00:00Z").unwrap(), 28);
         assert_eq!(monday.cohort_start.to_string(), "2026-10-26");
     }
 

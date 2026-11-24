@@ -1,3 +1,4 @@
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use std::sync::atomic::Ordering;
 
 use clickhouse::Client;
@@ -10,10 +11,12 @@ mod benchmark;
 fn request(from: i64, to: i64, filters: Vec<Filter>) -> RumQueryRequest {
     RumQueryRequest {
         time_range: crate::models::query::TimeRange {
-            from: chrono::DateTime::from_timestamp(from, 0)
+            from: time::OffsetDateTime::from_unix_timestamp(from)
+                .ok()
                 .unwrap()
                 .to_rfc3339(),
-            to: chrono::DateTime::from_timestamp(to, 0)
+            to: time::OffsetDateTime::from_unix_timestamp(to)
+                .ok()
                 .unwrap()
                 .to_rfc3339(),
         },
@@ -214,7 +217,7 @@ async fn rollups_preserve_sessions_bounds_filters_and_retention() -> anyhow::Res
         .await?;
     let result: anyhow::Result<()> = async {
         admin.query(&raw_ddl(&database, "rum")?).execute().await?;
-        let base = chrono::Utc::now().timestamp() / 300 * 300 - 36 * 3600;
+        let base = time::OffsetDateTime::now_utc().unix_timestamp() / 300 * 300 - 36 * 3600;
         // Boundaries, shared sessions across buckets, empty session IDs, varied
         // durations and all vital ratings. Neighbouring rows outside the exact
         // bounds must not enter through their aggregate bucket.
@@ -292,13 +295,13 @@ async fn rollups_preserve_sessions_bounds_filters_and_retention() -> anyhow::Res
         parity(&read, &request(base, base + 1800, vec![])).await?;
         parity(&read, &request(base + 172800, base + 259200, vec![])).await?;
         let mut fractional = request(base + 17, base + 115223, req.filters.clone());
-        fractional.time_range.from = chrono::DateTime::from_timestamp(base + 17, 500_000_000).unwrap().to_rfc3339();
-        fractional.time_range.to = chrono::DateTime::from_timestamp(base + 115223, 900_000_000).unwrap().to_rfc3339();
+        fractional.time_range.from = (time::OffsetDateTime::from_unix_timestamp(base + 17)? + time::Duration::milliseconds(500)).to_rfc3339();
+        fractional.time_range.to = (time::OffsetDateTime::from_unix_timestamp(base + 115223)? + time::Duration::milliseconds(900)).to_rfc3339();
         parity(&read, &fractional).await?;
-        let offset = chrono::FixedOffset::east_opt(19800).unwrap();
+        let offset = time::UtcOffset::from_hms(5, 30, 0)?;
         let mut zoned = request(base + 17, base + 115223, req.filters.clone());
-        zoned.time_range.from = chrono::DateTime::parse_from_rfc3339(&zoned.time_range.from)?.with_timezone(&offset).to_rfc3339();
-        zoned.time_range.to = chrono::DateTime::parse_from_rfc3339(&zoned.time_range.to)?.with_timezone(&offset).to_rfc3339();
+        zoned.time_range.from = parse_rfc3339(&zoned.time_range.from)?.to_offset(offset).to_rfc3339();
+        zoned.time_range.to = parse_rfc3339(&zoned.time_range.to)?.to_offset(offset).to_rfc3339();
         parity(&read, &zoned).await?;
         // Late data lands in an old summary bucket without a separate-table race.
         admin.query(&format!("INSERT INTO {database}.rum (tenant_id, Timestamp, AppName, Environment, PagePath, SessionId, EventType, DurationMs) VALUES ('a', fromUnixTimestamp64Second({}), 'shop', 'prod', '/', 'late', 'pageview', 400)", base + 900)).execute().await?;

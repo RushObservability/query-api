@@ -4,6 +4,7 @@
 //! parses SAML Response assertions, generates SP metadata XML, and
 //! verifies XML signatures against the IdP X.509 certificate.
 
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use flate2::{Compression, write::DeflateEncoder};
 use quick_xml::events::{BytesStart, Event};
@@ -47,7 +48,7 @@ pub fn build_authn_request(
     acs_url: &str,
     idp_sso_url: &str,
 ) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let now = time::OffsetDateTime::now_utc().utc_seconds();
 
     format!(
         r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{request_id}" Version="2.0" IssueInstant="{now}" Destination="{idp_sso_url}" AssertionConsumerServiceURL="{acs_url}" ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"><saml:Issuer>{sp_entity_id}</saml:Issuer></samlp:AuthnRequest>"#,
@@ -373,8 +374,8 @@ fn attribute(
 }
 
 fn parse_saml_time(value: &str, field: &str) -> Result<i64, String> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|value| value.timestamp())
+    parse_rfc3339(value)
+        .map(|value| value.unix_timestamp())
         .map_err(|_| format!("SAML {field} is not a valid RFC3339 timestamp"))
 }
 

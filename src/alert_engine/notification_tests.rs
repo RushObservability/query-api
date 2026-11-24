@@ -2,6 +2,7 @@
 //! Run with: cargo test --lib alert_engine::notification_tests
 
 use super::*;
+use crate::timestamps::parse_rfc3339;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -358,10 +359,8 @@ async fn recovery_payloads_and_identity_are_preserved_for_every_http_channel() {
                 )),
                 "alertmanager" => {
                     assert_eq!(body[0]["labels"], fired[0]["labels"]);
-                    let ends =
-                        chrono::DateTime::parse_from_rfc3339(body[0]["endsAt"].as_str().unwrap())
-                            .unwrap();
-                    assert!(ends <= chrono::Utc::now());
+                    let ends = parse_rfc3339(body[0]["endsAt"].as_str().unwrap()).unwrap();
+                    assert!(ends <= time::OffsetDateTime::now_utc());
                     assert!(body[0].get("status").is_none());
                 }
                 "rootly" => {

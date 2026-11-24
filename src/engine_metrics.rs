@@ -68,7 +68,7 @@ impl Drop for EvaluationObservation<'_> {
                 metrics.set_gauge(
                     "rush_engine_evaluation_last_success_timestamp_seconds",
                     &[("engine", self.engine)],
-                    chrono::Utc::now().timestamp() as f64,
+                    time::OffsetDateTime::now_utc().unix_timestamp() as f64,
                 );
             }
         }

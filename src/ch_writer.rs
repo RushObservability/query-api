@@ -910,7 +910,7 @@ impl ChWriter {
                         self.metrics.set_gauge(
                             "rush_ingest_replay_last_success_timestamp_seconds",
                             &[("backend", backend)],
-                            chrono::Utc::now().timestamp() as f64,
+                            time::OffsetDateTime::now_utc().unix_timestamp() as f64,
                         );
                     }
                     tracing::info!(records = n, "replayer: batch replayed and committed");

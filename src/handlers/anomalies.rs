@@ -1,3 +1,4 @@
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -54,21 +55,15 @@ pub async fn analyze_anomaly_event(
     let re = regex::Regex::new(r#"status_code="(\d+)""#).unwrap();
     if let Some(caps) = re.captures(&event.metric) {
         if let Ok(status_code) = caps[1].parse::<u16>() {
-            let event_ts =
-                chrono::NaiveDateTime::parse_from_str(&event.created_at, "%Y-%m-%dT%H:%M:%SZ")
-                    .or_else(|_| {
-                        chrono::NaiveDateTime::parse_from_str(
-                            &event.created_at,
-                            "%Y-%m-%dT%H:%M:%S%.fZ",
-                        )
-                    })
-                    .ok();
+            let event_ts = parse_rfc3339(&event.created_at)
+                .map(|value| value.to_offset(time::UtcOffset::UTC))
+                .ok();
 
             if let Some(ts) = event_ts {
-                let from = ts - chrono::Duration::minutes(5);
-                let to = ts + chrono::Duration::minutes(5);
-                let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
-                let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
+                let from = ts - time::Duration::minutes(5);
+                let to = ts + time::Duration::minutes(5);
+                let from_str = from.clickhouse_seconds();
+                let to_str = to.clickhouse_seconds();
 
                 // Service breakdown
                 let svc_query = format!(
@@ -516,15 +511,13 @@ pub async fn get_event_correlations(
     };
 
     // 3. Compute ±5 min window
-    let event_ts = chrono::NaiveDateTime::parse_from_str(&event.created_at, "%Y-%m-%dT%H:%M:%SZ")
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(&event.created_at, "%Y-%m-%dT%H:%M:%S%.fZ")
-        })
+    let event_ts = parse_rfc3339(&event.created_at)
+        .map(|value| value.to_offset(time::UtcOffset::UTC))
         .map_err(|e| crate::api_error::internal_legacy("anomalies.event_timestamp", e))?;
-    let from = event_ts - chrono::Duration::minutes(5);
-    let to = event_ts + chrono::Duration::minutes(5);
-    let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
-    let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
+    let from = event_ts - time::Duration::minutes(5);
+    let to = event_ts + time::Duration::minutes(5);
+    let from_str = from.clickhouse_seconds();
+    let to_str = to.clickhouse_seconds();
 
     // 4. ClickHouse query — service breakdown with 1-minute buckets
     let bucket_query = format!(

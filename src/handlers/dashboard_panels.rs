@@ -1,4 +1,5 @@
 //! Read-only, tenant-scoped data for dashboard pattern and scatter panels.
+use crate::timestamps::parse_rfc3339;
 use axum::{Extension, Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -40,9 +41,7 @@ pub struct PatternRow {
 }
 
 fn validate(range: &TimeRange, filters: &[Filter]) -> Result<(), ApiError> {
-    if chrono::DateTime::parse_from_rfc3339(&range.from).is_err()
-        || chrono::DateTime::parse_from_rfc3339(&range.to).is_err()
-    {
+    if parse_rfc3339(&range.from).is_err() || parse_rfc3339(&range.to).is_err() {
         return Err(bad("Panel time ranges must use RFC3339 timestamps"));
     }
     let max_range = crate::query_governor::active_budget()
@@ -84,7 +83,7 @@ fn pattern_sql(req: &PatternRequest, tenant: &str) -> Result<String, ApiError> {
     )
     .map_err(|_| bad("Invalid time range"))?;
     // At most ~60 sparkline buckets per pattern, including for a month-long window.
-    let step = ((range.to - range.from).num_seconds().max(1) / 60).max(1);
+    let step = ((range.to - range.from).whole_seconds().max(1) / 60).max(1);
     let template = super::services::LOG_BODY_TEMPLATE;
     Ok(format!(
         "SELECT service, severity, template, argMax(sample_body, last_timestamp) AS example, \

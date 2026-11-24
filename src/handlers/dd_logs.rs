@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension, Json,
     body::Bytes,
@@ -97,7 +98,7 @@ async fn ingest_logs_inner(
         .ingest_limits
         .check_entities("datadog", entries.len())?;
 
-    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc refactor: tenant_id + the constant scope fields are shared across all
     // entries in this request — allocate each once and Arc-clone per row.

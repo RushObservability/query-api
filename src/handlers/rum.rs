@@ -1,6 +1,7 @@
 mod cohorts;
 pub use cohorts::returning_users;
 
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -310,7 +311,7 @@ pub(super) async fn ingest_events(
         .check_entities("rum", payload.events.len())?;
     let tenant_id = &tenant.tenant_id;
     let meta = &payload.meta;
-    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Build all rum rows and write via the durable writer.
     let rum_rows: Vec<RumRecord> = payload
@@ -771,7 +772,7 @@ pub async fn ingest_replay(
             .malformed("rum", "invalid RUM replay events")
     })?;
 
-    let chunk_ts = chrono::Utc::now().timestamp_millis();
+    let chunk_ts = time::OffsetDateTime::now_utc().unix_millis();
 
     let row = RumReplayChunk {
         tenant_id: tenant.tenant_id.clone(),

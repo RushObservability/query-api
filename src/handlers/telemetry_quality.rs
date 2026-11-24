@@ -1,5 +1,6 @@
 //! Bounded telemetry-quality checks. Findings describe the sample,
 //! not the population. Never fetch log bodies or return metric label values.
+use crate::timestamps::{TimestampExt, from_unix_millis};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -8,9 +9,9 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 
 use crate::handlers::users::require_principal;
 use crate::instrumentation_score::{
@@ -311,11 +312,11 @@ pub(crate) fn validated_minutes(params: &QualityParams) -> Result<u32, (StatusCo
 
 /// Table names come only from SOURCES. Tenant predicates and row policies both
 /// apply; clients cannot select a global scope or a different tenant here.
-fn sample_sql(table: &str, tenant: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> String {
+fn sample_sql(table: &str, tenant: &str, from: OffsetDateTime, to: OffsetDateTime) -> String {
     assert!(SOURCES.contains(&table));
     let tenant = escape_string_literal(tenant);
-    let from = from.format("%Y-%m-%d %H:%M:%S%.9f");
-    let to = to.format("%Y-%m-%d %H:%M:%S%.9f");
+    let from = from.clickhouse_nanos();
+    let to = to.clickhouse_nanos();
     let (fields, time) = if table == "spans" {
         // Empty legacy resource metadata remains unknown, not a failed check.
         ("service_name AS service, if(notEmpty(resource_attributes), JSONExtractString(resource_attributes, 'service.version'), JSONExtractString(attributes, 'service.version')) AS version, \
@@ -478,8 +479,8 @@ pub(crate) async fn analyze(
     tenant: &str,
     minutes: u32,
 ) -> QualityResponse {
-    let to = Utc::now();
-    let from = to - chrono::Duration::minutes(i64::from(minutes));
+    let to = OffsetDateTime::now_utc();
+    let from = to - time::Duration::minutes(i64::from(minutes));
     let mut records = Vec::new();
     let mut sources = Vec::new();
     // Sequential small reads avoid multiplying a single page's CH concurrency.
@@ -564,7 +565,7 @@ impl Tally {
 }
 
 fn timestamp(ms: i64) -> String {
-    DateTime::from_timestamp_millis(ms)
+    from_unix_millis(ms)
         .map(|t| t.to_rfc3339())
         .unwrap_or_default()
 }
@@ -652,8 +653,8 @@ fn evaluate(
     sources: Vec<QualitySource>,
     known: Vec<String>,
     inventory_available: bool,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
     minutes: u32,
 ) -> QualityResponse {
     let definitions = rules();
@@ -996,7 +997,7 @@ fn evaluate(
         instrumentation_score: standard::mean(&service_scores),
         standard_rules,
         history: vec![], history_available: false, history_capped: false, scheduled_at: None, cache_hit: false,
-        evaluated_at: Utc::now().to_rfc3339(),
+        evaluated_at: OffsetDateTime::now_utc().to_rfc3339(),
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
         minutes,
@@ -1045,13 +1046,13 @@ pub(crate) mod tests {
         }
     }
     fn run(records: Vec<(&str, Sample)>, known: Vec<String>) -> QualityResponse {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         evaluate(
             records,
             vec![],
             known,
             true,
-            now - chrono::Duration::hours(1),
+            now - time::Duration::hours(1),
             now,
             60,
         )
@@ -1186,7 +1187,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn unavailable_sources_are_partial_not_healthy() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let r = evaluate(
             vec![],
             vec![QualitySource {
@@ -1207,7 +1208,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn queries_are_scoped_bounded_and_do_not_read_log_bodies() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         for source in SOURCES {
             let sql = sample_sql(source, "a'b", now, now);
             assert!(sql.contains("tenant_id = 'a''b'"));
@@ -1359,11 +1360,11 @@ pub(crate) mod tests {
             .with_user(std::env::var("RUSH_TEST_CLICKHOUSE_USER").unwrap_or("default".into()))
             .with_password(std::env::var("RUSH_TEST_CLICKHOUSE_PASSWORD").unwrap_or_default());
         let tenant = std::env::var("RUSH_TEST_TENANT").unwrap_or("default".into());
-        let to = Utc::now();
+        let to = OffsetDateTime::now_utc();
         for table in SOURCES {
             let rows = read_sample(
                 &client,
-                &sample_sql(table, &tenant, to - chrono::Duration::hours(24), to),
+                &sample_sql(table, &tenant, to - time::Duration::hours(24), to),
                 &tenant,
             )
             .await

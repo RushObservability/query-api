@@ -9,10 +9,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
-use chrono::{DateTime, Utc};
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 
 use crate::handlers::{
     log_views::ensure_requested_tenant, telemetry_quality::read_bounded, users::require_admin,
@@ -368,8 +368,8 @@ struct RouteResult {
 
 #[derive(Debug, Serialize)]
 pub struct PreviewResponse {
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
     window_minutes: u32,
     settling_seconds: i64,
     coverage: Coverage,
@@ -422,21 +422,25 @@ pub struct OptionRow {
 
 #[derive(Debug, Copy, Clone)]
 struct Window {
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
     from_ns: i128,
     to_ns: i128,
 }
 
 impl Window {
-    fn new(minutes: u32, now: DateTime<Utc>) -> Self {
+    fn new(minutes: u32, now: OffsetDateTime) -> Self {
         // Whole minutes make the coverage denominator precise. Let recent
         // spans settle before sampling, then look beyond both window edges.
-        let end = now.timestamp().div_euclid(60) * 60 - SETTLE_SECONDS;
+        let end = now.unix_timestamp().div_euclid(60) * 60 - SETTLE_SECONDS;
         let start = end - i64::from(minutes) * 60;
         Self {
-            from: DateTime::from_timestamp(start, 0).expect("valid sample start"),
-            to: DateTime::from_timestamp(end, 0).expect("valid sample end"),
+            from: time::OffsetDateTime::from_unix_timestamp(start)
+                .ok()
+                .expect("valid sample start"),
+            to: time::OffsetDateTime::from_unix_timestamp(end)
+                .ok()
+                .expect("valid sample end"),
             from_ns: i128::from(start) * 1_000_000_000,
             to_ns: i128::from(end) * 1_000_000_000,
         }
@@ -475,7 +479,7 @@ pub async fn preview(
     let _query = state
         .self_metrics
         .query_guard("trace_sampling.preview", "spans");
-    let window = Window::new(policy.window_minutes, Utc::now());
+    let window = Window::new(policy.window_minutes, OffsetDateTime::now_utc());
     // The preview receives only the tenant-scoped SELECT client. No policy
     // object or decision is stored or made available to the ingest pipeline.
     let response = tokio::time::timeout(
@@ -510,7 +514,7 @@ pub async fn options(
     let _query = state
         .self_metrics
         .query_guard("trace_sampling.options", "spans");
-    let window = Window::new(params.window_minutes, Utc::now());
+    let window = Window::new(params.window_minutes, OffsetDateTime::now_utc());
     let limit = crate::query_governor::active_budget().map_or(MAX_OPTION_ROWS, |budget| {
         MAX_OPTION_ROWS.min(budget.max_result_rows as usize)
     });
@@ -552,8 +556,8 @@ pub async fn options(
 
 fn options_sql(tenant: &str, window: Window, limit: usize) -> String {
     let tenant = escape_string_literal(tenant);
-    let from = window.from.timestamp();
-    let to = window.to.timestamp();
+    let from = window.from.unix_timestamp();
+    let to = window.to.unix_timestamp();
     // Aggregate combinations from the same stored span. Never suggest raw URLs.
     format!(
         "SELECT service, method, route, http_status, root, server
@@ -574,8 +578,8 @@ fn options_sql(tenant: &str, window: Window, limit: usize) -> String {
 
 fn discovery_sql(tenant: &str, window: Window, limit: usize) -> String {
     let tenant = escape_string_literal(tenant);
-    let from = window.from.timestamp();
-    let to = window.to.timestamp();
+    let from = window.from.unix_timestamp();
+    let to = window.to.unix_timestamp();
     format!(
         "SELECT if(length(spans.trace_id) = 32, spans.trace_id, '') AS trace_id,
                 intDiv(toUnixTimestamp64Milli(timestamp), 60000) AS minute
@@ -595,8 +599,8 @@ fn lookup_sql(
     rules: &[Rule],
 ) -> String {
     let tenant = escape_string_literal(tenant);
-    let from = window.from.timestamp() - SETTLE_SECONDS;
-    let to = window.to.timestamp() + SETTLE_SECONDS;
+    let from = window.from.unix_timestamp() - SETTLE_SECONDS;
+    let to = window.to.unix_timestamp() + SETTLE_SECONDS;
     let ids = ids
         .iter()
         .map(|id| format!("'{}'", escape_string_literal(id)))
@@ -924,7 +928,12 @@ mod tests {
     use super::*;
 
     fn window() -> Window {
-        Window::new(15, DateTime::from_timestamp(1_702_123_401, 0).unwrap())
+        Window::new(
+            15,
+            time::OffsetDateTime::from_unix_timestamp(1_702_123_401)
+                .ok()
+                .unwrap(),
+        )
     }
 
     fn span(id: u8, parent: u8) -> Span {

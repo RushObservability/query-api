@@ -1,3 +1,4 @@
+use crate::timestamps::{TimestampExt, parse_clickhouse};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, clickhouse::Row, Serialize, Deserialize)]
@@ -75,10 +76,9 @@ pub struct KubernetesSessionChunkView {
 
 impl From<KubernetesSessionChunk> for KubernetesSessionChunkView {
     fn from(row: KubernetesSessionChunk) -> Self {
-        let created_at =
-            chrono::NaiveDateTime::parse_from_str(&row.created_at, "%Y-%m-%d %H:%M:%S")
-                .map(|value| value.and_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                .unwrap_or(row.created_at);
+        let created_at = parse_clickhouse(&row.created_at)
+            .map(|value| value.utc_seconds())
+            .unwrap_or(row.created_at);
         Self {
             id: row.id,
             session_id: row.session_id,
@@ -168,8 +168,8 @@ impl From<KubernetesAccessEvent> for KubernetesAccessEventView {
         }
 
         fn utc_timestamp(raw: &str) -> String {
-            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
-                .map(|value| value.and_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            parse_clickhouse(raw)
+                .map(|value| value.utc_seconds())
                 .unwrap_or_else(|_| raw.to_string())
         }
 

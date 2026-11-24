@@ -1,6 +1,7 @@
 //! RUM summaries stored as aggregate projections on the source table. Complete
 //! buckets use mergeable states; partial buckets retain raw bounds.
 
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use std::collections::HashMap;
 use std::sync::{
     Mutex,
@@ -306,12 +307,8 @@ fn filters(kind: Kind, req: &RumQueryRequest) -> Vec<Filter> {
 fn full_bucket_window(req: &RumQueryRequest, kind: Kind) -> Option<(i64, i64)> {
     // Existing RUM predicates use parseDateTimeBestEffort, which has second
     // precision. Match those effective bounds, including the inclusive end.
-    let from = chrono::DateTime::parse_from_rfc3339(&req.time_range.from)
-        .ok()?
-        .timestamp();
-    let to = chrono::DateTime::parse_from_rfc3339(&req.time_range.to)
-        .ok()?
-        .timestamp();
+    let from = parse_rfc3339(&req.time_range.from).ok()?.unix_timestamp();
+    let to = parse_rfc3339(&req.time_range.to).ok()?.unix_timestamp();
     let minimum_span = match kind {
         Kind::Pages => MIN_ROLLUP_SPAN_SECS,
         Kind::Vitals => 24 * 3600,
@@ -367,10 +364,12 @@ fn rollup_sql(
         conditions,
         kind.dimensions(),
     );
-    let start = chrono::DateTime::from_timestamp(from, 0)
+    let start = time::OffsetDateTime::from_unix_timestamp(from)
+        .ok()
         .expect("validated RUM bucket timestamp")
         .to_rfc3339();
-    let end = chrono::DateTime::from_timestamp(to, 0)
+    let end = time::OffsetDateTime::from_unix_timestamp(to)
+        .ok()
         .expect("validated RUM bucket timestamp")
         .to_rfc3339();
     // Separate PREWHERE ranges are essential: an OR over Timestamp with a

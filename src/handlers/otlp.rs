@@ -13,6 +13,7 @@
 ///   application/x-protobuf  → prost Message::decode (primary)
 ///   application/json        → 415 Unsupported Media Type (OTLP JSON not supported)
 ///   Missing / other         → attempt protobuf decode; 400 on failure
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension,
     body::Bytes,
@@ -524,7 +525,7 @@ pub async fn ingest_otlp_logs(
 
     let mut rows: Vec<LogInsertRow> = Vec::new();
 
-    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc refactor: tenant_id is shared across the whole batch — allocate once.
     let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
@@ -1105,7 +1106,7 @@ pub async fn ingest_vector_logs(
         })?;
     state.ingest_limits.check_entities("otlp", entity_count)?;
 
-    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc refactor: tenant_id is shared across all entries; the empty scope
     // strings/attrs are shared constants — allocate each once per request.

@@ -1,3 +1,4 @@
+use crate::timestamps::{TimestampExt, parse_clickhouse};
 use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
@@ -2632,7 +2633,7 @@ impl ConfigDb {
             idle_timeout_seconds: policy.idle_timeout_secs,
             activity_interval_seconds: policy.activity_touch_interval_secs(),
             idle_remaining_seconds: deadline
-                .saturating_sub(chrono::Utc::now().timestamp())
+                .saturating_sub(time::OffsetDateTime::now_utc().unix_timestamp())
                 .max(0),
         })
     }
@@ -3634,7 +3635,7 @@ impl ConfigDb {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn now_str() -> String {
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        time::OffsetDateTime::now_utc().clickhouse_seconds()
     }
 
     fn next_version() -> u64 {
@@ -3651,7 +3652,7 @@ impl ConfigDb {
     /// An ambiguous insert failure is checked by key and always fails closed.
     /// Local mode uses the same contract inside the sole permitted replica.
     pub async fn claim_sso_key_once(&self, key: &str, expires_at: i64) -> anyhow::Result<bool> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if expires_at <= now {
             return Ok(false);
         }
@@ -3737,7 +3738,7 @@ impl ConfigDb {
     /// one-way representation as replay claims, so session identifiers are not
     /// recoverable from ClickHouse or its query logs.
     pub async fn revoke_sso_setup_session(&self, key: &str, expires_at: i64) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if expires_at <= now {
             anyhow::bail!("cannot revoke an expired SSO setup session");
         }
@@ -3765,7 +3766,7 @@ impl ConfigDb {
                 "SELECT count() AS count FROM config_sso_setup_revocations WHERE claim_key = ? AND expires_at > ?",
             )
             .bind(sso_claim_storage_key(key))
-            .bind(chrono::Utc::now().timestamp())
+            .bind(time::OffsetDateTime::now_utc().unix_timestamp())
             .fetch_one::<ClaimCount>()
             .await?;
         Ok(row.count > 0)
@@ -4810,15 +4811,12 @@ impl ConfigDb {
         };
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
-        let created_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
-        let absolute_expires = now + chrono::Duration::seconds(policy.absolute_timeout_secs);
-        let idle_expires = now + chrono::Duration::seconds(policy.idle_timeout_secs);
-        let expires_at = idle_expires
-            .min(absolute_expires)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        let absolute_expires_at = absolute_expires.format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = time::OffsetDateTime::now_utc();
+        let created_at = now.clickhouse_seconds();
+        let absolute_expires = now + time::Duration::seconds(policy.absolute_timeout_secs);
+        let idle_expires = now + time::Duration::seconds(policy.idle_timeout_secs);
+        let expires_at = idle_expires.min(absolute_expires).clickhouse_seconds();
+        let absolute_expires_at = absolute_expires.clickhouse_seconds();
         let stored_token = session_storage_key(&self.session_hmac_secret, &token);
         self.client
             .query("INSERT INTO config_sessions (token, session_id, user_id, user_version, auth_method, provider_id, sso_revision, created_at, last_seen_at, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -4921,10 +4919,9 @@ impl ConfigDb {
         // Fail closed on a policy-store error. Lowering the global timeout
         // applies to existing sessions too, without reviving expired bearers.
         let policy = self.effective_session_policy().await.ok()?;
-        let idle_cutoff = (chrono::Utc::now()
-            - chrono::Duration::seconds(policy.idle_timeout_secs))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+        let idle_cutoff = (time::OffsetDateTime::now_utc()
+            - time::Duration::seconds(policy.idle_timeout_secs))
+        .clickhouse_seconds();
         let stored_token = delegated_storage_key
             .map(str::to_owned)
             .unwrap_or_else(|| session_storage_key(&self.session_hmac_secret, token));
@@ -5052,10 +5049,9 @@ impl ConfigDb {
         current_token: &str,
     ) -> anyhow::Result<Vec<AuthSessionInfo>> {
         let policy = self.effective_session_policy().await?;
-        let idle_cutoff = (chrono::Utc::now()
-            - chrono::Duration::seconds(policy.idle_timeout_secs))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+        let idle_cutoff = (time::OffsetDateTime::now_utc()
+            - time::Duration::seconds(policy.idle_timeout_secs))
+        .clickhouse_seconds();
         let now = Self::now_str();
         let base = "SELECT s.session_id, s.user_id, u.username, u.tenant_id, s.auth_method, s.provider_id, s.sso_revision, s.created_at, s.last_seen_at, s.expires_at, s.absolute_expires_at, s.token FROM config_sessions s JOIN config_users u FINAL ON s.user_id = u.id WHERE s.session_id != '' AND s.user_version = u.version AND u.enabled = 1 AND u.is_deleted = 0 AND s.expires_at > ? AND s.absolute_expires_at > ? AND s.session_id NOT IN (SELECT session_id FROM config_session_revocations WHERE expires_at > ?) AND s.token NOT IN (SELECT token FROM config_session_rotation_grace WHERE grace_expires_at <= ?)";
         let base = format!("{base} AND s.last_seen_at > ?");
@@ -5109,11 +5105,9 @@ impl ConfigDb {
             .into_iter()
             .filter(|row| seen.insert(row.session_id.clone()))
             .map(|mut row| {
-                let last_seen =
-                    chrono::NaiveDateTime::parse_from_str(&row.last_seen_at, "%Y-%m-%d %H:%M:%S")?;
-                let deadline = (last_seen + chrono::Duration::seconds(policy.idle_timeout_secs))
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string();
+                let last_seen = parse_clickhouse(&row.last_seen_at)?;
+                let deadline = (last_seen + time::Duration::seconds(policy.idle_timeout_secs))
+                    .clickhouse_seconds();
                 row.expires_at = row.expires_at.min(deadline);
                 Ok(row.into_info(&self.session_hmac_secret, current_token))
             })
@@ -5204,9 +5198,9 @@ impl ConfigDb {
             absolute_expires_at: String,
         }
 
-        let now = chrono::Utc::now();
-        let now_unix = now.timestamp();
-        let now_string = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = time::OffsetDateTime::now_utc();
+        let now_unix = now.unix_timestamp();
+        let now_string = now.clickhouse_seconds();
         let stored_token = session_storage_key(&self.session_hmac_secret, token);
         let row = self
             .client
@@ -5254,22 +5248,20 @@ impl ConfigDb {
             return Ok(None);
         }
         let max_age_seconds = policy.idle_timeout_secs.min(remaining_absolute);
-        let expires_at = (now + chrono::Duration::seconds(max_age_seconds))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+        let expires_at = (now + time::Duration::seconds(max_age_seconds)).clickhouse_seconds();
         let grace_expires_unix = now_unix
             .saturating_add(SESSION_ROTATION_GRACE_SECS)
             .min(row.absolute_expires_unix);
-        let grace_expires_at = chrono::DateTime::from_timestamp(grace_expires_unix, 0)
+        let grace_expires_at = time::OffsetDateTime::from_unix_timestamp(grace_expires_unix)
+            .ok()
             .ok_or_else(|| anyhow::anyhow!("invalid session rotation grace deadline"))?
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+            .clickhouse_seconds();
         let grace_record_expires_unix = row.expires_unix.max(grace_expires_unix);
         let grace_record_expires_at =
-            chrono::DateTime::from_timestamp(grace_record_expires_unix, 0)
+            time::OffsetDateTime::from_unix_timestamp(grace_record_expires_unix)
+                .ok()
                 .ok_or_else(|| anyhow::anyhow!("invalid session rotation cleanup deadline"))?
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string();
+                .clickhouse_seconds();
         let new_token: String = {
             use rand::RngExt;
             let bytes: [u8; 32] = rand::rng().random();
@@ -7539,7 +7531,7 @@ impl ConfigDb {
         if !self
             .claim_sso_key_once(
                 &format!("explain-result:postgresql:{tenant_id}:{id}:{claim_hash}"),
-                chrono::Utc::now().timestamp() + 120,
+                time::OffsetDateTime::now_utc().unix_timestamp() + 120,
             )
             .await?
         {
@@ -7645,7 +7637,7 @@ impl ConfigDb {
         if !self
             .claim_sso_key_once(
                 &format!("explain-result:mysql:{tenant_id}:{id}:{claim_hash}"),
-                chrono::Utc::now().timestamp() + 120,
+                time::OffsetDateTime::now_utc().unix_timestamp() + 120,
             )
             .await?
         {
@@ -7682,9 +7674,8 @@ impl ConfigDb {
         provider: &str,
         hostname: &str,
     ) -> anyhow::Result<()> {
-        let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(30))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+        let expires_at =
+            (time::OffsetDateTime::now_utc() + time::Duration::minutes(30)).clickhouse_seconds();
         let ver = Self::next_version();
         self.client
             .query("INSERT INTO config_setup_tokens (token, purpose, created_by, expires_at, used, provider, hostname, version, is_deleted) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0)")

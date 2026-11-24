@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -114,7 +115,7 @@ pub async fn create_alert_route(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_write(&state, &headers).await?;
     let req = normalize_alert_route(&state, &tenant.tenant_id, req).await?;
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = time::OffsetDateTime::now_utc().clickhouse_seconds();
     let route = AlertRoute {
         id: uuid::Uuid::new_v4().to_string(),
         tenant_id: tenant.tenant_id.clone(),
@@ -180,7 +181,7 @@ pub async fn update_alert_route(
         tag_matchers: req.tag_matchers,
         channel_ids: req.channel_ids,
         created_at: existing.created_at,
-        updated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        updated_at: time::OffsetDateTime::now_utc().clickhouse_seconds(),
     };
     state
         .config_db

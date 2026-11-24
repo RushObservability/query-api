@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -181,7 +182,7 @@ pub async fn create_provider(
     if body.api_key.is_empty() {
         return Err(invalid("provider credential is required"));
     }
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = time::OffsetDateTime::now_utc().to_rfc3339();
     let provider = LlmProviderSecret {
         id: uuid::Uuid::new_v4().to_string(),
         tenant_id: caller.3.clone(),
@@ -251,7 +252,7 @@ pub async fn update_provider(
         routing: body.routing,
         enabled: body.enabled,
         created_at: current.created_at,
-        updated_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: time::OffsetDateTime::now_utc().to_rfc3339(),
     };
     state
         .config_db
@@ -369,7 +370,7 @@ pub async fn create_model(
         .map_err(internal)?
         .ok_or(invalid("provider_id does not exist"))?;
     require_sre_compatible_model(&provider.kind, &body.model_id)?;
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = time::OffsetDateTime::now_utc().to_rfc3339();
     let model = LlmModel {
         id: uuid::Uuid::new_v4().to_string(),
         tenant_id: caller.3.clone(),
@@ -420,7 +421,7 @@ pub async fn update_model(
         reasoning: body.reasoning,
         enabled: body.enabled,
         created_at: current.created_at,
-        updated_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: time::OffsetDateTime::now_utc().to_rfc3339(),
     };
     state
         .config_db

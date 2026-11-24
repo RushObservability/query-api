@@ -5,6 +5,7 @@
 //! public key — no license server required. This is honest-customer licensing:
 //! it gates entitlements and proves a legit, unexpired license, not unbreakable
 //! DRM. Mint licenses with the `mint-license` binary using the private key.
+use crate::timestamps::TimestampExt;
 use serde::{Deserialize, Serialize};
 
 /// Embedded Ed25519 public key (PEM). Override with `RUSH_LICENSE_PUBKEY` only
@@ -106,7 +107,9 @@ fn verify(token: &str, pubkey: &str) -> LicenseStatus {
     match decode::<LicenseClaims>(token, &key, &validation) {
         Ok(data) => {
             let c = data.claims;
-            let expires_at = chrono::DateTime::from_timestamp(c.exp, 0).map(|dt| dt.to_rfc3339());
+            let expires_at = time::OffsetDateTime::from_unix_timestamp(c.exp)
+                .ok()
+                .map(|dt| dt.to_rfc3339());
             LicenseStatus {
                 valid: true,
                 status: "active".into(),

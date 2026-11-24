@@ -1,5 +1,6 @@
 //! Optional, bounded explanations for empty structured searches.
 //! Tenant and time predicates are never relaxed by the diagnostic probes.
+use crate::timestamps::parse_rfc3339;
 use axum::{Extension, Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -74,8 +75,8 @@ fn validate(req: &DiagnoseRequest) -> Result<(), (StatusCode, String)> {
             "Diagnostics accept at most 8 filters and 512 search bytes".into(),
         ));
     }
-    let from = chrono::DateTime::parse_from_rfc3339(&req.time_range.from);
-    let to = chrono::DateTime::parse_from_rfc3339(&req.time_range.to);
+    let from = parse_rfc3339(&req.time_range.from);
+    let to = parse_rfc3339(&req.time_range.to);
     if !matches!((from, to), (Ok(from), Ok(to)) if from <= to) {
         return Err((
             StatusCode::BAD_REQUEST,

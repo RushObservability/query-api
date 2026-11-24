@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -200,11 +201,9 @@ pub struct SpanNode {
 
 /// Convert nanoseconds since epoch to a human-readable UTC timestamp string.
 pub fn nanos_to_string(nanos: i64) -> String {
-    let secs = nanos / 1_000_000_000;
-    let subsec_nanos = (nanos % 1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, subsec_nanos)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.9f").to_string())
-        .unwrap_or_else(|| nanos.to_string())
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos))
+        .map(|dt| dt.clickhouse_nanos())
+        .unwrap_or_else(|_| nanos.to_string())
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use crate::timestamps::TimestampExt;
 use axum::{
     Json,
     extract::{Extension, Path, State},
@@ -297,7 +298,7 @@ pub async fn create_api_key(
         signals,
         rate_limit_per_minute,
         source_cidrs,
-        created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        created_at: time::OffsetDateTime::now_utc().utc_seconds(),
     }))
 }
 

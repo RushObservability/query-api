@@ -4,6 +4,7 @@
 //! tenant id is used to select a semaphore, but is never emitted as a metric
 //! label, keeping the self-metrics surface low-cardinality.
 
+use crate::timestamps::parse_rfc3339;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
@@ -11,10 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::self_metrics::SelfMetrics;
@@ -775,8 +776,8 @@ pub fn active_budget() -> Option<QueryBudget> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedTimeRange {
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
+    pub from: OffsetDateTime,
+    pub to: OffsetDateTime,
 }
 
 impl ValidatedTimeRange {
@@ -786,7 +787,7 @@ impl ValidatedTimeRange {
         if from > to {
             return Err(TimeRangeError::Reversed);
         }
-        let seconds = to.signed_duration_since(from).num_seconds().max(0) as u64;
+        let seconds = (to - from).whole_seconds().max(0) as u64;
         if seconds > max_seconds {
             return Err(TimeRangeError::TooLarge {
                 max_seconds,
@@ -797,25 +798,22 @@ impl ValidatedTimeRange {
     }
 }
 
-fn parse_time(value: &str) -> Option<DateTime<Utc>> {
+fn parse_time(value: &str) -> Option<OffsetDateTime> {
     if let Ok(seconds) = value.parse::<i64>() {
-        return DateTime::from_timestamp(seconds, 0);
+        return time::OffsetDateTime::from_unix_timestamp(seconds).ok();
     }
     if let Ok(seconds) = value.parse::<f64>()
         && seconds.is_finite()
     {
         let whole = seconds.floor() as i64;
         let nanos = ((seconds - whole as f64) * 1_000_000_000.0).round() as u32;
-        return DateTime::from_timestamp(whole, nanos.min(999_999_999));
+        let nanos = i128::from(whole) * 1_000_000_000 + i128::from(nanos.min(999_999_999));
+        return OffsetDateTime::from_unix_timestamp_nanos(nanos).ok();
     }
-    DateTime::parse_from_rfc3339(value)
+    parse_rfc3339(value)
+        .or_else(|_| parse_rfc3339(&format!("{value}Z")))
         .ok()
-        .map(|value| value.with_timezone(&Utc))
-        .or_else(|| {
-            DateTime::parse_from_rfc3339(&format!("{value}Z"))
-                .ok()
-                .map(|value| value.with_timezone(&Utc))
-        })
+        .map(|value| value.to_offset(time::UtcOffset::UTC))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

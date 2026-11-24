@@ -3,6 +3,7 @@
 //! The interactive query endpoints stay capped at 1000 rows; exports use the
 //! admin-configurable `export_max_rows` setting (default 1000) instead.
 
+use crate::timestamps::TimestampExt;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
@@ -183,7 +184,7 @@ impl ExportJobs {
         filename: String,
         requested_rows: u64,
     ) -> anyhow::Result<ExportJobStatus> {
-        let now = chrono::Utc::now();
+        let now = time::OffsetDateTime::now_utc();
         let record = JobRecord {
             id: uuid::Uuid::new_v4().to_string(),
             tenant_id: tenant_id.into(),
@@ -192,7 +193,7 @@ impl ExportJobs {
             filename,
             requested_rows,
             created_at: now,
-            expires_at: now + chrono::Duration::from_std(self.ttl)?,
+            expires_at: now + time::Duration::try_from(self.ttl)?,
             state: ExportJobState::Queued,
             rows_written: 0,
             bytes_written: 0,
@@ -200,7 +201,7 @@ impl ExportJobs {
             truncated: false,
             error: None,
             owner: self.instance.clone(),
-            lease_until: now + chrono::Duration::seconds(WORKER_LEASE_SECS),
+            lease_until: now + time::Duration::seconds(WORKER_LEASE_SECS),
             revision: 0,
         };
         if !self.store.save(&record, None).await? {
@@ -307,7 +308,7 @@ impl ExportJobs {
     }
 
     async fn reconcile(&self, mut record: JobRecord) -> anyhow::Result<JobRecord> {
-        let now = chrono::Utc::now();
+        let now = time::OffsetDateTime::now_utc();
         let expired = record.expires_at <= now;
         let lost = matches!(
             record.state,
@@ -367,7 +368,7 @@ impl ExportJobs {
             self.store.delete_artifacts(&record).await?;
             // Keep a tombstone beyond the maximum workload duration so a
             // fenced old worker cannot leave an undiscoverable artifact.
-            if record.expires_at + chrono::Duration::minutes(15) <= now {
+            if record.expires_at + time::Duration::minutes(15) <= now {
                 self.store.delete_metadata(&record).await?;
             }
             self.jobs.remove(&record.id);
@@ -429,7 +430,7 @@ impl ExportJobs {
         let Some((record, _)) = self.store.load(tenant, id).await? else {
             return Ok(None);
         };
-        if record.expires_at <= chrono::Utc::now() {
+        if record.expires_at <= time::OffsetDateTime::now_utc() {
             return Ok(None);
         }
         let updated = self
@@ -466,7 +467,7 @@ impl ExportJobs {
             return Ok(None);
         };
         let record = self.reconcile(record).await?;
-        if record.expires_at <= chrono::Utc::now() {
+        if record.expires_at <= time::OffsetDateTime::now_utc() {
             return Ok(None);
         }
         Ok(Some(status_snapshot(&record)))
@@ -478,7 +479,7 @@ impl ExportJobs {
         tenant: &str,
         expected: ExportJobState,
     ) -> anyhow::Result<JobRecord> {
-        let now = chrono::Utc::now();
+        let now = time::OffsetDateTime::now_utc();
         let progress = self
             .jobs
             .get(id)
@@ -494,7 +495,7 @@ impl ExportJobs {
                     return false;
                 }
                 record.state = ExportJobState::Running;
-                record.lease_until = now + chrono::Duration::seconds(WORKER_LEASE_SECS);
+                record.lease_until = now + time::Duration::seconds(WORKER_LEASE_SECS);
                 record.rows_written = progress.rows;
                 record.bytes_written = progress.bytes;
                 record.truncated = progress.truncated;
@@ -605,7 +606,7 @@ impl ExportJobs {
             .get(&record.id)
             .map(|local| *local.progress.lock().expect("export progress poisoned"))
             .unwrap_or_default();
-        let now = chrono::Utc::now();
+        let now = time::OffsetDateTime::now_utc();
         let updated = self
             .update(&record.tenant_id, &record.id, |current| {
                 if current.owner != self.instance
@@ -643,7 +644,7 @@ impl ExportJobs {
             .reconcile(record)
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if record.expires_at <= chrono::Utc::now() {
+        if record.expires_at <= time::OffsetDateTime::now_utc() {
             return Err(StatusCode::NOT_FOUND);
         }
         if record.state != ExportJobState::Completed {
@@ -816,9 +817,7 @@ pub fn csv_field(s: &str) -> String {
 
 /// Format a ClickHouse DateTime64(9) value (nanoseconds since epoch) as RFC3339.
 pub fn ts_rfc3339(nanos: i64) -> String {
-    let secs = nanos.div_euclid(1_000_000_000);
-    let nsub = nanos.rem_euclid(1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, nsub)
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos))
         .map(|d| d.to_rfc3339())
         .unwrap_or_default()
 }
@@ -856,7 +855,7 @@ pub fn csv_query_preamble(
     }
     out.push_str(&format!(
         "# exported_at: {}\n",
-        chrono::Utc::now().to_rfc3339()
+        time::OffsetDateTime::now_utc().to_rfc3339()
     ));
     out
 }
@@ -1127,7 +1126,7 @@ where
 pub fn json_query_preamble(query: serde_json::Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(&serde_json::json!({
         "query": query,
-        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "exported_at": time::OffsetDateTime::now_utc().to_rfc3339(),
     }))
     .unwrap_or_else(|_| b"{}".to_vec());
     if bytes.last() == Some(&b'}') {
@@ -1403,7 +1402,7 @@ mod tests {
         );
         assert_ne!(first.is_ok(), second.is_ok());
         let (mut old, version) = a.store.load("tenant-a", &status.id).await.unwrap().unwrap();
-        old.lease_until = chrono::Utc::now() - chrono::Duration::seconds(1);
+        old.lease_until = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
         old.revision += 1;
         assert!(a.store.save(&old, Some(version)).await.unwrap());
         let status = b.status("tenant-a", &status.id).await.unwrap().unwrap();
@@ -1571,7 +1570,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        record.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        record.expires_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
         record.revision += 1;
         assert!(jobs.store.save(&record, Some(version)).await.unwrap());
         assert!(jobs.status("tenant-a", &status.id).await.unwrap().is_none());

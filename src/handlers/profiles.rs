@@ -1,4 +1,5 @@
 //! Built-in, tenant-scoped CPU profiling. No integration or license gate.
+use crate::timestamps::{TimestampExt, parse_rfc3339};
 use crate::{
     AppState, TenantContext,
     ch_writer::{SpoolBatch, WriteError},
@@ -359,8 +360,8 @@ fn default_profile_type() -> String {
 }
 fn profile_time<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
     let value = String::deserialize(deserializer)?;
-    chrono::DateTime::parse_from_rfc3339(&value)
-        .map(|t| t.timestamp_millis())
+    parse_rfc3339(&value)
+        .map(|t| t.unix_millis())
         .map_err(serde::de::Error::custom)
 }
 impl ProfileQuery {
