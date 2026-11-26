@@ -116,10 +116,15 @@ pub(crate) fn build_log_where(
     // Bound the partition column `TimestampDate` (PARTITION BY TimestampDate) in addition
     // to the precise `Timestamp` filter: a predicate on raw `Timestamp` alone does not
     // reliably drive partition pruning, so add the date range to prune partitions first.
+    // `Timestamp` is not in the primary key either; `TimestampTime` (whole seconds,
+    // `toDateTime(Timestamp)`) is, so bounding it keeps granule reads inside the window
+    // instead of the whole UTC day. Flooring both sides keeps the bound exact.
     let time_tenant = format!(
         "tenant_id = '{escaped_tenant}' \
          AND TimestampDate >= toDate({from}) \
          AND TimestampDate <= toDate({to}) \
+         AND TimestampTime >= toDateTime({from}) \
+         AND TimestampTime <= toDateTime({to}) \
          AND Timestamp >= {from} \
          AND Timestamp <= {to}"
     );
@@ -697,6 +702,7 @@ fn log_detail_sql(req: &LogDetailRequest, tenant_id: &str) -> (String, String) {
         "SELECT {LOG_DETAIL_SELECT_COLS} FROM logs \
          PREWHERE tenant_id = '{tenant}' \
            AND TimestampDate = toDate(fromUnixTimestamp64Nano({ts})) \
+           AND TimestampTime = toDateTime(fromUnixTimestamp64Nano({ts})) \
          WHERE Timestamp = fromUnixTimestamp64Nano({ts}) \
            AND _block_number = {} AND _block_offset = {} \
          LIMIT 1",
@@ -707,6 +713,7 @@ fn log_detail_sql(req: &LogDetailRequest, tenant_id: &str) -> (String, String) {
         "SELECT {LOG_DETAIL_SELECT_COLS} FROM logs \
          PREWHERE tenant_id = '{tenant}' \
            AND TimestampDate = toDate(fromUnixTimestamp64Nano({ts})) \
+           AND TimestampTime = toDateTime(fromUnixTimestamp64Nano({ts})) \
            AND Timestamp = fromUnixTimestamp64Nano({ts}) \
          WHERE ServiceName = '{service}' AND SeverityText = '{severity}' \
            AND TraceId = '{trace_id}' AND SpanId = '{span_id}' \
@@ -1437,6 +1444,22 @@ mod tests {
     }
 
     #[test]
+    fn time_range_bounds_the_primary_key_time_column() {
+        let clauses = build_log_where(
+            &[],
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert!(clauses.prewhere.contains(
+            "TimestampTime >= toDateTime(parseDateTimeBestEffort('2026-01-01T00:00:00Z')) \
+             AND TimestampTime <= toDateTime(parseDateTimeBestEffort('2026-01-01T00:05:00Z'))"
+        ));
+    }
+
+    #[test]
     fn level_and_severity_aliases_resolve_to_severity_text() {
         for alias in ["level", "severity", "severity_text", "SeverityText"] {
             assert_eq!(resolve_log_field(alias), "SeverityText", "alias {alias}");
@@ -1692,6 +1715,11 @@ mod tests {
         assert!(coordinate.contains("tenant_id = 'tenant''one'"));
         assert!(coordinate.contains("_block_number = 42 AND _block_offset = 7"));
         assert!(coordinate.contains("Timestamp = fromUnixTimestamp64Nano(1720000000123456789)"));
+        for sql in [&coordinate, &stable] {
+            assert!(sql.contains(
+                "TimestampTime = toDateTime(fromUnixTimestamp64Nano(1720000000123456789))"
+            ));
+        }
         assert!(stable.contains("ServiceName = 'api''edge'"));
         assert!(stable.contains("cityHash64(Body) = 99"));
         assert!(stable.contains("TraceId = 'abc' AND SpanId = 'def'"));

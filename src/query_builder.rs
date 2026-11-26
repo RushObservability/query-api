@@ -1082,8 +1082,10 @@ pub(crate) fn log_severity_condition(field_expr: &str, filter: &Filter) -> Optio
 pub fn build_logs_where_clause(filters: &[Filter], from: &str, to: &str) -> QueryClauses {
     let from = sanitize_datetime(from);
     let to = sanitize_datetime(to);
+    // `TimestampTime` is the primary-key time column; without it the scan covers the whole day.
     let prewhere = format!(
-        "Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
+        "TimestampTime >= parseDateTimeBestEffort('{from}') AND TimestampTime <= parseDateTimeBestEffort('{to}') \
+         AND Timestamp >= parseDateTimeBestEffort('{from}') AND Timestamp <= parseDateTimeBestEffort('{to}')"
     );
 
     let mut conditions = Vec::new();
@@ -1839,6 +1841,15 @@ mod log_severity_tests {
         let clauses =
             build_logs_where_clause(&filters, "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z");
         assert_eq!(clauses.where_clause, "upper(SeverityText) = 'ERROR'");
+    }
+
+    #[test]
+    fn alert_log_window_bounds_the_primary_key_time_column() {
+        let clauses = build_logs_where_clause(&[], "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z");
+        assert!(clauses.prewhere.contains(
+            "TimestampTime >= parseDateTimeBestEffort('2026-01-01T00:00:00Z') \
+             AND TimestampTime <= parseDateTimeBestEffort('2026-01-01T00:05:00Z')"
+        ));
     }
 
     #[test]

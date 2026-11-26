@@ -391,11 +391,11 @@ mod tests {
                 .collect()
         }
         let logs = "WITH logs AS (SELECT * FROM values(\
-            'tenant_id String, Timestamp DateTime64(9), TimestampDate Date, ServiceName String, SeverityText String, Body String, TraceId String', \
-            ('one','2026-11-07 13:10:00','2026-11-07','payments','WARN','retry 3','a'), \
-            ('one','2026-11-07 13:11:00','2026-11-07','payments','WARN','retry 4','b'), \
-            ('one','2026-11-07 13:12:00','2026-11-07','payments','INFO','ok','c'), \
-            ('two','2026-11-07 13:10:00','2026-11-07','private','WARN','retry 5','d')))";
+            'tenant_id String, Timestamp DateTime64(9), TimestampDate Date, TimestampTime DateTime, ServiceName String, SeverityText String, Body String, TraceId String', \
+            ('one','2026-11-07 13:10:00','2026-11-07','2026-11-07 13:10:00','payments','WARN','retry 3','a'), \
+            ('one','2026-11-07 13:11:00','2026-11-07','2026-11-07 13:11:00','payments','WARN','retry 4','b'), \
+            ('one','2026-11-07 13:12:00','2026-11-07','2026-11-07 13:12:00','payments','INFO','ok','c'), \
+            ('two','2026-11-07 13:10:00','2026-11-07','2026-11-07 13:10:00','private','WARN','retry 5','d')))";
         let req = PatternRequest {
             time_range: range(),
             filters: vec![],
@@ -430,7 +430,7 @@ mod tests {
         assert!(rows.iter().all(|row| row["service"] == "payments"));
 
         let logs = "WITH logs AS (SELECT 'one' AS tenant_id, \
-            parseDateTime64BestEffort('2026-11-07 13:10:00', 9) AS Timestamp, toDate(Timestamp) AS TimestampDate, \
+            parseDateTime64BestEffort('2026-11-07 13:10:00', 9) AS Timestamp, toDate(Timestamp) AS TimestampDate, toDateTime(Timestamp) AS TimestampTime, \
             'payments' AS ServiceName, '{\"bytes\":0}' AS Body, 'a' AS TraceId, 'b' AS SpanId, \
             toUInt8(17) AS SeverityNumber, map('latency','7') AS LogAttributes)";
         let req = ScatterRequest {
