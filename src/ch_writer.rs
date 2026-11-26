@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use clickhouse::Client;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::models::ingest::{
     ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, RumReplayChunk, SumRow, SummaryRow,
@@ -487,7 +487,8 @@ impl serde::ser::SerializeStructVariant for &mut SizeEstimate {
 // `BatchAccumulator` coalesces requests into bounded per-table buffers. Before
 // admitting rows that reach a row/byte limit, the writer flushes the previously
 // accepted buffer. Failed flushes retain those rows and reject new requests
-// without retaining them. The same slot lock covers admission and delivery.
+// without retaining them. The slot lock only moves rows in and out; a per-table
+// lane serializes deliveries, so requests keep being admitted during an insert.
 //
 // With batching enabled, success can still mean an in-memory acknowledgment;
 // a hard process crash can lose rows that have not reached the durable spool.
@@ -615,26 +616,38 @@ impl Drop for DeliveryObservation<'_> {
 /// peers and the flusher.
 pub struct BatchAccumulator {
     cfg: BatchConfig,
+    /// Held only to move rows in or out, never across a ClickHouse insert.
     slots: [AsyncMutex<TableBuffer>; SpoolBatch::SLOTS],
+    /// One delivery per table at a time; held for the whole insert.
+    lanes: [Arc<AsyncMutex<()>>; SpoolBatch::SLOTS],
     health: [BatchHealth; SpoolBatch::SLOTS],
 }
+
+/// How long a request that needs a flush waits for the table's in-flight
+/// insert before getting 429. Bounded so waiting request bodies cannot become
+/// an unbounded second queue while ClickHouse is slow.
+const SLOT_WAIT: Duration = Duration::from_secs(1);
 
 impl BatchAccumulator {
     fn new(cfg: BatchConfig) -> Self {
         BatchAccumulator {
             cfg,
             slots: std::array::from_fn(|_| AsyncMutex::new(TableBuffer::default())),
+            lanes: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
             health: std::array::from_fn(|_| BatchHealth::default()),
         }
     }
 
     async fn is_empty(&self) -> bool {
-        for slot in &self.slots {
+        for (slot, lane) in self.slots.iter().zip(&self.lanes) {
             match slot.try_lock() {
                 Ok(buffer) if buffer.batch.is_none() => {}
-                // A write in flight must also prevent shutdown from treating
-                // the accumulator as drained, without blocking on its network I/O.
                 _ => return false,
+            }
+            // A delivery in flight holds its rows outside the slot; shutdown
+            // must not treat them as drained or block on their network I/O.
+            if lane.try_lock().is_err() {
+                return false;
             }
         }
         true
@@ -750,8 +763,10 @@ impl ChWriter {
     /// Batching accepts rows into a bounded per-table accumulator. Reaching a
     /// limit flushes previously accepted rows before admitting this request;
     /// a failed flush rejects it without adding its rows to the queue. Requests
-    /// exceeding either limit are written synchronously. The age flusher and
-    /// shutdown share the same lock and preserve accepted rows across failures.
+    /// exceeding either limit are written synchronously. A request that needs a
+    /// flush waits up to `SLOT_WAIT` for the table's in-flight insert. The age
+    /// flusher and shutdown share the same lane and preserve accepted rows
+    /// across failures.
     /// Disabling batching makes every request use synchronous insert/spool.
     pub async fn write(&self, mut batch: SpoolBatch) -> Result<(), WriteError> {
         // Metric firewall runs once here over the request's rows so the firewall
@@ -768,32 +783,55 @@ impl ChWriter {
             return self.write_now(&batch).await;
         }
 
-        // Keep the slot locked through delivery. Background and inline flushes
-        // must not detach a batch while another request fills the same slot.
         let bytes = batch_estimated_size(&batch);
-        // Do not turn pending mutex waiters into an unbounded second queue of
-        // request bodies while ClickHouse is slow or unresponsive.
         let index = batch.slot();
-        let mut slot = self.batcher.slots[index].try_lock().map_err(|_| {
-            self.metrics.inc_counter(
-                "rush_ingest_batch_rejections_total",
-                &[("table", batch.table()), ("reason", "busy")],
-                1,
-            );
-            WriteError::Backpressure
-        })?;
-        let rows = slot.batch.as_ref().map_or(0, SpoolBatch::len);
-        if slot.needs_flush
-            || rows.saturating_add(batch.len()) >= self.batcher.cfg.max_rows
-            || slot.bytes.saturating_add(bytes) >= self.batcher.cfg.max_bytes
-        {
-            // Only previously accepted rows are retained on failure. The current
-            // request has not entered the accumulator and is safe to retry.
-            self.flush_slot(&mut slot).await?;
-        }
-        if batch.len() >= self.batcher.cfg.max_rows || bytes >= self.batcher.cfg.max_bytes {
+        let oversized =
+            batch.len() >= self.batcher.cfg.max_rows || bytes >= self.batcher.cfg.max_bytes;
+        let batch = if oversized {
+            batch
+        } else {
+            match self.admit(index, batch, bytes).await {
+                Ok(()) => return Ok(()),
+                Err(batch) => batch,
+            }
+        };
+        let lane = tokio::time::timeout(SLOT_WAIT, self.batcher.lanes[index].clone().lock_owned())
+            .await
+            .map_err(|_| self.busy(&batch))?;
+        // Only previously accepted rows are retained on failure. The current
+        // request has not entered the accumulator and is safe to retry.
+        self.flush_slot(index, lane).await?;
+        if oversized {
             return self.write_now(&batch).await;
         }
+        // Requests admitted while the insert ran may have refilled the slot.
+        self.admit(index, batch, bytes)
+            .await
+            .map_err(|batch| self.busy(&batch))
+    }
+
+    fn busy(&self, batch: &SpoolBatch) -> WriteError {
+        self.metrics.inc_counter(
+            "rush_ingest_batch_rejections_total",
+            &[("table", batch.table()), ("reason", "busy")],
+            1,
+        );
+        WriteError::Backpressure
+    }
+
+    /// Add rows to the slot when they fit without a flush first; otherwise
+    /// hand the batch back untouched.
+    async fn admit(&self, index: usize, batch: SpoolBatch, bytes: usize) -> Result<(), SpoolBatch> {
+        let cfg = self.batcher.cfg;
+        let mut slot = self.batcher.slots[index].lock().await;
+        let rows = slot.batch.as_ref().map_or(0, SpoolBatch::len);
+        if slot.needs_flush
+            || rows.saturating_add(batch.len()) >= cfg.max_rows
+            || slot.bytes.saturating_add(bytes) >= cfg.max_bytes
+        {
+            return Err(batch);
+        }
+        let added = batch.len() as u64;
         match slot.batch.as_mut() {
             Some(existing) => existing.extend_from(batch),
             None => {
@@ -802,12 +840,10 @@ impl ChWriter {
             }
         }
         slot.bytes = slot.bytes.saturating_add(bytes);
+        // Pending counts include rows of an insert in flight until it succeeds.
         let health = &self.batcher.health[index];
-        health.rows.store(
-            slot.batch.as_ref().map_or(0, SpoolBatch::len) as u64,
-            Ordering::Relaxed,
-        );
-        health.bytes.store(slot.bytes as u64, Ordering::Relaxed);
+        health.rows.fetch_add(added, Ordering::Relaxed);
+        health.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         let _ = health.first_row_ms.compare_exchange(
             0,
             unix_millis(),
@@ -818,24 +854,58 @@ impl ChWriter {
         Ok(())
     }
 
-    /// Borrow the queued batch across delivery so cancellation or failure leaves
-    /// acknowledged rows in place. Clearing it requires a successful write.
-    async fn flush_slot(&self, slot: &mut TableBuffer) -> Result<(), WriteError> {
-        if let Some(batch) = &slot.batch {
-            slot.needs_flush = true;
-            let index = batch.slot();
-            let health = &self.batcher.health[index];
-            health.blocked.store(true, Ordering::Relaxed);
-            self.record_pending(index);
-            self.write_now(batch).await?;
-            health.rows.store(0, Ordering::Relaxed);
-            health.bytes.store(0, Ordering::Relaxed);
-            health.first_row_ms.store(0, Ordering::Relaxed);
-            health.blocked.store(false, Ordering::Relaxed);
-            self.record_pending(index);
+    /// Deliver the slot's rows while holding the table's lane. The rows leave
+    /// the slot for the insert so other requests keep being admitted; the insert
+    /// runs in its own task so a caller that goes away cannot drop them.
+    async fn flush_slot(&self, index: usize, lane: OwnedMutexGuard<()>) -> Result<(), WriteError> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let _lane = lane;
+            me.deliver(index).await
+        })
+        .await
+        .map_err(|error| WriteError::Fatal(format!("batch flush task: {error}")))?
+    }
+
+    async fn deliver(&self, index: usize) -> Result<(), WriteError> {
+        let taken = std::mem::take(&mut *self.batcher.slots[index].lock().await);
+        let Some(batch) = &taken.batch else {
+            return Ok(());
+        };
+        let health = &self.batcher.health[index];
+        health.blocked.store(true, Ordering::Relaxed);
+        self.record_pending(index);
+        let result = self.write_now(batch).await;
+        let mut slot = self.batcher.slots[index].lock().await;
+        match result {
+            Ok(()) => {
+                health.rows.store(
+                    slot.batch.as_ref().map_or(0, SpoolBatch::len) as u64,
+                    Ordering::Relaxed,
+                );
+                health.bytes.store(slot.bytes as u64, Ordering::Relaxed);
+                health.first_row_ms.store(
+                    slot.first_row_at.map_or(0, |at| {
+                        unix_millis().saturating_sub(at.elapsed().as_millis() as u64)
+                    }),
+                    Ordering::Relaxed,
+                );
+                health.blocked.store(false, Ordering::Relaxed);
+                self.record_pending(index);
+                Ok(())
+            }
+            Err(error) => {
+                // Put the acknowledged rows back ahead of any admitted since,
+                // and make new writes retry this flush before entering.
+                let newer = std::mem::replace(&mut *slot, taken);
+                if let (Some(restored), Some(rows)) = (slot.batch.as_mut(), newer.batch) {
+                    restored.extend_from(rows);
+                }
+                slot.bytes = slot.bytes.saturating_add(newer.bytes);
+                slot.needs_flush = true;
+                Err(error)
+            }
         }
-        *slot = TableBuffer::default();
-        Ok(())
     }
 
     /// Perform the actual insert for a (firewall-already-applied) batch, spooling
@@ -898,8 +968,8 @@ impl ChWriter {
     pub async fn flush_all(&self) {
         stream::iter(0..SpoolBatch::SLOTS)
             .for_each_concurrent(4, |index| async move {
-                let mut slot = self.batcher.slots[index].lock().await;
-                if let Err(error) = self.flush_slot(&mut slot).await {
+                let lane = self.batcher.lanes[index].clone().lock_owned().await;
+                if let Err(error) = self.flush_slot(index, lane).await {
                     tracing::warn!(%error, index, "flush_all: buffered rows retained");
                 }
             })
@@ -951,9 +1021,13 @@ impl ChWriter {
                     .for_each_concurrent(4, |index| {
                         let me = &me;
                         async move {
-                            let mut slot = me.batcher.slots[index].lock().await;
-                            if slot.first_row_at.is_some_and(|at| now.saturating_duration_since(at) >= me.batcher.cfg.max_age) {
-                                if let Err(error) = me.flush_slot(&mut slot).await {
+                            // An insert already in flight owns this table; look again next tick.
+                            let Ok(lane) = me.batcher.lanes[index].clone().try_lock_owned() else {
+                                return;
+                            };
+                            let aged = me.batcher.slots[index].lock().await.first_row_at.is_some_and(|at| now.saturating_duration_since(at) >= me.batcher.cfg.max_age);
+                            if aged {
+                                if let Err(error) = me.flush_slot(index, lane).await {
                                     tracing::warn!(%error, index, "batch flush failed; buffered rows retained");
                                 }
                             }
@@ -1773,11 +1847,17 @@ mod batch_tests {
             let writer = test.0.clone();
             tasks.push(tokio::spawn(async move { writer.write(gauge(1)).await }));
         }
+        let mut admitted = 0;
         for task in tasks {
-            assert!(matches!(task.await.unwrap(), Err(WriteError::Backpressure)));
+            match task.await.unwrap() {
+                Ok(()) => admitted += 1,
+                Err(error) => assert!(matches!(error, WriteError::Backpressure)),
+            }
         }
+        // At most one write fits beside the in-flight row (max_rows 2).
+        assert!(admitted <= 1);
         let slot = test.0.batcher.slots[accepted.slot()].lock().await;
-        assert!(same_batch(slot.batch.as_ref().unwrap(), &accepted));
+        assert_eq!(slot.batch.as_ref().unwrap().len(), 1 + admitted);
         assert!(slot.needs_flush);
     }
 
@@ -1883,18 +1963,19 @@ mod batch_tests {
     }
 
     #[tokio::test]
-    async fn stalled_flush_rejects_new_writes_and_cancellation_preserves_accepted_rows() {
-        use axum::{Router, routing::any};
+    async fn slow_insert_does_not_block_admission_and_survives_its_caller() {
+        use axum::{Router, http::StatusCode, routing::any};
         let reached = Arc::new(tokio::sync::Notify::new());
-        let signal = reached.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (signal, gate) = (reached.clone(), release.clone());
         let router = Router::new().route(
             "/",
             any(move || {
-                let signal = signal.clone();
+                let (signal, gate) = (signal.clone(), gate.clone());
                 async move {
                     signal.notify_one();
-                    std::future::pending::<()>().await;
-                    ""
+                    gate.notified().await;
+                    StatusCode::SERVICE_UNAVAILABLE
                 }
             }),
         );
@@ -1903,7 +1984,14 @@ mod batch_tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let test = TestWriter::new(&url, BatchConfig::default());
+        let test = TestWriter::new(
+            &url,
+            BatchConfig {
+                max_rows: 2,
+                ..BatchConfig::default()
+            },
+        );
+        let index = gauge(1).slot();
         test.0.write(gauge(1)).await.unwrap();
         let writer = test.0.clone();
         let flush = tokio::spawn(async move {
@@ -1912,21 +2000,43 @@ mod batch_tests {
         tokio::time::timeout(Duration::from_secs(2), reached.notified())
             .await
             .unwrap();
+        // The insert is in flight without the slot lock: a new request is admitted.
+        tokio::time::timeout(Duration::from_millis(50), test.0.write(gauge(1)))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(test.0.has_pending_batches().await);
-        let rejected = tokio::time::timeout(Duration::from_millis(50), test.0.write(gauge(1)))
+        // The slot is full again; the next request waits a bounded time, then 429.
+        let started = Instant::now();
+        let busy = tokio::time::timeout(SLOT_WAIT * 3, test.0.write(gauge(1)))
             .await
             .unwrap();
-        assert!(matches!(rejected, Err(WriteError::Backpressure)));
+        assert!(matches!(busy, Err(WriteError::Backpressure)));
+        assert!(started.elapsed() >= SLOT_WAIT);
+        // The flush's caller goes away; the delivery does not.
         flush.abort();
         assert!(flush.await.unwrap_err().is_cancelled());
-        let slot = test.0.batcher.slots[gauge(1).slot()].lock().await;
-        assert_eq!(slot.batch.as_ref().unwrap().len(), 1);
-        assert!(slot.needs_flush);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !test.0.batcher.slots[index].lock().await.needs_flush {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The failed insert (spool full) put its row back ahead of the one
+        // admitted meanwhile; neither acknowledged row is lost.
+        let slot = test.0.batcher.slots[index].lock().await;
+        assert_eq!(slot.batch.as_ref().unwrap().len(), 2);
+        assert_eq!(slot.bytes, 2 * batch_estimated_size(&gauge(1)));
+        drop(slot);
         let metrics = test.0.metrics.render_prometheus();
         assert!(metrics.contains(
-            "rush_ingest_delivery_total{outcome=\"cancelled\",table=\"metrics_gauge\"} 1"
+            "rush_ingest_delivery_total{outcome=\"backpressure\",table=\"metrics_gauge\"} 1"
         ));
-        assert!(metrics.contains("rush_ingest_batch_pending_rows{table=\"metrics_gauge\"} 1"));
+        assert!(metrics.contains(
+            "rush_ingest_batch_rejections_total{reason=\"busy\",table=\"metrics_gauge\"} 1"
+        ));
         server.abort();
     }
 }
