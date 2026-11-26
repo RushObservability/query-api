@@ -12424,11 +12424,11 @@ impl ConfigDb {
 }
 
 #[cfg(test)]
-mod session_tenant_regressions {
+pub(crate) mod session_tenant_regressions {
     use super::*;
     use clickhouse::test::{Mock, handlers};
 
-    fn config(mock: &Mock) -> ConfigDb {
+    pub(crate) fn config(mock: &Mock) -> ConfigDb {
         ConfigDb {
             metrics: std::sync::OnceLock::new(),
             client: Client::default()

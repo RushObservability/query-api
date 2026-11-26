@@ -35,6 +35,34 @@ const ENGINE_CONCURRENCY: usize = 6;
 /// Flush `last_eval_at` to the config table once per this many evals per monitor.
 const EVAL_FLUSH_EVERY: u32 = 10;
 
+/// Monitor id → epoch ms of the first evaluation in the current run of empty
+/// results. In memory only: after a restart the count starts again.
+#[derive(Default)]
+struct NoDataSince(std::sync::Mutex<HashMap<String, i64>>);
+
+impl NoDataSince {
+    /// The monitor's query returned rows.
+    fn seen(&self, monitor_id: &str) {
+        self.0.lock().unwrap().remove(monitor_id);
+    }
+
+    /// The query over the window ending at `now_ms` returned no rows. True once
+    /// data has been missing for the monitor's `no_data_timeframe`.
+    fn lasted(&self, monitor: &Monitor, now_ms: i64) -> bool {
+        let since = *self
+            .0
+            .lock()
+            .unwrap()
+            .entry(monitor.id.clone())
+            .or_insert(now_ms);
+        // The first empty window already means `eval_window_secs` without data.
+        let missing_ms = now_ms
+            .saturating_sub(since)
+            .saturating_add(monitor.eval_window_secs.saturating_mul(1000));
+        missing_ms >= monitor.no_data_timeframe.saturating_mul(1000)
+    }
+}
+
 /// Spawn the monitor evaluation engine. Runs every 60 seconds.
 pub fn spawn(
     ch: Client,
@@ -47,6 +75,7 @@ pub fn spawn(
         let http_client = reqwest::Client::new();
         let smtp_transport = build_smtp_transport(&smtp_config);
         let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
+        let no_data = NoDataSince::default();
 
         loop {
             if !lease.is_leader() {
@@ -62,6 +91,7 @@ pub fn spawn(
                 &smtp_config,
                 &smtp_transport,
                 &mut eval_state,
+                &no_data,
             );
             let (evaluated, state_changes) = match crate::leader::fenced(lease.clone(), cycle).await
             {
@@ -301,6 +331,7 @@ async fn run_evaluation_cycle(
     smtp_config: &alert_engine::SmtpConfig,
     smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
     eval_state: &mut crate::eval_state::EvalState,
+    no_data: &NoDataSince,
 ) -> anyhow::Result<(u64, u64)> {
     use futures_util::StreamExt;
 
@@ -350,69 +381,20 @@ async fn run_evaluation_cycle(
     crate::engine_metrics::due(config_db.self_metrics(), "monitor_engine", jobs.len());
     let outcomes: Vec<(String, u64, bool, bool)> =
         futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
-            let mut observation =
-                EvaluationObservation::new(config_db.self_metrics(), "monitor_engine");
-            let window = EvaluationWindow::new(
-                time::OffsetDateTime::now_utc().unix_millis(),
-                monitor.eval_window_secs,
-            );
-            let result = match crate::query_governor::run_background(
-                &monitor.tenant_id,
-                evaluate_monitor(
-                    ch,
-                    config_db,
-                    &monitor,
-                    now_str_ref,
-                    window,
-                    http_client,
-                    smtp_config,
-                    smtp_transport,
-                    monitor_states_ref,
-                    should_flush,
-                    policy_ref,
-                ),
+            let (changes, persisted, failed) = evaluate_job(
+                ch,
+                config_db,
+                &monitor,
+                now_str_ref,
+                http_client,
+                smtp_config,
+                smtp_transport,
+                monitor_states_ref,
+                should_flush,
+                policy_ref,
+                no_data,
             )
-            .await
-            {
-                Ok(result) => {
-                    observation.finish(if result.is_ok() {
-                        EvaluationOutcome::Completed
-                    } else {
-                        EvaluationOutcome::Error
-                    });
-                    result
-                }
-                Err(error) => {
-                    observation.finish(EvaluationOutcome::AdmissionRejected);
-                    Err(anyhow::anyhow!("background admission rejected: {error:?}"))
-                }
-            };
-            let failed = result.is_err();
-            let (changes, persisted) = match result {
-                Ok(cp) => cp,
-                Err(e) => {
-                    tracing::warn!(
-                        engine = "monitors",
-                        monitor_id = %monitor.id,
-                        monitor_name = %monitor.name,
-                        error = %e,
-                        "monitor evaluation failed"
-                    );
-                    // On query failure, check no_data handling
-                    handle_no_data(
-                        config_db,
-                        &monitor,
-                        now_str_ref,
-                        window,
-                        http_client,
-                        smtp_config,
-                        smtp_transport,
-                        should_flush,
-                        policy_ref,
-                    )
-                    .await
-                }
-            };
+            .await;
             (monitor.id, changes, persisted, failed)
         }))
         .buffer_unordered(ENGINE_CONCURRENCY)
@@ -431,6 +413,76 @@ async fn run_evaluation_cycle(
     Ok((evaluated, state_changes))
 }
 
+/// Evaluate one monitor under background admission. Returns
+/// (state_changes, persisted_to_db, failed).
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_job(
+    ch: &Client,
+    config_db: &ConfigDb,
+    monitor: &Monitor,
+    now_str: &str,
+    http_client: &reqwest::Client,
+    smtp_config: &alert_engine::SmtpConfig,
+    smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
+    monitor_states: &HashMap<String, (String, String)>,
+    should_flush: bool,
+    policy: &NotifyPolicy,
+    no_data: &NoDataSince,
+) -> (u64, bool, bool) {
+    let mut observation = EvaluationObservation::new(config_db.self_metrics(), "monitor_engine");
+    let window = EvaluationWindow::new(
+        time::OffsetDateTime::now_utc().unix_millis(),
+        monitor.eval_window_secs,
+    );
+    let result = match crate::query_governor::run_background(
+        &monitor.tenant_id,
+        evaluate_monitor(
+            ch,
+            config_db,
+            monitor,
+            now_str,
+            window,
+            http_client,
+            smtp_config,
+            smtp_transport,
+            monitor_states,
+            should_flush,
+            policy,
+            no_data,
+        ),
+    )
+    .await
+    {
+        Ok(result) => {
+            observation.finish(if result.is_ok() {
+                EvaluationOutcome::Completed
+            } else {
+                EvaluationOutcome::Error
+            });
+            result
+        }
+        Err(error) => {
+            observation.finish(EvaluationOutcome::AdmissionRejected);
+            Err(anyhow::anyhow!("background admission rejected: {error:?}"))
+        }
+    };
+    match result {
+        Ok((changes, persisted)) => (changes, persisted, false),
+        Err(e) => {
+            // A failed or rejected query says nothing about the data: keep the
+            // current state rather than running the no-data path.
+            tracing::warn!(
+                engine = "monitors",
+                monitor_id = %monitor.id,
+                monitor_name = %monitor.name,
+                error = %e,
+                "monitor evaluation failed; state unchanged"
+            );
+            (0, false, true)
+        }
+    }
+}
+
 /// Evaluate a single monitor. Returns (state_changes, persisted_to_db).
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_monitor(
@@ -445,6 +497,7 @@ async fn evaluate_monitor(
     monitor_states: &HashMap<String, (String, String)>,
     should_flush: bool,
     policy: &NotifyPolicy,
+    no_data: &NoDataSince,
 ) -> anyhow::Result<(u64, bool)> {
     let group_by: Vec<String> = serde_json::from_str(&monitor.group_by).unwrap_or_default();
     let has_groups = !group_by.is_empty();
@@ -466,7 +519,13 @@ async fn evaluate_monitor(
     let results = run_monitor_query(ch, monitor, &query, &group_by, window).await?;
 
     if results.is_empty() {
-        // No data returned
+        if !no_data.lasted(monitor, window.to) {
+            // Not missing for `no_data_timeframe` yet: keep the current state.
+            if should_flush {
+                config_db.persist_monitor_eval(monitor, now_str).await?;
+            }
+            return Ok((0, should_flush));
+        }
         return Ok(handle_no_data(
             config_db,
             monitor,
@@ -480,6 +539,7 @@ async fn evaluate_monitor(
         )
         .await);
     }
+    no_data.seen(&monitor.id);
 
     // Evaluate thresholds for each group result
     let mut group_states: HashMap<String, String> =
@@ -2870,6 +2930,133 @@ mod notify_policy_tests {
         assert_eq!(
             decide_notification("no_data", "ok", Some(("ok", 0)), NOW, false, None, quiet),
             Notify::No
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_data_tests {
+    use super::*;
+    use clickhouse::test::{Mock, handlers};
+
+    #[derive(clickhouse::Row, serde::Serialize)]
+    struct Grouped {
+        group_key: String,
+        value: f64,
+    }
+
+    /// A grouped metric monitor that is firing and resolves on no data.
+    fn monitor() -> Monitor {
+        Monitor {
+            id: "m1".into(),
+            tenant_id: "default".into(),
+            name: "cpu".into(),
+            monitor_type: "metric".into(),
+            query_config: r#"{"metric_name":"cpu","aggregation":"avg"}"#.into(),
+            critical: Some(90.0),
+            critical_recovery: None,
+            warning: None,
+            warning_recovery: None,
+            comparator: "above".into(),
+            eval_window_secs: 300,
+            eval_interval_secs: 60,
+            group_by: r#"["host"]"#.into(),
+            state: "alert".into(),
+            group_states: r#"{"web-1":"alert"}"#.into(),
+            no_data_action: "resolve".into(),
+            no_data_timeframe: 600,
+            auto_resolve_hours: None,
+            message: String::new(),
+            notification_channels: "[]".into(),
+            renotify_interval: None,
+            tags: "[]".into(),
+            priority: None,
+            enabled: true,
+            composite_formula: String::new(),
+            composite_monitor_ids: "[]".into(),
+            last_eval_at: None,
+            last_triggered_at: None,
+            created_by: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            rule_version: 0,
+        }
+    }
+
+    /// Evaluate `monitor()` against a telemetry mock. The config mock has no
+    /// handlers, so any state write, event or notification fails the test.
+    async fn evaluate(telemetry: &Mock, no_data: &NoDataSince) -> (u64, bool, bool) {
+        let config_mock = Mock::new();
+        let config_db = crate::clickhouse_config::session_tenant_regressions::config(&config_mock);
+        let ch = Client::default()
+            .with_url(telemetry.url())
+            .with_validation(false);
+        let policy = NotifyPolicy {
+            now_ms: 0,
+            windows: Vec::new(),
+            last: None,
+        };
+        let smtp = alert_engine::SmtpConfig {
+            host: None,
+            port: 25,
+            user: None,
+            pass: None,
+            from: String::new(),
+        };
+        evaluate_job(
+            &ch,
+            &config_db,
+            &monitor(),
+            "2026-01-01 00:00:00",
+            &reqwest::Client::new(),
+            &smtp,
+            &None,
+            &HashMap::new(),
+            false,
+            &policy,
+            no_data,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn failed_query_keeps_the_firing_state() {
+        let telemetry = Mock::new();
+        telemetry.add(handlers::failure(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+        assert_eq!(
+            evaluate(&telemetry, &NoDataSince::default()).await,
+            (0, false, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_result_keeps_state_until_the_no_data_timeframe() {
+        let telemetry = Mock::new();
+        telemetry.add(handlers::provide(Vec::<Grouped>::new()));
+        assert_eq!(
+            evaluate(&telemetry, &NoDataSince::default()).await,
+            (0, false, false)
+        );
+    }
+
+    #[test]
+    fn no_data_counts_from_the_first_empty_window() {
+        let tracker = NoDataSince::default();
+        let m = monitor(); // 300 s window, 600 s timeframe
+        assert!(!tracker.lasted(&m, 0));
+        assert!(!tracker.lasted(&m, 299_000));
+        assert!(tracker.lasted(&m, 300_000));
+        tracker.seen(&m.id);
+        assert!(!tracker.lasted(&m, 400_000), "data resets the count");
+        let short = Monitor {
+            no_data_timeframe: 300,
+            ..monitor()
+        };
+        assert!(
+            tracker.lasted(&short, 400_000),
+            "timeframe within the window"
         );
     }
 }
