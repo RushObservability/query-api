@@ -350,6 +350,20 @@ fn requires_csrf_origin(method: &Method, path: &str, credential: Option<&Credent
         )
 }
 
+/// Outermost layer: fix the audited client IP before any layer writes a row.
+async fn audit_client_ip_middleware(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0.ip());
+    rush_api::audit::pin_client_ip(req.headers_mut(), peer, &state.trusted_proxy_cidrs);
+    next.run(req).await
+}
+
 /// SameSite=Lax protects normal cross-site form traffic, while this Origin
 /// check covers same-site subdomain attacks and login/setup-session mutations
 /// that establish or consume ambient browser credentials.
@@ -4317,6 +4331,10 @@ async fn main() -> anyhow::Result<()> {
         ))
         .layer(axum::middleware::from_fn(
             rush_api::api_error::public_error_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            audit_client_ip_middleware,
         ));
     let shutdown_writer = state.writer.clone();
 

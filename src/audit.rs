@@ -32,7 +32,8 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
+use std::net::IpAddr;
 
 use crate::self_metrics::SelfMetrics;
 
@@ -1295,10 +1296,29 @@ impl AuditLogger {
     }
 }
 
+/// Replace the client-supplied forwarding headers with the single client IP
+/// resolved from the TCP peer and `RUSH_TRUSTED_PROXY_CIDRS`, so
+/// [`actor_context_from_headers`] records an address the client cannot
+/// choose. main.rs runs this once per request before any other layer.
+pub fn pin_client_ip(
+    headers: &mut HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_proxy_cidrs: &[String],
+) {
+    let client = peer.map(|peer| {
+        crate::handlers::auth::resolve_login_client_ip(peer, headers, trusted_proxy_cidrs)
+    });
+    headers.remove("x-forwarded-for");
+    headers.remove("x-real-ip");
+    if let Some(value) = client.and_then(|ip| HeaderValue::from_str(&ip.to_string()).ok()) {
+        headers.insert("x-forwarded-for", value);
+    }
+}
+
 /// Extract `(ip, user_agent, request_id)` from request headers for audit
 /// context. Reusable across all instrumented call sites (phase 2).
 ///
-/// - ip: first hop of `X-Forwarded-For`, else `X-Real-IP`, else `""`.
+/// - ip: `X-Forwarded-For` as rewritten by [`pin_client_ip`], else `""`.
 /// - user_agent: `User-Agent`, else `""`.
 /// - request_id: `X-Request-Id`, else `""`.
 pub fn actor_context_from_headers(headers: &HeaderMap) -> (String, String, String) {
@@ -1324,6 +1344,32 @@ pub fn actor_context_from_headers(headers: &HeaderMap) -> (String, String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_ip_comes_from_the_peer_unless_a_trusted_proxy_forwards_it() {
+        let ip = |forwarded: &str, peer: Option<&str>, trusted: &[String]| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_str(forwarded).unwrap());
+            headers.insert("x-real-ip", HeaderValue::from_static("198.51.100.2"));
+            pin_client_ip(&mut headers, peer.map(|p| p.parse().unwrap()), trusted);
+            actor_context_from_headers(&headers).0
+        };
+        let proxies = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(ip("198.51.100.1", Some("203.0.113.7"), &[]), "203.0.113.7");
+        assert_eq!(
+            ip("198.51.100.1", Some("203.0.113.7"), &proxies),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            ip(
+                "198.51.100.1, 198.51.100.9, 10.0.0.2",
+                Some("10.0.0.1"),
+                &proxies
+            ),
+            "198.51.100.9"
+        );
+        assert_eq!(ip("198.51.100.1", None, &proxies), "");
+    }
 
     #[test]
     fn api_key_principals_are_recorded_as_api_key_actors() {
