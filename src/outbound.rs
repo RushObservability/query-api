@@ -5,7 +5,7 @@
 //! before sending so redirects and DNS rebinding cannot bypass the checks.
 
 use reqwest::{Method, RequestBuilder};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use url::Url;
 
@@ -54,15 +54,29 @@ pub(crate) fn blocked_address(ip: IpAddr) -> bool {
                 || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
         }
         IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return blocked_address(IpAddr::V4(mapped));
+            if let Some(embedded) = embedded_ipv4(ip) {
+                return blocked_address(IpAddr::V4(embedded));
             }
-            ip.is_loopback()
+            let segments = ip.segments();
+            // Local-use NAT64 (RFC 8215): the IPv4 offset is site-defined.
+            (segments[..3] == [0x64, 0xff9b, 1])
+                || ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
         }
+    }
+}
+
+/// IPv4 address that an IPv6 destination may be translated or tunnelled to:
+/// NAT64 well-known prefix, 6to4, and IPv4-mapped/compatible addresses.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = ip.octets();
+    match ip.segments() {
+        [0x64, 0xff9b, 0, 0, 0, 0, _, _] => Some(Ipv4Addr::new(o[12], o[13], o[14], o[15])),
+        [0x2002, ..] => Some(Ipv4Addr::new(o[2], o[3], o[4], o[5])),
+        _ => ip.to_ipv4(),
     }
 }
 
@@ -279,5 +293,29 @@ mod tests {
         assert!(blocked_address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(blocked_address(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert!(!blocked_address(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn checks_ipv4_embedded_in_ipv6_forms() {
+        let v6 = |s: &str| blocked_address(IpAddr::V6(s.parse::<Ipv6Addr>().unwrap()));
+        for internal in [
+            "::ffff:10.0.0.1",
+            "::10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "2002:a00:1::1",
+            "2002:7f00:1::",
+            "64:ff9b:1::1",
+        ] {
+            assert!(v6(internal), "{internal} must be blocked");
+        }
+        for public in [
+            "64:ff9b::8.8.8.8",
+            "2002:808:808::1",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(!v6(public), "{public} must be allowed");
+        }
     }
 }
