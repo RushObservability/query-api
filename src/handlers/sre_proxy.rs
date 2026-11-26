@@ -13,21 +13,29 @@
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Duration};
 
 use crate::AppState;
 use crate::handlers::settings::{SreAgentAccessDecision, sre_agent_access_decision};
 use crate::handlers::users::{is_api_key_principal, require_agent_principal};
 
-/// Shared HTTP client. No total timeout — `/investigate` streams for minutes;
-/// a short connect timeout still fails fast when the agent is down.
+const AGENT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const TEMPLATE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_TEMPLATE_BYTES: usize = 1024 * 1024;
+
+/// SSE can run for minutes, so the client bounds inactivity without imposing
+/// a fixed total lifetime on a healthy stream.
 fn client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| {
         reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(AGENT_IDLE_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .expect("build sre-agent reqwest client")
     })
@@ -45,8 +53,8 @@ fn sre_base() -> String {
 
 /// Shared credential for the internal SRE-agent API. Refusing to proxy when it
 /// is absent avoids silently falling back to an unauthenticated agent.
-fn sre_internal_token() -> Result<String, (StatusCode, String)> {
-    std::env::var("SRE_AGENT_INTERNAL_TOKEN")
+fn sre_internal_token() -> Result<HeaderValue, (StatusCode, String)> {
+    let token = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
@@ -54,10 +62,16 @@ fn sre_internal_token() -> Result<String, (StatusCode, String)> {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SRE agent internal authentication is not configured".to_string(),
             )
-        })
+        })?;
+    let mut token = HeaderValue::from_str(&token).map_err(unavailable)?;
+    token.set_sensitive(true);
+    Ok(token)
 }
 
-fn with_internal_token(request: reqwest::RequestBuilder, token: String) -> reqwest::RequestBuilder {
+fn with_internal_token(
+    request: reqwest::RequestBuilder,
+    token: HeaderValue,
+) -> reqwest::RequestBuilder {
     request.header("x-rush-internal-token", token)
 }
 
@@ -186,11 +200,8 @@ pub async fn investigate(
 
     let url = format!("{}/api/v1/investigate", sre_base());
     let internal_token = sre_internal_token()?;
-    let resp = with_internal_token(client().post(&url), internal_token)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(unavailable)?;
+    let request = with_internal_token(client().post(&url), internal_token).json(&payload);
+    let resp = send_with_header_deadline(request, AGENT_HEADER_TIMEOUT).await?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = resp
@@ -228,13 +239,45 @@ pub async fn investigate(
         .into_response())
 }
 
+async fn send_with_header_deadline(
+    request: reqwest::RequestBuilder,
+    deadline: Duration,
+) -> Result<reqwest::Response, (StatusCode, String)> {
+    let response = tokio::time::timeout(deadline, request.send())
+        .await
+        .map_err(unavailable)?
+        .map_err(unavailable)?;
+    if response.status().is_redirection() {
+        return Err(unavailable("SRE agent returned a redirect"));
+    }
+    Ok(response)
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(unavailable("SRE agent response exceeded its size limit"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(unavailable)? {
+        if chunk.len() > limit - body.len() {
+            return Err(unavailable("SRE agent response exceeded its size limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Forward a buffered (JSON) GET to the agent, returning its status + body.
 async fn forward_get(url: String) -> Result<Response, (StatusCode, String)> {
     let internal_token = sre_internal_token()?;
-    let resp = with_internal_token(client().get(&url), internal_token)
-        .send()
-        .await
-        .map_err(unavailable)?;
+    let request = with_internal_token(client().get(&url), internal_token).timeout(TEMPLATE_TIMEOUT);
+    let resp = send_with_header_deadline(request, TEMPLATE_TIMEOUT).await?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = resp
         .headers()
@@ -242,7 +285,7 @@ async fn forward_get(url: String) -> Result<Response, (StatusCode, String)> {
         .and_then(|h| h.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    let bytes = resp.bytes().await.map_err(unavailable)?;
+    let bytes = read_bounded_response(resp, MAX_TEMPLATE_BYTES).await?;
     Ok((
         status,
         [(axum::http::header::CONTENT_TYPE, content_type)],
@@ -263,13 +306,44 @@ pub async fn list_investigation_templates(
 
 #[cfg(test)]
 mod tests {
-    use super::{scopes_for_caller, scopes_for_role, with_internal_token};
+    use super::*;
+
+    #[tokio::test]
+    async fn template_body_reader_accepts_exact_limits_and_rejects_larger_bodies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let router = axum::Router::new().route(
+                "/",
+                axum::routing::get(|| async {
+                    Body::from_stream(futures_util::stream::iter([
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"test ")),
+                        Ok(Bytes::from_static(b"response")),
+                    ]))
+                }),
+            );
+            axum::serve(listener, router).await.unwrap();
+        });
+        let url = format!("http://{address}");
+        let response = client().get(&url).send().await.unwrap();
+        assert!(response.content_length().is_none());
+        assert_eq!(
+            read_bounded_response(response, 13).await.unwrap(),
+            b"test response"
+        );
+        let response = client().get(&url).send().await.unwrap();
+        assert_eq!(
+            read_bounded_response(response, 12).await.unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        server.abort();
+    }
 
     #[test]
     fn proxy_attaches_the_internal_agent_credential() {
         let request = with_internal_token(
             reqwest::Client::new().post("http://agent.internal/api/v1/investigate"),
-            "test-token".to_string(),
+            HeaderValue::from_static("test-token"),
         )
         .build()
         .expect("request builds");
