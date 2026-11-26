@@ -30,8 +30,11 @@ struct GroupedRow {
     value: f64,
 }
 
-/// Max monitors evaluated concurrently per cycle (bounds parallel CH data queries).
-const ENGINE_CONCURRENCY: usize = 6;
+/// Cycles start on this fixed period, however long the previous one took.
+const CYCLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+/// Ticks land a few ms early or late, so a monitor evaluated last tick could
+/// look 59.99 s old. Count it as due rather than wait a whole extra cycle.
+const DUE_SLACK: time::Duration = time::Duration::seconds(1);
 /// Flush `last_eval_at` to the config table once per this many evals per monitor.
 const EVAL_FLUSH_EVERY: u32 = 10;
 
@@ -63,7 +66,7 @@ impl NoDataSince {
     }
 }
 
-/// Spawn the monitor evaluation engine. Runs every 60 seconds.
+/// Spawn the monitor evaluation engine. Starts a cycle every 60 seconds.
 pub fn spawn(
     ch: Client,
     config_db: Arc<ConfigDb>,
@@ -76,12 +79,17 @@ pub fn spawn(
         let smtp_transport = build_smtp_transport(&smtp_config);
         let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
         let no_data = NoDataSince::default();
+        let mut ticker = tokio::time::interval(CYCLE_PERIOD);
+        // A cycle that overruns starts the next one at once, then the schedule
+        // resumes, instead of adding the overrun to every later cycle.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             if !lease.is_leader() {
                 tokio::time::sleep(crate::leader::FOLLOWER_POLL).await;
                 continue;
             }
+            ticker.tick().await;
             let start = Instant::now();
             let mut ok = true;
             let cycle = run_evaluation_cycle(
@@ -114,8 +122,6 @@ pub fn spawn(
                     "monitor evaluation cycle completed"
                 );
             }
-
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
 }
@@ -356,18 +362,7 @@ async fn run_evaluation_cycle(
     // check ⇒ max(db, mem) + interval <= now semantics.
     let jobs: Vec<(Monitor, bool)> = monitors
         .into_iter()
-        .filter(|monitor| {
-            if let Some(ref last_eval) = monitor.last_eval_at {
-                if let Ok(last) = time::PrimitiveDateTime::parse(last_eval, UTC_SECONDS) {
-                    let last_utc = last.assume_utc();
-                    let elapsed = (now - last_utc).whole_seconds();
-                    if elapsed < monitor.eval_interval_secs {
-                        return false;
-                    }
-                }
-            }
-            eval_state.is_due(&monitor.id, now, monitor.eval_interval_secs)
-        })
+        .filter(|monitor| monitor_due(monitor, eval_state, now))
         .map(|m| {
             let flush = eval_state.should_flush(&m.id);
             (m, flush)
@@ -379,25 +374,42 @@ async fn run_evaluation_cycle(
     let monitor_states_ref = &monitor_states;
 
     crate::engine_metrics::due(config_db.self_metrics(), "monitor_engine", jobs.len());
+    let mut by_tenant: BTreeMap<String, Vec<(Monitor, bool)>> = BTreeMap::new();
+    for job in jobs {
+        by_tenant
+            .entry(job.0.tenant_id.clone())
+            .or_default()
+            .push(job);
+    }
+    let budget = crate::query_governor::global()
+        .map(|governor| governor.config())
+        .unwrap_or_default()
+        .background;
+    let (tenants_at_once, per_tenant) = engine_concurrency(&budget);
     let outcomes: Vec<(String, u64, bool, bool)> =
-        futures_util::stream::iter(jobs.into_iter().map(|(monitor, should_flush)| async move {
-            let (changes, persisted, failed) = evaluate_job(
-                ch,
-                config_db,
-                &monitor,
-                now_str_ref,
-                http_client,
-                smtp_config,
-                smtp_transport,
-                monitor_states_ref,
-                should_flush,
-                policy_ref,
-                no_data,
-            )
-            .await;
-            (monitor.id, changes, persisted, failed)
+        futures_util::stream::iter(by_tenant.into_values().map(move |jobs| {
+            futures_util::stream::iter(jobs.into_iter().map(
+                move |(monitor, should_flush)| async move {
+                    let (changes, persisted, failed) = evaluate_job(
+                        ch,
+                        config_db,
+                        &monitor,
+                        now_str_ref,
+                        http_client,
+                        smtp_config,
+                        smtp_transport,
+                        monitor_states_ref,
+                        should_flush,
+                        policy_ref,
+                        no_data,
+                    )
+                    .await;
+                    (monitor.id, changes, persisted, failed)
+                },
+            ))
+            .buffer_unordered(per_tenant)
         }))
-        .buffer_unordered(ENGINE_CONCURRENCY)
+        .flatten_unordered(tenants_at_once)
         .collect()
         .await;
 
@@ -411,6 +423,34 @@ async fn run_evaluation_cycle(
 
     anyhow::ensure!(failures == 0, "{failures} monitor evaluation job(s) failed");
     Ok((evaluated, state_changes))
+}
+
+/// Whether a monitor is due: both the coarse DB `last_eval_at` and the exact
+/// in-memory time must be at least `eval_interval_secs` old.
+fn monitor_due(
+    monitor: &Monitor,
+    eval_state: &crate::eval_state::EvalState,
+    now: time::OffsetDateTime,
+) -> bool {
+    let now = now + DUE_SLACK;
+    if let Some(ref last_eval) = monitor.last_eval_at {
+        if let Ok(last) = time::PrimitiveDateTime::parse(last_eval, UTC_SECONDS) {
+            let elapsed = (now - last.assume_utc()).whole_seconds();
+            if elapsed < monitor.eval_interval_secs {
+                return false;
+            }
+        }
+    }
+    eval_state.is_due(&monitor.id, now, monitor.eval_interval_secs)
+}
+
+/// (tenants evaluated at once, monitors at once per tenant), sized to the
+/// background query budget so the engine fills it without queueing work the
+/// governor would reject, and one slow tenant holds only its own share.
+fn engine_concurrency(budget: &crate::query_governor::QueryBudget) -> (usize, usize) {
+    let per_tenant = (budget.per_tenant_concurrency as usize).max(1);
+    let tenants = (budget.global_concurrency as usize / per_tenant).max(1);
+    (tenants, per_tenant)
 }
 
 /// Evaluate one monitor under background admission. Returns
@@ -2946,7 +2986,7 @@ mod no_data_tests {
     }
 
     /// A grouped metric monitor that is firing and resolves on no data.
-    fn monitor() -> Monitor {
+    pub(super) fn monitor() -> Monitor {
         Monitor {
             id: "m1".into(),
             tenant_id: "default".into(),
@@ -3058,5 +3098,33 @@ mod no_data_tests {
             tracker.lasted(&short, 400_000),
             "timeframe within the window"
         );
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_is_due_on_the_next_tick_even_if_it_lands_early() {
+        let m = super::no_data_tests::monitor(); // 60 s interval, never flushed
+        let mut state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
+        let t0 = time::OffsetDateTime::now_utc();
+        state.record(m.id.clone(), t0, false);
+        assert!(!monitor_due(&m, &state, t0 + time::Duration::seconds(30)));
+        assert!(monitor_due(
+            &m,
+            &state,
+            t0 + time::Duration::milliseconds(59_990)
+        ));
+    }
+
+    #[test]
+    fn concurrency_fills_the_background_budget_per_tenant() {
+        let mut budget = crate::query_governor::QueryGovernorConfig::default().background;
+        assert_eq!(engine_concurrency(&budget), (4, 2));
+        budget.global_concurrency = 5;
+        budget.per_tenant_concurrency = 5;
+        assert_eq!(engine_concurrency(&budget), (1, 5));
     }
 }
