@@ -9,11 +9,13 @@ use prost::Message;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use super::dd_common::{decompress_body, validate_api_key};
+use super::dd_common::{decode_body, validate_api_key};
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::ingest_limits::{IngestError, IngestLimits};
 use crate::models::ingest::TraceInsertRow;
+use crate::models::trace::WideEvent;
 
 // ═══ DD Agent protobuf types (AgentPayload) ═══
 // The DD agent v1 trace writer sends protobuf-encoded AgentPayload
@@ -233,60 +235,40 @@ pub async fn ingest_v04(
     // but we still accept it if present
     let _ = validate_api_key(&headers);
 
-    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
-
-    // Decode msgpack: Vec<Vec<DdSpan>> (array of traces, each trace is array of spans)
-    let traces: Vec<Vec<DdSpan>> = rmp_serde::from_slice(&raw).map_err(|_| {
-        state
-            .ingest_limits
-            .malformed("datadog", "invalid Datadog traces payload")
-    })?;
-
-    let span_count: usize = traces.iter().map(|t| t.len()).sum();
-    state
-        .ingest_limits
-        .check_entities("datadog", span_count.saturating_add(traces.len()))?;
+    // Arc refactor: tenant_id is shared across every span — allocate once.
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let (built, raw_len) = decode_body(&state.ingest_limits, &headers, body, move |limits, raw| {
+        // Decode msgpack: Vec<Vec<DdSpan>> (array of traces, each trace is array of spans)
+        let traces: Vec<Vec<DdSpan>> = rmp_serde::from_slice(&raw)
+            .map_err(|_| limits.malformed("datadog", "invalid Datadog traces payload"))?;
+        Ok((msgpack_spans(limits, &tenant_arc, &traces)?, raw.len()))
+    })
+    .await?;
+    let (spans, span_count, traces_count) = built;
     if span_count == 0 {
         return Ok(Json(serde_json::json!({"rate_by_service": {}})));
     }
 
-    // Arc refactor: tenant_id is shared across every span — allocate once.
-    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
-    let rows: Vec<TraceInsertRow> = traces
-        .iter()
-        .flat_map(|trace| {
-            trace.iter().map(|span| {
-                let env = span.meta.get("env").cloned().unwrap_or_default();
-                let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-                convert_span(span, &env, &hostname, &tenant_arc)
-            })
-        })
-        .collect();
-
-    crate::handlers::ingest_gate::write_gated(
-        &state,
-        tenant_id,
-        SpoolBatch::Spans(crate::models::trace::WideEvent::from_rows(rows)),
-    )
-    .await
-    .map_err(|e| match e {
-        WriteError::Backpressure => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-        ),
-        WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
-    })?;
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(spans))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
+        })?;
 
     // Record usage for per-tenant ingest metering
     state
         .usage_accumulator
-        .record(tenant_id, "traces", span_count as u64, raw.len() as u64);
+        .record(tenant_id, "traces", span_count as u64, raw_len as u64);
 
     tracing::debug!(
         signal = "traces",
         tenant_id = %tenant_id,
         spans_count = span_count,
-        traces_count = traces.len(),
+        traces_count = traces_count,
         source = "datadog",
         endpoint = "v0.4",
         "ingested spans"
@@ -321,22 +303,96 @@ pub async fn ingest_agent(
     // Arc refactor: tenant_id is shared across every span in this request.
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     let _ = validate_api_key(&headers);
-    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
 
     // Log content-type for debugging
     let ct = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("none");
-    tracing::debug!(
-        endpoint = "v0.2",
-        bytes = raw.len(),
-        content_type = ct,
-        "datadog traces payload received"
-    );
+        .unwrap_or("none")
+        .to_string();
+    let (decoded, raw_len) =
+        decode_body(&state.ingest_limits, &headers, body, move |limits, raw| {
+            tracing::debug!(
+                endpoint = "v0.2",
+                bytes = raw.len(),
+                content_type = %ct,
+                "datadog traces payload received"
+            );
+            Ok((decode_agent_payload(limits, &tenant_arc, &raw)?, raw.len()))
+        })
+        .await?;
 
+    let (spans, span_count, traces_count, encoding) = match decoded {
+        AgentTraces::Spans {
+            spans,
+            span_count,
+            traces_count,
+            encoding,
+        } => (spans, span_count, traces_count, encoding),
+        AgentTraces::Undecodable(error) => {
+            tracing::warn!(
+                error = %error,
+                signal = "traces",
+                handler = "dd_traces",
+                endpoint = "v0.2",
+                bytes = raw_len,
+                "payload decode failed"
+            );
+            return Ok(Json(serde_json::json!({})));
+        }
+    };
+    if span_count == 0 {
+        return Ok(Json(serde_json::json!({"rate_by_service": {}})));
+    }
+
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(spans))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
+        })?;
+
+    // Record usage for per-tenant ingest metering
+    state
+        .usage_accumulator
+        .record(tenant_id, "traces", span_count as u64, raw_len as u64);
+
+    tracing::debug!(
+        signal = "traces",
+        tenant_id = %tenant_id,
+        spans_count = span_count,
+        traces_count = ?traces_count,
+        source = "datadog",
+        endpoint = "v0.2",
+        encoding = encoding,
+        "ingested spans"
+    );
+    Ok(Json(serde_json::json!({"rate_by_service": {}})))
+}
+
+/// A decoded `/api/v0.2/traces` body.
+enum AgentTraces {
+    Spans {
+        spans: Vec<WideEvent>,
+        span_count: usize,
+        traces_count: Option<usize>,
+        encoding: &'static str,
+    },
+    Undecodable(String),
+}
+
+/// Decode an agent trace payload (protobuf AgentPayload first, msgpack as
+/// fallback) and build its rows. Runs on the blocking pool.
+fn decode_agent_payload(
+    limits: &IngestLimits,
+    tenant_arc: &std::sync::Arc<str>,
+    raw: &[u8],
+) -> Result<AgentTraces, IngestError> {
     // Try protobuf AgentPayload first
-    match AgentPayload::decode(raw.as_slice()) {
+    match AgentPayload::decode(raw) {
         Err(e) => {
             tracing::debug!(error = %e, endpoint = "v0.2", "protobuf decode failed, trying msgpack");
         }
@@ -414,122 +470,61 @@ pub async fn ingest_agent(
                 }
             }
 
-            state.ingest_limits.check_entities("datadog", span_count)?;
-
-            if span_count == 0 {
-                return Ok(Json(serde_json::json!({"rate_by_service": {}})));
-            }
+            limits.check_entities("datadog", span_count)?;
 
             let rows: Vec<TraceInsertRow> = all_spans
                 .iter()
                 .map(|span| {
                     let span_env = span.meta.get("env").cloned().unwrap_or_default();
                     let span_host = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-                    convert_span(span, &span_env, &span_host, &tenant_arc)
+                    convert_span(span, &span_env, &span_host, tenant_arc)
                 })
                 .collect();
-
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                tenant_id,
-                SpoolBatch::Spans(crate::models::trace::WideEvent::from_rows(rows)),
-            )
-            .await
-            .map_err(|e| match e {
-                WriteError::Backpressure => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-                ),
-                WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
-            })?;
-
-            // Record usage for per-tenant ingest metering (protobuf path)
-            state.usage_accumulator.record(
-                tenant_id,
-                "traces",
-                span_count as u64,
-                raw.len() as u64,
-            );
-
-            tracing::debug!(
-                signal = "traces",
-                tenant_id = %tenant_id,
-                spans_count = span_count,
-                source = "datadog",
-                endpoint = "v0.2",
-                encoding = "protobuf",
-                "ingested spans"
-            );
-            return Ok(Json(serde_json::json!({"rate_by_service": {}})));
+            return Ok(AgentTraces::Spans {
+                spans: WideEvent::from_rows(rows),
+                span_count,
+                traces_count: None,
+                encoding: "protobuf",
+            });
         }
     }
 
     // Fallback: try msgpack decode (Vec<Vec<DdSpan>> format)
-    match rmp_serde::from_slice::<Vec<Vec<DdSpan>>>(&raw) {
+    match rmp_serde::from_slice::<Vec<Vec<DdSpan>>>(raw) {
         Ok(traces) => {
-            let span_count: usize = traces.iter().map(|t| t.len()).sum();
-            state
-                .ingest_limits
-                .check_entities("datadog", span_count.saturating_add(traces.len()))?;
-            if span_count == 0 {
-                return Ok(Json(serde_json::json!({"rate_by_service": {}})));
-            }
-
-            let rows: Vec<TraceInsertRow> = traces
-                .iter()
-                .flat_map(|trace| {
-                    trace.iter().map(|span| {
-                        let env = span.meta.get("env").cloned().unwrap_or_default();
-                        let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
-                        convert_span(span, &env, &hostname, &tenant_arc)
-                    })
-                })
-                .collect();
-
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                tenant_id,
-                SpoolBatch::Spans(crate::models::trace::WideEvent::from_rows(rows)),
-            )
-            .await
-            .map_err(|e| match e {
-                WriteError::Backpressure => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-                ),
-                WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_traces.write", s),
-            })?;
-
-            // Record usage for per-tenant ingest metering (msgpack fallback path)
-            state.usage_accumulator.record(
-                tenant_id,
-                "traces",
-                span_count as u64,
-                raw.len() as u64,
-            );
-
-            tracing::debug!(
-                signal = "traces",
-                tenant_id = %tenant_id,
-                spans_count = span_count,
-                traces_count = traces.len(),
-                source = "datadog",
-                endpoint = "v0.2",
-                encoding = "msgpack",
-                "ingested spans"
-            );
-            Ok(Json(serde_json::json!({"rate_by_service": {}})))
+            let (spans, span_count, traces_count) = msgpack_spans(limits, tenant_arc, &traces)?;
+            Ok(AgentTraces::Spans {
+                spans,
+                span_count,
+                traces_count: Some(traces_count),
+                encoding: "msgpack",
+            })
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                signal = "traces",
-                handler = "dd_traces",
-                endpoint = "v0.2",
-                bytes = raw.len(),
-                "payload decode failed"
-            );
-            Ok(Json(serde_json::json!({})))
-        }
+        Err(e) => Ok(AgentTraces::Undecodable(e.to_string())),
     }
+}
+
+/// Limit-check msgpack traces and convert them to span rows. Returns the
+/// rows, span count and trace count.
+fn msgpack_spans(
+    limits: &IngestLimits,
+    tenant_arc: &std::sync::Arc<str>,
+    traces: &[Vec<DdSpan>],
+) -> Result<(Vec<WideEvent>, usize, usize), IngestError> {
+    let span_count: usize = traces.iter().map(|t| t.len()).sum();
+    limits.check_entities("datadog", span_count.saturating_add(traces.len()))?;
+    if span_count == 0 {
+        return Ok((Vec::new(), 0, traces.len()));
+    }
+    let rows: Vec<TraceInsertRow> = traces
+        .iter()
+        .flat_map(|trace| {
+            trace.iter().map(|span| {
+                let env = span.meta.get("env").cloned().unwrap_or_default();
+                let hostname = span.meta.get("_dd.hostname").cloned().unwrap_or_default();
+                convert_span(span, &env, &hostname, tenant_arc)
+            })
+        })
+        .collect();
+    Ok((WideEvent::from_rows(rows), span_count, traces.len()))
 }

@@ -23,40 +23,45 @@ pub fn validate_api_key(headers: &HeaderMap) -> Result<(), (StatusCode, String)>
     Ok(())
 }
 
-/// Decompress body based on Content-Encoding header (gzip, deflate, zstd, or identity).
-/// Compressed bodies are inflated on the blocking pool — decompression is
-/// synchronous CPU work that would otherwise stall a tokio worker for the
-/// duration (tens to hundreds of ms on large agent payloads).
-pub async fn decompress_body(
+/// Decompress the body (gzip, deflate, zstd or identity) and hand it to
+/// `parse`, all on the blocking pool under a decode permit. Inflating, JSON or
+/// msgpack parsing and row building are all synchronous CPU work that would
+/// otherwise stall a tokio worker on large agent payloads.
+pub async fn decode_body<T, F>(
     limits: &crate::ingest_limits::IngestLimits,
     headers: &HeaderMap,
     body: Bytes,
-) -> Result<Vec<u8>, (StatusCode, String)> {
+    parse: F,
+) -> Result<T, (StatusCode, String)>
+where
+    T: Send + 'static,
+    F: FnOnce(&crate::ingest_limits::IngestLimits, Vec<u8>) -> Result<T, (StatusCode, String)>
+        + Send
+        + 'static,
+{
     limits.check_body("datadog", &body)?;
     let encoding = headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if is_compressed_encoding(&encoding) {
-        let permit = limits.acquire_decode("datadog").await?;
-        let limits = limits.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            decompress_body_sync(
-                &limits,
-                "datadog",
-                "invalid compressed Datadog payload",
-                &encoding,
-                &body,
-            )
+    limits
+        .spawn_decode("datadog", move |limits| {
+            let raw = if is_compressed_encoding(&encoding) {
+                decompress_body_sync(
+                    limits,
+                    "datadog",
+                    "invalid compressed Datadog payload",
+                    &encoding,
+                    &body,
+                )?
+            } else {
+                limits.check_decompressed("datadog", body.len())?;
+                body.to_vec()
+            };
+            parse(limits, raw)
         })
         .await
-        .map_err(|e| crate::api_error::internal_legacy("datadog.decompress_task", e))?
-    } else {
-        limits.check_decompressed("datadog", body.len())?;
-        Ok(body.to_vec())
-    }
 }
 
 /// Content-Encoding values `decompress_body_sync` can inflate.
@@ -208,11 +213,26 @@ mod tests {
         for encoding in ["zstd", "zstandard"] {
             let mut headers = HeaderMap::new();
             headers.insert("content-encoding", encoding.parse().unwrap());
-            let decoded = decompress_body(&limits(), &headers, compressed.clone())
+            let decoded = decode_body(&limits(), &headers, compressed.clone(), |_, raw| Ok(raw))
                 .await
                 .unwrap();
             assert_eq!(decoded, payload);
         }
+    }
+
+    #[tokio::test]
+    async fn uncompressed_datadog_body_takes_a_decode_permit() {
+        let limits = limits();
+        let _held = limits.acquire_decode("datadog").await.unwrap();
+        let error = decode_body(
+            &limits,
+            &HeaderMap::new(),
+            Bytes::from_static(b"[]"),
+            |_, raw| Ok(raw),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

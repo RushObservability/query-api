@@ -62,6 +62,24 @@ pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<T, (StatusCode, String)> {
+    decode_proto_with(limits, headers, body, |_, req| Ok(req)).await
+}
+
+/// `decode_proto`, then `build` (entity checks and row building) in the same
+/// blocking task and decode permit, so none of it runs on a tokio worker.
+async fn decode_proto_with<T, R, F>(
+    limits: &crate::ingest_limits::IngestLimits,
+    headers: &HeaderMap,
+    body: Bytes,
+    build: F,
+) -> Result<R, (StatusCode, String)>
+where
+    T: Message + Default,
+    R: Send + 'static,
+    F: FnOnce(&crate::ingest_limits::IngestLimits, T) -> Result<R, (StatusCode, String)>
+        + Send
+        + 'static,
+{
     limits.check_body("otlp", &body)?;
     let ct = headers
         .get("content-type")
@@ -90,16 +108,13 @@ pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
         ));
     }
 
-    let permit = limits.acquire_decode("otlp").await?;
-    let limits = limits.clone();
     // Protobuf decode is synchronous CPU work even for identity bodies. Always
     // admit it through the dedicated semaphore and blocking pool.
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        decode_proto_sync::<T>(&limits, &encoding, &body)
-    })
-    .await
-    .map_err(|e| crate::api_error::internal_legacy("otlp.decode_task", e))?
+    limits
+        .spawn_decode("otlp", move |limits| {
+            build(limits, decode_proto_sync::<T>(limits, &encoding, &body)?)
+        })
+        .await
 }
 
 fn decode_proto_sync<T: Message + Default>(
@@ -354,14 +369,331 @@ pub async fn ingest_otlp_traces(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
 
-    let req: ExportTraceServiceRequest =
-        decode_proto(&state.ingest_limits, &headers, body.clone()).await?;
-    validate_trace_entities(&state.ingest_limits, &req)?;
+    let tenant = tenant_id.clone();
+    let rows = decode_proto_with(
+        &state.ingest_limits,
+        &headers,
+        body.clone(),
+        move |limits, req: ExportTraceServiceRequest| {
+            validate_trace_entities(limits, &req)?;
+            // Reshape OTel-native rows into wide `spans` rows at ingest (the former
+            // spans_mv transform) for the single `spans` table — no spans_raw copy.
+            Ok(crate::models::trace::WideEvent::from_rows(otlp_trace_rows(
+                &req, &tenant,
+            )))
+        },
+    )
+    .await?;
 
+    if rows.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+
+    let count = rows.len();
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Spans(rows))
+        .await
+        .map_err(map_write_err)?;
+
+    state
+        .usage_accumulator
+        .record(&tenant_id, "traces", count as u64, body.len() as u64);
+
+    tracing::debug!(
+        signal = "traces",
+        tenant_id = %tenant_id,
+        spans_count = count,
+        source = "otlp",
+        "ingested spans"
+    );
+
+    Ok(StatusCode::OK)
+}
+
+// ─── POST /v1/logs ────────────────────────────────────────────────────────────
+
+pub async fn ingest_otlp_logs(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+
+    let tenant = tenant_id.clone();
+    let rows = decode_proto_with(
+        &state.ingest_limits,
+        &headers,
+        body.clone(),
+        move |limits, req: ExportLogsServiceRequest| {
+            validate_log_entities(limits, &req)?;
+            Ok(otlp_log_rows(&req, &tenant))
+        },
+    )
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+
+    let count = rows.len();
+    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows))
+        .await
+        .map_err(map_write_err)?;
+
+    state
+        .usage_accumulator
+        .record(&tenant_id, "logs", count as u64, body.len() as u64);
+
+    tracing::debug!(
+        signal = "logs",
+        tenant_id = %tenant_id,
+        count = count,
+        source = "otlp",
+        "ingested logs"
+    );
+
+    Ok(StatusCode::OK)
+}
+
+// ─── POST /v1/metrics ────────────────────────────────────────────────────────
+
+pub async fn ingest_otlp_metrics(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+
+    let tenant = tenant_id.clone();
+    let (gauge_rows, sum_rows, histogram_rows, exp_histogram_rows, summary_rows) =
+        decode_proto_with(
+            &state.ingest_limits,
+            &headers,
+            body.clone(),
+            move |limits, req: ExportMetricsServiceRequest| {
+                validate_metric_entities(limits, &req)?;
+                Ok(otlp_metric_rows(&req, &tenant))
+            },
+        )
+        .await?;
+
+    let total = gauge_rows.len()
+        + sum_rows.len()
+        + histogram_rows.len()
+        + exp_histogram_rows.len()
+        + summary_rows.len();
+
+    if total == 0 {
+        return Ok(StatusCode::OK);
+    }
+
+    // Write each non-empty type batch concurrently.
+    let gauge_fut = async {
+        if !gauge_rows.is_empty() {
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Gauge(gauge_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
+        }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let sum_fut = async {
+        if !sum_rows.is_empty() {
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Sum(sum_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
+        }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let histogram_fut = async {
+        if !histogram_rows.is_empty() {
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Histogram(histogram_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
+        }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let exp_histogram_fut = async {
+        if !exp_histogram_rows.is_empty() {
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::ExpHistogram(exp_histogram_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
+        }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let summary_fut = async {
+        if !summary_rows.is_empty() {
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                &tenant_id,
+                SpoolBatch::Summary(summary_rows),
+            )
+            .await
+            .map_err(map_write_err)?;
+        }
+        Ok::<_, (StatusCode, String)>(())
+    };
+
+    let (r1, r2, r3, r4, r5) = tokio::join!(
+        gauge_fut,
+        sum_fut,
+        histogram_fut,
+        exp_histogram_fut,
+        summary_fut
+    );
+    r1?;
+    r2?;
+    r3?;
+    r4?;
+    r5?;
+
+    state
+        .usage_accumulator
+        .record(&tenant_id, "metrics", total as u64, body.len() as u64);
+
+    tracing::debug!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        total = total,
+        source = "otlp",
+        "ingested metrics"
+    );
+
+    Ok(StatusCode::OK)
+}
+
+// ─── POST /api/v1/ingest/logs  (Vector JSON) ─────────────────────────────────
+//
+// Vector's `http` sink with `encoding.codec = "json"` posts a JSON array of
+// objects shaped by the `parse_logs` transform in vector-kube-logs.yaml:
+//
+//   {
+//     "ServiceName":        "my-svc",
+//     "SeverityText":       "ERROR",
+//     "SeverityNumber":     17,
+//     "Body":               "...",
+//     "Timestamp":          1700000000000000000,   // i64 nanos
+//     "TraceId":            "abc123",
+//     "SpanId":             "deadbeef",
+//     "TraceFlags":         1,
+//     "ResourceAttributes": { "k8s.namespace.name": "prod" },
+//     "LogAttributes":      { "foo": "bar" },
+//     "ScopeName":          "opentelemetry.instrumentation.logging",
+//     "EventName":          ""
+//   }
+//
+// Supports:  top-level JSON array  (Vector default)
+//            single JSON object    (tolerated for convenience)
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VectorLogEntry {
+    #[serde(default)]
+    pub service_name: String,
+    #[serde(default)]
+    pub severity_text: String,
+    #[serde(default)]
+    pub severity_number: u8,
+    #[serde(default)]
+    pub body: String,
+    /// Unix nanoseconds as i64; 0 / missing → current time.
+    #[serde(default)]
+    pub timestamp: i64,
+    #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
+    pub span_id: String,
+    #[serde(default)]
+    pub trace_flags: u32,
+    /// Flat JSON object.  Missing keys → empty map. Deserialized straight into
+    /// a map (not a generic Value) so attrs are parsed exactly once.
+    #[serde(default)]
+    pub resource_attributes: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub log_attributes: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub scope_name: String,
+    #[serde(default)]
+    pub event_name: String,
+}
+
+/// Flatten a JSON object into Vec<(String,String)>.
+/// Non-string leaf values are stringified.
+fn json_obj_to_attrs(map: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    map.iter()
+        .map(|(k, v)| {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), s)
+        })
+        .collect()
+}
+
+pub async fn ingest_vector_logs(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    state.ingest_limits.check_body("otlp", &body)?;
+    state.ingest_limits.check_decompressed("otlp", body.len())?;
+
+    let wire_bytes = body.len();
+    let tenant = tenant_id.clone();
+    let rows = state
+        .ingest_limits
+        .spawn_decode("otlp", move |limits| {
+            vector_log_rows(limits, &tenant, &body)
+        })
+        .await?;
+    if rows.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+
+    let count = rows.len();
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Logs(rows))
+        .await
+        .map_err(map_write_err)?;
+
+    state
+        .usage_accumulator
+        .record(tenant_id, "logs", count as u64, wire_bytes as u64);
+
+    tracing::info!(
+        signal = "logs",
+        tenant_id = %tenant_id,
+        count = count,
+        source = "vector",
+        "ingested logs"
+    );
+
+    Ok(StatusCode::OK)
+}
+
+/// Build span rows from a decoded OTLP trace request. Runs on the blocking pool.
+fn otlp_trace_rows(req: &ExportTraceServiceRequest, tenant_id: &str) -> Vec<TraceInsertRow> {
     let mut rows: Vec<TraceInsertRow> = Vec::new();
 
     // Arc refactor: tenant_id is shared across the whole batch — allocate once.
-    let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
+    let tenant_id: std::sync::Arc<str> = tenant_id.into();
 
     for rs in &req.resource_spans {
         let resource = rs.resource.as_ref();
@@ -488,54 +820,17 @@ pub async fn ingest_otlp_traces(
         }
     }
 
-    if rows.is_empty() {
-        return Ok(StatusCode::OK);
-    }
-
-    let count = rows.len();
-    // Reshape OTel-native rows into wide `spans` rows at ingest (the former spans_mv
-    // transform) and write directly to the single `spans` table — no spans_raw copy.
-    let wide: Vec<crate::models::trace::WideEvent> =
-        crate::models::trace::WideEvent::from_rows(rows);
-    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Spans(wide))
-        .await
-        .map_err(map_write_err)?;
-
-    state
-        .usage_accumulator
-        .record(&tenant_id, "traces", count as u64, body.len() as u64);
-
-    tracing::debug!(
-        signal = "traces",
-        tenant_id = %tenant_id,
-        spans_count = count,
-        source = "otlp",
-        "ingested spans"
-    );
-
-    Ok(StatusCode::OK)
+    rows
 }
 
-// ─── POST /v1/logs ────────────────────────────────────────────────────────────
-
-pub async fn ingest_otlp_logs(
-    State(state): State<AppState>,
-    Extension(tenant): Extension<TenantContext>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tenant_id = &tenant.tenant_id;
-
-    let req: ExportLogsServiceRequest =
-        decode_proto(&state.ingest_limits, &headers, body.clone()).await?;
-    validate_log_entities(&state.ingest_limits, &req)?;
-
+/// Build log rows from a decoded OTLP logs request. Runs on the blocking pool.
+fn otlp_log_rows(req: &ExportLogsServiceRequest, tenant_id: &str) -> Vec<LogInsertRow> {
     let mut rows: Vec<LogInsertRow> = Vec::new();
 
     let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc refactor: tenant_id is shared across the whole batch — allocate once.
-    let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
+    let tenant_id: std::sync::Arc<str> = tenant_id.into();
 
     for rl in &req.resource_logs {
         let resource = rl.resource.as_ref();
@@ -607,44 +902,21 @@ pub async fn ingest_otlp_logs(
         }
     }
 
-    if rows.is_empty() {
-        return Ok(StatusCode::OK);
-    }
-
-    let count = rows.len();
-    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows))
-        .await
-        .map_err(map_write_err)?;
-
-    state
-        .usage_accumulator
-        .record(&tenant_id, "logs", count as u64, body.len() as u64);
-
-    tracing::debug!(
-        signal = "logs",
-        tenant_id = %tenant_id,
-        count = count,
-        source = "otlp",
-        "ingested logs"
-    );
-
-    Ok(StatusCode::OK)
+    rows
 }
 
-// ─── POST /v1/metrics ────────────────────────────────────────────────────────
+/// Rows built from one OTLP metrics request: gauge, sum, histogram,
+/// exponential histogram and summary.
+type OtlpMetricRows = (
+    Vec<GaugeRow>,
+    Vec<SumRow>,
+    Vec<HistogramRow>,
+    Vec<ExpHistogramRow>,
+    Vec<SummaryRow>,
+);
 
-pub async fn ingest_otlp_metrics(
-    State(state): State<AppState>,
-    Extension(tenant): Extension<TenantContext>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tenant_id = &tenant.tenant_id;
-
-    let req: ExportMetricsServiceRequest =
-        decode_proto(&state.ingest_limits, &headers, body.clone()).await?;
-    validate_metric_entities(&state.ingest_limits, &req)?;
-
+/// Build metric rows from a decoded OTLP metrics request. Runs on the blocking pool.
+fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpMetricRows {
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
     let mut histogram_rows: Vec<HistogramRow> = Vec::new();
@@ -655,7 +927,7 @@ pub async fn ingest_otlp_metrics(
     // For a 10k-datapoint batch the per-resource/scope/metric values below are
     // each allocated once and cheaply Arc-cloned into every datapoint row, in
     // place of the previous per-datapoint String/Vec clones.
-    let tenant_id: std::sync::Arc<str> = tenant_id.as_str().into();
+    let tenant_id: std::sync::Arc<str> = tenant_id.into();
 
     for rm in &req.resource_metrics {
         let resource = rm.resource.as_ref();
@@ -893,210 +1165,40 @@ pub async fn ingest_otlp_metrics(
         }
     }
 
-    let total = gauge_rows.len()
-        + sum_rows.len()
-        + histogram_rows.len()
-        + exp_histogram_rows.len()
-        + summary_rows.len();
-
-    if total == 0 {
-        return Ok(StatusCode::OK);
-    }
-
-    // Write each non-empty type batch concurrently.
-    let gauge_fut = async {
-        if !gauge_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                &tenant_id,
-                SpoolBatch::Gauge(gauge_rows),
-            )
-            .await
-            .map_err(map_write_err)?;
-        }
-        Ok::<_, (StatusCode, String)>(())
-    };
-    let sum_fut = async {
-        if !sum_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                &tenant_id,
-                SpoolBatch::Sum(sum_rows),
-            )
-            .await
-            .map_err(map_write_err)?;
-        }
-        Ok::<_, (StatusCode, String)>(())
-    };
-    let histogram_fut = async {
-        if !histogram_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                &tenant_id,
-                SpoolBatch::Histogram(histogram_rows),
-            )
-            .await
-            .map_err(map_write_err)?;
-        }
-        Ok::<_, (StatusCode, String)>(())
-    };
-    let exp_histogram_fut = async {
-        if !exp_histogram_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                &tenant_id,
-                SpoolBatch::ExpHistogram(exp_histogram_rows),
-            )
-            .await
-            .map_err(map_write_err)?;
-        }
-        Ok::<_, (StatusCode, String)>(())
-    };
-    let summary_fut = async {
-        if !summary_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                &tenant_id,
-                SpoolBatch::Summary(summary_rows),
-            )
-            .await
-            .map_err(map_write_err)?;
-        }
-        Ok::<_, (StatusCode, String)>(())
-    };
-
-    let (r1, r2, r3, r4, r5) = tokio::join!(
-        gauge_fut,
-        sum_fut,
-        histogram_fut,
-        exp_histogram_fut,
-        summary_fut
-    );
-    r1?;
-    r2?;
-    r3?;
-    r4?;
-    r5?;
-
-    state
-        .usage_accumulator
-        .record(&tenant_id, "metrics", total as u64, body.len() as u64);
-
-    tracing::debug!(
-        signal = "metrics",
-        tenant_id = %tenant_id,
-        total = total,
-        source = "otlp",
-        "ingested metrics"
-    );
-
-    Ok(StatusCode::OK)
+    (
+        gauge_rows,
+        sum_rows,
+        histogram_rows,
+        exp_histogram_rows,
+        summary_rows,
+    )
 }
 
-// ─── POST /api/v1/ingest/logs  (Vector JSON) ─────────────────────────────────
-//
-// Vector's `http` sink with `encoding.codec = "json"` posts a JSON array of
-// objects shaped by the `parse_logs` transform in vector-kube-logs.yaml:
-//
-//   {
-//     "ServiceName":        "my-svc",
-//     "SeverityText":       "ERROR",
-//     "SeverityNumber":     17,
-//     "Body":               "...",
-//     "Timestamp":          1700000000000000000,   // i64 nanos
-//     "TraceId":            "abc123",
-//     "SpanId":             "deadbeef",
-//     "TraceFlags":         1,
-//     "ResourceAttributes": { "k8s.namespace.name": "prod" },
-//     "LogAttributes":      { "foo": "bar" },
-//     "ScopeName":          "opentelemetry.instrumentation.logging",
-//     "EventName":          ""
-//   }
-//
-// Supports:  top-level JSON array  (Vector default)
-//            single JSON object    (tolerated for convenience)
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct VectorLogEntry {
-    #[serde(default)]
-    pub service_name: String,
-    #[serde(default)]
-    pub severity_text: String,
-    #[serde(default)]
-    pub severity_number: u8,
-    #[serde(default)]
-    pub body: String,
-    /// Unix nanoseconds as i64; 0 / missing → current time.
-    #[serde(default)]
-    pub timestamp: i64,
-    #[serde(default)]
-    pub trace_id: String,
-    #[serde(default)]
-    pub span_id: String,
-    #[serde(default)]
-    pub trace_flags: u32,
-    /// Flat JSON object.  Missing keys → empty map. Deserialized straight into
-    /// a map (not a generic Value) so attrs are parsed exactly once.
-    #[serde(default)]
-    pub resource_attributes: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
-    pub log_attributes: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
-    pub scope_name: String,
-    #[serde(default)]
-    pub event_name: String,
-}
-
-/// Flatten a JSON object into Vec<(String,String)>.
-/// Non-string leaf values are stringified.
-fn json_obj_to_attrs(map: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
-    map.iter()
-        .map(|(k, v)| {
-            let s = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            (k.clone(), s)
-        })
-        .collect()
-}
-
-pub async fn ingest_vector_logs(
-    State(state): State<AppState>,
-    Extension(tenant): Extension<TenantContext>,
-    body: Bytes,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tenant_id = &tenant.tenant_id;
-    state.ingest_limits.check_body("otlp", &body)?;
-    state.ingest_limits.check_decompressed("otlp", body.len())?;
-
+/// Parse a Vector JSON logs body and build its rows. Runs on the blocking pool.
+fn vector_log_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    tenant_id: &str,
+    body: &[u8],
+) -> Result<Vec<LogInsertRow>, (StatusCode, String)> {
     // Framing-agnostic: Vector's http sink may send a JSON array, a single
     // object, or newline/whitespace-separated JSON depending on version and
     // framing config. Handle all three.
     let first_non_ws = body.iter().find(|b| !b.is_ascii_whitespace()).copied();
     let entries: Vec<VectorLogEntry> = if first_non_ws == Some(b'[') {
-        serde_json::from_slice(&body).map_err(|_| {
-            state
-                .ingest_limits
-                .malformed("otlp", "invalid Vector log payload")
-        })?
+        serde_json::from_slice(body)
+            .map_err(|_| limits.malformed("otlp", "invalid Vector log payload"))?
     } else {
         // Stream of concatenated/NDJSON objects (also covers a single object).
         let mut out = Vec::new();
-        let mut stream = serde_json::Deserializer::from_slice(&body).into_iter::<VectorLogEntry>();
+        let mut stream = serde_json::Deserializer::from_slice(body).into_iter::<VectorLogEntry>();
         for item in &mut stream {
-            out.push(item.map_err(|_| {
-                state
-                    .ingest_limits
-                    .malformed("otlp", "invalid Vector log payload")
-            })?);
+            out.push(item.map_err(|_| limits.malformed("otlp", "invalid Vector log payload"))?);
         }
         out
     };
 
     if entries.is_empty() {
-        return Ok(StatusCode::OK);
+        return Ok(Vec::new());
     }
     let entity_count = entries
         .iter()
@@ -1105,23 +1207,18 @@ pub async fn ingest_vector_logs(
                 .checked_add(entry.resource_attributes.len())
                 .and_then(|count| count.checked_add(entry.log_attributes.len()))
         })
-        .ok_or_else(|| {
-            state
-                .ingest_limits
-                .check_entities("otlp", usize::MAX)
-                .unwrap_err()
-        })?;
-    state.ingest_limits.check_entities("otlp", entity_count)?;
+        .ok_or_else(|| limits.check_entities("otlp", usize::MAX).unwrap_err())?;
+    limits.check_entities("otlp", entity_count)?;
 
     let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc refactor: tenant_id is shared across all entries; the empty scope
     // strings/attrs are shared constants — allocate each once per request.
-    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let tenant_arc: std::sync::Arc<str> = tenant_id.into();
     let empty_str: std::sync::Arc<str> = "".into();
     let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
 
-    let rows: Vec<LogInsertRow> = entries
+    let rows = entries
         .into_iter()
         .map(|e| {
             let ts = if e.timestamp != 0 {
@@ -1154,24 +1251,7 @@ pub async fn ingest_vector_logs(
         })
         .collect();
 
-    let count = rows.len();
-    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Logs(rows))
-        .await
-        .map_err(map_write_err)?;
-
-    state
-        .usage_accumulator
-        .record(tenant_id, "logs", count as u64, body.len() as u64);
-
-    tracing::info!(
-        signal = "logs",
-        tenant_id = %tenant_id,
-        count = count,
-        source = "vector",
-        "ingested logs"
-    );
-
-    Ok(StatusCode::OK)
+    Ok(rows)
 }
 
 #[cfg(test)]

@@ -7,11 +7,15 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::dd_common::{decompress_body, validate_api_key};
+use super::dd_common::{decode_body, validate_api_key};
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::ingest_limits::{IngestError, IngestLimits};
 use crate::models::ingest::{GaugeRow, SumRow};
+
+/// Gauge rows, sum rows and the number of series they came from.
+type SeriesRows = (Vec<GaugeRow>, Vec<SumRow>, usize);
 
 // ═══ V1 Series payload ═══
 
@@ -175,75 +179,16 @@ pub async fn ingest_v1(
     let tenant_id = &tenant.tenant_id;
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
-    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
-
-    let payload: V1SeriesPayload = serde_json::from_slice(&raw).map_err(|_| {
-        state
-            .ingest_limits
-            .malformed("datadog", "invalid Datadog metrics payload")
-    })?;
-
-    if payload.series.is_empty() {
+    let (built, raw_len) = decode_body(&state.ingest_limits, &headers, body, move |limits, raw| {
+        Ok((build_v1_rows(limits, &tenant_arc, &raw)?, raw.len()))
+    })
+    .await?;
+    let (gauge_rows, sum_rows, series_count) = built;
+    if series_count == 0 {
         return Ok((
             StatusCode::ACCEPTED,
             Json(serde_json::json!({"status": "ok"})),
         ));
-    }
-    state.ingest_limits.check_count(
-        "datadog",
-        payload.series.len(),
-        state.ingest_limits.max_series,
-    )?;
-    let entity_count = payload
-        .series
-        .iter()
-        .try_fold(payload.series.len(), |count, series| {
-            count
-                .checked_add(series.points.len())
-                .and_then(|count| count.checked_add(series.tags.len()))
-        })
-        .ok_or_else(|| {
-            state
-                .ingest_limits
-                .check_entities("datadog", usize::MAX)
-                .unwrap_err()
-        })?;
-    state
-        .ingest_limits
-        .check_entities("datadog", entity_count)?;
-
-    // Group by target table
-    let mut gauge_rows: Vec<GaugeRow> = Vec::new();
-    let mut sum_rows: Vec<SumRow> = Vec::new();
-
-    for series in &payload.series {
-        let (svc, attrs) = extract_tags(&series.tags);
-        let is_sum = table_for_type(&series.r#type) == "metrics_sum";
-        let template = build_template(
-            svc,
-            series.metric.clone(),
-            String::new(),
-            attrs,
-            &series.host,
-            &tenant_arc,
-        );
-
-        // Clone template once per series; only time_unix/value (scalars) change per point.
-        let mut row = template.clone();
-        let is_count = series.r#type.to_lowercase() == "count";
-        for point in &series.points {
-            if point.len() < 2 {
-                continue;
-            }
-            row.time_unix = (point[0] as i64) * 1_000_000_000; // seconds → ns
-            row.value = point[1];
-
-            if is_sum {
-                sum_rows.push(SumRow::from_gauge(&row, is_count));
-            } else {
-                gauge_rows.push(row.clone());
-            }
-        }
     }
 
     let total = gauge_rows.len() + sum_rows.len();
@@ -285,12 +230,12 @@ pub async fn ingest_v1(
     // Record usage for per-tenant ingest metering
     state
         .usage_accumulator
-        .record(tenant_id, "metrics", total as u64, raw.len() as u64);
+        .record(tenant_id, "metrics", total as u64, raw_len as u64);
 
     tracing::debug!(
         signal = "metrics",
         tenant_id = %tenant_id,
-        series_count = payload.series.len(),
+        series_count = series_count,
         datapoints = total,
         gauge_count = gauge_len,
         sum_count = sum_len,
@@ -317,41 +262,147 @@ pub async fn ingest_v2(
     let tenant_id = &tenant.tenant_id;
     let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
     validate_api_key(&headers)?;
-    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
-
-    // DD agent v7 sends protobuf by default for v2/series.
-    // Try JSON first; if it fails, accept gracefully (protobuf support TODO).
-    let payload: V2SeriesPayload = match serde_json::from_slice(&raw) {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::debug!(
-                signal = "metrics",
-                endpoint = "v2",
-                bytes = raw.len(),
-                content_type = headers
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("none"),
-                "received non-JSON payload, accepting"
-            );
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({"status": "ok"})),
-            ));
-        }
+    let (built, raw_len) = decode_body(&state.ingest_limits, &headers, body, move |limits, raw| {
+        Ok((build_v2_rows(limits, &tenant_arc, &raw)?, raw.len()))
+    })
+    .await?;
+    let Some((gauge_rows, sum_rows, series_count)) = built else {
+        tracing::debug!(
+            signal = "metrics",
+            endpoint = "v2",
+            bytes = raw_len,
+            content_type = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("none"),
+            "received non-JSON payload, accepting"
+        );
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "ok"})),
+        ));
     };
-
-    if payload.series.is_empty() {
+    if series_count == 0 {
         return Ok((
             StatusCode::ACCEPTED,
             Json(serde_json::json!({"status": "ok"})),
         ));
     }
-    state.ingest_limits.check_count(
-        "datadog",
-        payload.series.len(),
-        state.ingest_limits.max_series,
-    )?;
+
+    let total = gauge_rows.len() + sum_rows.len();
+
+    let map_err = |e: WriteError| match e {
+        WriteError::Backpressure => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+        ),
+        WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_metrics.write", s),
+    };
+    let gauge_fut = async {
+        if !gauge_rows.is_empty() {
+            crate::handlers::ingest_gate::write_gated(
+                &state,
+                tenant_id,
+                SpoolBatch::Gauge(gauge_rows),
+            )
+            .await
+            .map_err(map_err)?;
+        }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let sum_fut = async {
+        if !sum_rows.is_empty() {
+            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows))
+                .await
+                .map_err(map_err)?;
+        }
+        Ok::<_, (StatusCode, String)>(())
+    };
+    let (gauge_res, sum_res) = tokio::join!(gauge_fut, sum_fut);
+    gauge_res?;
+    sum_res?;
+
+    // Record usage for per-tenant ingest metering
+    state
+        .usage_accumulator
+        .record(tenant_id, "metrics", total as u64, raw_len as u64);
+
+    tracing::debug!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        series_count = series_count,
+        datapoints = total,
+        source = "datadog",
+        endpoint = "v2",
+        "ingested metrics"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "ok"})),
+    ))
+}
+
+/// POST /datadog/api/v1/check_run — Datadog service checks.
+/// Maps check status to a gauge metric: dd.check.{check_name} = status.
+pub async fn check_run(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tenant_id = &tenant.tenant_id;
+    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    validate_api_key(&headers)?;
+    let (rows, raw_len) = decode_body(&state.ingest_limits, &headers, body, move |limits, raw| {
+        Ok((build_check_rows(limits, &tenant_arc, &raw)?, raw.len()))
+    })
+    .await?;
+    if rows.is_empty() {
+        return Ok(Json(serde_json::json!({"status": "ok"})));
+    }
+    let check_count = rows.len();
+
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_metrics.write", s),
+        })?;
+
+    // Record usage for per-tenant ingest metering
+    state
+        .usage_accumulator
+        .record(tenant_id, "metrics", check_count as u64, raw_len as u64);
+
+    tracing::debug!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        count = check_count,
+        source = "datadog",
+        endpoint = "check_run",
+        "ingested service checks"
+    );
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Parse a Datadog V1 series payload and build its rows. Runs on the blocking pool.
+fn build_v1_rows(
+    limits: &IngestLimits,
+    tenant_arc: &std::sync::Arc<str>,
+    raw: &[u8],
+) -> Result<SeriesRows, IngestError> {
+    let payload: V1SeriesPayload = serde_json::from_slice(raw)
+        .map_err(|_| limits.malformed("datadog", "invalid Datadog metrics payload"))?;
+
+    if payload.series.is_empty() {
+        return Ok((Vec::new(), Vec::new(), 0));
+    }
+    limits.check_count("datadog", payload.series.len(), limits.max_series)?;
     let entity_count = payload
         .series
         .iter()
@@ -360,15 +411,74 @@ pub async fn ingest_v2(
                 .checked_add(series.points.len())
                 .and_then(|count| count.checked_add(series.tags.len()))
         })
-        .ok_or_else(|| {
-            state
-                .ingest_limits
-                .check_entities("datadog", usize::MAX)
-                .unwrap_err()
-        })?;
-    state
-        .ingest_limits
-        .check_entities("datadog", entity_count)?;
+        .ok_or_else(|| limits.check_entities("datadog", usize::MAX).unwrap_err())?;
+    limits.check_entities("datadog", entity_count)?;
+
+    // Group by target table
+    let mut gauge_rows: Vec<GaugeRow> = Vec::new();
+    let mut sum_rows: Vec<SumRow> = Vec::new();
+
+    for series in &payload.series {
+        let (svc, attrs) = extract_tags(&series.tags);
+        let is_sum = table_for_type(&series.r#type) == "metrics_sum";
+        let template = build_template(
+            svc,
+            series.metric.clone(),
+            String::new(),
+            attrs,
+            &series.host,
+            &tenant_arc,
+        );
+
+        // Clone template once per series; only time_unix/value (scalars) change per point.
+        let mut row = template.clone();
+        let is_count = series.r#type.to_lowercase() == "count";
+        for point in &series.points {
+            if point.len() < 2 {
+                continue;
+            }
+            row.time_unix = (point[0] as i64) * 1_000_000_000; // seconds → ns
+            row.value = point[1];
+
+            if is_sum {
+                sum_rows.push(SumRow::from_gauge(&row, is_count));
+            } else {
+                gauge_rows.push(row.clone());
+            }
+        }
+    }
+
+    Ok((gauge_rows, sum_rows, payload.series.len()))
+}
+
+/// Parse a Datadog V2 series payload and build its rows. Runs on the blocking
+/// pool. `None` means the body is not JSON (the agent's protobuf default).
+fn build_v2_rows(
+    limits: &IngestLimits,
+    tenant_arc: &std::sync::Arc<str>,
+    raw: &[u8],
+) -> Result<Option<SeriesRows>, IngestError> {
+    // DD agent v7 sends protobuf by default for v2/series.
+    // Try JSON first; if it fails, accept gracefully (protobuf support TODO).
+    let payload: V2SeriesPayload = match serde_json::from_slice(raw) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+
+    if payload.series.is_empty() {
+        return Ok(Some((Vec::new(), Vec::new(), 0)));
+    }
+    limits.check_count("datadog", payload.series.len(), limits.max_series)?;
+    let entity_count = payload
+        .series
+        .iter()
+        .try_fold(payload.series.len(), |count, series| {
+            count
+                .checked_add(series.points.len())
+                .and_then(|count| count.checked_add(series.tags.len()))
+        })
+        .ok_or_else(|| limits.check_entities("datadog", usize::MAX).unwrap_err())?;
+    limits.check_entities("datadog", entity_count)?;
 
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
@@ -419,79 +529,22 @@ pub async fn ingest_v2(
         }
     }
 
-    let total = gauge_rows.len() + sum_rows.len();
-
-    let map_err = |e: WriteError| match e {
-        WriteError::Backpressure => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-        ),
-        WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_metrics.write", s),
-    };
-    let gauge_fut = async {
-        if !gauge_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(
-                &state,
-                tenant_id,
-                SpoolBatch::Gauge(gauge_rows),
-            )
-            .await
-            .map_err(map_err)?;
-        }
-        Ok::<_, (StatusCode, String)>(())
-    };
-    let sum_fut = async {
-        if !sum_rows.is_empty() {
-            crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Sum(sum_rows))
-                .await
-                .map_err(map_err)?;
-        }
-        Ok::<_, (StatusCode, String)>(())
-    };
-    let (gauge_res, sum_res) = tokio::join!(gauge_fut, sum_fut);
-    gauge_res?;
-    sum_res?;
-
-    // Record usage for per-tenant ingest metering
-    state
-        .usage_accumulator
-        .record(tenant_id, "metrics", total as u64, raw.len() as u64);
-
-    tracing::debug!(
-        signal = "metrics",
-        tenant_id = %tenant_id,
-        series_count = payload.series.len(),
-        datapoints = total,
-        source = "datadog",
-        endpoint = "v2",
-        "ingested metrics"
-    );
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"status": "ok"})),
-    ))
+    Ok(Some((gauge_rows, sum_rows, payload.series.len())))
 }
 
-/// POST /datadog/api/v1/check_run — Datadog service checks.
-/// Maps check status to a gauge metric: dd.check.{check_name} = status.
-pub async fn check_run(
-    State(state): State<AppState>,
-    Extension(tenant): Extension<TenantContext>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tenant_id = &tenant.tenant_id;
-    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
-    validate_api_key(&headers)?;
-    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
-
+/// Parse a Datadog service-check payload and build its rows. Runs on the
+/// blocking pool. Unparseable payloads are ignored, as the agent expects.
+fn build_check_rows(
+    limits: &IngestLimits,
+    tenant_arc: &std::sync::Arc<str>,
+    raw: &[u8],
+) -> Result<Vec<GaugeRow>, IngestError> {
     // Agent may send null or non-array — handle gracefully
-    let checks: Vec<ServiceCheck> = match serde_json::from_slice(&raw) {
+    let checks: Vec<ServiceCheck> = match serde_json::from_slice(raw) {
         Ok(c) => c,
         Err(_) => {
             // Try to parse as single check, or return empty
-            match serde_json::from_slice::<ServiceCheck>(&raw) {
+            match serde_json::from_slice::<ServiceCheck>(raw) {
                 Ok(c) => vec![c],
                 Err(_) => {
                     tracing::debug!(
@@ -499,22 +552,20 @@ pub async fn check_run(
                         endpoint = "check_run",
                         "ignoring unparseable payload"
                     );
-                    return Ok(Json(serde_json::json!({"status": "ok"})));
+                    return Ok(Vec::new());
                 }
             }
         }
     };
 
     if checks.is_empty() {
-        return Ok(Json(serde_json::json!({"status": "ok"})));
+        return Ok(Vec::new());
     }
-    state
-        .ingest_limits
-        .check_entities("datadog", checks.len())?;
+    limits.check_entities("datadog", checks.len())?;
 
     let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
 
-    let rows: Vec<GaugeRow> = checks
+    let rows = checks
         .iter()
         .map(|check| {
             let (svc, attrs) = extract_tags(&check.tags);
@@ -525,7 +576,7 @@ pub async fn check_run(
                 String::new(),
                 attrs,
                 &check.host_name,
-                &tenant_arc,
+                tenant_arc,
             );
             row.time_unix = ts;
             row.value = check.status as f64;
@@ -533,29 +584,5 @@ pub async fn check_run(
         })
         .collect();
 
-    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
-        .await
-        .map_err(|e| match e {
-            WriteError::Backpressure => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-            ),
-            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_metrics.write", s),
-        })?;
-
-    // Record usage for per-tenant ingest metering
-    state
-        .usage_accumulator
-        .record(tenant_id, "metrics", checks.len() as u64, raw.len() as u64);
-
-    tracing::debug!(
-        signal = "metrics",
-        tenant_id = %tenant_id,
-        count = checks.len(),
-        source = "datadog",
-        endpoint = "check_run",
-        "ingested service checks"
-    );
-
-    Ok(Json(serde_json::json!({"status": "ok"})))
+    Ok(rows)
 }
