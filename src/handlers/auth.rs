@@ -196,6 +196,102 @@ fn account_failure_limit_exceeded(
     !credentials_valid && !(local_allowed && distributed_allowed)
 }
 
+fn login_window_start() -> String {
+    (time::OffsetDateTime::now_utc() - time::Duration::seconds(60)).clickhouse_seconds()
+}
+
+/// Spends one attempt from the per-IP password budget. Login and step-up
+/// password checks share it. Returns false once the budget is spent.
+async fn consume_password_ip_budget(
+    state: &AppState,
+    ip_hash: &str,
+    since: &str,
+) -> anyhow::Result<bool> {
+    let local_allowed = consume_local_login_limit(
+        &state.login_limiter,
+        format!("ip:{ip_hash}"),
+        state.login_ip_limit_per_minute,
+        Instant::now(),
+    );
+    state.config_db.record_login_ip_attempt(ip_hash).await?;
+    let attempts = state
+        .config_db
+        .login_ip_attempt_count(ip_hash, since)
+        .await?;
+    Ok(local_allowed && attempts <= u64::from(state.login_ip_limit_per_minute))
+}
+
+/// Records a failed password for the account. Returns whether the local and
+/// distributed account budgets still allow attempts.
+async fn record_password_account_failure(
+    state: &AppState,
+    account_hash: &str,
+    since: &str,
+) -> anyhow::Result<(bool, bool)> {
+    let local_allowed = consume_local_login_limit(
+        &state.login_limiter,
+        format!("account:{account_hash}"),
+        state.login_account_limit_per_minute,
+        Instant::now(),
+    );
+    state
+        .config_db
+        .record_login_account_failure(account_hash)
+        .await?;
+    let failures = state
+        .config_db
+        .login_account_failure_count(account_hash, since)
+        .await?;
+    Ok((
+        local_allowed,
+        failures <= u64::from(state.login_account_limit_per_minute),
+    ))
+}
+
+fn password_limit_hashes(client_ip: IpAddr, username: &str) -> anyhow::Result<(String, String)> {
+    let secret = login_rate_limit_secret().map_err(anyhow::Error::msg)?;
+    Ok((
+        keyed_login_identifier(b"ip", &client_ip.to_string(), &secret),
+        keyed_login_identifier(b"account", &username.trim().to_lowercase(), &secret),
+    ))
+}
+
+/// Applies the login IP and account budgets to a step-up password check, so a
+/// stolen session cannot guess the account password faster than login allows.
+/// Call before verifying the password. The account budget is read here and
+/// spent by [`record_step_up_failure`].
+pub(crate) async fn step_up_attempt_allowed(
+    state: &AppState,
+    peer_ip: IpAddr,
+    headers: &HeaderMap,
+    username: &str,
+) -> anyhow::Result<bool> {
+    let client_ip = resolve_login_client_ip(peer_ip, headers, &state.trusted_proxy_cidrs);
+    let (ip_hash, account_hash) = password_limit_hashes(client_ip, username)?;
+    let since = login_window_start();
+    if !consume_password_ip_budget(state, &ip_hash, &since).await? {
+        return Ok(false);
+    }
+    let failures = state
+        .config_db
+        .login_account_failure_count(&account_hash, &since)
+        .await?;
+    Ok(failures < u64::from(state.login_account_limit_per_minute))
+}
+
+/// Spends the account budget after a failed step-up password check.
+pub(crate) async fn record_step_up_failure(
+    state: &AppState,
+    peer_ip: IpAddr,
+    headers: &HeaderMap,
+    username: &str,
+) -> anyhow::Result<()> {
+    let client_ip = resolve_login_client_ip(peer_ip, headers, &state.trusted_proxy_cidrs);
+    let (_, account_hash) = password_limit_hashes(client_ip, username)?;
+    record_password_account_failure(state, &account_hash, &login_window_start()).await?;
+    Ok(())
+}
+
 fn login_audit_context(headers: &HeaderMap, client_ip: IpAddr) -> (String, String, String) {
     let (_, user_agent, request_id) = crate::audit::actor_context_from_headers(headers);
     (client_ip.to_string(), user_agent, request_id)
@@ -259,44 +355,11 @@ pub async fn login(
     let account = req.username.trim().to_lowercase();
     let ip_hash = keyed_login_identifier(b"ip", &client_ip.to_string(), &secret);
     let account_hash = keyed_login_identifier(b"account", &account, &secret);
-    let local_now = Instant::now();
-    let local_ip_allowed = consume_local_login_limit(
-        &state.login_limiter,
-        format!("ip:{ip_hash}"),
-        state.login_ip_limit_per_minute,
-        local_now,
-    );
-
-    if let Err(error) = state.config_db.record_login_ip_attempt(&ip_hash).await {
-        tracing::error!(%error, "failed to persist login rate-limit attempt");
-        state
-            .audit
-            .log(
-                crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
-                    .actor_name(req.username.clone())
-                    .outcome("failure")
-                    .changes(
-                        serde_json::json!({ "reason": "rate_limit_store_unavailable" }).to_string(),
-                    )
-                    .description("authentication unavailable")
-                    .context(login_audit_context(&headers, client_ip)),
-            )
-            .await;
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "authentication temporarily unavailable".to_string(),
-        ));
-    }
-    let since =
-        (time::OffsetDateTime::now_utc() - time::Duration::seconds(60)).clickhouse_seconds();
-    let ip_attempts = match state
-        .config_db
-        .login_ip_attempt_count(&ip_hash, &since)
-        .await
-    {
-        Ok(count) => count,
+    let since = login_window_start();
+    let ip_allowed = match consume_password_ip_budget(&state, &ip_hash, &since).await {
+        Ok(allowed) => allowed,
         Err(error) => {
-            tracing::error!(%error, "failed to read login rate-limit attempts");
+            tracing::error!(%error, "failed to apply login rate limit");
             state
                 .audit
                 .log(
@@ -317,8 +380,7 @@ pub async fn login(
             ));
         }
     };
-    let distributed_ip_allowed = ip_attempts <= u64::from(state.login_ip_limit_per_minute);
-    if !(local_ip_allowed && distributed_ip_allowed) {
+    if !ip_allowed {
         state
             .audit
             .log(
@@ -413,67 +475,33 @@ pub async fn login(
             // Only failed credentials consume the account budget. Checking
             // this after password verification ensures targeted failures can
             // never deny a legitimate login with the correct password.
-            let local_account_allowed = consume_local_login_limit(
-                &state.login_limiter,
-                format!("account:{account_hash}"),
-                state.login_account_limit_per_minute,
-                Instant::now(),
-            );
-            if let Err(error) = state
-                .config_db
-                .record_login_account_failure(&account_hash)
-                .await
-            {
-                tracing::error!(%error, "failed to persist account login failure");
-                state
-                    .audit
-                    .log(
-                        crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
-                            .actor_name(req.username.clone())
-                            .outcome("failure")
-                            .changes(
-                                serde_json::json!({ "reason": "rate_limit_store_unavailable" })
-                                    .to_string(),
-                            )
-                            .description("authentication unavailable")
-                            .context(login_audit_context(&headers, client_ip)),
-                    )
-                    .await;
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "authentication temporarily unavailable".to_string(),
-                ));
-            }
-            let account_failures = match state
-                .config_db
-                .login_account_failure_count(&account_hash, &since)
-                .await
-            {
-                Ok(count) => count,
-                Err(error) => {
-                    tracing::error!(%error, "failed to read account login failures");
-                    state
-                        .audit
-                        .log(
-                            crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
-                                .actor_name(req.username.clone())
-                                .outcome("failure")
-                                .changes(
-                                    serde_json::json!({ "reason": "rate_limit_store_unavailable" })
+            let (local_account_allowed, distributed_account_allowed) =
+                match record_password_account_failure(&state, &account_hash, &since).await {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to record account login failure");
+                        state
+                            .audit
+                            .log(
+                                crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                                    .actor_name(req.username.clone())
+                                    .outcome("failure")
+                                    .changes(
+                                        serde_json::json!({
+                                            "reason": "rate_limit_store_unavailable"
+                                        })
                                         .to_string(),
-                                )
-                                .description("authentication unavailable")
-                                .context(login_audit_context(&headers, client_ip)),
-                        )
-                        .await;
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "authentication temporarily unavailable".to_string(),
-                    ));
-                }
-            };
-            let distributed_account_allowed =
-                account_failures <= u64::from(state.login_account_limit_per_minute);
+                                    )
+                                    .description("authentication unavailable")
+                                    .context(login_audit_context(&headers, client_ip)),
+                            )
+                            .await;
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "authentication temporarily unavailable".to_string(),
+                        ));
+                    }
+                };
             if account_failure_limit_exceeded(
                 false,
                 local_account_allowed,
@@ -1035,6 +1063,34 @@ fn extract_session_cookie_with_mode(headers: &HeaderMap, insecure: bool) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn step_up_password_checks_share_the_login_rate_limits() {
+        let auth = include_str!("auth.rs");
+        let login = auth
+            .split_once("pub async fn login(")
+            .expect("login handler")
+            .1;
+        let login = &login[..login.find(".create_session_at_version(").expect("session")];
+        assert!(login.contains("consume_password_ip_budget(&state"));
+        assert!(login.contains("record_password_account_failure(&state"));
+
+        let users = include_str!("users.rs");
+        let change = users
+            .split_once("pub async fn change_password(")
+            .expect("change_password handler")
+            .1;
+        let change = &change[..change.find("pub async fn ").expect("next handler")];
+        let limited = change
+            .find("step_up_attempt_allowed(")
+            .expect("step-up limit");
+        let verify = change.find(".authenticate(").expect("step-up verification");
+        let failed = change
+            .find("record_step_up_failure(")
+            .expect("failure recorded");
+        assert!(limited < verify && verify < failed);
+        assert!(change.contains("StatusCode::TOO_MANY_REQUESTS"));
+    }
+
     use super::*;
 
     #[test]
