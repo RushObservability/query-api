@@ -163,12 +163,12 @@ impl ObjectStoreSpool {
     pub async fn refresh_counts(&self) -> anyhow::Result<()> {
         let _transaction = self.transactions.write().await;
         let mut index = self.index.lock().await;
-        self.scan(&mut index, true).await
+        self.scan(&mut index).await
     }
 
-    /// Count in one streaming pass and optionally retain the oldest bounded
-    /// batch. ObjectStore does not guarantee listing order.
-    async fn scan(&self, index: &mut BacklogIndex, rebuild_index: bool) -> anyhow::Result<()> {
+    /// Count in one streaming pass and retain the oldest bounded batch.
+    /// ObjectStore does not guarantee listing order.
+    async fn scan(&self, index: &mut BacklogIndex) -> anyhow::Result<()> {
         let pfx = OsPath::from(self.prefix.trim_end_matches('/'));
         let mut oldest = BTreeMap::new();
         let mut count = 0_usize;
@@ -180,22 +180,14 @@ impl ObjectStoreSpool {
             self.metadata_visited.fetch_add(1, Ordering::Relaxed);
             count += 1;
             total = total.saturating_add(meta.size);
-            if rebuild_index {
-                oldest.insert(meta.location, meta.size);
-                if oldest.len() > INDEX_BATCH_SIZE {
-                    oldest.pop_last();
-                }
+            oldest.insert(meta.location, meta.size);
+            if oldest.len() > INDEX_BATCH_SIZE {
+                oldest.pop_last();
             }
         }
-        if rebuild_index {
-            index.oldest = oldest;
-            index.complete = count <= INDEX_BATCH_SIZE;
-            index.refreshed_at = Some(Instant::now());
-        } else if total != self.total_bytes() || count != self.segment_count() {
-            // Another replica changed the backlog; rebuild before selecting
-            // the next batch, without retaining the entire listing here.
-            index.refreshed_at = None;
-        }
+        index.oldest = oldest;
+        index.complete = count <= INDEX_BATCH_SIZE;
+        index.refreshed_at = Some(Instant::now());
         self.bytes.store(total, Ordering::Relaxed);
         self.count.store(count, Ordering::Relaxed);
         self.reconciliations.fetch_add(1, Ordering::Release);
@@ -208,7 +200,7 @@ impl ObjectStoreSpool {
             .is_none_or(|at| at.elapsed() >= INDEX_REFRESH_INTERVAL)
             || index.oldest.is_empty() && self.segment_count() > 0
         {
-            self.scan(index, true).await?;
+            self.scan(index).await?;
         }
         Ok(())
     }
@@ -216,25 +208,10 @@ impl ObjectStoreSpool {
     /// Spill one batch as a new object. Returns `SpoolFull` if over the cap or
     /// the put fails (so the caller applies 429 backpressure rather than dropping).
     pub async fn append(&self, table: &str, payload: &[u8]) -> Result<(), SpoolFull> {
-        // This is already the failure path, so reconcile before enforcing the
-        // cap. It accounts for objects written or drained by another replica.
-        // Two concurrent producers can still race; exact global reservations
-        // require a distributed quota/CAS protocol and are intentionally out
-        // of scope for this single-writer drain design.
-        let observed = self.reconciliations.load(Ordering::Acquire);
-        let transaction = self.transactions.write().await;
-        let mut index = self.index.lock().await;
-        // Preserve fresh cross-replica capacity accounting. This count-only
-        // pass does not collect/sort the backlog or rebuild the drain index.
-        // Overlapping callers can share the reconciliation completed while
-        // they waited. A subsequent serial append still gets fresh counts.
-        if observed == self.reconciliations.load(Ordering::Acquire)
-            && self.scan(&mut index, false).await.is_err()
-        {
-            return Err(SpoolFull);
-        }
-        drop(index);
-        drop(transaction);
+        // Enforce the cap from local counters only. Listing the prefix here
+        // would hold the transaction lock for many LIST pages exactly when a
+        // ClickHouse outage grows the backlog; objects written or drained by
+        // other replicas are folded in by the periodic `refresh_counts`.
         // Concurrent PUTs share a read lock. A reconciliation takes the write
         // lock, so it cannot count a PUT before its local reservation commits.
         let transaction = self.transactions.read().await;
@@ -495,22 +472,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlapping_appends_share_counts_but_serial_appends_reconcile_again() {
-        let spool = ObjectStoreSpool::open(store(), "ingest", 30).await.unwrap();
-        let held = spool.index.lock().await;
-        let mut left = Box::pin(spool.append("m", &[0; 10]));
-        let mut right = Box::pin(spool.append("m", &[0; 10]));
-        assert!(futures_util::poll!(left.as_mut()).is_pending());
-        assert!(futures_util::poll!(right.as_mut()).is_pending());
-        drop(held);
-        let (left, right) = tokio::join!(left, right);
-        left.unwrap();
-        right.unwrap();
-        assert_eq!(spool.reconciliations.load(Ordering::Relaxed), 2);
-        assert_eq!(spool.total_bytes(), 24);
+    async fn append_enforces_cap_without_listing_the_backlog() {
+        let st = store();
+        seed(&st, 50).await;
+        let spool = ObjectStoreSpool::open(st, "ingest", 300 + 24)
+            .await
+            .unwrap();
+        let visited = spool.metadata_visited.load(Ordering::Relaxed);
+        spool.append("m", &[0; 10]).await.unwrap();
+        spool.append("m", &[0; 10]).await.unwrap();
         assert!(spool.append("m", &[0; 10]).await.is_err());
-        assert_eq!(spool.reconciliations.load(Ordering::Relaxed), 3);
-        assert_eq!(spool.total_bytes(), 24);
+        assert_eq!(spool.metadata_visited.load(Ordering::Relaxed), visited);
+        assert_eq!(spool.total_bytes(), 324);
+        assert_eq!(spool.segment_count(), 52);
     }
 
     #[tokio::test]
