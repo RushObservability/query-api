@@ -2997,17 +2997,27 @@ pub async fn sso_metadata(
     })?;
     let acs_url = format!("{base_url}/auth/sso/acs");
 
-    let sp_entity_id = match &provider {
-        Some(p) if !p.15.is_empty() => p.15.clone(),
-        _ => base_url.clone(),
-    };
-
-    let xml = saml::build_sp_metadata(&sp_entity_id, &acs_url);
+    let xml = saml::build_sp_metadata(
+        &sp_metadata_entity_id(provider.as_ref(), &base_url),
+        &acs_url,
+    );
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
     Ok((resp_headers, xml))
+}
+
+/// The entity ID the ACS checks as the assertion audience (saml_sp_entity_id),
+/// falling back to the base URL when none is configured.
+fn sp_metadata_entity_id(
+    provider: Option<&crate::clickhouse_config::SsoProviderRow>,
+    base_url: &str,
+) -> String {
+    match provider {
+        Some(p) if !p.18.is_empty() => p.18.clone(),
+        _ => base_url.to_string(),
+    }
 }
 
 /// GET /api/v1/sso/status -- Return whether SSO is enabled (for login page)
@@ -4143,6 +4153,40 @@ mod tests {
         assert_eq!(setup_provider_protocol("custom-oidc"), Some("oidc"));
         assert_eq!(setup_provider_protocol("okta"), Some("saml"));
         assert_eq!(setup_provider_protocol("attacker-controlled"), None);
+    }
+
+    #[test]
+    fn sp_metadata_advertises_the_configured_sp_entity_id() {
+        let s = |value: &str| value.to_string();
+        let mut provider: crate::clickhouse_config::SsoProviderRow = (
+            s("id"),
+            s("name"),
+            s("saml"),
+            true,
+            s(""),
+            s(""),
+            s("https://idp.example.com"),
+            s(""),
+            s("groups"),
+            s("email"),
+            s(""),
+            s(""),
+            true,
+            s(""),
+            s(""),
+            s("https://idp.example.com/metadata"),
+            s("https://idp.example.com/sso"),
+            s("cert"),
+            s("https://rush.example.com/sp"),
+        );
+        let base = "https://rush.example.com";
+        assert_eq!(
+            sp_metadata_entity_id(Some(&provider), base),
+            "https://rush.example.com/sp"
+        );
+        provider.18.clear();
+        assert_eq!(sp_metadata_entity_id(Some(&provider), base), base);
+        assert_eq!(sp_metadata_entity_id(None, base), base);
     }
 
     #[test]
