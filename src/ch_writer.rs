@@ -242,21 +242,240 @@ fn decode_spool(payload: &[u8]) -> anyhow::Result<SpoolBatch> {
     }
 }
 
-fn batch_serialized_size(batch: &SpoolBatch) -> Result<usize, WriteError> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+/// Estimated size of a batch for the per-table byte budget: string lengths,
+/// field names and fixed widths for numbers, summed by walking the rows through
+/// serde without producing any output. It tracks the JSON size this budget was
+/// first defined in closely enough, without formatting every row on each write.
+fn batch_estimated_size(batch: &SpoolBatch) -> usize {
+    let mut size = SizeEstimate(0);
+    // Counting cannot fail; serde only needs an error type.
+    let _ = batch.serialize(&mut size);
+    size.0
+}
+
+struct SizeEstimate(usize);
+
+type EstimateResult = Result<(), serde_json::Error>;
+
+impl SizeEstimate {
+    fn add(&mut self, bytes: usize) -> EstimateResult {
+        self.0 = self.0.saturating_add(bytes);
+        Ok(())
     }
-    let mut count = Counter(0);
-    serde_json::to_writer(&mut count, batch)
-        .map_err(|error| WriteError::Fatal(error.to_string()))?;
-    Ok(count.0)
+}
+
+macro_rules! fixed_width {
+    ($($method:ident($ty:ty) = $width:expr;)*) => {
+        $(fn $method(self, _: $ty) -> EstimateResult {
+            self.add($width)
+        })*
+    };
+}
+
+impl serde::Serializer for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    type SerializeSeq = Self;
+    type SerializeTuple = Self;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
+    type SerializeStructVariant = Self;
+
+    fixed_width! {
+        serialize_bool(bool) = 1;
+        serialize_i8(i8) = 1;
+        serialize_i16(i16) = 2;
+        serialize_i32(i32) = 4;
+        serialize_i64(i64) = 8;
+        serialize_u8(u8) = 1;
+        serialize_u16(u16) = 2;
+        serialize_u32(u32) = 4;
+        serialize_u64(u64) = 8;
+        serialize_f32(f32) = 4;
+        serialize_f64(f64) = 8;
+        serialize_char(char) = 4;
+    }
+
+    fn serialize_str(self, value: &str) -> EstimateResult {
+        self.add(value.len() + 2)
+    }
+    fn serialize_bytes(self, value: &[u8]) -> EstimateResult {
+        self.add(value.len())
+    }
+    fn serialize_none(self) -> EstimateResult {
+        self.add(1)
+    }
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> EstimateResult {
+        value.serialize(self)
+    }
+    fn serialize_unit(self) -> EstimateResult {
+        self.add(1)
+    }
+    fn serialize_unit_struct(self, _: &'static str) -> EstimateResult {
+        self.add(1)
+    }
+    fn serialize_unit_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        variant: &'static str,
+    ) -> EstimateResult {
+        self.add(variant.len() + 2)
+    }
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+        self,
+        _: &'static str,
+        value: &T,
+    ) -> EstimateResult {
+        value.serialize(self)
+    }
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
+        self,
+        _: &'static str,
+        _: u32,
+        variant: &'static str,
+        value: &T,
+    ) -> EstimateResult {
+        self.add(variant.len() + 4)?;
+        value.serialize(self)
+    }
+    fn serialize_seq(self, _: Option<usize>) -> Result<Self, serde_json::Error> {
+        self.add(2)?;
+        Ok(self)
+    }
+    fn serialize_tuple(self, _: usize) -> Result<Self, serde_json::Error> {
+        self.add(2)?;
+        Ok(self)
+    }
+    fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Self, serde_json::Error> {
+        self.add(2)?;
+        Ok(self)
+    }
+    fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        variant: &'static str,
+        _: usize,
+    ) -> Result<Self, serde_json::Error> {
+        self.add(variant.len() + 6)?;
+        Ok(self)
+    }
+    fn serialize_map(self, _: Option<usize>) -> Result<Self, serde_json::Error> {
+        self.add(2)?;
+        Ok(self)
+    }
+    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, serde_json::Error> {
+        self.add(2)?;
+        Ok(self)
+    }
+    fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        variant: &'static str,
+        _: usize,
+    ) -> Result<Self, serde_json::Error> {
+        self.add(variant.len() + 6)?;
+        Ok(self)
+    }
+}
+
+impl serde::ser::SerializeSeq for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> EstimateResult {
+        self.add(1)?;
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> EstimateResult {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTuple for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> EstimateResult {
+        self.add(1)?;
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> EstimateResult {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTupleStruct for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> EstimateResult {
+        self.add(1)?;
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> EstimateResult {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTupleVariant for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> EstimateResult {
+        self.add(1)?;
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> EstimateResult {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeMap for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> EstimateResult {
+        self.add(2)?;
+        key.serialize(&mut **self)
+    }
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> EstimateResult {
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> EstimateResult {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStruct for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> EstimateResult {
+        self.add(key.len() + 4)?;
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> EstimateResult {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStructVariant for &mut SizeEstimate {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> EstimateResult {
+        self.add(key.len() + 4)?;
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> EstimateResult {
+        Ok(())
+    }
 }
 
 // ─── Cross-request insert batching ─────────────────────────────────────────────
@@ -282,7 +501,7 @@ pub struct BatchConfig {
     pub max_rows: usize,
     /// Flush a table's buffer once this long has elapsed since its first row.
     pub max_age: Duration,
-    /// Maximum serialized bytes retained per table. Oversized requests bypass
+    /// Maximum estimated bytes retained per table. Oversized requests bypass
     /// the accumulator and receive synchronous insert/spool backpressure.
     pub max_bytes: usize,
 }
@@ -551,7 +770,7 @@ impl ChWriter {
 
         // Keep the slot locked through delivery. Background and inline flushes
         // must not detach a batch while another request fills the same slot.
-        let bytes = batch_serialized_size(&batch)?;
+        let bytes = batch_estimated_size(&batch);
         // Do not turn pending mutex waiters into an unbounded second queue of
         // request bodies while ClickHouse is slow or unresponsive.
         let index = batch.slot();
@@ -1215,6 +1434,62 @@ mod batch_tests {
         let encoded = encode_spool(&gauge(1)).expect("encode");
         assert!(serde_json::from_slice::<serde_json::Value>(&encoded).is_err());
     }
+
+    #[test]
+    fn size_estimate_stays_close_to_the_json_size_it_replaces() {
+        let attrs = |n: usize| -> Vec<(String, String)> {
+            (0..n)
+                .map(|i| {
+                    (
+                        format!("attribute.key.{i}"),
+                        format!("value-{i}-{}", "x".repeat(i)),
+                    )
+                })
+                .collect()
+        };
+        let SpoolBatch::Gauge(mut rows) = gauge(50) else {
+            unreachable!()
+        };
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.resource_attributes = Arc::new(attrs(12));
+            row.service_name = "checkout-service".into();
+            row.metric_name = "http.server.request.duration".into();
+            row.attributes = attrs(i % 8);
+            row.time_unix = 1_764_000_000_000_000_000 + i as i64;
+            row.value = i as f64 * 1.37;
+        }
+        let log = |i: usize| LogInsertRow {
+            tenant_id: "tenant-a".into(),
+            timestamp: 1_764_000_000_000_000_000 + i as i64,
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            span_id: "00f067aa0ba902b7".into(),
+            trace_flags: 1,
+            severity_text: "INFO".into(),
+            severity_number: 9,
+            body: format!(
+                "GET /api/cart/{i} completed in {i}ms \"ok\"\n{}",
+                "y".repeat(i * 7)
+            ),
+            service_name: "checkout-service".into(),
+            resource_schema_url: "".into(),
+            resource_attributes: Arc::new(attrs(10)),
+            scope_schema_url: "".into(),
+            scope_name: "io.opentelemetry.http".into(),
+            scope_version: "1.2.0".into(),
+            scope_attributes: Arc::new(Vec::new()),
+            log_attributes: attrs(i % 5),
+            event_name: "".into(),
+        };
+        for batch in [
+            gauge(1),
+            SpoolBatch::Gauge(rows),
+            SpoolBatch::Logs((0..50).map(log).collect()),
+        ] {
+            let json = serde_json::to_vec(&batch).unwrap().len() as f64;
+            let ratio = batch_estimated_size(&batch) as f64 / json;
+            assert!((0.5..=2.0).contains(&ratio), "estimate/json = {ratio}");
+        }
+    }
     struct TestWriter(ChWriter, std::path::PathBuf);
     impl TestWriter {
         fn new(url: &str, cfg: BatchConfig) -> Self {
@@ -1363,7 +1638,7 @@ mod batch_tests {
 
     #[tokio::test]
     async fn byte_budget_applies_before_row_threshold() {
-        let one = batch_serialized_size(&gauge(1)).unwrap();
+        let one = batch_estimated_size(&gauge(1));
         let test = TestWriter::new(
             "http://127.0.0.1:9",
             BatchConfig {
