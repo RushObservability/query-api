@@ -146,6 +146,9 @@ pub fn compile_count_query(
     if reparsed != [Statement::Query(query)] {
         return Err(invalid("query_sql could not be compiled safely"));
     }
+    // The read-back check above leaves every `?` inside a quoted literal or
+    // identifier, so it is safe to hide from the client's bind placeholders.
+    let scoped_sql = crate::query_builder::escape_bind_placeholders(&scoped_sql);
     let count_sql = format!("SELECT count() AS _siem_count FROM ({scoped_sql}) AS _siem_sub");
     Ok(CompiledDetectionQuery {
         scoped_sql,
@@ -746,6 +749,13 @@ mod tests {
         }
         // The read-back check also covers values injected after validation.
         assert!(compile_count_query("SELECT count() FROM logs", "a\\", "s", "e").is_err());
+    }
+
+    #[test]
+    fn question_marks_in_literals_do_not_reach_the_client_as_placeholders() {
+        let compiled = compile("SELECT count() FROM logs WHERE Body LIKE '%why?%'").unwrap();
+        assert!(!compiled.count_sql.contains('?'));
+        assert!(compiled.count_sql.contains("LIKE '%why\\x3F%'"));
     }
 
     #[test]
