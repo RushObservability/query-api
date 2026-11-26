@@ -167,8 +167,23 @@ impl RushConfig {
             return Ok(Self::default());
         }
         let contents = std::fs::read_to_string(path)?;
-        let config: RushConfig = toml::from_str(&contents)?;
+        let config = Self::parse(&contents)?;
         tracing::info!("loaded config from {}", path.display());
+        Ok(config)
+    }
+
+    fn parse(contents: &str) -> anyhow::Result<Self> {
+        let config: RushConfig = toml::from_str(contents)?;
+        // A bad pattern would otherwise fail every combined retention mutation at runtime.
+        for re in config
+            .retention
+            .metrics
+            .iter()
+            .filter_map(|r| r.name_regex.as_deref())
+        {
+            regex::Regex::new(re)
+                .map_err(|e| anyhow::anyhow!("invalid retention name_regex {re:?}: {e}"))?;
+        }
         Ok(config)
     }
 
@@ -197,5 +212,19 @@ impl RushConfig {
 
     pub fn effective_logs_ttl_days(&self) -> u32 {
         self.retention.defaults.logs_days
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RushConfig;
+
+    #[test]
+    fn invalid_retention_regex_is_rejected_at_load() {
+        let rule =
+            |re: &str| format!("[[retention.metrics]]\nname_regex = '{re}'\nretain_days = 1\n");
+        assert!(RushConfig::parse(&rule(r"^http_\d+?$")).is_ok());
+        let err = RushConfig::parse(&rule("http_(")).unwrap_err().to_string();
+        assert!(err.contains("name_regex"), "{err}");
     }
 }
