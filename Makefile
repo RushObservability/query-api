@@ -24,7 +24,7 @@ DEV_ALLOW_PRIVATE_NOTIFICATION_URLS := true
 DEV_ALLOWED_ORIGINS           := http://localhost:5173,http://localhost:8080
 DEV_ALLOW_ANONYMOUS_DEFAULT  := true
 
-.PHONY: build build-release release release-rc run run-anomaly dev check test fmt lint security security-scripts security-audit security-policy clean docker package \
+.PHONY: build build-release release release-rc run run-anomaly dev check test fmt lint security security-scripts security-secrets security-audit security-policy clean docker package \
         up up-full down deps logs run-local watch watch-anomaly licensed-check licensed-test licensed-build licensed-dev dev-license
 
 ## Development — local binary + ClickHouse in Docker
@@ -144,7 +144,7 @@ fmt:                  ## Format code
 lint:                 ## Run clippy lints
 	cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
 
-security: security-scripts security-audit security-policy ## Run the release security gate without releasing
+security: security-scripts security-secrets security-audit security-policy ## Run the release security gate without releasing
 
 security-scripts:     ## Release workflow script tests and security policy checks (needs ripgrep)
 	@# The policy scripts report "passed" when rg is missing, so require it up front.
@@ -156,6 +156,10 @@ security-scripts:     ## Release workflow script tests and security policy check
 	bash scripts/check-public-errors.sh
 	bash scripts/check-llm-gateway.sh
 	bash scripts/check-security-regressions.sh
+
+security-secrets:     ## Scan Git history for committed secrets
+	@command -v gitleaks >/dev/null 2>&1 || { echo "Install Gitleaks to scan the release history." >&2; exit 1; }
+	gitleaks git --log-opts='--full-history --diff-merges=first-parent HEAD' --redact=100 --no-banner .
 
 security-audit:       ## Scan Cargo.lock against RustSec (reviewed exceptions in .cargo/audit.toml)
 	cargo audit

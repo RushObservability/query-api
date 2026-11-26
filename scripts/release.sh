@@ -142,9 +142,9 @@ fi
 # Security checks run only here, never in CI: whoever releases decides. They run
 # before any branch exists, so a finding stops the release instead of surfacing
 # after the release PR merges. fmt, Clippy, and tests run below, after the bump.
-for gate_tool in cargo-audit cargo-deny python3 rg docker trivy; do
+for gate_tool in cargo-audit cargo-deny python3 rg docker trivy gitleaks; do
   if ! command -v "$gate_tool" >/dev/null 2>&1; then
-    echo "Required for the release security gate: $gate_tool. Install with: cargo install --locked cargo-audit cargo-deny; brew install ripgrep trivy; and Docker" >&2
+    echo "Required for the release security gate: $gate_tool. Install with: cargo install --locked cargo-audit cargo-deny; brew install ripgrep trivy gitleaks; and Docker" >&2
     exit 1
   fi
 done
@@ -261,7 +261,7 @@ pr_url="$(
     --base main \
     --head "$release_branch" \
     --title "Release $release_tag" \
-    --body "Updates the Query API Cargo package version to $version. After this PR merges, the release workflow will run the security gate, publish the image, create $release_tag, and generate release notes from merged pull requests."
+    --body "Updates the Query API Cargo package version to $version. After this PR merges, the release workflow will publish the image, create $release_tag, and generate release notes from merged pull requests."
 )"
 
 echo "Release PR created: $pr_url"
