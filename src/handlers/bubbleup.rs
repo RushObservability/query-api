@@ -164,7 +164,7 @@ fn build_filter_conditions(filters: &[Filter], signal: &str) -> String {
             }
         }
         let field = if signal == "logs" {
-            resolve_log_filter_field(&filter.field)
+            super::logs::resolve_log_field(&filter.field)
         } else {
             resolve_field(&filter.field)
         };
@@ -198,39 +198,6 @@ fn build_search_condition(search: Option<&str>, signal: &str) -> Option<String> 
         crate::query_builder::build_span_search_sql(term)
     }?;
     Some(format!("AND ({sql})"))
-}
-
-/// Resolve a log filter field to its ClickHouse column (mirrors logs handler).
-fn resolve_log_filter_field(field: &str) -> String {
-    match field {
-        "service_name" | "ServiceName" => "ServiceName".to_string(),
-        "severity" | "severity_text" | "SeverityText" => "SeverityText".to_string(),
-        "severity_number" | "SeverityNumber" => "SeverityNumber".to_string(),
-        "body" | "Body" => "Body".to_string(),
-        "trace_id" | "TraceId" => "TraceId".to_string(),
-        "span_id" | "SpanId" => "SpanId".to_string(),
-        "scope_name" | "ScopeName" => "ScopeName".to_string(),
-        _ => {
-            if let Some(attr) = field.strip_prefix("resource.") {
-                match attr {
-                    "k8s.namespace.name" => "mat_k8s_namespace".to_string(),
-                    "k8s.pod.name" => "mat_k8s_pod".to_string(),
-                    "k8s.container.name" => "mat_k8s_container".to_string(),
-                    "k8s.deployment.name" => "mat_k8s_deployment".to_string(),
-                    "deployment.environment" | "deployment.environment.name" => {
-                        // Existing parts may have been materialized before Rush recognized
-                        // deployment.environment.name.
-                        "if(notEmpty(mat_environment), mat_environment, ResourceAttributes['deployment.environment.name'])".to_string()
-                    }
-                    _ => format!("ResourceAttributes['{attr}']"),
-                }
-            } else if let Some(attr) = field.strip_prefix("log.") {
-                format!("LogAttributes['{attr}']")
-            } else {
-                field.to_string()
-            }
-        }
-    }
 }
 
 fn comparison_conditions(
@@ -546,12 +513,40 @@ mod tests {
 
     #[test]
     fn log_environment_dimension_accepts_current_and_legacy_otel_names() {
-        let current = resolve_log_filter_field("resource.deployment.environment.name");
-        let legacy = resolve_log_filter_field("resource.deployment.environment");
+        let current = super::super::logs::resolve_log_field("resource.deployment.environment.name");
+        let legacy = super::super::logs::resolve_log_field("resource.deployment.environment");
 
         assert_eq!(current, legacy);
         assert!(current.contains("mat_environment"));
         assert!(current.contains("deployment.environment.name"));
+    }
+
+    #[test]
+    fn log_filter_fields_cannot_break_out_of_the_condition() {
+        let filters = vec![
+            Filter {
+                field: "resource.a'] = '' OR 1=1 OR ['".into(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("x"),
+            },
+            Filter {
+                field: "log.a'] = '' OR 1=1 OR ['".into(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("x"),
+            },
+            Filter {
+                field: "1=1 OR ServiceName".into(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("x"),
+            },
+        ];
+        let sql = build_filter_conditions(&filters, "logs");
+        // Quotes in attribute keys are doubled, so each key stays one literal.
+        assert!(sql.contains("ResourceAttributes['a''] = '''' OR 1=1 OR ['''] = 'x'"));
+        assert!(sql.contains("LogAttributes['a''] = '''' OR 1=1 OR ['''] = 'x'"));
+        // Unknown names are attribute keys, never raw SQL.
+        assert!(!sql.contains("AND 1=1"));
+        assert!(sql.contains("LogAttributes['1=1 OR ServiceName']"));
     }
 
     fn request(signal: &str) -> BubbleUpRequest {
