@@ -124,7 +124,7 @@ fn is_trusted_proxy(address: IpAddr, trusted_proxy_cidrs: &[String]) -> bool {
         && crate::api_key_auth::source_allowed(address, trusted_proxy_cidrs)
 }
 
-fn resolve_login_client_ip(
+pub(crate) fn resolve_login_client_ip(
     peer_ip: IpAddr,
     headers: &HeaderMap,
     trusted_proxy_cidrs: &[String],
