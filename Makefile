@@ -104,7 +104,6 @@ run:                  ## Run query-api in debug mode (no dependency start)
 	RUST_LOG="$${RUST_LOG:-rush_api=info,tower_http=info}" cargo run $(CARGO_FEATURES) --bin $(BINARY)
 
 run-anomaly:          ## Run anomaly engine in debug mode
-	RUSH_PROM_BASE_URL=http://localhost:8080 \
 	RUST_LOG=rush_api=debug \
 	cargo run --bin wide-anomaly-engine
 
@@ -126,7 +125,6 @@ watch:                 ## Watch the community query-api with local development w
 	cargo watch -x 'run $(CARGO_FEATURES) --bin $(BINARY)'
 
 watch-anomaly:        ## Watch & restart anomaly engine on code changes
-	RUSH_PROM_BASE_URL=http://localhost:8080 \
 	RUST_LOG=rush_api=debug \
 	cargo watch -x 'run --bin wide-anomaly-engine'
 

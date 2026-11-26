@@ -71,9 +71,6 @@ async fn main() -> anyhow::Result<()> {
 
     let smtp_config = SmtpConfig::from_env();
 
-    let prom_base_url =
-        std::env::var("RUSH_PROM_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-
     tracing::info!("wide-anomaly-engine starting");
     // The standalone worker exports the same bounded metrics as the API process.
     let self_metrics = Arc::new(rush_api::self_metrics::SelfMetrics::new());
@@ -109,7 +106,6 @@ async fn main() -> anyhow::Result<()> {
         read_ch,
         write_ch,
         smtp_config,
-        prom_base_url,
         self_metrics,
         election.lease(rush_api::leader::ANOMALIES),
     );
