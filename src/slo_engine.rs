@@ -350,6 +350,18 @@ fn window_minutes(window_type: &str) -> i64 {
     }
 }
 
+/// Each evaluation re-scans the whole window of raw spans or samples (there are
+/// no span rollups), so 7d and 30d windows run at most every 10 and 15 minutes
+/// whatever their configured interval. Their budget moves slowly anyway.
+fn effective_eval_interval_secs(window_type: &str, configured_secs: i64) -> i64 {
+    let floor = match window_type {
+        "rolling_7d" => 600,
+        "rolling_30d" => 900,
+        _ => 0,
+    };
+    configured_secs.max(floor)
+}
+
 /// Events describe an incident lifecycle, not every evaluation-state change.
 /// A breach opens an incident and a compliant result closes it. `no_data`
 /// remains a valid live SLO state but never opens or closes an incident.
@@ -378,7 +390,13 @@ async fn eval_slos(
     let due_slos = config_db.get_due_slos(&now_str).await?;
     let jobs: Vec<(Slo, bool)> = due_slos
         .into_iter()
-        .filter(|s| eval_state.is_due(&s.id, now, s.eval_interval_secs))
+        .filter(|s| {
+            eval_state.is_due(
+                &s.id,
+                now,
+                effective_eval_interval_secs(&s.window_type, s.eval_interval_secs),
+            )
+        })
         .map(|s| {
             let flush = eval_state.should_flush(&s.id);
             (s, flush)
@@ -859,6 +877,24 @@ async fn eval_one_slo(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn long_windows_are_not_rescanned_every_minute() {
+        // Default interval is 60 s; a 30d window re-read 30 days of spans each time.
+        assert_eq!(effective_eval_interval_secs("rolling_30d", 60), 900);
+        assert_eq!(effective_eval_interval_secs("rolling_7d", 60), 600);
+        assert_eq!(effective_eval_interval_secs("rolling_24h", 60), 60);
+        assert_eq!(effective_eval_interval_secs("rolling_1h", 30), 30);
+        // A slower configured interval is kept.
+        assert_eq!(effective_eval_interval_secs("rolling_30d", 3600), 3600);
+
+        let mut state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
+        let t0 = time::OffsetDateTime::now_utc();
+        state.record("slo".to_string(), t0, true);
+        let interval = effective_eval_interval_secs("rolling_30d", 60);
+        assert!(!state.is_due("slo", t0 + time::Duration::minutes(1), interval));
+        assert!(state.is_due("slo", t0 + time::Duration::minutes(15), interval));
+    }
 
     #[test]
     fn incident_events_only_open_on_breach_and_close_on_recovery() {
