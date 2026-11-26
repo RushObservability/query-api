@@ -38,16 +38,18 @@ pub async fn decompress_body(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if encoding.contains("gzip")
-        || encoding.contains("deflate")
-        || encoding.contains("zstd")
-        || encoding.contains("zstandard")
-    {
+    if is_compressed_encoding(&encoding) {
         let permit = limits.acquire_decode("datadog").await?;
         let limits = limits.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            decompress_body_sync(&limits, &encoding, body)
+            decompress_body_sync(
+                &limits,
+                "datadog",
+                "invalid compressed Datadog payload",
+                &encoding,
+                &body,
+            )
         })
         .await
         .map_err(|e| crate::api_error::internal_legacy("datadog.decompress_task", e))?
@@ -57,27 +59,41 @@ pub async fn decompress_body(
     }
 }
 
-fn decompress_body_sync(
+/// Content-Encoding values `decompress_body_sync` can inflate.
+pub(crate) fn is_compressed_encoding(encoding: &str) -> bool {
+    encoding.contains("gzip")
+        || encoding.contains("deflate")
+        || encoding.contains("zstd")
+        || encoding.contains("zstandard")
+}
+
+/// Inflate a gzip, deflate or zstd body, capped at the decompressed-bytes limit.
+/// Only call it when `is_compressed_encoding(encoding)` is true.
+pub(crate) fn decompress_body_sync(
     limits: &crate::ingest_limits::IngestLimits,
+    source: &'static str,
+    invalid: &'static str,
     encoding: &str,
-    body: Bytes,
+    body: &[u8],
 ) -> Result<Vec<u8>, (StatusCode, String)> {
     if encoding.contains("gzip") {
-        let decoder = flate2::read::GzDecoder::new(body.as_ref());
-        read_capped(limits, decoder)
+        let decoder = flate2::read::GzDecoder::new(body);
+        read_capped(limits, source, invalid, decoder)
     } else if encoding.contains("deflate") {
-        let decoder = flate2::read::DeflateDecoder::new(body.as_ref());
-        read_capped(limits, decoder)
+        let decoder = flate2::read::DeflateDecoder::new(body);
+        read_capped(limits, source, invalid, decoder)
     } else {
-        // zstd / zstandard (only reachable for these encodings via the async wrapper)
-        let decoder = zstd::stream::read::Decoder::new(body.as_ref())
-            .map_err(|_| limits.malformed("datadog", "invalid compressed Datadog payload"))?;
-        read_capped(limits, decoder)
+        // zstd / zstandard
+        let decoder = zstd::stream::read::Decoder::new(body)
+            .map_err(|_| limits.malformed(source, invalid))?;
+        read_capped(limits, source, invalid, decoder)
     }
 }
 
 fn read_capped<R: std::io::Read>(
     limits: &crate::ingest_limits::IngestLimits,
+    source: &'static str,
+    invalid: &'static str,
     reader: R,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
     use std::io::Read;
@@ -85,8 +101,8 @@ fn read_capped<R: std::io::Read>(
     reader
         .take(limits.max_decompressed_bytes as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|_| limits.malformed("datadog", "invalid compressed Datadog payload"))?;
-    limits.check_decompressed("datadog", out.len())?;
+        .map_err(|_| limits.malformed(source, invalid))?;
+    limits.check_decompressed(source, out.len())?;
     Ok(out)
 }
 
@@ -149,20 +165,33 @@ mod tests {
         ))
     }
 
+    fn dd_sync(
+        limits: &crate::ingest_limits::IngestLimits,
+        encoding: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, (StatusCode, String)> {
+        decompress_body_sync(
+            limits,
+            "datadog",
+            "invalid compressed Datadog payload",
+            encoding,
+            body,
+        )
+    }
+
     #[test]
     fn datadog_gzip_bomb_is_bounded_and_returns_413() {
         let limits = limits();
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&vec![0_u8; 4097]).unwrap();
-        let compressed = Bytes::from(encoder.finish().unwrap());
-        let error = decompress_body_sync(&limits, "gzip", compressed).unwrap_err();
+        let compressed = encoder.finish().unwrap();
+        let error = dd_sync(&limits, "gzip", &compressed).unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn malformed_datadog_compression_error_is_stable() {
-        let error =
-            decompress_body_sync(&limits(), "gzip", Bytes::from_static(b"bad")).unwrap_err();
+        let error = dd_sync(&limits(), "gzip", b"bad").unwrap_err();
         assert_eq!(
             error,
             (
@@ -189,7 +218,7 @@ mod tests {
     #[test]
     fn datadog_zstd_bomb_is_bounded_and_returns_413() {
         let compressed = zstd::encode_all(vec![0_u8; 4097].as_slice(), 1).unwrap();
-        let error = decompress_body_sync(&limits(), "zstd", Bytes::from(compressed)).unwrap_err();
+        let error = dd_sync(&limits(), "zstd", &compressed).unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -197,8 +226,8 @@ mod tests {
     fn malformed_and_truncated_datadog_zstd_errors_are_stable() {
         let mut truncated = zstd::encode_all(b"test payload".as_slice(), 1).unwrap();
         truncated.pop();
-        for body in [Bytes::from_static(b"bad"), Bytes::from(truncated)] {
-            let error = decompress_body_sync(&limits(), "zstd", body).unwrap_err();
+        for body in [b"bad".to_vec(), truncated] {
+            let error = dd_sync(&limits(), "zstd", &body).unwrap_err();
             assert_eq!(
                 error,
                 (
