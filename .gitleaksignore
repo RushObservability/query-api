@@ -1,0 +1,13 @@
+# Reviewed false positives. Each fingerprint is specific to one historical finding.
+
+# Documentation prose about authenticated cursors.
+dbb1747b27331ea87c139d02209d9d1bce35fd56:docs/unified-query-contract.md:generic-api-key:84
+698fff11ea21850ba1a061b50c2d735bd6abc4cb:docs/unified-query-contract.md:generic-api-key:84
+
+# Synthetic credential in the unknown-key unit test.
+88d7c8eb404f6b855656a1aaab0620f6df16bb51:src/main.rs:generic-api-key:4367
+9b6fc65ea5148ad4702a5401af02a4c692d993e9:src/main.rs:generic-api-key:4367
+
+# Synthetic data in Kubernetes secret-redaction unit tests.
+02dc73bbfcc311ab204110ac7e3b2052afc31624:src/handlers/kubernetes_access.rs:generic-api-key:3844
+02dc73bbfcc311ab204110ac7e3b2052afc31624:src/handlers/kubernetes_access.rs:generic-api-key:3855
