@@ -553,6 +553,12 @@ fn configured_admission_policy(
     }
 }
 
+/// A setup link is handed to whoever configures the IdP. It may not choose a
+/// Rush group for every SSO login; group admission stays an admin decision.
+fn setup_link_admission_allowed(policy: SsoAdmissionPolicy, default_group_id: &str) -> bool {
+    policy != SsoAdmissionPolicy::Group && default_group_id.trim().is_empty()
+}
+
 fn fallback_groups_for_policy(
     policy: SsoAdmissionPolicy,
     default_group_id: &str,
@@ -1958,6 +1964,36 @@ pub async fn save_sso_provider(
     let admission_policy = req
         .admission_policy
         .unwrap_or_else(|| configured_admission_policy(inherited_jit, &inherited_default_group));
+    if let Some(session) = &setup_session
+        && !setup_link_admission_allowed(admission_policy, &inherited_default_group)
+    {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.config_update", "anonymous")
+                    .actor_name("SSO setup link")
+                    .tenant("default".to_string())
+                    .resource("sso_provider", id.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "provider": session.provider,
+                            "admission_policy": admission_policy,
+                            "default_group_id": inherited_default_group,
+                            "reason": "setup_link_group_admission",
+                        })
+                        .to_string(),
+                    )
+                    .description("SSO setup link group admission rejected")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "setup links may only use the 'deny' or 'global_viewer' admission policy; an administrator can set a default group later"
+                .to_string(),
+        ));
+    }
     let (jit_provisioning, default_group_id) = match admission_policy {
         SsoAdmissionPolicy::GlobalViewer => (true, String::new()),
         SsoAdmissionPolicy::Group => {
@@ -4136,6 +4172,37 @@ mod tests {
         assert!(claim < clear_cookie);
         assert!(endpoint.contains("revocation_newly_recorded"));
         assert!(endpoint.contains(".outcome(\"failure\")"));
+    }
+
+    #[test]
+    fn setup_link_cannot_choose_group_admission() {
+        assert!(setup_link_admission_allowed(
+            SsoAdmissionPolicy::GlobalViewer,
+            ""
+        ));
+        assert!(setup_link_admission_allowed(SsoAdmissionPolicy::Deny, ""));
+        assert!(!setup_link_admission_allowed(
+            SsoAdmissionPolicy::Group,
+            "admins"
+        ));
+        assert!(!setup_link_admission_allowed(SsoAdmissionPolicy::Group, ""));
+        assert!(!setup_link_admission_allowed(
+            SsoAdmissionPolicy::GlobalViewer,
+            "admins"
+        ));
+        let source = include_str!("sso.rs");
+        let save = source
+            .split_once("\npub async fn save_sso_provider(")
+            .map(|(_, endpoint)| endpoint)
+            .expect("provider save endpoint must exist")
+            .split("\npub async fn delete_sso_provider(")
+            .next()
+            .expect("provider delete must follow save");
+        let check = save
+            .find("setup_link_admission_allowed(")
+            .expect("save must restrict setup link admission");
+        assert!(check < save.find("revoke_sso_setup_session").unwrap());
+        assert!(check < save.find(".get_group(").unwrap());
     }
 
     #[test]
