@@ -166,7 +166,7 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `RUSH_INGEST_BATCH_ROWS` / `RUSH_INGEST_BATCH_MS` | `5000` / `500` | flush an in-memory table batch when either limit is reached; set rows to `1` or milliseconds to `0` for synchronous writes |
 | `RUSH_CLICKHOUSE_ASYNC_INSERT` | `true` | let ClickHouse buffer inserts server-side |
 | `RUSH_CLICKHOUSE_WAIT_FOR_ASYNC_INSERT` | `false` | wait for the ClickHouse async-insert flush; enable for stronger delivery confirmation at higher latency |
-| `RUSH_INGEST_DECODE_CONCURRENCY` | `4` | process-wide CPU-heavy ingest decode slots; excess requests receive retryable 429 responses |
+| `RUSH_INGEST_DECODE_CONCURRENCY` | number of CPU cores | process-wide CPU-heavy ingest decode slots; a request waits up to 2 seconds for a free slot, then receives a retryable 429 |
 | `RUSH_EXPORT_SYNC_MAX_ROWS` | `50000` | synchronous streaming ceiling; larger allowed exports become expiring jobs |
 | `RUSH_EXPORT_MAX_BYTES` | `268435456` | hard byte cap for synchronous downloads and asynchronous export objects |
 | `RUSH_EXPORT_JOB_TTL_SECONDS` | `3600` | lifetime for protected asynchronous export jobs and objects |
