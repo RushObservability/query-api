@@ -530,6 +530,26 @@ pub async fn delete_user(
         ));
     }
 
+    if crate::handlers::auth::is_break_glass_username(&username) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.delete", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", id.clone())
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "break_glass_protected" }).to_string())
+                    .description("delete rejected for protected break-glass account")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the break-glass account cannot be deleted".to_string(),
+        ));
+    }
+
     let deleted = state.config_db.delete_user(&id).await.map_err(|e| {
         tracing::error!(error = %e, "internal error");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
@@ -847,6 +867,17 @@ pub async fn change_password(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// With RUSH_SSO_ONLY the break-glass account is the way in when SSO breaks,
+/// so, as with password resets, other administrators cannot disable or
+/// regroup it.
+pub(crate) fn break_glass_change_refused(
+    target_username: &str,
+    caller_id: &str,
+    target_id: &str,
+) -> bool {
+    caller_id != target_id && crate::handlers::auth::is_break_glass_username(target_username)
+}
+
 /// PUT /api/v1/users/{id}/toggle
 pub async fn toggle_user(
     State(state): State<AppState>,
@@ -855,6 +886,39 @@ pub async fn toggle_user(
     Json(req): Json<ToggleUserRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
+
+    if !req.enabled {
+        let username = state
+            .config_db
+            .get_username(&id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            })?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
+        if break_glass_change_refused(&username, &caller.0, &id) {
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("user.update", "user")
+                        .actor(caller.0.clone(), caller.1.clone())
+                        .tenant(caller.3.clone())
+                        .resource("user", id.clone())
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "break_glass_protected" }).to_string(),
+                        )
+                        .description("disable rejected for protected break-glass account")
+                        .context(crate::audit::actor_context_from_headers(&headers)),
+                )
+                .await;
+            return Err((
+                StatusCode::FORBIDDEN,
+                "another administrator cannot disable the break-glass account".to_string(),
+            ));
+        }
+    }
 
     let updated = state
         .config_db
@@ -914,6 +978,51 @@ mod tests {
         assert_eq!(request.auth_provider.as_deref(), Some("oidc"));
         assert_eq!(request.sso_provider_id.as_deref(), Some("provider-a"));
         assert_eq!(request.group_ids.unwrap(), vec!["operators"]);
+    }
+}
+
+#[cfg(test)]
+mod break_glass_tests {
+    use super::break_glass_change_refused;
+
+    #[test]
+    fn only_the_break_glass_account_itself_may_change_it() {
+        // RUSH_BREAK_GLASS_USERNAME defaults to "admin".
+        assert!(break_glass_change_refused(
+            " Admin ",
+            "other-admin",
+            "bg-id"
+        ));
+        assert!(!break_glass_change_refused("admin", "bg-id", "bg-id"));
+        assert!(!break_glass_change_refused(
+            "alice",
+            "other-admin",
+            "alice-id"
+        ));
+    }
+
+    #[test]
+    fn delete_disable_and_regroup_check_the_break_glass_guard_before_mutating() {
+        let users = include_str!("users.rs");
+        let groups = include_str!("groups.rs");
+        for (source, start, mutation) in [
+            (
+                users,
+                "pub async fn delete_user(",
+                "state.config_db.delete_user(",
+            ),
+            (users, "pub async fn toggle_user(", ".set_user_enabled("),
+            (groups, "pub async fn set_user_groups(", ".set_user_groups("),
+        ] {
+            let body = source.split_once(start).expect("handler exists").1;
+            let before_mutation = &body[..body.find(mutation).expect("mutation exists")];
+            assert!(
+                before_mutation.contains("is_break_glass_username(")
+                    || before_mutation.contains("break_glass_change_refused("),
+                "{start} mutates before the break-glass guard"
+            );
+            assert!(before_mutation.contains("\"break_glass_protected\""));
+        }
     }
 }
 
