@@ -423,6 +423,37 @@ pub async fn set_user_groups(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
 
+    // Moving the break-glass account out of an admin group would make SSO-only
+    // login refuse it.
+    let username = state
+        .config_db
+        .get_username(&user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "user not found".to_string()))?;
+    if crate::handlers::users::break_glass_change_refused(&username, &caller.0, &user_id) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("user.role_change", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("user", user_id.clone())
+                    .outcome("failure")
+                    .changes(serde_json::json!({ "reason": "break_glass_protected" }).to_string())
+                    .description("group change rejected for protected break-glass account")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "another administrator cannot change the break-glass account's groups".to_string(),
+        ));
+    }
+
     state
         .config_db
         .set_user_groups(&user_id, &req.group_ids)
