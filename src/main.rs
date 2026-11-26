@@ -857,6 +857,7 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
         || path.starts_with("/prom/api/v1/label/")
         || path.starts_with("/api/v1/monitors/") && path.ends_with("/preview")
         || path == "/api/v1/monitors/forecast/series"
+        || path == "/api/v1/monitors/autocomplete"
         || path.starts_with("/api/v1/detection-rules/") && path.ends_with("/test");
     if !managed {
         return None;
@@ -4943,6 +4944,15 @@ mod tenant_auth_tests {
             .unwrap();
         assert_eq!(
             query_workload_for_request(&advisor),
+            Some(rush_api::query_governor::WorkloadClass::Interactive)
+        );
+        let autocomplete = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/monitors/autocomplete?type=label_key&metric=cpu")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            query_workload_for_request(&autocomplete),
             Some(rush_api::query_governor::WorkloadClass::Interactive)
         );
         let unified = Request::builder()

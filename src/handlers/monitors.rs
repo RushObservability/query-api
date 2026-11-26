@@ -817,151 +817,7 @@ pub async fn autocomplete(
     Query(params): Query<AutocompleteQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_principal(&state, &headers).await?;
-    let prefix = escape_ch(&params.prefix);
-    let tenant_id = escape_ch(&tenant.tenant_id);
-
     let suggestions: Vec<String> = match params.ac_type.as_str() {
-        "metric" | "forecast_metric" => {
-            let tables: &[&str] = if params.ac_type == "forecast_metric" {
-                &["metrics_gauge"]
-            } else {
-                &["metrics_gauge", "metrics_sum", "metrics_histogram"]
-            };
-            let mut all: Vec<String> = Vec::new();
-            for table in tables {
-                let sql = format!(
-                    "SELECT DISTINCT MetricName AS value FROM {table} \
-                     WHERE tenant_id = '{tenant_id}' AND MetricName LIKE '{prefix}%' \
-                     LIMIT 20"
-                );
-                match crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
-                    .fetch_all::<StringRow>()
-                    .await
-                {
-                    Ok(rows) => {
-                        for r in rows {
-                            if !all.contains(&r.value) {
-                                all.push(r.value);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(table = table, error = %e, "autocomplete metric query failed");
-                    }
-                }
-            }
-            all.truncate(20);
-            all
-        }
-        "label_key" => {
-            let metric = escape_ch(&params.metric);
-            let tables = ["metrics_gauge", "metrics_sum", "metrics_histogram"];
-            let mut all: Vec<String> = Vec::new();
-            for table in &tables {
-                let sql = format!(
-                    "SELECT DISTINCT arrayJoin(mapKeys(Attributes)) AS value \
-                     FROM {table} \
-                     WHERE tenant_id = '{tenant_id}' AND MetricName = '{metric}' \
-                     AND value LIKE '{prefix}%' \
-                     LIMIT 20"
-                );
-                match crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
-                    .fetch_all::<StringRow>()
-                    .await
-                {
-                    Ok(rows) => {
-                        for r in rows {
-                            if !all.contains(&r.value) {
-                                all.push(r.value);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(table = table, error = %e, "autocomplete label_key query failed");
-                    }
-                }
-            }
-            all.truncate(20);
-            all
-        }
-        "label_value" => {
-            let metric = escape_ch(&params.metric);
-            let key = escape_ch(&params.key);
-            let tables = ["metrics_gauge", "metrics_sum", "metrics_histogram"];
-            let mut all: Vec<String> = Vec::new();
-            for table in &tables {
-                let sql = format!(
-                    "SELECT DISTINCT Attributes['{key}'] AS value \
-                     FROM {table} \
-                     WHERE tenant_id = '{tenant_id}' AND MetricName = '{metric}' \
-                     AND value LIKE '{prefix}%' \
-                     LIMIT 20"
-                );
-                match crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
-                    .fetch_all::<StringRow>()
-                    .await
-                {
-                    Ok(rows) => {
-                        for r in rows {
-                            if !r.value.is_empty() && !all.contains(&r.value) {
-                                all.push(r.value);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(table = table, error = %e, "autocomplete label_value query failed");
-                    }
-                }
-            }
-            all.truncate(20);
-            all
-        }
-        "service" => {
-            let sql = format!(
-                "SELECT DISTINCT service_name AS value FROM spans \
-                 WHERE tenant_id = '{tenant_id}' AND service_name LIKE '{prefix}%' \
-                 LIMIT 20"
-            );
-            crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
-                .fetch_all::<StringRow>()
-                .await
-                .map(|rows| rows.into_iter().map(|r| r.value).collect())
-                .unwrap_or_default()
-        }
-        "endpoint" => {
-            let mut conditions = vec![
-                format!("tenant_id = '{tenant_id}'"),
-                format!("http_path LIKE '{prefix}%'"),
-            ];
-            if let Some(condition) =
-                monitor_engine::apm_match_condition("service_name", &params.service)
-            {
-                conditions.push(condition);
-            }
-            let sql = format!(
-                "SELECT DISTINCT http_path AS value FROM spans \
-                 WHERE {} \
-                 LIMIT 20",
-                conditions.join(" AND ")
-            );
-            crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
-                .fetch_all::<StringRow>()
-                .await
-                .map(|rows| rows.into_iter().map(|r| r.value).collect())
-                .unwrap_or_default()
-        }
-        "log_service" => {
-            let sql = format!(
-                "SELECT DISTINCT ServiceName AS value FROM logs \
-                 WHERE tenant_id = '{tenant_id}' AND ServiceName LIKE '{prefix}%' \
-                 LIMIT 20"
-            );
-            crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
-                .fetch_all::<StringRow>()
-                .await
-                .map(|rows| rows.into_iter().map(|r| r.value).collect())
-                .unwrap_or_default()
-        }
         "log_field" => {
             // Return a static list of known log fields, filtered by prefix
             let known_fields = vec![
@@ -995,18 +851,111 @@ pub async fn autocomplete(
                 .collect()
         }
         other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown autocomplete type '{}'; valid types: metric, label_key, label_value, \
-                     service, endpoint, log_service, log_field",
-                    other
-                ),
-            ));
+            let Some(queries) = autocomplete_queries(&params, &tenant.tenant_id) else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "unknown autocomplete type '{}'; valid types: metric, label_key, label_value, \
+                         service, endpoint, log_service, log_field",
+                        other
+                    ),
+                ));
+            };
+            let mut all: Vec<String> = Vec::new();
+            for sql in &queries {
+                match crate::tenant_query(&state.ch, sql, &tenant.tenant_id)
+                    .fetch_all::<StringRow>()
+                    .await
+                {
+                    Ok(rows) => {
+                        for r in rows {
+                            if !r.value.is_empty() && !all.contains(&r.value) {
+                                all.push(r.value);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(ac_type = other, error = %e, "autocomplete query failed");
+                    }
+                }
+            }
+            all.truncate(20);
+            all
         }
     };
 
     Ok(Json(serde_json::json!({ "suggestions": suggestions })))
+}
+
+/// One query per source table for a data-backed autocomplete type, or `None`
+/// for an unknown type. Every query only looks at the last day: it runs on each
+/// keystroke, and when fewer than 20 values match, `LIMIT` cannot stop the scan
+/// early, so an unbounded query read the whole retention window.
+fn autocomplete_queries(params: &AutocompleteQuery, tenant_id: &str) -> Option<Vec<String>> {
+    const METRICS_RECENT: &str = "TimeUnix >= now() - INTERVAL 1 DAY";
+    const SPANS_RECENT: &str = "timestamp >= now() - INTERVAL 1 DAY";
+    const LOGS_RECENT: &str = "TimestampDate >= toDate(now() - INTERVAL 1 DAY) \
+                               AND TimestampTime >= now() - INTERVAL 1 DAY";
+    let prefix = escape_ch(&params.prefix);
+    let tenant_id = escape_ch(tenant_id);
+    let metric = escape_ch(&params.metric);
+    let metric_tables: &[&str] = if params.ac_type == "forecast_metric" {
+        &["metrics_gauge"]
+    } else {
+        &["metrics_gauge", "metrics_sum", "metrics_histogram"]
+    };
+    let per_metric_table = |select: &str, filter: &str| {
+        metric_tables
+            .iter()
+            .map(|table| {
+                format!(
+                    "SELECT DISTINCT {select} AS value FROM {table} \
+                     WHERE tenant_id = '{tenant_id}' AND {METRICS_RECENT} AND {filter} \
+                     LIMIT 20"
+                )
+            })
+            .collect()
+    };
+    Some(match params.ac_type.as_str() {
+        "metric" | "forecast_metric" => {
+            per_metric_table("MetricName", &format!("MetricName LIKE '{prefix}%'"))
+        }
+        "label_key" => per_metric_table(
+            "arrayJoin(mapKeys(Attributes))",
+            &format!("MetricName = '{metric}' AND value LIKE '{prefix}%'"),
+        ),
+        "label_value" => per_metric_table(
+            &format!("Attributes['{}']", escape_ch(&params.key)),
+            &format!("MetricName = '{metric}' AND value LIKE '{prefix}%'"),
+        ),
+        "service" => vec![format!(
+            "SELECT DISTINCT service_name AS value FROM spans \
+             WHERE tenant_id = '{tenant_id}' AND {SPANS_RECENT} AND service_name LIKE '{prefix}%' \
+             LIMIT 20"
+        )],
+        "endpoint" => {
+            let mut conditions = vec![
+                format!("tenant_id = '{tenant_id}'"),
+                SPANS_RECENT.to_string(),
+                format!("http_path LIKE '{prefix}%'"),
+            ];
+            if let Some(condition) =
+                monitor_engine::apm_match_condition("service_name", &params.service)
+            {
+                conditions.push(condition);
+            }
+            vec![format!(
+                "SELECT DISTINCT http_path AS value FROM spans WHERE {} LIMIT 20",
+                conditions.join(" AND ")
+            )]
+        }
+        "log_service" => vec![format!(
+            "SELECT DISTINCT ServiceName AS value FROM logs \
+             WHERE tenant_id = '{tenant_id}' AND {LOGS_RECENT} AND ServiceName LIKE '{prefix}%' \
+             LIMIT 20"
+        )],
+        _ => return None,
+    })
 }
 
 // ── Suggest ──
@@ -1119,6 +1068,50 @@ pub async fn suggest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autocomplete_queries_only_scan_the_last_day() {
+        for ac_type in [
+            "metric",
+            "forecast_metric",
+            "label_key",
+            "label_value",
+            "service",
+            "endpoint",
+            "log_service",
+        ] {
+            let params = AutocompleteQuery {
+                ac_type: ac_type.to_string(),
+                prefix: "ht".to_string(),
+                metric: "cpu".to_string(),
+                key: "host".to_string(),
+                service: "api".to_string(),
+            };
+            let queries = autocomplete_queries(&params, "default").unwrap();
+            assert!(!queries.is_empty(), "{ac_type}");
+            for sql in queries {
+                let column = if sql.contains("FROM metrics_") {
+                    "TimeUnix"
+                } else if sql.contains("FROM spans") {
+                    "timestamp"
+                } else {
+                    "TimestampTime"
+                };
+                assert!(
+                    sql.contains(&format!("{column} >= now() - INTERVAL 1 DAY")),
+                    "{ac_type}: {sql}"
+                );
+            }
+        }
+        let unknown = AutocompleteQuery {
+            ac_type: "nope".to_string(),
+            prefix: String::new(),
+            metric: String::new(),
+            key: String::new(),
+            service: String::new(),
+        };
+        assert!(autocomplete_queries(&unknown, "default").is_none());
+    }
 
     #[test]
     fn monitor_validation_rejects_malicious_group_fields() {
