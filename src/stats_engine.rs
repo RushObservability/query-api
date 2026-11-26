@@ -26,6 +26,7 @@ pub fn spawn_stats_engine(
     buffer: Arc<IngestBuffer>,
     self_metrics: Arc<SelfMetrics>,
     instance_id: String,
+    counts_lease: Arc<crate::leader::EngineLease>,
 ) {
     tokio::spawn(async move {
         // Emit cadence for rush_stats_* gauges. Default 15s (Prometheus-standard) so
@@ -36,10 +37,13 @@ pub fn spawn_stats_engine(
             .filter(|&s| s >= 1)
             .unwrap_or(15);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
-        loop {
+        for tick in 0u64.. {
             interval.tick().await;
             let start = std::time::Instant::now();
-            let ok = match collect_and_write(&ch, &buffer, &self_metrics, &instance_id).await {
+            let run_counts = counts_due(tick, secs, counts_lease.is_leader());
+            let ok = match collect_and_write(&ch, &buffer, &self_metrics, &instance_id, run_counts)
+                .await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!("stats engine error: {e}");
@@ -51,11 +55,53 @@ pub fn spawn_stats_engine(
     });
 }
 
+/// The cluster-wide row counts scan the data tables and are the same on every
+/// replica, so only the stats lease holder runs them, at most once a minute.
+const COUNTS_EVERY_SECS: u64 = 60;
+
+fn counts_due(tick: u64, interval_secs: u64, leader: bool) -> bool {
+    leader && tick % COUNTS_EVERY_SECS.div_ceil(interval_secs) == 0
+}
+
+/// Last-hour row counts (spans, logs, gauge, sum, histogram) and gauge series.
+/// Each query bounds the table's partition and primary-key time columns so it
+/// reads only the last hour, not the whole day.
+fn count_queries(from: &str, to: &str) -> [String; 6] {
+    let range = |col: &str| {
+        format!(
+            "{col} >= parseDateTimeBestEffort('{from}') AND {col} <= parseDateTimeBestEffort('{to}')"
+        )
+    };
+    let metrics = |table: &str, select: &str| {
+        format!(
+            "SELECT {select} as count FROM {table} WHERE {}",
+            range("TimeUnix")
+        )
+    };
+    [
+        format!(
+            "SELECT count() as count FROM spans WHERE {}",
+            range("timestamp")
+        ),
+        format!(
+            "SELECT count() as count FROM logs WHERE TimestampDate >= toDate(parseDateTimeBestEffort('{from}')) \
+             AND {} AND {}",
+            range("TimestampTime"),
+            range("Timestamp")
+        ),
+        metrics("metrics_gauge", "count()"),
+        metrics("metrics_sum", "count()"),
+        metrics("metrics_histogram", "count()"),
+        metrics("metrics_gauge", "uniq(MetricName, Attributes)"),
+    ]
+}
+
 async fn collect_and_write(
     ch: &Client,
     buffer: &IngestBuffer,
     self_metrics: &SelfMetrics,
     instance_id: &str,
+    run_counts: bool,
 ) -> anyhow::Result<()> {
     // Object-store buffers are shared by ingest replicas. Reconcile before
     // exporting gauges so a drain performed by another pod is reflected here.
@@ -69,29 +115,24 @@ async fn collect_and_write(
 
     // All of these queries are independent — run them concurrently so the tick's
     // wall time is the slowest query, not the sum of all of them (~14 round trips).
-    let q_spans = format!(
-        "SELECT count() as count FROM spans WHERE timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND timestamp <= parseDateTimeBestEffort('{now_str}')"
-    );
-    let q_logs = format!(
-        "SELECT count() as count FROM logs WHERE Timestamp >= parseDateTimeBestEffort('{one_hour_ago}') AND Timestamp <= parseDateTimeBestEffort('{now_str}')"
-    );
-    let q_gauge = format!(
-        "SELECT count() as count FROM metrics_gauge WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
-    );
-    let q_sum = format!(
-        "SELECT count() as count FROM metrics_sum WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
-    );
-    let q_hist = format!(
-        "SELECT count() as count FROM metrics_histogram WHERE TimeUnix >= parseDateTimeBestEffort('{one_hour_ago}') AND TimeUnix <= parseDateTimeBestEffort('{now_str}')"
-    );
+    let counts = async {
+        if !run_counts {
+            return None;
+        }
+        let [q_spans, q_logs, q_gauge, q_sum, q_hist, q_series] =
+            count_queries(&one_hour_ago, &now_str);
+        Some(tokio::join!(
+            query_count(ch, &q_spans, self_metrics, "spans"),
+            query_count(ch, &q_logs, self_metrics, "logs"),
+            query_count(ch, &q_gauge, self_metrics, "metric_gauge"),
+            query_count(ch, &q_sum, self_metrics, "metric_sum"),
+            query_count(ch, &q_hist, self_metrics, "metric_histogram"),
+            query_count(ch, &q_series, self_metrics, "unique_series"),
+        ))
+    };
     let (
-        span_total,
+        counts,
         span_bytes,
-        log_total,
-        metric_gauge,
-        metric_sum,
-        metric_hist,
-        unique_series,
         storage_bytes,
         storage_rows,
         storage_local_bytes,
@@ -100,22 +141,12 @@ async fn collect_and_write(
         disk_local_total_bytes,
         buf_oldest,
     ) = tokio::join!(
-        query_count(ch, &q_spans, self_metrics, "spans"),
+        counts,
         query_bytes(
             ch,
             "SELECT sum(bytes_on_disk) as total FROM system.parts WHERE database = 'observability' AND table = 'spans' AND active",
             self_metrics,
             "span_bytes"
-        ),
-        query_count(ch, &q_logs, self_metrics, "logs"),
-        query_count(ch, &q_gauge, self_metrics, "metric_gauge"),
-        query_count(ch, &q_sum, self_metrics, "metric_sum"),
-        query_count(ch, &q_hist, self_metrics, "metric_histogram"),
-        query_count(
-            ch,
-            "SELECT uniq(MetricName, Attributes) as count FROM metrics_gauge WHERE TimeUnix >= now() - INTERVAL 1 HOUR",
-            self_metrics,
-            "unique_series"
         ),
         query_bytes(
             ch,
@@ -164,27 +195,37 @@ async fn collect_and_write(
         // Ingest buffer (durable spool) replay lag.
         buffer.oldest_age_secs(),
     );
+    // Skipped counts stay None, so their rows are left out of the INSERT below
+    // rather than written as zeros.
+    let (span_total, log_total, metric_gauge, metric_sum, metric_hist, unique_series) =
+        counts.unwrap_or_default();
     let metric_total = metric_gauge
         .zip(metric_sum)
         .zip(metric_hist)
         .map(|((a, b), c)| a + b + c);
-    let mut healthy = [
-        span_total,
-        span_bytes,
-        log_total,
-        metric_gauge,
-        metric_sum,
-        metric_hist,
-        unique_series,
-        storage_bytes,
-        storage_rows,
-        storage_local_bytes,
-        storage_object_store_bytes,
-        disk_local_free_bytes,
-        disk_local_total_bytes,
-    ]
-    .iter()
-    .all(Option::is_some);
+    let counts_ok = !run_counts
+        || [
+            span_total,
+            log_total,
+            metric_gauge,
+            metric_sum,
+            metric_hist,
+            unique_series,
+        ]
+        .iter()
+        .all(Option::is_some);
+    let mut healthy = counts_ok
+        && [
+            span_bytes,
+            storage_bytes,
+            storage_rows,
+            storage_local_bytes,
+            storage_object_store_bytes,
+            disk_local_free_bytes,
+            disk_local_total_bytes,
+        ]
+        .iter()
+        .all(Option::is_some);
     let buf_oldest = buf_oldest.unwrap_or(0);
 
     // ── Write all metrics ──
@@ -901,6 +942,44 @@ mod tests {
         assert!(sql.contains("query_duration_ms"));
         assert!(!sql.contains("QueryDurationMicroseconds"));
         assert!(CH_HEALTH_PROBE_CONCURRENCY < 8);
+    }
+
+    #[test]
+    fn cluster_counts_run_only_on_the_leader_once_a_minute() {
+        assert!(!counts_due(0, 15, false));
+        assert!(!counts_due(4, 15, false));
+        let leader_ticks: Vec<u64> = (0..9).filter(|&t| counts_due(t, 15, true)).collect();
+        assert_eq!(leader_ticks, vec![0, 4, 8]);
+        // A slower stats interval never runs the counts more often than it ticks.
+        assert!((0..3).all(|t| counts_due(t, 120, true)));
+    }
+
+    #[test]
+    fn count_queries_bound_the_primary_key_time_columns() {
+        let [spans, logs, gauge, sum, hist, series] =
+            count_queries("2026-01-02 03:00:00", "2026-01-02 04:00:00");
+        assert!(spans.contains("FROM spans WHERE timestamp >= "));
+        // logs is partitioned by TimestampDate and keyed by TimestampTime;
+        // filtering only on Timestamp read the whole day.
+        assert!(
+            logs.contains(
+                "TimestampDate >= toDate(parseDateTimeBestEffort('2026-01-02 03:00:00'))"
+            )
+        );
+        assert!(logs.contains("TimestampTime >= parseDateTimeBestEffort('2026-01-02 03:00:00')"));
+        assert!(logs.contains("TimestampTime <= parseDateTimeBestEffort('2026-01-02 04:00:00')"));
+        assert!(logs.contains("Timestamp <= parseDateTimeBestEffort('2026-01-02 04:00:00')"));
+        for (sql, table) in [
+            (&gauge, "metrics_gauge"),
+            (&sum, "metrics_sum"),
+            (&hist, "metrics_histogram"),
+            (&series, "metrics_gauge"),
+        ] {
+            assert!(sql.contains(&format!("FROM {table} WHERE TimeUnix >= ")));
+            assert!(sql.contains("TimeUnix <= parseDateTimeBestEffort('2026-01-02 04:00:00')"));
+        }
+        assert!(series.starts_with("SELECT uniq(MetricName, Attributes) as count"));
+        assert!(!format!("{spans}{logs}{gauge}{sum}{hist}{series}").contains('?'));
     }
 
     #[test]

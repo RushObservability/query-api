@@ -3288,13 +3288,15 @@ async fn main() -> anyhow::Result<()> {
             "ingest insert batching configured"
         );
     }
-    // Stats engine (emits ingest-buffer depth/age/drain metrics). API process only.
-    if !drain_only {
+    // Stats engine (emits ingest-buffer depth/age/drain metrics). API process only
+    // (`election` is None only in the drain-only process).
+    if let Some(election) = election.as_ref() {
         stats_engine::spawn_stats_engine(
             admin_ch.clone(),
             writer.buffer.clone(),
             self_metrics.clone(),
             instance_id,
+            election.lease(rush_api::leader::STATS),
         );
     }
 
