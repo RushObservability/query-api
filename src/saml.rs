@@ -614,11 +614,10 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                     value.get_or_insert_default().push_str(&text);
                 }
             }
-            // Signature canonicalization drops comments and the signed text
-            // ignores where they sit, so one inside a value could change what
-            // we read without breaking the signature. No IdP needs them.
-            Ok(Event::Comment(_)) | Ok(Event::PI(_)) => {
-                return Err("SAML comments and processing instructions are not supported".into());
+            // Comments need no handling: canonicalization drops them, so the
+            // concatenated text above is exactly the signed value.
+            Ok(Event::PI(_)) => {
+                return Err("SAML processing instructions are not supported".into());
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
@@ -999,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_values_cannot_be_split_by_comments_or_entities() {
+    fn signed_values_are_read_whole_across_comments_and_entities() {
         let now = 1_700_000_000;
         let recipient = "https://rush.example.com/auth/sso/acs";
         let audience = "https://rush.example.com";
@@ -1040,15 +1039,15 @@ mod tests {
         assert_eq!(assertion.name_id, "janedoe@acme.com");
         assert_eq!(assertion.groups, ["admins-sandbox"]);
 
-        // Comments do not change the signed digest, so they must not be able
-        // to change the value we read either.
-        for tampered in [
-            signed.replace("janedoe@", "jane<!---->doe@"),
-            signed.replace("admins-sandbox", "admins<!---->-sandbox"),
-        ] {
-            assert!(verify_signature(&tampered, &certificate).is_ok());
-            assert!(validate(&tampered).is_err(), "accepted {tampered}");
-        }
+        // Comments do not change the signed digest, so they must not change
+        // the value we read either.
+        let tampered = signed
+            .replace("janedoe@", "jane<!---->doe@")
+            .replace("admins-sandbox", "admins<!---->-sandbox");
+        assert!(verify_signature(&tampered, &certificate).is_ok());
+        let assertion = validate(&tampered).unwrap();
+        assert_eq!(assertion.name_id, "janedoe@acme.com");
+        assert_eq!(assertion.groups, ["admins-sandbox"]);
 
         assert!(
             parse_assertion_xml(
