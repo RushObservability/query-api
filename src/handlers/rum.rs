@@ -274,14 +274,53 @@ pub struct RumSessionRow {
 /// Whether RUM is enabled (admin toggle in Settings → General). Defaults ON;
 /// only an explicit "false" disables it. Gates both RUM ingest endpoints.
 pub(super) async fn rum_enabled(state: &AppState) -> bool {
-    state
+    if let Some(enabled) = cached_rum_enabled(std::time::Instant::now()) {
+        return enabled;
+    }
+    let enabled = state
         .config_db
         .get_setting("rum_enabled")
         .await
         .ok()
         .flatten()
         .map(|v| v != "false")
-        .unwrap_or(true)
+        .unwrap_or(true);
+    *RUM_ENABLED.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((enabled, std::time::Instant::now()));
+    enabled
+}
+
+/// Checked on every RUM, replay and frontend-telemetry request. A toggle on
+/// this replica applies at once; on other replicas within this TTL.
+const RUM_ENABLED_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+static RUM_ENABLED: std::sync::Mutex<Option<(bool, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+fn cached_rum_enabled(now: std::time::Instant) -> Option<bool> {
+    RUM_ENABLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(_, at)| now.saturating_duration_since(*at) < RUM_ENABLED_TTL)
+        .map(|(enabled, _)| enabled)
+}
+
+pub(crate) fn forget_rum_enabled() {
+    *RUM_ENABLED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(test)]
+mod rum_enabled_cache_tests {
+    use super::*;
+
+    #[test]
+    fn rum_enabled_is_cached_briefly_and_forgotten_on_toggle() {
+        let now = std::time::Instant::now();
+        *RUM_ENABLED.lock().unwrap() = Some((false, now));
+        assert_eq!(cached_rum_enabled(now + RUM_ENABLED_TTL / 2), Some(false));
+        assert_eq!(cached_rum_enabled(now + RUM_ENABLED_TTL), None);
+        forget_rum_enabled();
+        assert_eq!(cached_rum_enabled(now), None);
+    }
 }
 
 pub async fn ingest(

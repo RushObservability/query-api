@@ -633,6 +633,7 @@ pub async fn set_rum_setting(
                 "failed to save setting".to_string(),
             )
         })?;
+    super::rum::forget_rum_enabled();
 
     // AUDIT: RUM setting change.
     state
@@ -2055,6 +2056,7 @@ pub async fn delete_api_key(
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     }
     state.ingest_key_limiter.remove(&id);
+    state.api_key_cache.evict_key_id(&id);
     tracing::info!(
         event = "api_key_deleted",
         key_id = %id,

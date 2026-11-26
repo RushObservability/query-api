@@ -2141,6 +2141,10 @@ async fn enforce_tenant_auth_middleware(
     }
 
     let ingest_signal = ingest_signal_for_route(&method, &path);
+    // Neither tenant policy changes the outcome for an ingest key on an ingest
+    // route, so a policy lookup error must not block it (spool during outages).
+    let ingest_key_route =
+        ingest_signal.is_some() && resolution.credential == CredentialKind::IngestKey;
     let policy_started = std::time::Instant::now();
     let policy_result = state
         .config_db
@@ -2168,11 +2172,14 @@ async fn enforce_tenant_auth_middleware(
         }
         Err(error) => {
             tracing::error!(tenant_id = %tenant_id, %error, "tenant auth policy lookup failed");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "tenant policy unavailable",
-            )
-                .into_response();
+            if !ingest_key_route {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "tenant policy unavailable",
+                )
+                    .into_response();
+            }
+            true
         }
     };
     let default_compatibility =
@@ -2210,11 +2217,14 @@ async fn enforce_tenant_auth_middleware(
             }
             Err(error) => {
                 tracing::error!(tenant_id = %tenant_id, %error, "tenant ingest auth policy lookup failed");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "tenant ingest policy unavailable",
-                )
-                    .into_response();
+                if !ingest_key_route {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "tenant ingest policy unavailable",
+                    )
+                        .into_response();
+                }
+                true
             }
         }
     } else {
@@ -2376,6 +2386,14 @@ async fn resolve_api_key_credential(state: &AppState, key: &str) -> KeyLookup {
         return KeyLookup::NotFound;
     }
     let key_hash = handlers::settings::hash_api_key(key);
+    if let Some(grant) = state.api_key_cache.fresh(&key_hash) {
+        state.self_metrics.record_auth_cache("api_key_grant", "hit");
+        return KeyLookup::Found(Box::new(TenantResolution::api_key(grant)));
+    }
+    state
+        .self_metrics
+        .record_auth_cache("api_key_grant", "miss");
+    let generation = state.api_key_cache.generation();
     let started = std::time::Instant::now();
     let result = state.config_db.resolve_api_key(&key_hash).await;
     state.self_metrics.record_auth_lookup(
@@ -2389,9 +2407,23 @@ async fn resolve_api_key_credential(state: &AppState, key: &str) -> KeyLookup {
         },
     );
     match result {
-        Ok(Some(grant)) => KeyLookup::Found(Box::new(TenantResolution::api_key(grant))),
-        Ok(None) => KeyLookup::NotFound,
+        Ok(Some(grant)) => {
+            state
+                .api_key_cache
+                .insert(&key_hash, grant.clone(), generation);
+            KeyLookup::Found(Box::new(TenantResolution::api_key(grant)))
+        }
+        Ok(None) => {
+            state.api_key_cache.remove(&key_hash);
+            KeyLookup::NotFound
+        }
         Err(error) => {
+            // Ingest keys keep their last good grant so telemetry reaches the
+            // spool during a ClickHouse outage; every other key fails closed.
+            if let Some(grant) = state.api_key_cache.stale_ingest(&key_hash) {
+                tracing::warn!(%error, key_id = %grant.id, "API key check unavailable; using last good ingest grant");
+                return KeyLookup::Found(Box::new(TenantResolution::api_key(grant)));
+            }
             tracing::warn!(%error, "API key resolution failed");
             KeyLookup::Unavailable
         }
@@ -3434,6 +3466,7 @@ async fn main() -> anyhow::Result<()> {
         login_ip_limit_per_minute,
         trusted_proxy_cidrs,
         ingest_key_limiter,
+        api_key_cache: Default::default(),
         audit,
         self_metrics,
         query_governor,
@@ -6232,8 +6265,10 @@ mod tenant_auth_tests {
         }
     }
 
+    // Grants are now cached for a short TTL (behaviour is tested in
+    // api_key_cache.rs); this pins the wiring so a revoke still evicts locally.
     #[test]
-    fn api_key_revocation_has_no_process_local_cache_grace_period() {
+    fn api_key_grants_are_cached_and_revocation_evicts_them() {
         let source = include_str!("main.rs");
         let resolver = source
             .split_once("async fn resolve_api_key_credential")
@@ -6242,9 +6277,14 @@ mod tenant_auth_tests {
             .split("async fn resolve_tenant_inner")
             .next()
             .expect("tenant resolver must follow API key resolver");
+        assert!(resolver.contains("api_key_cache.fresh(&key_hash)"));
         assert!(resolver.contains("config_db.resolve_api_key"));
-        assert!(!resolver.contains("api_key_cache"));
-        assert!(!include_str!("lib.rs").contains("pub api_key_cache"));
+        assert!(resolver.contains("api_key_cache.stale_ingest(&key_hash)"));
+        let revoke = include_str!("handlers/settings.rs")
+            .split_once("pub async fn delete_api_key")
+            .expect("API key revoke handler must exist")
+            .1;
+        assert!(revoke.contains("api_key_cache.evict_key_id(&id)"));
     }
 
     #[test]

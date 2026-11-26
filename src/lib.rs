@@ -2,6 +2,7 @@ pub mod alert_engine;
 pub mod anomaly_engine;
 pub mod api_error;
 pub mod api_key_auth;
+pub mod api_key_cache;
 pub mod audit;
 pub mod buffer_topology;
 pub mod ch_writer;
@@ -281,6 +282,8 @@ pub struct AppState {
     pub trusted_proxy_cidrs: Arc<Vec<String>>,
     /// Per ingest-key fixed-window request limiter: key id -> (count, window start).
     pub ingest_key_limiter: Arc<DashMap<String, (u64, Instant)>>,
+    /// Resolved API key grants by key hash; see [`api_key_cache`].
+    pub api_key_cache: Arc<api_key_cache::ApiKeyCache>,
     /// Tamper-evident audit log writer (hash-chained, serialized). Shared.
     pub audit: Arc<audit::AuditLogger>,
     /// In-process system-health self-metrics registry. Updated on the HTTP hot path,
