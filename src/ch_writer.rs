@@ -28,7 +28,7 @@ use crate::models::rum::RumRecord;
 use crate::models::trace::WideEvent;
 use crate::self_metrics::SelfMetrics;
 use crate::shutdown::{ShutdownController, ShutdownPhase};
-use crate::spool::{IngestBuffer, SpoolFull};
+use crate::spool::{DrainBatch, IngestBuffer, SpoolFull};
 
 // ─── Public error type ───────────────────────────────────────────────────────
 
@@ -1017,6 +1017,7 @@ impl ChWriter {
             let mut backoff = Duration::from_secs(5);
             const MAX_BACKOFF: Duration = Duration::from_secs(60);
             const POLL_INTERVAL: Duration = Duration::from_secs(5);
+            let mut progress = ReplayProgress::default();
 
             loop {
                 match shutdown.phase() {
@@ -1051,42 +1052,14 @@ impl ChWriter {
 
                 let started = Instant::now();
                 let backend = self.buffer.backend_name();
-                let mut all_ok = true;
-                let mut partial = drain.discarded_bytes > 0;
-                let mut discarded_records = 0;
-                let mut discarded_bytes = 0;
-                for (table, payload) in &drain.records {
-                    let batch: SpoolBatch = match decode_spool(payload) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            discarded_records += 1;
-                            discarded_bytes += payload.len() as u64;
-                            partial = true;
-                            tracing::warn!(error = %e, table = table, "replayer: deserialise failed — skipping record");
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = try_insert(&self.ch, &batch).await {
-                        tracing::warn!(
-                            error = %e,
-                            table = table,
-                            "replayer: CH insert failed — backing off"
-                        );
-                        self.metrics.inc_counter(
-                            "rush_ingest_replay_records_total",
-                            &[("backend", backend), ("outcome", "insert_error")],
-                            1,
-                        );
-                        all_ok = false;
-                        break;
-                    }
-                    self.metrics.inc_counter(
-                        "rush_ingest_replay_records_total",
-                        &[("backend", backend), ("outcome", "inserted")],
-                        1,
-                    );
-                }
+                let all_ok = self.replay_records(&drain, &mut progress).await;
+                let partial = drain.discarded_bytes > 0
+                    || progress.discarded_records > 0
+                    || progress.rejected_records > 0;
+                let (discarded_records, discarded_bytes) =
+                    (progress.discarded_records, progress.discarded_bytes);
+                let (rejected_records, rejected_bytes) =
+                    (progress.rejected_records, progress.rejected_bytes);
 
                 self.metrics.observe_histogram(
                     "rush_ingest_replay_duration_ms",
@@ -1096,22 +1069,28 @@ impl ChWriter {
                 if all_ok {
                     let n = drain.records.len();
                     let committed = self.buffer.commit(drain).await;
-                    if committed && discarded_records > 0 {
-                        let labels = [
-                            ("backend", backend),
-                            ("reason", "payload_decode"),
-                            ("unit", "record"),
-                        ];
-                        self.metrics.inc_counter(
-                            "rush_ingest_spool_discarded_total",
-                            &labels,
-                            discarded_records,
-                        );
-                        self.metrics.inc_counter(
-                            "rush_ingest_spool_discarded_bytes_total",
-                            &labels,
-                            discarded_bytes,
-                        );
+                    if committed {
+                        // A later segment starts from its first record.
+                        progress = ReplayProgress::default();
+                    }
+                    for (reason, records, bytes) in [
+                        ("payload_decode", discarded_records, discarded_bytes),
+                        ("insert_rejected", rejected_records, rejected_bytes),
+                    ] {
+                        if committed && records > 0 {
+                            let labels =
+                                [("backend", backend), ("reason", reason), ("unit", "record")];
+                            self.metrics.inc_counter(
+                                "rush_ingest_spool_discarded_total",
+                                &labels,
+                                records,
+                            );
+                            self.metrics.inc_counter(
+                                "rush_ingest_spool_discarded_bytes_total",
+                                &labels,
+                                bytes,
+                            );
+                        }
                     }
                     let outcome = if !committed {
                         "commit_error"
@@ -1153,6 +1132,109 @@ impl ChWriter {
                 }
             }
         })
+    }
+}
+
+/// Replay position inside the segment at the head of the buffer. A record that
+/// fails leaves the ones before it delivered, so the next pass resumes at the
+/// failed record instead of inserting them again. Kept in memory: a restart
+/// mid-segment still replays the segment from its start.
+#[derive(Default)]
+struct ReplayProgress {
+    batch: String,
+    next: usize,
+    rejections: u32,
+    discarded_records: u64,
+    discarded_bytes: u64,
+    rejected_records: u64,
+    rejected_bytes: u64,
+}
+
+/// Passes in a row that ClickHouse may reject a record as invalid before the
+/// replayer drops it, so one bad record cannot block the spool forever.
+const REPLAY_MAX_REJECTIONS: u32 = 5;
+
+/// ClickHouse error codes meaning the rows themselves can never be inserted
+/// (unparseable, mistyped or out-of-range values). Everything else, including
+/// overload, a missing table during migrations, and network errors, is retried.
+const PERMANENT_INSERT_ERRORS: [u32; 14] =
+    [6, 26, 27, 32, 33, 38, 41, 53, 69, 70, 72, 117, 131, 349];
+
+fn is_permanent_rejection(error: &clickhouse::error::Error) -> bool {
+    let clickhouse::error::Error::BadResponse(reason) = error else {
+        return false;
+    };
+    reason
+        .strip_prefix("Code: ")
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|code| code.parse().ok())
+        .is_some_and(|code| PERMANENT_INSERT_ERRORS.contains(&code))
+}
+
+impl ChWriter {
+    /// Insert the drained records from where the last pass stopped. Returns
+    /// whether every record was delivered or deliberately skipped, i.e. whether
+    /// the batch may be committed.
+    async fn replay_records(&self, drain: &DrainBatch, progress: &mut ReplayProgress) -> bool {
+        let backend = self.buffer.backend_name();
+        let id = drain.id();
+        if progress.batch != id {
+            *progress = ReplayProgress {
+                batch: id,
+                ..ReplayProgress::default()
+            };
+        }
+        for (table, payload) in drain.records.iter().skip(progress.next) {
+            let batch: SpoolBatch = match decode_spool(payload) {
+                Ok(b) => b,
+                Err(e) => {
+                    progress.discarded_records += 1;
+                    progress.discarded_bytes += payload.len() as u64;
+                    progress.next += 1;
+                    tracing::warn!(error = %e, table = table, "replayer: deserialise failed — skipping record");
+                    continue;
+                }
+            };
+
+            if let Err(e) = try_insert(&self.ch, &batch).await {
+                if is_permanent_rejection(&e) {
+                    progress.rejections += 1;
+                    if progress.rejections >= REPLAY_MAX_REJECTIONS {
+                        tracing::error!(
+                            error = %e,
+                            table = table,
+                            rows = batch.len(),
+                            attempts = progress.rejections,
+                            "replayer: ClickHouse keeps rejecting record — discarding it"
+                        );
+                        progress.rejected_records += 1;
+                        progress.rejected_bytes += payload.len() as u64;
+                        progress.next += 1;
+                        progress.rejections = 0;
+                        continue;
+                    }
+                }
+                tracing::warn!(
+                    error = %e,
+                    table = table,
+                    "replayer: CH insert failed — backing off"
+                );
+                self.metrics.inc_counter(
+                    "rush_ingest_replay_records_total",
+                    &[("backend", backend), ("outcome", "insert_error")],
+                    1,
+                );
+                return false;
+            }
+            progress.next += 1;
+            progress.rejections = 0;
+            self.metrics.inc_counter(
+                "rush_ingest_replay_records_total",
+                &[("backend", backend), ("outcome", "inserted")],
+                1,
+            );
+        }
+        true
     }
 }
 
@@ -1597,6 +1679,82 @@ mod batch_tests {
         );
         assert!(!text.contains("last_success_timestamp"));
         assert!(!text.contains("untrusted-table-name"));
+    }
+
+    #[test]
+    fn only_data_errors_count_as_permanent_rejections() {
+        use clickhouse::error::Error;
+        let rejected = |reason: &str| is_permanent_rejection(&Error::BadResponse(reason.into()));
+        assert!(rejected("Code: 27. DB::Exception: Cannot parse input"));
+        assert!(rejected("Code: 53"));
+        assert!(!rejected("Code: 241. DB::Exception: Memory limit exceeded"));
+        assert!(!rejected("Code: 60. DB::Exception: Unknown table"));
+        assert!(!rejected("503 Service Unavailable"));
+        assert!(!is_permanent_rejection(&Error::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn replay_resumes_after_a_failed_record_and_drops_one_clickhouse_keeps_rejecting() {
+        use axum::{Router, body::Bytes, http::StatusCode, routing::any};
+        let inserted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = inserted.clone();
+        let router = Router::new().route(
+            "/",
+            any(move |body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let has =
+                        |marker: &str| body.windows(marker.len()).any(|w| w == marker.as_bytes());
+                    if has("rejected-row") {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Code: 27. DB::Exception: Cannot parse input",
+                        );
+                    }
+                    seen.lock()
+                        .unwrap()
+                        .push(if has("first-row") { "first" } else { "third" });
+                    (StatusCode::OK, "")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!("rush-replay-{}", uuid::Uuid::new_v4()));
+        let buffer = Arc::new(IngestBuffer::Disk(
+            crate::spool::Spool::open(&dir, 1 << 20).unwrap(),
+        ));
+        for name in ["first-row", "rejected-row", "third-row"] {
+            let SpoolBatch::Gauge(mut rows) = gauge(1) else {
+                unreachable!()
+            };
+            rows[0].metric_name = name.into();
+            let payload = encode_spool(&SpoolBatch::Gauge(rows)).unwrap();
+            buffer.append("metrics_gauge", payload).await.unwrap();
+        }
+        let writer = ChWriter::new(
+            Client::default()
+                .with_url(url)
+                .with_validation(false)
+                .with_compression(clickhouse::Compression::None),
+            buffer.clone(),
+        );
+        let mut progress = ReplayProgress::default();
+        for _ in 1..REPLAY_MAX_REJECTIONS {
+            let drain = buffer.next_batch().await.unwrap();
+            assert!(!writer.replay_records(&drain, &mut progress).await);
+        }
+        let drain = buffer.next_batch().await.unwrap();
+        assert!(writer.replay_records(&drain, &mut progress).await);
+        assert_eq!(progress.rejected_records, 1);
+        assert!(buffer.commit(drain).await);
+        // Each deliverable record reached ClickHouse exactly once.
+        assert_eq!(*inserted.lock().unwrap(), ["first", "third"]);
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

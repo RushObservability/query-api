@@ -408,6 +408,16 @@ pub struct DrainBatch {
     handle: BatchHandle,
 }
 
+impl DrainBatch {
+    /// Identity of the stored segment or object, stable across replay passes.
+    pub fn id(&self) -> String {
+        match &self.handle {
+            BatchHandle::Disk(path) => path.display().to_string(),
+            BatchHandle::ObjectStore { key, .. } => key.to_string(),
+        }
+    }
+}
+
 enum BatchHandle {
     Disk(PathBuf),
     ObjectStore {
