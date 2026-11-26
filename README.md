@@ -179,7 +179,7 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `RUSH_DRAIN_WORKER_ONLY` | `false` | run one shared-buffer drain worker |
 | `RUSH_LEADER_ELECTION` | `auto` | `auto`, `local`, or `keeper`; `auto` uses Keeper leases for production or more than one replica, and `local` refuses to start in either |
 | `RUSH_LEADER_LEASE_TTL_SECS` | `15` | background-engine lease lifetime, 6 to 300 seconds; renewed every third of it |
-| `RUSH_SHUTDOWN_TOKEN` | _(empty)_ | optional token for non-loopback shutdown callers |
+| `RUSH_SHUTDOWN_TOKEN` | _(empty)_ | when set, every `POST /shutdown` caller, loopback included, must send it in `X-Rush-Shutdown-Token`; set it when a same-pod proxy forwards outside traffic from loopback |
 | `RUSH_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `RUST_LOG` | _(unset)_ | tracing filter, for example `rush_api=info` |
 
