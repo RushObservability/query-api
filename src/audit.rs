@@ -74,6 +74,105 @@ pub struct AuditLogger {
     replay_slots: Arc<Semaphore>,
     replay_wakeup: Arc<Notify>,
     state: Arc<Mutex<ChainState>>,
+    failures: Arc<FailureAggregator>,
+}
+
+/// Unauthenticated failures (no actor id) can be triggered by anyone, and each
+/// row costs several fsyncs on a serialized writer. Repeats of the same action
+/// from the same client inside one window are counted in memory and written as
+/// a single summary row when the window closes.
+struct FailureAggregator {
+    window: Duration,
+    max_clients: usize,
+    buckets: std::sync::Mutex<HashMap<(String, String), FailureBucket>>,
+}
+
+struct FailureBucket {
+    first: AuditEvent,
+    repeats: u64,
+}
+
+/// Client key shared by every new client once `max_clients` are tracked.
+const OVERFLOW_CLIENT: &str = "*";
+
+impl Default for FailureAggregator {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(60), 1024)
+    }
+}
+
+impl FailureAggregator {
+    fn new(window: Duration, max_clients: usize) -> Self {
+        Self {
+            window,
+            max_clients,
+            buckets: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn applies_to(ev: &AuditEvent) -> bool {
+        ev.outcome == "failure" && ev.actor_id.is_empty()
+    }
+
+    /// Returns the bucket key when `ev` opens a new window and must be written
+    /// now, or `None` when it was counted into an open window.
+    fn admit(&self, ev: &AuditEvent) -> Option<(String, String)> {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut key = (ev.action.clone(), ev.ip_address.clone());
+        // Past the bound, new clients share one bucket per action. Actions are
+        // code literals, so the map holds at most max_clients + actions entries.
+        if !buckets.contains_key(&key) && buckets.len() >= self.max_clients {
+            key.1 = OVERFLOW_CLIENT.to_string();
+        }
+        if let Some(bucket) = buckets.get_mut(&key) {
+            bucket.repeats += 1;
+            return None;
+        }
+        buckets.insert(
+            key.clone(),
+            FailureBucket {
+                first: ev.clone(),
+                repeats: 0,
+            },
+        );
+        Some(key)
+    }
+
+    /// Close a window, returning the summary row to write if it had repeats.
+    fn close(&self, key: &(String, String)) -> Option<AuditEvent> {
+        let bucket = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key)?;
+        if bucket.repeats == 0 {
+            return None;
+        }
+        let overflow = key.1 == OVERFLOW_CLIENT;
+        let mut summary = bucket.first;
+        if overflow {
+            summary.ip_address.clear();
+            summary.user_agent.clear();
+        }
+        summary.request_id.clear();
+        Some(
+            summary
+                .description(format!(
+                    "{} more '{}' failures within {}s were aggregated into this row",
+                    bucket.repeats,
+                    key.0,
+                    self.window.as_secs()
+                ))
+                .metadata(
+                    serde_json::json!({
+                        "aggregated_repeats": bucket.repeats,
+                        "window_seconds": self.window.as_secs_f64(),
+                        "multiple_clients": overflow,
+                    })
+                    .to_string(),
+                ),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -642,6 +741,7 @@ impl AuditLogger {
             replay_slots: Arc::new(Semaphore::new(1)),
             replay_wakeup: Arc::new(Notify::new()),
             state: Arc::new(Mutex::new(ChainState::default())),
+            failures: Arc::default(),
         };
         logger.publish_metrics();
         let rechained = logger.recover_spool().await?;
@@ -896,7 +996,26 @@ impl AuditLogger {
     /// NON-BLOCKING CONTRACT: returns `()`. On any DB/serialization error it
     /// logs at `error` level and does NOT propagate — callers must never fail
     /// their operation because the audit write failed.
+    ///
+    /// Unauthenticated failures are aggregated (see `FailureAggregator`):
+    /// a repeat inside an open window returns without touching the outbox.
     pub async fn log(&self, ev: AuditEvent) {
+        if FailureAggregator::applies_to(&ev) {
+            let Some(key) = self.failures.admit(&ev) else {
+                return;
+            };
+            let logger = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(logger.failures.window).await;
+                if let Some(summary) = logger.failures.close(&key) {
+                    logger.persist(summary).await;
+                }
+            });
+        }
+        self.persist(ev).await;
+    }
+
+    async fn persist(&self, ev: AuditEvent) {
         let Ok(permit) = self.persist_slots.clone().acquire_owned().await else {
             return;
         };
@@ -1356,6 +1475,7 @@ mod tests {
                 key_id: String::new(),
                 segment_id: String::new(),
             })),
+            failures: Arc::default(),
         };
         let mut row = sample_row(1, "");
         row.hash = compute_hash(&secret, &row);
@@ -1421,6 +1541,7 @@ mod tests {
                 key_id: String::new(),
                 segment_id: String::new(),
             })),
+            failures: Arc::default(),
         };
 
         logger.log(AuditEvent::new("test.mutation", "system")).await;
@@ -1466,6 +1587,7 @@ mod tests {
                 key_id: String::new(),
                 segment_id: String::new(),
             })),
+            failures: Arc::default(),
         };
 
         logger.log(AuditEvent::new("test.mutation", "system")).await;
@@ -1520,6 +1642,7 @@ mod tests {
             replay_slots: Arc::new(Semaphore::new(1)),
             replay_wakeup: Arc::new(Notify::new()),
             state: Arc::new(Mutex::new(ChainState::default())),
+            failures: Arc::default(),
         }
     }
 
@@ -2013,5 +2136,109 @@ mod tests {
             .execute()
             .await?;
         result
+    }
+
+    fn spooled_rows(dir: &Path) -> Vec<AuditRow> {
+        pending_files(dir)
+            .unwrap()
+            .into_iter()
+            .map(|path| read_spool_row(&path).unwrap().0)
+            .collect()
+    }
+
+    fn denied_from(ip: &str) -> AuditEvent {
+        AuditEvent::new("tenant.auth_denied", "anonymous")
+            .outcome("failure")
+            .context((ip.to_string(), "ua".to_string(), "req".to_string()))
+    }
+
+    #[tokio::test]
+    async fn repeated_unauthenticated_failures_are_written_as_one_summary() {
+        let dir = TestDirectory::new();
+        let mut logger = test_logger(
+            Client::default().with_url("http://127.0.0.1:9"),
+            dir.0.clone(),
+        );
+        logger.failures = Arc::new(FailureAggregator::new(Duration::from_secs(2), 64));
+
+        logger.log(denied_from("10.0.0.1")).await;
+        logger.log(denied_from("10.0.0.2")).await;
+        // Repeats must not wait on the outbox, even when it is stalled.
+        let held = lock_spool_directory(&dir.0).await.unwrap();
+        for _ in 0..4 {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                logger.log(denied_from("10.0.0.1")),
+            )
+            .await
+            .expect("an aggregated repeat must not wait for persistence");
+        }
+        drop(held);
+        // Authenticated failures and successes are never aggregated.
+        for _ in 0..2 {
+            logger
+                .log(
+                    AuditEvent::new("tenant.auth_denied", "user")
+                        .actor("u1", "alice")
+                        .outcome("failure"),
+                )
+                .await;
+        }
+        assert_eq!(spooled_rows(&dir.0).len(), 4);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while spooled_rows(&dir.0).len() < 5 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("summary row is written when the window closes");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rows = spooled_rows(&dir.0);
+        assert_eq!(rows.len(), 5, "10.0.0.2 had no repeats, so no summary");
+        let summary = &rows[4];
+        assert_eq!(summary.action, "tenant.auth_denied");
+        assert_eq!(summary.ip_address, "10.0.0.1");
+        let metadata: serde_json::Value = serde_json::from_str(&summary.metadata).unwrap();
+        assert_eq!(metadata["aggregated_repeats"], 4);
+        assert_eq!(
+            crate::handlers::audit::verify_rows(&rows, |_| Some(TEST_SECRET))["intact"],
+            true
+        );
+
+        // A closed window starts over with a full row.
+        logger.log(denied_from("10.0.0.1")).await;
+        assert_eq!(spooled_rows(&dir.0).len(), 6);
+    }
+
+    #[tokio::test]
+    async fn failure_aggregation_memory_is_bounded() {
+        let dir = TestDirectory::new();
+        let mut logger = test_logger(
+            Client::default().with_url("http://127.0.0.1:9"),
+            dir.0.clone(),
+        );
+        logger.failures = Arc::new(FailureAggregator::new(Duration::from_secs(2), 2));
+
+        for i in 0..50 {
+            logger.log(denied_from(&format!("10.0.1.{i}"))).await;
+        }
+        // Two tracked clients, then one shared overflow bucket.
+        assert_eq!(logger.failures.buckets.lock().unwrap().len(), 3);
+        assert_eq!(spooled_rows(&dir.0).len(), 3);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while spooled_rows(&dir.0).len() < 4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("overflow summary is written when the window closes");
+        let rows = spooled_rows(&dir.0);
+        let metadata: serde_json::Value = serde_json::from_str(&rows[3].metadata).unwrap();
+        assert_eq!(metadata["aggregated_repeats"], 47);
+        assert_eq!(metadata["multiple_clients"], true);
+        assert!(rows[3].ip_address.is_empty());
+        assert!(logger.failures.buckets.lock().unwrap().is_empty());
     }
 }
