@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::clickhouse_config::ConfigDb;
 use crate::config::{MetricRetentionRule, RushConfig, TraceRetentionRule};
+use crate::query_builder::escape_string_literal as esc;
 
 /// Spawn the retention enforcer as a background task (fire-and-forget).
 /// Follows the same pattern as `alert_engine::spawn_alert_engine`.
@@ -145,14 +146,14 @@ fn build_metric_where(rule: &MetricRetentionRule) -> String {
 
     if let Some(ref name) = rule.name {
         // Glob → SQL LIKE: `*` → `%`, `?` → `_`
-        let like = name.replace('*', "%").replace('?', "_");
+        let like = esc(&name.replace('*', "%").replace('?', "_"));
         parts.push(format!("MetricName LIKE '{like}'"));
     }
     if let Some(ref re) = rule.name_regex {
-        parts.push(format!("match(MetricName, '{re}')"));
+        parts.push(format!("match(MetricName, '{}')", esc(re)));
     }
     for (k, v) in &rule.labels {
-        parts.push(format!("Attributes['{k}'] = '{v}'"));
+        parts.push(format!("Attributes['{}'] = '{}'", esc(k), esc(v)));
     }
 
     parts.join(" AND ")
@@ -162,17 +163,18 @@ fn build_trace_where_wide(rule: &TraceRetentionRule) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(ref svc) = rule.service_name {
-        parts.push(format!("service_name = '{svc}'"));
+        parts.push(format!("service_name = '{}'", esc(svc)));
     }
     if let Some(ref attr) = rule.attribute {
         // spans has `environment` as a first-class column for the common case
         if attr.key == "deployment.environment" {
-            parts.push(format!("environment = '{}'", attr.value));
+            parts.push(format!("environment = '{}'", esc(&attr.value)));
         } else {
             // Fall back to the JSON attributes column
             parts.push(format!(
                 "JSONExtractString(attributes, '{}') = '{}'",
-                attr.key, attr.value
+                esc(&attr.key),
+                esc(&attr.value)
             ));
         }
     }
@@ -352,4 +354,36 @@ async fn enforce_tenant_retention(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AttributeMatch;
+
+    #[test]
+    fn rule_values_are_escaped_as_sql_literals() {
+        let metric = MetricRetentionRule {
+            name: Some("o'k*".into()),
+            name_regex: Some(r"^http_\d+?$".into()),
+            labels: [("en'v".to_string(), "pr?d".to_string())].into(),
+            retain_days: 1,
+        };
+        assert_eq!(
+            build_metric_where(&metric),
+            r"MetricName LIKE 'o''k%' AND match(MetricName, '^http_\\d+\x3F$') AND Attributes['en''v'] = 'pr\x3Fd'"
+        );
+        let trace = TraceRetentionRule {
+            service_name: Some("o'brien".into()),
+            attribute: Some(AttributeMatch {
+                key: "team?".into(),
+                value: "a'b".into(),
+            }),
+            retain_days: 1,
+        };
+        assert_eq!(
+            build_trace_where_wide(&trace).unwrap(),
+            r"service_name = 'o''brien' AND JSONExtractString(attributes, 'team\x3F') = 'a''b'"
+        );
+    }
 }
