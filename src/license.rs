@@ -8,8 +8,8 @@
 use crate::timestamps::TimestampExt;
 use serde::{Deserialize, Serialize};
 
-/// Embedded Ed25519 public key (PEM). Override with `RUSH_LICENSE_PUBKEY` only
-/// for development against a different signing key.
+/// Embedded Ed25519 public key (PEM). `RUSH_LICENSE_PUBKEY` overrides it only
+/// outside production (`RUSH_ENVIRONMENT=development|dev|local|test`).
 const EMBEDDED_PUBKEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
 MCowBQYDK2VwAyEAwb1wsHS0gi1aKKSykN+XfQYHAFGz4A8/HVgSKi4HDKM=\n\
 -----END PUBLIC KEY-----\n";
@@ -80,7 +80,28 @@ impl LicenseStatus {
 }
 
 fn pubkey_pem() -> String {
-    std::env::var("RUSH_LICENSE_PUBKEY").unwrap_or_else(|_| EMBEDDED_PUBKEY_PEM.to_string())
+    select_pubkey(
+        std::env::var("RUSH_LICENSE_PUBKEY").ok(),
+        crate::api_key_auth::production_mode(),
+    )
+}
+
+/// A key override would let an operator verify licenses they signed
+/// themselves, so production always uses the embedded key.
+fn select_pubkey(override_pem: Option<String>, production: bool) -> String {
+    match override_pem {
+        Some(pem) if !production => pem,
+        Some(_) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "RUSH_LICENSE_PUBKEY is ignored in production; using the embedded license key"
+                );
+            });
+            EMBEDDED_PUBKEY_PEM.to_string()
+        }
+        None => EMBEDDED_PUBKEY_PEM.to_string(),
+    }
 }
 
 /// Verify the license in `RUSH_LICENSE_KEY` (offline). Cheap enough to call per
@@ -135,5 +156,27 @@ fn verify(token: &str, pubkey: &str) -> LicenseStatus {
                 _ => LicenseStatus::invalid(format!("invalid license: {e}")),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EMBEDDED_PUBKEY_PEM, select_pubkey};
+
+    const OTHER_KEY: &str = "-----BEGIN PUBLIC KEY-----\nother\n-----END PUBLIC KEY-----\n";
+
+    #[test]
+    fn production_ignores_the_public_key_override() {
+        assert_eq!(
+            select_pubkey(Some(OTHER_KEY.into()), true),
+            EMBEDDED_PUBKEY_PEM
+        );
+        assert_eq!(select_pubkey(None, true), EMBEDDED_PUBKEY_PEM);
+    }
+
+    #[test]
+    fn development_may_override_the_public_key() {
+        assert_eq!(select_pubkey(Some(OTHER_KEY.into()), false), OTHER_KEY);
+        assert_eq!(select_pubkey(None, false), EMBEDDED_PUBKEY_PEM);
     }
 }
