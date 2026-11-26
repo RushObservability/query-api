@@ -724,7 +724,8 @@ fn default_detection_rules() -> Vec<(
             "Detects IPs with 10+ failed login attempts within the detection window.",
             "SELECT mat_source_ip, count() AS attempt_count \
              FROM logs \
-             WHERE Timestamp BETWEEN @window_start AND @window_end \
+             WHERE TimestampTime BETWEEN @window_start AND @window_end \
+               AND Timestamp BETWEEN @window_start AND @window_end \
                AND mat_action = 'login_failed' \
              GROUP BY mat_source_ip \
              HAVING attempt_count >= 10",
@@ -811,7 +812,8 @@ fn default_detection_rules() -> Vec<(
             "Fires when ERROR/FATAL log volume exceeds 100 entries in the window.",
             "SELECT ServiceName, SeverityText, count() AS log_count \
              FROM logs \
-             WHERE Timestamp BETWEEN @window_start AND @window_end \
+             WHERE TimestampTime BETWEEN @window_start AND @window_end \
+               AND Timestamp BETWEEN @window_start AND @window_end \
                AND SeverityText IN ('ERROR', 'FATAL') \
              GROUP BY ServiceName, SeverityText \
              HAVING log_count >= 100",
@@ -824,7 +826,8 @@ fn default_detection_rules() -> Vec<(
             "Detects services with 5+ ERROR/FATAL logs carrying trace context, providing a safe single-signal correlation point.",
             "SELECT ServiceName, count() AS correlated_errors \
              FROM logs \
-             WHERE Timestamp BETWEEN @window_start AND @window_end \
+             WHERE TimestampTime BETWEEN @window_start AND @window_end \
+               AND Timestamp BETWEEN @window_start AND @window_end \
                AND SeverityText IN ('ERROR', 'FATAL') \
                AND TraceId != '' \
              GROUP BY ServiceName \
@@ -868,7 +871,8 @@ fn default_detection_rules() -> Vec<(
             "Identifies repeated ERROR/FATAL message patterns appearing 3+ times in the current window.",
             "SELECT ServiceName, Body, count() AS occurrences \
              FROM logs \
-             WHERE Timestamp BETWEEN @window_start AND @window_end \
+             WHERE TimestampTime BETWEEN @window_start AND @window_end \
+               AND Timestamp BETWEEN @window_start AND @window_end \
                AND SeverityText IN ('ERROR', 'FATAL') \
              GROUP BY ServiceName, Body \
              HAVING occurrences >= 3",
@@ -2421,6 +2425,20 @@ mod default_detection_rule_tests {
         for (name, _, sql, _, _, _) in default_detection_rules() {
             crate::detection_query::validate_template(sql)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn log_rules_bound_the_primary_key_time_column() {
+        // `Timestamp` is not in the logs primary key; without `TimestampTime` each
+        // evaluation reads the whole day and trips the detection row limit.
+        for (name, _, sql, _, _, _) in default_detection_rules() {
+            if sql.contains("FROM logs") {
+                assert!(
+                    sql.contains("TimestampTime BETWEEN @window_start AND @window_end"),
+                    "{name}"
+                );
+            }
         }
     }
 

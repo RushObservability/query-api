@@ -1372,10 +1372,20 @@ impl EvaluationWindow {
     }
 
     fn condition(self, column: &str) -> String {
-        format!(
+        let mut condition = format!(
             "{column} >= fromUnixTimestamp64Milli({}, 'UTC') AND {column} <= fromUnixTimestamp64Milli({}, 'UTC')",
             self.from, self.to
-        )
+        );
+        // Logs `Timestamp` is not in the primary key; its whole-second copy
+        // `TimestampTime` is. Without it every evaluation reads the whole UTC day.
+        if column == "Timestamp" {
+            condition.push_str(&format!(
+                " AND TimestampTime >= toDateTime({}) AND TimestampTime <= toDateTime({})",
+                self.from.div_euclid(1000),
+                self.to.div_euclid(1000)
+            ));
+        }
+        condition
     }
 
     fn evidence(
@@ -2172,6 +2182,21 @@ async fn build_preview_series_promql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_window_bounds_the_primary_key_time_column() {
+        let window = EvaluationWindow {
+            from: 1_764_150_000_999,
+            to: 1_764_150_300_999,
+        };
+        assert_eq!(
+            window.condition("Timestamp"),
+            "Timestamp >= fromUnixTimestamp64Milli(1764150000999, 'UTC') \
+             AND Timestamp <= fromUnixTimestamp64Milli(1764150300999, 'UTC') \
+             AND TimestampTime >= toDateTime(1764150000) AND TimestampTime <= toDateTime(1764150300)"
+        );
+        assert!(!window.condition("timestamp").contains("TimestampTime"));
+    }
 
     fn route(
         id: &str,
