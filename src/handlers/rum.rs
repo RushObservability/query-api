@@ -333,9 +333,15 @@ pub async fn ingest(
     }
     state.ingest_limits.check_body("rum", &body)?;
     state.ingest_limits.check_decompressed("rum", body.len())?;
-    let payload: RumIngestPayload = serde_json::from_slice(&body)
-        .map_err(|_| state.ingest_limits.malformed("rum", "invalid RUM payload"))?;
-    ingest_events(state, tenant, payload, body.len()).await
+    let wire_bytes = body.len();
+    let payload: RumIngestPayload = state
+        .ingest_limits
+        .spawn_decode("rum", move |limits| {
+            serde_json::from_slice(&body)
+                .map_err(|_| limits.malformed("rum", "invalid RUM payload"))
+        })
+        .await?;
+    ingest_events(state, tenant, payload, wire_bytes).await
 }
 
 /// Shared durable RUM write path after the route-specific credential and payload checks.
@@ -794,22 +800,22 @@ pub async fn ingest_replay(
     }
     state.ingest_limits.check_body("rum", &body)?;
     state.ingest_limits.check_decompressed("rum", body.len())?;
-    let payload: ReplayIngestPayload = serde_json::from_slice(&body).map_err(|_| {
-        state
-            .ingest_limits
-            .malformed("rum", "invalid RUM replay payload")
-    })?;
-    if payload.session_id.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
-    }
-    let event_count = payload.events.as_array().map(Vec::len).unwrap_or(1);
-    state.ingest_limits.check_entities("rum", event_count)?;
+    let (payload, events_json) = state
+        .ingest_limits
+        .spawn_decode("rum", move |limits| {
+            let payload: ReplayIngestPayload = serde_json::from_slice(&body)
+                .map_err(|_| limits.malformed("rum", "invalid RUM replay payload"))?;
+            if payload.session_id.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
+            }
+            let event_count = payload.events.as_array().map(Vec::len).unwrap_or(1);
+            limits.check_entities("rum", event_count)?;
 
-    let events_json = serde_json::to_string(&payload.events).map_err(|_| {
-        state
-            .ingest_limits
-            .malformed("rum", "invalid RUM replay events")
-    })?;
+            let events_json = serde_json::to_string(&payload.events)
+                .map_err(|_| limits.malformed("rum", "invalid RUM replay events"))?;
+            Ok((payload, events_json))
+        })
+        .await?;
 
     let chunk_ts = time::OffsetDateTime::now_utc().unix_millis();
 

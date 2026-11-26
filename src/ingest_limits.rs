@@ -174,6 +174,24 @@ impl IngestLimits {
         Ok(())
     }
 
+    /// Run CPU-heavy ingest work (decompress, parse, build rows) on the
+    /// blocking pool while holding a decode permit, so it never stalls a tokio
+    /// worker and stays within the process-wide decode budget.
+    pub async fn spawn_decode<T, F>(&self, source: &'static str, work: F) -> Result<T, IngestError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&IngestLimits) -> Result<T, IngestError> + Send + 'static,
+    {
+        let permit = self.acquire_decode(source).await?;
+        let limits = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(&limits)
+        })
+        .await
+        .map_err(|e| crate::api_error::internal_legacy("ingest.decode_task", e))?
+    }
+
     pub fn malformed(&self, source: &'static str, message: &'static str) -> IngestError {
         self.reject(source, "malformed", StatusCode::BAD_REQUEST, message)
     }

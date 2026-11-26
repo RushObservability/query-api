@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::dd_common::{dd_status_to_severity, decompress_body, parse_dd_tags, validate_api_key};
+use super::dd_common::{dd_status_to_severity, decode_body, parse_dd_tags, validate_api_key};
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
@@ -73,36 +73,68 @@ async fn ingest_logs_inner(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_api_key(&headers)?;
 
-    let raw = decompress_body(&state.ingest_limits, &headers, body).await?;
+    let tenant = tenant_id.clone();
+    let (rows, raw_len) = decode_body(&state.ingest_limits, &headers, body, move |limits, raw| {
+        Ok((build_log_rows(limits, &tenant, &raw)?, raw.len()))
+    })
+    .await?;
+    if rows.is_empty() {
+        return Ok(Json(serde_json::json!({})));
+    }
 
+    let count = rows.len() as u64;
+    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_logs.write", s),
+        })?;
+
+    // Record usage for per-tenant ingest metering
+    state
+        .usage_accumulator
+        .record(&tenant_id, "logs", count, raw_len as u64);
+
+    tracing::debug!(
+        signal = "logs",
+        tenant_id = %tenant_id,
+        count = count,
+        source = "datadog",
+        "ingested logs"
+    );
+
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Parse a Datadog logs payload and build its rows. Runs on the blocking pool.
+fn build_log_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    tenant_id: &str,
+    raw: &[u8],
+) -> Result<Vec<LogInsertRow>, (StatusCode, String)> {
     // The DD agent sends either a JSON array or a single object
     let entries: Vec<DdLogEntry> = if raw.first() == Some(&b'[') {
-        serde_json::from_slice(&raw).map_err(|_| {
-            state
-                .ingest_limits
-                .malformed("datadog", "invalid Datadog logs payload")
-        })?
+        serde_json::from_slice(raw)
+            .map_err(|_| limits.malformed("datadog", "invalid Datadog logs payload"))?
     } else {
-        let single: DdLogEntry = serde_json::from_slice(&raw).map_err(|_| {
-            state
-                .ingest_limits
-                .malformed("datadog", "invalid Datadog logs payload")
-        })?;
+        let single: DdLogEntry = serde_json::from_slice(raw)
+            .map_err(|_| limits.malformed("datadog", "invalid Datadog logs payload"))?;
         vec![single]
     };
 
     if entries.is_empty() {
-        return Ok(Json(serde_json::json!({})));
+        return Ok(Vec::new());
     }
-    state
-        .ingest_limits
-        .check_entities("datadog", entries.len())?;
+    limits.check_entities("datadog", entries.len())?;
 
     let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc refactor: tenant_id + the constant scope fields are shared across all
     // entries in this request — allocate each once and Arc-clone per row.
-    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let tenant_arc: std::sync::Arc<str> = tenant_id.into();
     let empty_str: std::sync::Arc<str> = "".into();
     let scope_dd: std::sync::Arc<str> = "datadog".into();
     let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
@@ -188,29 +220,5 @@ async fn ingest_logs_inner(
         });
     }
 
-    let count = rows.len() as u64;
-    crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows))
-        .await
-        .map_err(|e| match e {
-            WriteError::Backpressure => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-            ),
-            WriteError::Fatal(s) => crate::api_error::internal_legacy("dd_logs.write", s),
-        })?;
-
-    // Record usage for per-tenant ingest metering
-    state
-        .usage_accumulator
-        .record(&tenant_id, "logs", count, raw.len() as u64);
-
-    tracing::debug!(
-        signal = "logs",
-        tenant_id = %tenant_id,
-        count = count,
-        source = "datadog",
-        "ingested logs"
-    );
-
-    Ok(Json(serde_json::json!({})))
+    Ok(rows)
 }

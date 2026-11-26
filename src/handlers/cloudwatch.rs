@@ -57,26 +57,12 @@ struct CwlEvent {
 }
 
 /// Gunzip a buffer with a hard size cap.
-async fn gunzip_capped(
-    limits: &crate::ingest_limits::IngestLimits,
-    input: Vec<u8>,
-) -> Result<Vec<u8>, (StatusCode, String)> {
-    limits.check_compressed("cloudwatch", input.len())?;
-    let permit = limits.acquire_decode("cloudwatch").await?;
-    let limits = limits.clone();
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        gunzip_capped_sync(&limits, &input)
-    })
-    .await
-    .map_err(|e| crate::api_error::internal_legacy("cloudwatch.decode_task", e))?
-}
-
 fn gunzip_capped_sync(
     limits: &crate::ingest_limits::IngestLimits,
     input: &[u8],
 ) -> Result<Vec<u8>, (StatusCode, String)> {
     use std::io::Read;
+    limits.check_compressed("cloudwatch", input.len())?;
     let decoder = flate2::read::GzDecoder::new(input);
     let mut out = Vec::new();
     decoder
@@ -244,15 +230,81 @@ async fn ingest_firehose_inner(
         .map(|e| e.contains("gzip"))
         .unwrap_or(false);
     let raw_len = body.len() as u64;
-    let outer: Vec<u8> = if gzipped {
-        match gunzip_capped(&state.ingest_limits, body.to_vec()).await {
-            Ok(b) => b,
-            Err((status, message)) => {
-                return (status, firehose_response(&request_id, Some(&message)));
-            }
+    let tenant = tenant_id.clone();
+    let decode = state
+        .ingest_limits
+        .spawn_decode("cloudwatch", move |limits| {
+            Ok(build_firehose_rows(limits, &tenant, gzipped, &body))
+        });
+    let (body_request_id, decoded) = match decode.await {
+        Ok(result) => result,
+        Err(error) => (String::new(), Err(error)),
+    };
+    // Prefer the body's requestId if the header was missing.
+    let request_id = if request_id.is_empty() && !body_request_id.is_empty() {
+        body_request_id
+    } else {
+        request_id
+    };
+    let rows = match decoded {
+        Ok(rows) => rows,
+        Err((status, message)) => {
+            return (status, firehose_response(&request_id, Some(&message)));
+        }
+    };
+
+    if rows.is_empty() {
+        // Nothing to write (e.g. all CONTROL_MESSAGE). Still a successful delivery.
+        return (StatusCode::OK, firehose_response(&request_id, None));
+    }
+
+    let count = rows.len() as u64;
+    if let Err(e) =
+        crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows)).await
+    {
+        let (status, msg) = match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("cloudwatch.write", s),
+        };
+        return (status, firehose_response(&request_id, Some(&msg)));
+    }
+
+    // Record usage for per-tenant ingest metering.
+    state
+        .usage_accumulator
+        .record(&tenant_id, "logs", count, raw_len);
+
+    tracing::info!(
+        signal = "logs",
+        tenant_id = %tenant_id,
+        count = count,
+        source = "cloudwatch",
+        duration_ms = started.elapsed().as_millis() as u64,
+        "ingested logs"
+    );
+
+    (StatusCode::OK, firehose_response(&request_id, None))
+}
+
+/// Inflate and parse a Firehose body and build its log rows. Runs on the
+/// blocking pool. Returns the body's requestId ("" when the envelope did not
+/// parse) alongside the outcome so errors can still echo it.
+fn build_firehose_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    tenant_id: &str,
+    gzipped: bool,
+    body: &[u8],
+) -> (String, Result<Vec<LogInsertRow>, (StatusCode, String)>) {
+    let outer: std::borrow::Cow<[u8]> = if gzipped {
+        match gunzip_capped_sync(limits, body) {
+            Ok(b) => std::borrow::Cow::Owned(b),
+            Err(error) => return (String::new(), Err(error)),
         }
     } else {
-        body.to_vec()
+        std::borrow::Cow::Borrowed(body)
     };
 
     // Parse the outer Firehose envelope.
@@ -260,35 +312,38 @@ async fn ingest_firehose_inner(
         Ok(r) => r,
         Err(_) => {
             return (
-                StatusCode::BAD_REQUEST,
-                firehose_response(&request_id, Some("invalid Firehose JSON payload")),
+                String::new(),
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid Firehose JSON payload".to_string(),
+                )),
             );
         }
     };
-    // Prefer the body's requestId if the header was missing.
-    let request_id = if request_id.is_empty() && !req.request_id.is_empty() {
-        req.request_id.clone()
-    } else {
-        request_id
-    };
+    let rows = firehose_record_rows(limits, tenant_id, &req, outer.len());
+    (req.request_id, rows)
+}
 
+/// Decode every Firehose record (base64 → gzip → CloudWatch Logs JSON) into
+/// log rows, enforcing the cumulative decompressed-byte and entity limits.
+fn firehose_record_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    tenant_id: &str,
+    req: &FirehoseRequest,
+    outer_len: usize,
+) -> Result<Vec<LogInsertRow>, (StatusCode, String)> {
     let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
     // Arc-share the constant fields across all rows in this request.
-    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let tenant_arc: std::sync::Arc<str> = tenant_id.into();
     let empty_str: std::sync::Arc<str> = "".into();
     let scope_cw: std::sync::Arc<str> = "cloudwatch".into();
     let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
 
     let mut rows: Vec<LogInsertRow> = Vec::new();
     let mut decoded_entities = req.records.len();
-    let mut decompressed_total = outer.len();
-    if let Err((status, message)) = state
-        .ingest_limits
-        .check_entities("cloudwatch", decoded_entities)
-    {
-        return (status, firehose_response(&request_id, Some(&message)));
-    }
+    let mut decompressed_total = outer_len;
+    limits.check_entities("cloudwatch", decoded_entities)?;
 
     for record in &req.records {
         // Each record's data is base64 → gzip → CloudWatch Logs JSON.
@@ -296,41 +351,26 @@ async fn ingest_firehose_inner(
         {
             Ok(d) => d,
             Err(_) => {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
-                    firehose_response(&request_id, Some("invalid base64 Firehose record")),
-                );
+                    "invalid base64 Firehose record".to_string(),
+                ));
             }
         };
-        let inflated = match gunzip_capped(&state.ingest_limits, decoded).await {
-            Ok(b) => b,
-            Err((status, message)) => {
-                return (status, firehose_response(&request_id, Some(&message)));
-            }
-        };
+        let inflated = gunzip_capped_sync(limits, &decoded)?;
         decompressed_total = decompressed_total.saturating_add(inflated.len());
-        if let Err((status, message)) = state
-            .ingest_limits
-            .check_decompressed("cloudwatch", decompressed_total)
-        {
-            return (status, firehose_response(&request_id, Some(&message)));
-        }
+        limits.check_decompressed("cloudwatch", decompressed_total)?;
         let payload: CwlPayload = match serde_json::from_slice(&inflated) {
             Ok(p) => p,
             Err(_) => {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
-                    firehose_response(&request_id, Some("invalid CloudWatch Logs JSON payload")),
-                );
+                    "invalid CloudWatch Logs JSON payload".to_string(),
+                ));
             }
         };
         decoded_entities = decoded_entities.saturating_add(payload.log_events.len());
-        if let Err((status, message)) = state
-            .ingest_limits
-            .check_entities("cloudwatch", decoded_entities)
-        {
-            return (status, firehose_response(&request_id, Some(&message)));
-        }
+        limits.check_entities("cloudwatch", decoded_entities)?;
 
         // CONTROL_MESSAGE records are CWL/Firehose health checks — skip them.
         if payload.message_type == "CONTROL_MESSAGE" {
@@ -388,38 +428,5 @@ async fn ingest_firehose_inner(
         }
     }
 
-    if rows.is_empty() {
-        // Nothing to write (e.g. all CONTROL_MESSAGE). Still a successful delivery.
-        return (StatusCode::OK, firehose_response(&request_id, None));
-    }
-
-    let count = rows.len() as u64;
-    if let Err(e) =
-        crate::handlers::ingest_gate::write_gated(&state, &tenant_id, SpoolBatch::Logs(rows)).await
-    {
-        let (status, msg) = match e {
-            WriteError::Backpressure => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-            ),
-            WriteError::Fatal(s) => crate::api_error::internal_legacy("cloudwatch.write", s),
-        };
-        return (status, firehose_response(&request_id, Some(&msg)));
-    }
-
-    // Record usage for per-tenant ingest metering.
-    state
-        .usage_accumulator
-        .record(&tenant_id, "logs", count, raw_len);
-
-    tracing::info!(
-        signal = "logs",
-        tenant_id = %tenant_id,
-        count = count,
-        source = "cloudwatch",
-        duration_ms = started.elapsed().as_millis() as u64,
-        "ingested logs"
-    );
-
-    (StatusCode::OK, firehose_response(&request_id, None))
+    Ok(rows)
 }
