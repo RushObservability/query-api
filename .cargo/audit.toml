@@ -4,5 +4,4 @@
 ignore = [
     # Unmaintained, not vulnerable:
     "RUSTSEC-2025-0141", # bincode: promql-parser's lrpar uses it, in every release up to 0.11
-    "RUSTSEC-2024-0449", # unsafe-libyaml: serde_yaml in kube 1.x; kube 4 drops it (separate upgrade)
 ]
