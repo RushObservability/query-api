@@ -3194,8 +3194,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Anomaly detection engine — evaluates anomaly rules, persists events, and
-        // sends notifications. Queries Prometheus-source rules against the API's own
-        // /prom endpoint (RUSH_PROM_BASE_URL, defaulting to this server).
+        // sends notifications. Prometheus-source rules are evaluated in-process.
         //
         // Runs in-process by default. The chart can instead run a dedicated
         // `anomaly_engine` Deployment and set RUSH_RUN_ANOMALY_ENGINE=false here;
@@ -3204,14 +3203,11 @@ async fn main() -> anyhow::Result<()> {
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
             .unwrap_or(true);
         if run_anomaly_in_process {
-            let prom_base_url = std::env::var("RUSH_PROM_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string());
             anomaly_engine::spawn_anomaly_engine(
                 config_db.clone(),
                 ch.clone(),
                 admin_ch.clone(),
                 smtp_config.clone(),
-                prom_base_url,
                 self_metrics.clone(),
                 election.lease(rush_api::leader::ANOMALIES),
             );
