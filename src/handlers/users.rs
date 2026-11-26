@@ -1,9 +1,10 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use std::net::SocketAddr;
 
 use crate::AppState;
 use crate::handlers::auth::extract_session_cookie;
@@ -566,6 +567,7 @@ pub async fn delete_user(
 /// PUT /api/v1/users/{id}/password
 pub async fn change_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<ChangePasswordRequest>,
@@ -699,9 +701,66 @@ pub async fn change_password(
                 "current_password is required".to_string(),
             ));
         }
+        match crate::handlers::auth::step_up_attempt_allowed(&state, peer.ip(), &headers, &caller.1)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("user.password_change", "user")
+                            .actor(caller.0.clone(), caller.1.clone())
+                            .tenant(caller.3.clone())
+                            .resource("user", id.clone())
+                            .outcome("failure")
+                            .changes(serde_json::json!({ "reason": "rate_limited" }).to_string())
+                            .description("password change rejected by the password rate limit")
+                            .context(crate::audit::actor_context_from_headers(&headers)),
+                    )
+                    .await;
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many password attempts, try again later".to_string(),
+                ));
+            }
+            Err(error) => {
+                tracing::error!(%error, "password rate limit unavailable");
+                state
+                    .audit
+                    .log(
+                        crate::audit::AuditEvent::new("user.password_change", "user")
+                            .actor(caller.0.clone(), caller.1.clone())
+                            .tenant(caller.3.clone())
+                            .resource("user", id.clone())
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({ "reason": "rate_limit_store_unavailable" })
+                                    .to_string(),
+                            )
+                            .description("password change unavailable before step-up")
+                            .context(crate::audit::actor_context_from_headers(&headers)),
+                    )
+                    .await;
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication temporarily unavailable".to_string(),
+                ));
+            }
+        }
         match state.config_db.authenticate(&caller.1, current).await {
             Ok(Some(_)) => {}
             Ok(None) => {
+                if let Err(error) = crate::handlers::auth::record_step_up_failure(
+                    &state,
+                    peer.ip(),
+                    &headers,
+                    &caller.1,
+                )
+                .await
+                {
+                    tracing::error!(%error, "failed to record step-up password failure");
+                }
                 state
                     .audit
                     .log(
