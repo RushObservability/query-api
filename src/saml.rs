@@ -512,6 +512,9 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
     let mut status_code = String::new();
     let mut status_message = String::new();
     let mut in_status_message = false;
+    // Text of the element being captured. A value can arrive as several text,
+    // CDATA and entity events; it is only used once the element closes.
+    let mut value: Option<String> = None;
 
     let mut buf = Vec::new();
     loop {
@@ -540,9 +543,13 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                                 attribute(e, b"ID", reader.decoder()).unwrap_or_default();
                         }
                     }
-                    "Issuer" => in_issuer = true,
+                    "Issuer" => {
+                        in_issuer = true;
+                        value = None;
+                    }
                     "NameID" => {
                         in_name_id = true;
+                        value = None;
                     }
                     "StatusCode" => {
                         // Record only the first (top-level) StatusCode Value.
@@ -553,6 +560,7 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                     }
                     "StatusMessage" => {
                         in_status_message = true;
+                        value = None;
                     }
                     "Attribute" => {
                         // Extract the Name attribute
@@ -561,6 +569,7 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                     }
                     "AttributeValue" => {
                         in_attr_value = true;
+                        value = None;
                     }
                     _ => {}
                 }
@@ -586,30 +595,69 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                             .map(|value| value.into_owned())
                     })
                     .unwrap_or_default();
-                if in_issuer && in_assertion {
-                    issuer = text;
-                } else if in_name_id {
-                    name_id = text;
-                } else if in_status_message {
-                    status_message = text;
-                } else if in_attr_value && !current_attr_name.is_empty() {
-                    // Check if this attribute is a groups claim
-                    if is_groups_attr(&current_attr_name, groups_claim) {
-                        groups.push(text.clone());
-                    }
-                    // Store first value for each attribute name
-                    attributes.entry(current_attr_name.clone()).or_insert(text);
+                if in_issuer || in_name_id || in_status_message || in_attr_value {
+                    value.get_or_insert_default().push_str(&text);
                 }
+            }
+            Ok(Event::CData(ref e)) => {
+                if in_issuer || in_name_id || in_status_message || in_attr_value {
+                    let text = e.decode().map_err(|_| "invalid SAML CDATA text")?;
+                    value.get_or_insert_default().push_str(&text);
+                }
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                let name = e.decode().map_err(|_| "invalid SAML entity reference")?;
+                let text = quick_xml::escape::unescape(&format!("&{name};"))
+                    .map_err(|_| "unsupported SAML entity reference")?
+                    .into_owned();
+                if in_issuer || in_name_id || in_status_message || in_attr_value {
+                    value.get_or_insert_default().push_str(&text);
+                }
+            }
+            // Signature canonicalization drops comments and the signed text
+            // ignores where they sit, so one inside a value could change what
+            // we read without breaking the signature. No IdP needs them.
+            Ok(Event::Comment(_)) | Ok(Event::PI(_)) => {
+                return Err("SAML comments and processing instructions are not supported".into());
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match local {
                     "Assertion" => in_assertion = false,
-                    "Issuer" => in_issuer = false,
-                    "NameID" => in_name_id = false,
-                    "StatusMessage" => in_status_message = false,
-                    "AttributeValue" => in_attr_value = false,
+                    "Issuer" => {
+                        in_issuer = false;
+                        if let Some(text) = value.take()
+                            && in_assertion
+                        {
+                            issuer = text;
+                        }
+                    }
+                    "NameID" => {
+                        in_name_id = false;
+                        if let Some(text) = value.take() {
+                            name_id = text;
+                        }
+                    }
+                    "StatusMessage" => {
+                        in_status_message = false;
+                        if let Some(text) = value.take() {
+                            status_message = text;
+                        }
+                    }
+                    "AttributeValue" => {
+                        in_attr_value = false;
+                        if let Some(text) = value.take()
+                            && !current_attr_name.is_empty()
+                        {
+                            // Check if this attribute is a groups claim
+                            if is_groups_attr(&current_attr_name, groups_claim) {
+                                groups.push(text.clone());
+                            }
+                            // Store first value for each attribute name
+                            attributes.entry(current_attr_name.clone()).or_insert(text);
+                        }
+                    }
                     "Attribute" => current_attr_name.clear(),
                     _ => {}
                 }
@@ -948,6 +996,76 @@ mod tests {
 
         let tampered = signed.replace("jane@acme.com", "attacker@example.com");
         assert!(verify_signature(&tampered, &certificate).is_err());
+    }
+
+    #[test]
+    fn signed_values_cannot_be_split_by_comments_or_entities() {
+        let now = 1_700_000_000;
+        let recipient = "https://rush.example.com/auth/sso/acs";
+        let audience = "https://rush.example.com";
+        let response = constrained_response(
+            "_request-1",
+            audience,
+            recipient,
+            "2023-11-14T22:11:20Z",
+            "2023-11-14T22:18:20Z",
+        )
+        .replace("jane@acme.com", "janedoe@acme.com")
+        .replace("operators", "admins-sandbox");
+        let signature = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#_response-1"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue></ds:SignatureValue></ds:Signature>"##;
+        let template = response.replacen(
+            ">\n  <samlp:Status>",
+            &format!(">\n  {signature}\n  <samlp:Status>"),
+            1,
+        );
+        let (private_key, certificate) = test_signing_material();
+        let key = bergshamra::keys::loader::load_rsa_private_pem(&private_key).unwrap();
+        let mut keys = bergshamra::KeysManager::new();
+        keys.add_key(key);
+        let context = bergshamra::DsigContext::new_permissive(keys);
+        let signed = bergshamra::sign(&context, &template).unwrap();
+        let validate = |xml: &str| {
+            let verified = verify_signature(xml, &certificate)?;
+            validate_signed_assertion(
+                &verified,
+                "groups",
+                "_request-1",
+                recipient,
+                audience,
+                "https://idp.example.com",
+                now,
+            )
+        };
+        let assertion = validate(&signed).unwrap();
+        assert_eq!(assertion.name_id, "janedoe@acme.com");
+        assert_eq!(assertion.groups, ["admins-sandbox"]);
+
+        // Comments do not change the signed digest, so they must not be able
+        // to change the value we read either.
+        for tampered in [
+            signed.replace("janedoe@", "jane<!---->doe@"),
+            signed.replace("admins-sandbox", "admins<!---->-sandbox"),
+        ] {
+            assert!(verify_signature(&tampered, &certificate).is_ok());
+            assert!(validate(&tampered).is_err(), "accepted {tampered}");
+        }
+
+        assert!(
+            parse_assertion_xml(
+                &template.replace("admins-sandbox", "admins<?x?>-sandbox"),
+                "groups"
+            )
+            .is_err()
+        );
+
+        // A value split by entity references or CDATA is read whole.
+        let parsed = parse_assertion_xml(
+            "<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\"><saml:Subject><saml:NameID>a&amp;b&#46;c<![CDATA[<d>]]></saml:NameID></saml:Subject><saml:AttributeStatement><saml:Attribute Name=\"groups\"><saml:AttributeValue>x&amp;y</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>",
+            "groups",
+        )
+        .unwrap();
+        assert_eq!(parsed.assertion.name_id, "a&b.c<d>");
+        assert_eq!(parsed.assertion.groups, ["x&y"]);
     }
 
     fn constrained_response(
