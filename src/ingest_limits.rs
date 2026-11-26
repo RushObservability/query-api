@@ -7,6 +7,7 @@
 use axum::http::StatusCode;
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::self_metrics::SelfMetrics;
@@ -14,6 +15,9 @@ use crate::self_metrics::SelfMetrics;
 pub type IngestError = (StatusCode, String);
 
 const MIB: usize = 1024 * 1024;
+
+/// How long a request waits for a decode slot before it gets a retryable 429.
+const DECODE_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct IngestLimits {
@@ -27,6 +31,7 @@ pub struct IngestLimits {
     pub max_label_name_bytes: usize,
     pub max_label_value_bytes: usize,
     decode: Arc<Semaphore>,
+    decode_wait: Duration,
     metrics: Arc<SelfMetrics>,
 }
 
@@ -53,7 +58,9 @@ impl IngestLimits {
             env_limit("RUSH_INGEST_MAX_LABEL_NAME_BYTES", 256, 1, 64 * 1024)?;
         let max_label_value_bytes =
             env_limit("RUSH_INGEST_MAX_LABEL_VALUE_BYTES", 4096, 1, 1024 * 1024)?;
-        let decode_concurrency = env_limit("RUSH_INGEST_DECODE_CONCURRENCY", 4, 1, 1024)?;
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let decode_concurrency =
+            env_limit("RUSH_INGEST_DECODE_CONCURRENCY", cores.min(1024), 1, 1024)?;
 
         Ok(Self {
             max_compressed_bytes,
@@ -66,6 +73,7 @@ impl IngestLimits {
             max_label_name_bytes,
             max_label_value_bytes,
             decode: Arc::new(Semaphore::new(decode_concurrency)),
+            decode_wait: DECODE_WAIT,
             metrics,
         })
     }
@@ -83,6 +91,7 @@ impl IngestLimits {
             max_label_name_bytes: 32,
             max_label_value_bytes: 64,
             decode: Arc::new(Semaphore::new(1)),
+            decode_wait: Duration::from_millis(50),
             metrics,
         }
     }
@@ -173,14 +182,15 @@ impl IngestLimits {
         &self,
         source: &'static str,
     ) -> Result<OwnedSemaphorePermit, IngestError> {
-        self.decode.clone().try_acquire_owned().map_err(|_| {
-            self.reject(
+        match tokio::time::timeout(self.decode_wait, self.decode.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(self.reject(
                 source,
                 "decode_concurrency",
                 StatusCode::TOO_MANY_REQUESTS,
                 "ingest decoder is at capacity; retry later",
-            )
-        })
+            )),
+        }
     }
 
     pub fn record_rejection(&self, source: &'static str, reason: &'static str) {
@@ -263,7 +273,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_concurrency_fails_fast_and_is_measured() {
+    async fn decode_waits_briefly_for_a_free_slot() {
+        let limits = IngestLimits::for_test(Arc::new(SelfMetrics::new()));
+        let permit = limits.acquire_decode("otlp").await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(permit);
+        });
+        assert!(limits.acquire_decode("datadog").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn decode_concurrency_times_out_and_is_measured() {
         let metrics = Arc::new(SelfMetrics::new());
         let limits = IngestLimits::for_test(metrics.clone());
         let _permit = limits.acquire_decode("otlp").await.unwrap();
