@@ -53,9 +53,10 @@ fn map_write_err(e: WriteError) -> (StatusCode, String) {
     }
 }
 
-/// Decode an incoming request body as protobuf, returning 415 for JSON and
-/// 400 for other decode failures. Honors `Content-Encoding: gzip` (the OTel
-/// Collector's otlphttp exporter compresses by default), bounded by MAX_OTLP_BODY.
+/// Decode an incoming request body as protobuf, returning 415 for JSON or an
+/// unsupported Content-Encoding and 400 for other decode failures. Honors
+/// gzip, deflate and zstd `Content-Encoding` (the OTel Collector's otlphttp
+/// exporter compresses by default), bounded by the decompressed-bytes limit.
 pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
     limits: &crate::ingest_limits::IngestLimits,
     headers: &HeaderMap,
@@ -74,12 +75,20 @@ pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
         ));
     }
 
-    let gzip = headers
+    let encoding = headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
-        .to_ascii_lowercase()
-        .contains("gzip");
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(encoding.as_str(), "" | "identity")
+        && !super::dd_common::is_compressed_encoding(&encoding)
+    {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported Content-Encoding; use gzip, deflate or zstd".to_string(),
+        ));
+    }
 
     let permit = limits.acquire_decode("otlp").await?;
     let limits = limits.clone();
@@ -87,7 +96,7 @@ pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
     // admit it through the dedicated semaphore and blocking pool.
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        decode_proto_sync::<T>(&limits, gzip, &body)
+        decode_proto_sync::<T>(&limits, &encoding, &body)
     })
     .await
     .map_err(|e| crate::api_error::internal_legacy("otlp.decode_task", e))?
@@ -95,20 +104,18 @@ pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
 
 fn decode_proto_sync<T: Message + Default>(
     limits: &crate::ingest_limits::IngestLimits,
-    gzip: bool,
+    encoding: &str,
     body: &[u8],
 ) -> Result<T, (StatusCode, String)> {
-    let decoded: std::borrow::Cow<[u8]> = if gzip {
-        use std::io::Read;
-        // Read at most the configured cap+1 so an over-large inflation is detected and
-        // rejected rather than exhausting memory (decompression-bomb guard).
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(body)
-            .take(limits.max_decompressed_bytes as u64 + 1)
-            .read_to_end(&mut out)
-            .map_err(|_| limits.malformed("otlp", "invalid compressed OTLP payload"))?;
-        limits.check_decompressed("otlp", out.len())?;
-        std::borrow::Cow::Owned(out)
+    let decoded: std::borrow::Cow<[u8]> = if super::dd_common::is_compressed_encoding(encoding) {
+        // Capped at the decompressed-bytes limit (decompression-bomb guard).
+        std::borrow::Cow::Owned(super::dd_common::decompress_body_sync(
+            limits,
+            "otlp",
+            "invalid compressed OTLP payload",
+            encoding,
+            body,
+        )?)
     } else {
         limits.check_decompressed("otlp", body.len())?;
         std::borrow::Cow::Borrowed(body)
@@ -1189,8 +1196,8 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         assert!(compressed.len() < limits.max_compressed_bytes);
 
-        let error =
-            decode_proto_sync::<ExportLogsServiceRequest>(&limits, true, &compressed).unwrap_err();
+        let error = decode_proto_sync::<ExportLogsServiceRequest>(&limits, "gzip", &compressed)
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(
             error.1,
@@ -1201,13 +1208,51 @@ mod tests {
     #[test]
     fn malformed_otlp_error_is_stable() {
         let limits = limits();
-        let error =
-            decode_proto_sync::<ExportLogsServiceRequest>(&limits, false, &[0xff, 0xff, 0xff])
-                .unwrap_err();
+        let error = decode_proto_sync::<ExportLogsServiceRequest>(&limits, "", &[0xff, 0xff, 0xff])
+            .unwrap_err();
         assert_eq!(
             error,
             (StatusCode::BAD_REQUEST, "invalid OTLP payload".into())
         );
+    }
+
+    #[tokio::test]
+    async fn otlp_accepts_gzip_deflate_and_zstd_bodies() {
+        use flate2::write::DeflateEncoder;
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![Default::default()],
+        };
+        let raw = request.encode_to_vec();
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&raw).unwrap();
+        let mut deflate = DeflateEncoder::new(Vec::new(), Compression::default());
+        deflate.write_all(&raw).unwrap();
+        let zstd = zstd::encode_all(raw.as_slice(), 1).unwrap();
+        for (encoding, body) in [
+            ("gzip", gzip.finish().unwrap()),
+            ("deflate", deflate.finish().unwrap()),
+            ("zstd", zstd),
+            ("identity", raw.clone()),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", encoding.parse().unwrap());
+            let decoded: ExportLogsServiceRequest =
+                decode_proto(&limits(), &headers, Bytes::from(body))
+                    .await
+                    .unwrap_or_else(|e| panic!("{encoding}: {e:?}"));
+            assert_eq!(decoded, request, "{encoding}");
+        }
+    }
+
+    #[tokio::test]
+    async fn otlp_unsupported_encoding_returns_415() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "snappy".parse().unwrap());
+        let error =
+            decode_proto::<ExportLogsServiceRequest>(&limits(), &headers, Bytes::from_static(b"x"))
+                .await
+                .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[test]
