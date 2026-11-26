@@ -139,6 +139,13 @@ pub fn compile_count_query(
     inject_tenant_predicate(&mut query, tenant_id)?;
 
     let scoped_sql = query.to_string();
+    // sqlparser does not re-escape every literal when rendering, so only run SQL
+    // that reads back as exactly the query that was validated.
+    let reparsed = Parser::parse_sql(&dialect, &scoped_sql)
+        .map_err(|_| invalid("query_sql could not be compiled safely"))?;
+    if reparsed != [Statement::Query(query)] {
+        return Err(invalid("query_sql could not be compiled safely"));
+    }
     let count_sql = format!("SELECT count() AS _siem_count FROM ({scoped_sql}) AS _siem_sub");
     Ok(CompiledDetectionQuery {
         scoped_sql,
@@ -472,6 +479,11 @@ fn validate_expression(expr: &Expr) -> Result<(), DetectionQueryError> {
         {
             Ok(())
         }
+        // ClickHouse reads backslash escapes in literals, but sqlparser renders
+        // them back unescaped, which would change where the literal ends.
+        Expr::Value(value) if matches!(&value.value, Value::SingleQuotedString(text) if text.contains('\\')) => {
+            Err(invalid("backslashes in string literals are not supported"))
+        }
         Expr::Value(value)
             if matches!(
                 value.value,
@@ -722,6 +734,18 @@ mod tests {
         ] {
             assert!(compile(sql).is_err(), "accepted: {sql}");
         }
+    }
+
+    #[test]
+    fn rejects_string_literals_that_do_not_render_back_unchanged() {
+        for sql in [
+            "SELECT Body FROM logs WHERE Body = 'x\\\\' OR Body = 'y'",
+            "SELECT Body FROM logs WHERE Body LIKE '%\\\\%'",
+        ] {
+            assert!(compile(sql).is_err(), "accepted: {sql}");
+        }
+        // The read-back check also covers values injected after validation.
+        assert!(compile_count_query("SELECT count() FROM logs", "a\\", "s", "e").is_err());
     }
 
     #[test]
