@@ -939,9 +939,29 @@ impl ChWriter {
 
 // ─── try_insert helper ───────────────────────────────────────────────────────
 
+/// Upper bound for one INSERT, connect included. A server that accepts the
+/// connection and then stops answering would otherwise hold the table slot,
+/// the age flusher and shutdown for as long as the TCP connection survives.
+const INSERT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Perform the actual typed ClickHouse INSERT for any `SpoolBatch` variant.
 /// This is used both by `ChWriter::write` (normal path) and the replayer.
+/// A timeout is an ordinary insert failure, so the caller spools or retries.
 pub async fn try_insert(ch: &Client, batch: &SpoolBatch) -> Result<(), clickhouse::error::Error> {
+    insert_within(ch, batch, INSERT_TIMEOUT).await
+}
+
+async fn insert_within(
+    ch: &Client,
+    batch: &SpoolBatch,
+    limit: Duration,
+) -> Result<(), clickhouse::error::Error> {
+    tokio::time::timeout(limit, insert_rows(ch, batch))
+        .await
+        .unwrap_or(Err(clickhouse::error::Error::TimedOut))
+}
+
+async fn insert_rows(ch: &Client, batch: &SpoolBatch) -> Result<(), clickhouse::error::Error> {
     match batch {
         SpoolBatch::Profiles(rows) => {
             let mut ins = ch.insert::<ProfileRow>("profile_samples").await?;
@@ -1105,6 +1125,22 @@ mod batch_tests {
             }
             .disabled()
         );
+    }
+
+    #[tokio::test]
+    async fn unresponsive_clickhouse_insert_times_out() {
+        // The kernel accepts the connection into the backlog; nothing ever answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ch = Client::default()
+            .with_url(format!("http://{}", silent.local_addr().unwrap()))
+            .with_compression(clickhouse::Compression::None);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            insert_within(&ch, &gauge(1), Duration::from_millis(100)),
+        )
+        .await
+        .expect("the insert must give up on its own");
+        assert!(matches!(result, Err(clickhouse::error::Error::TimedOut)));
     }
 
     // ── Spool payload codec ──
