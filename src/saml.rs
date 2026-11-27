@@ -100,6 +100,7 @@ pub fn build_login_redirect_url(
 /// Callers must parse this value rather than the untrusted outer envelope.
 pub fn verify_signature(xml: &str, idp_cert_pem: &str) -> Result<String, String> {
     validate_idp_certificate(idp_cert_pem)?;
+    reject_weak_signature_algorithms(xml)?;
     // bergshamra wants the bare base64 certificate body — it rejects the PEM
     // armor lines. Drop the BEGIN/END lines and concatenate.
     let cert_b64: String = idp_cert_pem
@@ -172,6 +173,46 @@ fn preserve_signed_namespaces(xml: &str, verified: &str) -> Result<String, Strin
     }
 }
 
+/// MD5 and RIPEMD-160 signature and digest methods. The verifier accepts every
+/// algorithm it implements, so these are refused before verification.
+const WEAK_SIGNATURE_ALGORITHMS: &[&str] = &[
+    "http://www.w3.org/2001/04/xmldsig-more#md5",
+    "http://www.w3.org/2001/04/xmlenc#ripemd160",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-md5",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-ripemd160",
+    "http://www.w3.org/2007/05/xmldsig-more#ecdsa-ripemd160",
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-md5",
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-ripemd160",
+];
+
+const MIN_RSA_KEY_BITS: u32 = 2048;
+
+/// Refuse a response whose signature or reference digest uses MD5 or
+/// RIPEMD-160, wherever the signature sits.
+fn reject_weak_signature_algorithms(xml: &str) -> Result<(), String> {
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if matches!(
+                    local_name(e.name().as_ref()),
+                    "SignatureMethod" | "DigestMethod"
+                ) =>
+            {
+                let algorithm = attribute(e, b"Algorithm", reader.decoder()).unwrap_or_default();
+                if WEAK_SIGNATURE_ALGORITHMS.contains(&algorithm.trim()) {
+                    return Err(format!("SAML signature uses a weak algorithm: {algorithm}"));
+                }
+            }
+            Ok(Event::Eof) => return Ok(()),
+            Err(error) => return Err(format!("XML parse error: {error}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
 /// Validate a configured IdP certificate before an SSO provider can be enabled.
 /// PEM and bare base64 DER forms are accepted because both are commonly copied
 /// from IdP metadata/admin consoles.
@@ -180,15 +221,29 @@ pub fn validate_idp_certificate(idp_cert: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("SAML signing certificate is required".to_string());
     }
-    if openssl::x509::X509::from_pem(trimmed.as_bytes()).is_ok() {
-        return Ok(());
+    let certificate = match openssl::x509::X509::from_pem(trimmed.as_bytes()) {
+        Ok(certificate) => certificate,
+        Err(_) => {
+            let der = B64
+                .decode(trimmed.lines().collect::<String>())
+                .map_err(|_| {
+                    "SAML signing certificate is not valid PEM or base64 DER".to_string()
+                })?;
+            openssl::x509::X509::from_der(&der).map_err(|_| {
+                "SAML signing certificate is not a valid X.509 certificate".to_string()
+            })?
+        }
+    };
+    let key = certificate
+        .public_key()
+        .map_err(|_| "SAML signing certificate has no usable public key".to_string())?;
+    if key.id() == openssl::pkey::Id::RSA && key.bits() < MIN_RSA_KEY_BITS {
+        return Err(format!(
+            "SAML signing certificate uses a {}-bit RSA key; at least {MIN_RSA_KEY_BITS} bits are required",
+            key.bits()
+        ));
     }
-    let der = B64
-        .decode(trimmed.lines().collect::<String>())
-        .map_err(|_| "SAML signing certificate is not valid PEM or base64 DER".to_string())?;
-    openssl::x509::X509::from_der(&der)
-        .map(|_| ())
-        .map_err(|_| "SAML signing certificate is not a valid X.509 certificate".to_string())
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -817,6 +872,10 @@ mod tests {
 
     /// Self-signed RSA key and certificate for signature contract tests.
     fn test_signing_material() -> (Vec<u8>, String) {
+        test_signing_material_with_bits(2048)
+    }
+
+    fn test_signing_material_with_bits(bits: u32) -> (Vec<u8>, String) {
         use openssl::asn1::Asn1Time;
         use openssl::bn::BigNum;
         use openssl::hash::MessageDigest;
@@ -824,7 +883,7 @@ mod tests {
         use openssl::rsa::Rsa;
         use openssl::x509::{X509Builder, X509NameBuilder};
 
-        let rsa = Rsa::generate(2048).expect("RSA key generation");
+        let rsa = Rsa::generate(bits).expect("RSA key generation");
         let pkey = PKey::from_rsa(rsa).expect("PKey from RSA");
         let mut name = X509NameBuilder::new().expect("name builder");
         name.append_entry_by_text("CN", "Test IdP").expect("CN");
@@ -879,6 +938,36 @@ mod tests {
         );
         let res = verify_signature(xml, &test_cert_pem());
         assert!(res.is_err(), "bogus signature must not verify: {res:?}");
+    }
+
+    #[test]
+    fn rejects_weak_signature_algorithms_and_short_keys() {
+        let signed_info = |signature: &str, digest: &str| {
+            format!(
+                r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:SignatureMethod Algorithm="{signature}"/><ds:Reference URI="#_r"><ds:DigestMethod Algorithm="{digest}"/></ds:Reference></ds:SignedInfo></ds:Signature></samlp:Response>"##
+            )
+        };
+        let rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+        let sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
+        assert!(reject_weak_signature_algorithms(&signed_info(rsa_sha256, sha256)).is_ok());
+        assert!(
+            reject_weak_signature_algorithms(&signed_info(
+                "http://www.w3.org/2001/04/xmldsig-more#rsa-md5",
+                sha256
+            ))
+            .is_err()
+        );
+        assert!(
+            reject_weak_signature_algorithms(&signed_info(
+                rsa_sha256,
+                "http://www.w3.org/2001/04/xmldsig-more#md5"
+            ))
+            .is_err()
+        );
+
+        assert!(validate_idp_certificate(&test_signing_material_with_bits(2048).1).is_ok());
+        let short = validate_idp_certificate(&test_signing_material_with_bits(1024).1);
+        assert!(short.unwrap_err().contains("1024-bit"));
     }
 
     #[test]
