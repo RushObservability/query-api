@@ -93,9 +93,24 @@ fn safe_sso_redirect(raw: Option<&str>) -> String {
 }
 
 fn sso_transaction_secret() -> Result<Vec<u8>, String> {
-    let secret = std::env::var("RUSH_SSO_TRANSACTION_SECRET")
-        .or_else(|_| std::env::var("RUSH_API_KEY_SECRET"))
-        .map_err(|_| {
+    resolve_sso_transaction_secret(
+        std::env::var("RUSH_SSO_TRANSACTION_SECRET").ok(),
+        std::env::var("RUSH_API_KEY_SECRET").ok(),
+        crate::api_key_auth::production_mode(),
+    )
+}
+
+/// Production needs its own key, so a leak of the API key hashing secret does
+/// not also let someone mint SSO login transactions and setup sessions. Local
+/// development may still fall back to it.
+fn resolve_sso_transaction_secret(
+    sso_secret: Option<String>,
+    api_key_secret: Option<String>,
+    production: bool,
+) -> Result<Vec<u8>, String> {
+    let secret = sso_secret
+        .or(api_key_secret.filter(|_| !production))
+        .ok_or_else(|| {
             "SSO is unavailable: configure RUSH_SSO_TRANSACTION_SECRET with at least 32 bytes"
                 .to_string()
         })?;
@@ -3402,6 +3417,15 @@ pub async fn complete_setup_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn production_sso_secret_does_not_fall_back_to_api_key_secret() {
+        let key = || Some("k".repeat(32));
+        assert!(resolve_sso_transaction_secret(None, key(), true).is_err());
+        assert!(resolve_sso_transaction_secret(None, key(), false).is_ok());
+        assert!(resolve_sso_transaction_secret(key(), None, true).is_ok());
+        assert!(resolve_sso_transaction_secret(Some("short".into()), None, true).is_err());
+    }
+
     use super::*;
 
     fn oidc_test_response(chunks: Vec<Result<bytes::Bytes, std::io::Error>>) -> reqwest::Response {
