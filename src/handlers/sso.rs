@@ -9,6 +9,8 @@ use hmac::{Hmac, Mac};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::AppState;
 use crate::handlers::users::require_admin;
@@ -786,6 +788,73 @@ async fn fetch_oidc_discovery(issuer_url: &str) -> anyhow::Result<OidcDiscovery>
     Ok(discovery)
 }
 
+/// How long a fetched discovery document or JWKS is reused for logins.
+const OIDC_METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Only one provider is enabled at a time; the cap bounds issuer changes.
+const OIDC_METADATA_CACHE_MAX_ENTRIES: usize = 16;
+
+type OidcMetadataCache<T> =
+    std::sync::LazyLock<std::sync::Mutex<HashMap<String, (std::time::Instant, Arc<T>)>>>;
+
+static OIDC_DISCOVERY_CACHE: OidcMetadataCache<OidcDiscovery> =
+    std::sync::LazyLock::new(Default::default);
+static OIDC_JWKS_CACHE: OidcMetadataCache<jsonwebtoken::jwk::JwkSet> =
+    std::sync::LazyLock::new(Default::default);
+
+fn oidc_cache_get<T>(
+    cache: &OidcMetadataCache<T>,
+    key: &str,
+    now: std::time::Instant,
+) -> Option<Arc<T>> {
+    let entries = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries
+        .get(key)
+        .filter(|(fetched_at, _)| {
+            now.saturating_duration_since(*fetched_at) < OIDC_METADATA_CACHE_TTL
+        })
+        .map(|(_, value)| value.clone())
+}
+
+fn oidc_cache_put<T>(
+    cache: &OidcMetadataCache<T>,
+    key: &str,
+    value: Arc<T>,
+    now: std::time::Instant,
+) {
+    let mut entries = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if entries.len() >= OIDC_METADATA_CACHE_MAX_ENTRIES && !entries.contains_key(key) {
+        entries.retain(|_, (fetched_at, _)| {
+            now.saturating_duration_since(*fetched_at) < OIDC_METADATA_CACHE_TTL
+        });
+        if entries.len() >= OIDC_METADATA_CACHE_MAX_ENTRIES {
+            entries.clear();
+        }
+    }
+    entries.insert(key.to_string(), (now, value));
+}
+
+/// Discovery for the login and callback paths, so every login does not cost
+/// an outbound request. Saving a provider still fetches it fresh.
+async fn cached_oidc_discovery(issuer_url: &str) -> anyhow::Result<Arc<OidcDiscovery>> {
+    if let Some(discovery) =
+        oidc_cache_get(&OIDC_DISCOVERY_CACHE, issuer_url, std::time::Instant::now())
+    {
+        return Ok(discovery);
+    }
+    let discovery = Arc::new(fetch_oidc_discovery(issuer_url).await?);
+    oidc_cache_put(
+        &OIDC_DISCOVERY_CACHE,
+        issuer_url,
+        discovery.clone(),
+        std::time::Instant::now(),
+    );
+    Ok(discovery)
+}
+
 fn validate_oidc_discovery(discovery: &OidcDiscovery, issuer_url: &str) -> anyhow::Result<()> {
     if discovery.issuer != issuer_url {
         anyhow::bail!("OIDC discovery issuer does not exactly match the configured issuer");
@@ -1072,7 +1141,7 @@ pub async fn sso_login(
                 )
             })?;
             let redirect_uri = format!("{base}/auth/sso/callback");
-            let discovery = fetch_oidc_discovery(&issuer_url).await.map_err(|e| {
+            let discovery = cached_oidc_discovery(&issuer_url).await.map_err(|e| {
                 tracing::warn!(reason = %e, "OIDC discovery rejected");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1308,7 +1377,7 @@ async fn sso_callback_inner(
     }
 
     // 3. Exchange authorization code for tokens
-    let discovery = fetch_oidc_discovery(&issuer_url).await.map_err(|e| {
+    let discovery = cached_oidc_discovery(&issuer_url).await.map_err(|e| {
         tracing::warn!(reason = %e, "OIDC discovery rejected during callback");
         (
             StatusCode::BAD_GATEWAY,
@@ -1750,9 +1819,24 @@ async fn verify_and_decode_jwt(
 ) -> anyhow::Result<serde_json::Value> {
     use jsonwebtoken::jwk::JwkSet;
 
-    // Fetch the JSON Web Key Set
-    let jwks: JwkSet = fetch_bounded_oidc_json(&discovery.jwks_uri, "OIDC JWKS").await?;
-
+    // Reuse recently fetched keys. When they do not verify the token (the IdP
+    // may have rotated keys), fetch once more before rejecting it.
+    if let Some(jwks) = oidc_cache_get(
+        &OIDC_JWKS_CACHE,
+        &discovery.jwks_uri,
+        std::time::Instant::now(),
+    ) && let Ok(claims) = verify_oidc_token_with_jwks(token, &jwks, issuer_url, client_id)
+    {
+        return Ok(claims);
+    }
+    let jwks: Arc<JwkSet> =
+        Arc::new(fetch_bounded_oidc_json(&discovery.jwks_uri, "OIDC JWKS").await?);
+    oidc_cache_put(
+        &OIDC_JWKS_CACHE,
+        &discovery.jwks_uri,
+        jwks.clone(),
+        std::time::Instant::now(),
+    );
     verify_oidc_token_with_jwks(token, &jwks, issuer_url, client_id)
 }
 
@@ -3935,6 +4019,20 @@ mod tests {
         let profile = extract_oidc_profile(&claims, "email", "given_name", "family_name").unwrap();
         assert_eq!(profile.username, "subject-1");
         assert_eq!(profile.display_name, "Example User");
+    }
+
+    #[test]
+    fn oidc_metadata_cache_expires_and_stays_bounded() {
+        static CACHE: OidcMetadataCache<u32> = std::sync::LazyLock::new(Default::default);
+        let start = std::time::Instant::now();
+        oidc_cache_put(&CACHE, "issuer", Arc::new(1), start);
+        assert_eq!(oidc_cache_get(&CACHE, "issuer", start).as_deref(), Some(&1));
+        assert!(oidc_cache_get(&CACHE, "issuer", start + OIDC_METADATA_CACHE_TTL).is_none());
+
+        for index in 0..OIDC_METADATA_CACHE_MAX_ENTRIES * 2 {
+            oidc_cache_put(&CACHE, &format!("issuer-{index}"), Arc::new(2), start);
+        }
+        assert!(CACHE.lock().unwrap().len() <= OIDC_METADATA_CACHE_MAX_ENTRIES);
     }
 
     #[test]
