@@ -350,7 +350,7 @@ async fn find_namespaced_external_user(
     provider_id: &str,
     issuer: &str,
     subject: &str,
-    username: &str,
+    pending_username: Option<&str>,
     auth_provider: &str,
 ) -> Result<(Option<String>, String), (StatusCode, String)> {
     let identity_key = external_identity_key(provider_id, issuer, subject);
@@ -376,6 +376,9 @@ async fn find_namespaced_external_user(
     // An administrator may pre-provision an SSO user for a deny-by-default
     // provider. Bind that account only after a verified assertion supplies the
     // expected canonical username for this exact provider.
+    let Some(username) = pending_username else {
+        return Ok((None, identity_key));
+    };
     let pending_identity =
         crate::clickhouse_config::pending_sso_identity_key(provider_id, username);
     let pending = state
@@ -926,6 +929,17 @@ fn extract_oidc_profile(
     })
 }
 
+/// The username that may claim an account an administrator pre-provisioned.
+/// `email_verified` only vouches for the standard `email` claim, so a username
+/// read from another configured claim qualifies only when it is that address.
+fn oidc_pending_claim_username<'a>(
+    claims: &serde_json::Value,
+    username: &'a str,
+) -> Option<&'a str> {
+    let verified = claims.get("email_verified") == Some(&serde_json::Value::Bool(true));
+    (verified && oidc_string_claim(claims, "email") == Some(username)).then_some(username)
+}
+
 // ── Initiate SSO Login (protocol-aware: OIDC or SAML) ──
 
 /// GET /auth/sso/login -- Redirect to IdP.
@@ -1468,7 +1482,7 @@ async fn sso_callback_inner(
         &provider_id,
         &issuer_url,
         &external_id,
-        &username,
+        oidc_pending_claim_username(&claims, &username),
         "oidc",
     )
     .await?;
@@ -2836,7 +2850,7 @@ async fn sso_acs_inner(
         &provider_id,
         &assertion.issuer,
         external_id,
-        username,
+        Some(username),
         auth_provider,
     )
     .await?;
@@ -3913,6 +3927,31 @@ mod tests {
                 display_name: "Ada Lovelace".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn oidc_pending_claim_requires_the_verified_standard_email() {
+        let claims = serde_json::json!({
+            "sub": "subject-1",
+            "email": "person@example.com",
+            "preferred_username": "someone-else@example.com",
+            "email_verified": true,
+        });
+        let profile = extract_oidc_profile(&claims, "preferred_username", "", "").unwrap();
+        assert_eq!(profile.username, "someone-else@example.com");
+        assert_eq!(
+            oidc_pending_claim_username(&claims, &profile.username),
+            None
+        );
+
+        let profile = extract_oidc_profile(&claims, "email", "", "").unwrap();
+        assert_eq!(
+            oidc_pending_claim_username(&claims, &profile.username),
+            Some("person@example.com")
+        );
+
+        let unattested = serde_json::json!({"sub": "subject-1", "email": "subject-1"});
+        assert_eq!(oidc_pending_claim_username(&unattested, "subject-1"), None);
     }
 
     #[test]
