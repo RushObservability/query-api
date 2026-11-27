@@ -955,6 +955,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_weak_signature_algorithms_and_short_keys() {
+        let signed_info = |signature: &str, digest: &str| {
+            format!(
+                r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:SignatureMethod Algorithm="{signature}"/><ds:Reference URI="#_r"><ds:DigestMethod Algorithm="{digest}"/></ds:Reference></ds:SignedInfo></ds:Signature></samlp:Response>"##
+            )
+        };
+        let rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+        let sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
+        assert!(reject_weak_signature_algorithms(&signed_info(rsa_sha256, sha256)).is_ok());
+        assert!(
+            reject_weak_signature_algorithms(&signed_info(
+                "http://www.w3.org/2001/04/xmldsig-more#rsa-md5",
+                sha256
+            ))
+            .is_err()
+        );
+        assert!(
+            reject_weak_signature_algorithms(&signed_info(
+                rsa_sha256,
+                "http://www.w3.org/2001/04/xmldsig-more#md5"
+            ))
+            .is_err()
+        );
+
+        assert!(validate_idp_certificate(&test_signing_material_with_bits(2048).1).is_ok());
+        let short = validate_idp_certificate(&test_signing_material_with_bits(1024).1);
+        assert!(short.unwrap_err().contains("1024-bit"));
+    }
+
+    #[test]
     fn saml_signed_response_contract_verifies_and_rejects_tampering() {
         let now = 1_700_000_000;
         let recipient = "https://rush.example.com/auth/sso/acs";
@@ -1272,35 +1302,5 @@ mod tests {
             .unwrap_err()
             .contains("issuer")
         );
-    }
-
-    #[test]
-    fn rejects_weak_signature_algorithms_and_short_keys() {
-        let signed_info = |signature: &str, digest: &str| {
-            format!(
-                r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:SignatureMethod Algorithm="{signature}"/><ds:Reference URI="#_r"><ds:DigestMethod Algorithm="{digest}"/></ds:Reference></ds:SignedInfo></ds:Signature></samlp:Response>"##
-            )
-        };
-        let rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-        let sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
-        assert!(reject_weak_signature_algorithms(&signed_info(rsa_sha256, sha256)).is_ok());
-        assert!(
-            reject_weak_signature_algorithms(&signed_info(
-                "http://www.w3.org/2001/04/xmldsig-more#rsa-md5",
-                sha256
-            ))
-            .is_err()
-        );
-        assert!(
-            reject_weak_signature_algorithms(&signed_info(
-                rsa_sha256,
-                "http://www.w3.org/2001/04/xmldsig-more#md5"
-            ))
-            .is_err()
-        );
-
-        assert!(validate_idp_certificate(&test_signing_material_with_bits(2048).1).is_ok());
-        let short = validate_idp_certificate(&test_signing_material_with_bits(1024).1);
-        assert!(short.unwrap_err().contains("1024-bit"));
     }
 }
