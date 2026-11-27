@@ -497,38 +497,42 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
     let mut destination = String::new();
     let mut assertion_id = String::new();
     let mut assertion_count = 0usize;
-    let mut in_assertion = false;
     let mut issuer = String::new();
-    let mut in_issuer = false;
     let mut name_id = String::new();
     let mut attributes: HashMap<String, String> = HashMap::new();
     let mut current_attr_name = String::new();
-    let mut in_name_id = false;
-    let mut in_attr_value = false;
     let mut groups: Vec<String> = Vec::new();
     // Top-level <samlp:StatusCode Value="..."> + optional <samlp:StatusMessage>.
     // A non-Success status means the IdP rejected the request (no assertion is
     // present), so we surface its message instead of a misleading "no NameID".
     let mut status_code = String::new();
     let mut status_message = String::new();
-    let mut in_status_message = false;
-    // Text of the element being captured. A value can arrive as several text,
-    // CDATA and entity events; it is only used once the element closes.
-    let mut value: Option<String> = None;
+    // Local names of the open elements. Values are read only from their schema
+    // positions: the signature's KeyInfo and Object children are not covered by
+    // the signature, so a matching tag name anywhere else must be ignored.
+    let mut path: Vec<String> = Vec::new();
+    // The element whose text is being captured, and its depth in `path`. A
+    // value can arrive as several text, CDATA and entity events; it is only
+    // used once that element closes.
+    let mut capture: Option<(Capture, usize)> = None;
+    let mut value = String::new();
 
     let mut buf = Vec::new();
     loop {
         let event = reader.read_event_into(&mut buf);
-        let is_empty = matches!(&event, Ok(Event::Empty(_)));
         match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let is_empty = matches!(&event, Ok(Event::Empty(_)));
                 let name = e.name();
                 let local = local_name(name.as_ref());
+                let parent = path.last().map(String::as_str).unwrap_or("");
+                let grandparent = path.iter().rev().nth(1).map(String::as_str).unwrap_or("");
                 if root_name.is_empty() {
                     root_name = local.to_string();
                 }
+                let mut captured = None;
                 match local {
-                    "Response" => {
+                    "Response" if path.is_empty() => {
                         response_id = attribute(e, b"ID", reader.decoder());
                         response_in_response_to =
                             attribute(e, b"InResponseTo", reader.decoder()).unwrap_or_default();
@@ -536,73 +540,60 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                             attribute(e, b"Destination", reader.decoder()).unwrap_or_default();
                     }
                     "Assertion" => {
+                        // Counted anywhere, so a nested or misplaced assertion
+                        // makes validation fail rather than being skipped.
                         assertion_count += 1;
-                        in_assertion = true;
                         if assertion_id.is_empty() {
                             assertion_id =
                                 attribute(e, b"ID", reader.decoder()).unwrap_or_default();
                         }
                     }
-                    "Issuer" => {
-                        in_issuer = true;
-                        value = None;
+                    "Issuer" if parent == "Assertion" => captured = Some(Capture::Issuer),
+                    "NameID" if parent == "Subject" && grandparent == "Assertion" => {
+                        captured = Some(Capture::NameId)
                     }
-                    "NameID" => {
-                        in_name_id = true;
-                        value = None;
+                    "StatusCode" if parent == "Status" && grandparent == "Response" => {
+                        status_code = attribute(e, b"Value", reader.decoder()).unwrap_or_default();
                     }
-                    "StatusCode" => {
-                        // Record only the first (top-level) StatusCode Value.
-                        if status_code.is_empty() {
-                            status_code =
-                                attribute(e, b"Value", reader.decoder()).unwrap_or_default();
-                        }
+                    "StatusMessage" if parent == "Status" && grandparent == "Response" => {
+                        captured = Some(Capture::StatusMessage)
                     }
-                    "StatusMessage" => {
-                        in_status_message = true;
-                        value = None;
-                    }
-                    "Attribute" => {
-                        // Extract the Name attribute
+                    "Attribute" if parent == "AttributeStatement" && grandparent == "Assertion" => {
                         current_attr_name =
                             attribute(e, b"Name", reader.decoder()).unwrap_or_default();
                     }
-                    "AttributeValue" => {
-                        in_attr_value = true;
-                        value = None;
+                    "AttributeValue"
+                        if parent == "Attribute"
+                            && grandparent == "AttributeStatement"
+                            && !current_attr_name.is_empty() =>
+                    {
+                        captured = Some(Capture::AttributeValue)
                     }
                     _ => {}
                 }
-                if is_empty {
-                    match local {
-                        "Assertion" => in_assertion = false,
-                        "Issuer" => in_issuer = false,
-                        "NameID" => in_name_id = false,
-                        "StatusMessage" => in_status_message = false,
-                        "AttributeValue" => in_attr_value = false,
-                        "Attribute" => current_attr_name.clear(),
-                        _ => {}
+                if !is_empty {
+                    path.push(local.to_string());
+                    if let Some(kind) = captured
+                        && capture.is_none()
+                    {
+                        capture = Some((kind, path.len()));
+                        value.clear();
                     }
                 }
             }
             Ok(Event::Text(ref e)) => {
-                let text = e
-                    .decode()
-                    .ok()
-                    .and_then(|decoded| {
-                        quick_xml::escape::unescape(&decoded)
-                            .ok()
-                            .map(|value| value.into_owned())
-                    })
-                    .unwrap_or_default();
-                if in_issuer || in_name_id || in_status_message || in_attr_value {
-                    value.get_or_insert_default().push_str(&text);
+                if capture.is_some() {
+                    let decoded = e.decode().map_err(|_| "invalid SAML text")?;
+                    value.push_str(
+                        &quick_xml::escape::unescape(&decoded)
+                            .map_err(|_| "invalid SAML text escape")?,
+                    );
                 }
             }
             Ok(Event::CData(ref e)) => {
-                if in_issuer || in_name_id || in_status_message || in_attr_value {
+                if capture.is_some() {
                     let text = e.decode().map_err(|_| "invalid SAML CDATA text")?;
-                    value.get_or_insert_default().push_str(&text);
+                    value.push_str(&text);
                 }
             }
             Ok(Event::GeneralRef(ref e)) => {
@@ -610,8 +601,8 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                 let text = quick_xml::escape::unescape(&format!("&{name};"))
                     .map_err(|_| "unsupported SAML entity reference")?
                     .into_owned();
-                if in_issuer || in_name_id || in_status_message || in_attr_value {
-                    value.get_or_insert_default().push_str(&text);
+                if capture.is_some() {
+                    value.push_str(&text);
                 }
             }
             // Comments need no handling: canonicalization drops them, so the
@@ -619,37 +610,22 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
             Ok(Event::PI(_)) => {
                 return Err("SAML processing instructions are not supported".into());
             }
+            Ok(Event::DocType(_)) => {
+                return Err("SAML document types are not supported".into());
+            }
             Ok(Event::End(ref e)) => {
-                let name = e.name();
-                let local = local_name(name.as_ref());
-                match local {
-                    "Assertion" => in_assertion = false,
-                    "Issuer" => {
-                        in_issuer = false;
-                        if let Some(text) = value.take()
-                            && in_assertion
-                        {
-                            issuer = text;
-                        }
-                    }
-                    "NameID" => {
-                        in_name_id = false;
-                        if let Some(text) = value.take() {
-                            name_id = text;
-                        }
-                    }
-                    "StatusMessage" => {
-                        in_status_message = false;
-                        if let Some(text) = value.take() {
-                            status_message = text;
-                        }
-                    }
-                    "AttributeValue" => {
-                        in_attr_value = false;
-                        if let Some(text) = value.take()
-                            && !current_attr_name.is_empty()
-                        {
-                            // Check if this attribute is a groups claim
+                let depth = path.len();
+                path.pop();
+                if let Some((kind, captured_depth)) = capture
+                    && captured_depth == depth
+                {
+                    capture = None;
+                    let text = std::mem::take(&mut value);
+                    match kind {
+                        Capture::Issuer => issuer = text,
+                        Capture::NameId => name_id = text,
+                        Capture::StatusMessage => status_message = text,
+                        Capture::AttributeValue => {
                             if is_groups_attr(&current_attr_name, groups_claim) {
                                 groups.push(text.clone());
                             }
@@ -657,8 +633,10 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
                             attributes.entry(current_attr_name.clone()).or_insert(text);
                         }
                     }
-                    "Attribute" => current_attr_name.clear(),
-                    _ => {}
+                } else if local_name(e.name().as_ref()) == "Attribute"
+                    && path.last().map(String::as_str) == Some("AttributeStatement")
+                {
+                    current_attr_name.clear();
                 }
             }
             Ok(Event::Eof) => break,
@@ -718,6 +696,14 @@ fn parse_assertion_xml(xml: &str, groups_claim: &str) -> Result<ParsedSamlAssert
         destination,
         assertion_count,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Capture {
+    Issuer,
+    NameId,
+    StatusMessage,
+    AttributeValue,
 }
 
 /// Check if an attribute name matches the groups claim.
@@ -1213,5 +1199,69 @@ mod tests {
             .unwrap_err()
             .contains("issuer")
         );
+    }
+
+    #[test]
+    fn ignores_values_outside_their_signed_positions() {
+        let now = 1_700_000_000;
+        let recipient = "https://rush.example.com/auth/sso/acs";
+        let audience = "https://rush.example.com";
+        let response = constrained_response(
+            "_request-1",
+            audience,
+            recipient,
+            "2023-11-14T22:11:20Z",
+            "2023-11-14T22:18:20Z",
+        );
+        // Assertion-level signature, as most IdPs send it. Its KeyInfo and
+        // Object children are not covered by the signature.
+        let signature = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#_assertion-1"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue></ds:SignatureValue></ds:Signature>"##;
+        let template =
+            response.replacen("</saml:Issuer>", &format!("</saml:Issuer>{signature}"), 1);
+        let (private_key, certificate) = test_signing_material();
+        let key =
+            bergshamra::keys::loader::load_rsa_private_pem(&private_key).expect("SAML signing key");
+        let mut keys = bergshamra::KeysManager::new();
+        keys.add_key(key);
+        let context = bergshamra::DsigContext::new_permissive(keys);
+        let signed = bergshamra::sign(&context, &template).expect("signed SAML assertion");
+
+        let unsigned = r#"<saml:AttributeStatement><saml:Attribute Name="groups"><saml:AttributeValue>unsigned-group</saml:AttributeValue></saml:Attribute><saml:Attribute Name="email"><saml:AttributeValue>unsigned@example.com</saml:AttributeValue></saml:Attribute></saml:AttributeStatement><saml:NameID>unsigned@example.com</saml:NameID>"#;
+        for container in ["KeyInfo", "Object"] {
+            let xml = signed.replacen(
+                "</ds:Signature>",
+                &format!("<ds:{container}>{unsigned}</ds:{container}></ds:Signature>"),
+                1,
+            );
+            let verified = verify_signature(&xml, &certificate).expect(container);
+            let assertion = validate_signed_assertion(
+                &verified,
+                "groups",
+                "_request-1",
+                recipient,
+                audience,
+                "https://idp.example.com",
+                now,
+            )
+            .expect(container);
+            assert_eq!(assertion.groups, ["operators"], "{container}");
+            assert_eq!(assertion.email, None, "{container}");
+            assert_eq!(assertion.name_id, "jane@acme.com", "{container}");
+        }
+
+        // A NameID carried as an attribute value is not the subject.
+        let xml = constrained_response(
+            "_request-1",
+            audience,
+            recipient,
+            "2023-11-14T22:11:20Z",
+            "2023-11-14T22:18:20Z",
+        )
+        .replace(
+            "<saml:AttributeValue>operators</saml:AttributeValue>",
+            "<saml:AttributeValue>operators</saml:AttributeValue></saml:Attribute><saml:Attribute Name=\"targeted\"><saml:AttributeValue><saml:NameID>other@example.com</saml:NameID></saml:AttributeValue>",
+        );
+        let parsed = parse_assertion_xml(&xml, "groups").unwrap();
+        assert_eq!(parsed.assertion.name_id, "jane@acme.com");
     }
 }
