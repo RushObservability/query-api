@@ -1913,6 +1913,53 @@ mod auth_storage_tests {
     }
 
     #[test]
+    fn notification_channel_secrets_are_encrypted_and_legacy_rows_still_read() {
+        let key = config_encryption_key_from_secret(
+            "0123456789abcdef0123456789abcdef-extra-key-material",
+        )
+        .unwrap();
+        let plain = serde_json::json!({
+            "url": "https://hooks.example.test/services/T0001/SECRETWEBHOOKTOKEN",
+            "headers": {"Authorization": "Bearer fake-header-secret"},
+            "token": "",
+            "channel": "alerts"
+        })
+        .to_string();
+        let stored = encrypt_channel_config_with_key(&plain, &key, "tenant-a", "ch-1").unwrap();
+        assert!(!stored.contains("SECRETWEBHOOKTOKEN"), "{stored}");
+        assert!(!stored.contains("fake-header-secret"), "{stored}");
+        let stored_value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored_value["channel"], "alerts");
+        assert_eq!(stored_value["token"], "");
+
+        // Encrypting again (e.g. on delete) leaves ciphertext as is.
+        assert_eq!(
+            encrypt_channel_config_with_key(&stored, &key, "tenant-a", "ch-1").unwrap(),
+            stored
+        );
+        let read: serde_json::Value = serde_json::from_str(
+            &decrypt_channel_config_with_key(&stored, &key, "tenant-a", "ch-1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read,
+            serde_json::from_str::<serde_json::Value>(&plain).unwrap()
+        );
+
+        assert!(decrypt_channel_config_with_key(&stored, &key, "tenant-b", "ch-1").is_err());
+        assert!(decrypt_channel_config_with_key(&stored, &key, "tenant-a", "ch-2").is_err());
+        // Plaintext rows from before encryption pass through unchanged.
+        assert_eq!(
+            decrypt_channel_config_with_key(&plain, &key, "tenant-a", "ch-1").unwrap(),
+            plain
+        );
+        assert_eq!(
+            decrypt_channel_config(&plain, "tenant-a", "ch-1").unwrap(),
+            plain
+        );
+    }
+
+    #[test]
     fn legacy_plaintext_secret_is_read_only_for_startup_migration() {
         let key = config_encryption_key_from_secret(
             "0123456789abcdef0123456789abcdef-extra-key-material",
@@ -2097,6 +2144,7 @@ const ENCRYPTED_SECRET_PREFIX: &str = "enc:v1:";
 const CONFIG_ENCRYPTION_CONTEXT: &[u8] = b"rush-config-encryption-v1\0";
 const SSO_SECRET_AAD: &[u8] = b"rush-sso-client-secret-v1";
 const LLM_PROVIDER_SECRET_AAD: &[u8] = b"rush-llm-provider-secret-v1\0";
+const NOTIFICATION_CHANNEL_SECRET_AAD: &[u8] = b"rush-notification-channel-secret-v1\0";
 
 const SESSION_HMAC_PREFIX: &str = "hmac-sha256:v1:";
 
@@ -2260,6 +2308,103 @@ fn decrypt_llm_provider_secret(
     }
     let aad = llm_provider_secret_aad(tenant_id, provider_id);
     decrypt_config_secret_with_key(stored, &config_encryption_key()?, &aad, "LLM provider")
+}
+
+fn notification_channel_secret_aad(tenant_id: &str, channel_id: &str, field: &str) -> Vec<u8> {
+    let mut aad = NOTIFICATION_CHANNEL_SECRET_AAD.to_vec();
+    for part in [tenant_id, channel_id, field] {
+        aad.extend_from_slice(part.as_bytes());
+        aad.push(0);
+    }
+    aad
+}
+
+/// Encrypt each secret field of a channel config (as its JSON text) so tokens
+/// never reach storage or the ClickHouse query log in plaintext. Without
+/// `RUSH_CONFIG_ENCRYPTION_KEY` the config is stored unchanged, as before.
+fn encrypt_channel_config(
+    config: &str,
+    tenant_id: &str,
+    channel_id: &str,
+) -> anyhow::Result<String> {
+    if std::env::var("RUSH_CONFIG_ENCRYPTION_KEY").is_ok_and(|value| !value.is_empty()) {
+        encrypt_channel_config_with_key(config, &config_encryption_key()?, tenant_id, channel_id)
+    } else {
+        Ok(config.to_string())
+    }
+}
+
+fn encrypt_channel_config_with_key(
+    config: &str,
+    key: &[u8; 32],
+    tenant_id: &str,
+    channel_id: &str,
+) -> anyhow::Result<String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(config) else {
+        return Ok(config.to_string());
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(config.to_string());
+    };
+    for field in crate::models::alert::SECRET_CONFIG_KEYS {
+        let Some(secret) = object.get_mut(*field) else {
+            continue;
+        };
+        if secret.is_null()
+            || secret
+                .as_str()
+                .is_some_and(|text| text.is_empty() || text.starts_with(ENCRYPTED_SECRET_PREFIX))
+        {
+            continue;
+        }
+        let aad = notification_channel_secret_aad(tenant_id, channel_id, field);
+        *secret = serde_json::Value::String(encrypt_config_secret_with_key(
+            &secret.to_string(),
+            key,
+            &aad,
+        )?);
+    }
+    Ok(value.to_string())
+}
+
+/// Decrypt a stored channel config. Rows written before encryption hold
+/// plaintext and are returned unchanged; the next write encrypts them.
+fn decrypt_channel_config(
+    config: &str,
+    tenant_id: &str,
+    channel_id: &str,
+) -> anyhow::Result<String> {
+    if !config.contains(ENCRYPTED_SECRET_PREFIX) {
+        return Ok(config.to_string());
+    }
+    decrypt_channel_config_with_key(config, &config_encryption_key()?, tenant_id, channel_id)
+}
+
+fn decrypt_channel_config_with_key(
+    config: &str,
+    key: &[u8; 32],
+    tenant_id: &str,
+    channel_id: &str,
+) -> anyhow::Result<String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(config) else {
+        return Ok(config.to_string());
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(config.to_string());
+    };
+    for field in crate::models::alert::SECRET_CONFIG_KEYS {
+        let Some(stored) = object
+            .get(*field)
+            .and_then(|secret| secret.as_str())
+            .filter(|text| text.starts_with(ENCRYPTED_SECRET_PREFIX))
+        else {
+            continue;
+        };
+        let aad = notification_channel_secret_aad(tenant_id, channel_id, field);
+        let plaintext = decrypt_config_secret_with_key(stored, key, &aad, "notification channel")?;
+        object.insert(field.to_string(), serde_json::from_str(&plaintext)?);
+    }
+    Ok(value.to_string())
 }
 
 // ── Module-level row types used by helper methods ─────────────────────────────
@@ -8749,16 +8894,18 @@ impl ConfigDb {
             .await?;
         Ok(rows
             .into_iter()
-            .map(|r| crate::models::alert::NotificationChannel {
-                id: r.id,
-                tenant_id: r.tenant_id,
-                name: r.name,
-                channel_type: r.channel_type,
-                config: r.config,
-                enabled: r.enabled != 0,
-                created_at: r.created_at,
+            .map(|r| {
+                Ok(crate::models::alert::NotificationChannel {
+                    config: decrypt_channel_config(&r.config, &r.tenant_id, &r.id)?,
+                    id: r.id,
+                    tenant_id: r.tenant_id,
+                    name: r.name,
+                    channel_type: r.channel_type,
+                    enabled: r.enabled != 0,
+                    created_at: r.created_at,
+                })
             })
-            .collect())
+            .collect::<anyhow::Result<_>>()?)
     }
 
     pub async fn get_channel(
@@ -8783,11 +8930,11 @@ impl ConfigDb {
             .await;
         match result {
             Ok(r) => Ok(Some(crate::models::alert::NotificationChannel {
+                config: decrypt_channel_config(&r.config, &r.tenant_id, &r.id)?,
                 id: r.id,
                 tenant_id: r.tenant_id,
                 name: r.name,
                 channel_type: r.channel_type,
-                config: r.config,
                 enabled: r.enabled != 0,
                 created_at: r.created_at,
             })),
@@ -8817,11 +8964,11 @@ impl ConfigDb {
             .await;
         match result {
             Ok(r) => Ok(Some(crate::models::alert::NotificationChannel {
+                config: decrypt_channel_config(&r.config, &r.tenant_id, &r.id)?,
                 id: r.id,
                 tenant_id: r.tenant_id,
                 name: r.name,
                 channel_type: r.channel_type,
-                config: r.config,
                 enabled: r.enabled != 0,
                 created_at: r.created_at,
             })),
@@ -8840,9 +8987,10 @@ impl ConfigDb {
     ) -> anyhow::Result<()> {
         let now = Self::now_str();
         let ver = Self::next_version();
+        let config = encrypt_channel_config(config, tenant_id, id)?;
         self.client
             .query("INSERT INTO config_notification_channels (id, tenant_id, name, channel_type, config, enabled, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0)")
-            .bind(id).bind(tenant_id).bind(name).bind(channel_type).bind(config).bind(&now).bind(ver)
+            .bind(id).bind(tenant_id).bind(name).bind(channel_type).bind(&config).bind(&now).bind(ver)
             .execute().await?;
         Ok(())
     }
@@ -8861,9 +9009,10 @@ impl ConfigDb {
             None => return Ok(false),
         };
         let ver = Self::next_version();
+        let config = encrypt_channel_config(config, tenant_id, id)?;
         self.client
             .query("INSERT INTO config_notification_channels (id, tenant_id, name, channel_type, config, enabled, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(id).bind(tenant_id).bind(name).bind(&row.channel_type).bind(config)
+            .bind(id).bind(tenant_id).bind(name).bind(&row.channel_type).bind(&config)
             .bind(if enabled { 1u8 } else { 0u8 }).bind(&row.created_at).bind(ver)
             .execute().await?;
         Ok(true)
@@ -8877,9 +9026,10 @@ impl ConfigDb {
         };
         let now = Self::now_str();
         let ver = Self::next_version();
+        let config = encrypt_channel_config(&row.config, tenant_id, id)?;
         self.client
             .query("INSERT INTO config_notification_channels (id, tenant_id, name, channel_type, config, enabled, created_at, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)")
-            .bind(id).bind(tenant_id).bind(&row.name).bind(&row.channel_type).bind(&row.config)
+            .bind(id).bind(tenant_id).bind(&row.name).bind(&row.channel_type).bind(&config)
             .bind(if row.enabled { 1u8 } else { 0u8 }).bind(&now).bind(ver)
             .execute().await?;
         Ok(true)
