@@ -872,7 +872,12 @@ fn query_workload_for_request(req: &Request) -> Option<WorkloadClass> {
         || path.starts_with("/api/v1/monitors/") && path.ends_with("/preview")
         || path == "/api/v1/monitors/forecast/series"
         || path == "/api/v1/monitors/autocomplete"
-        || path.starts_with("/api/v1/detection-rules/") && path.ends_with("/test");
+        || path.starts_with("/api/v1/detection-rules/") && path.ends_with("/test")
+        || path.starts_with("/api/v1/funnels/") && path.ends_with("/run")
+        || path == "/api/v1/insights"
+        || path == "/api/v1/usage"
+        || path.starts_with("/api/v1/usage/cardinality/")
+        || path.starts_with("/api/v1/anomaly-events/") && path.ends_with("/correlations");
     if !managed {
         return None;
     }
@@ -5087,6 +5092,42 @@ mod tenant_auth_tests {
             (Method::POST, "/api/v1/investigate"),
             // The Capacity page must load while query capacity is saturated.
             (Method::GET, "/api/v1/system/metrics"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(query_workload_for_request(&request), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn telemetry_reads_outside_the_query_prefixes_are_admitted() {
+        for (method, path) in [
+            (Method::POST, "/api/v1/funnels/f-1/run"),
+            (Method::GET, "/api/v1/insights"),
+            (Method::GET, "/api/v1/usage"),
+            (Method::GET, "/api/v1/usage/cardinality/http_requests_total"),
+            (Method::GET, "/api/v1/anomaly-events/e-1/correlations"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                query_workload_for_request(&request),
+                Some(rush_api::query_governor::WorkloadClass::Interactive),
+                "{path}"
+            );
+        }
+        // Funnel CRUD, the billing-period metering reads (a pre-aggregated
+        // table) and the LLM analysis call stay outside the interactive pool.
+        for (method, path) in [
+            (Method::POST, "/api/v1/funnels"),
+            (Method::GET, "/api/v1/usage/summary"),
+            (Method::POST, "/api/v1/anomaly-events/e-1/analyze"),
         ] {
             let request = Request::builder()
                 .method(method)
