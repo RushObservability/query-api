@@ -186,6 +186,17 @@ pub struct UpdateGroupRequest {
     pub permissions: Option<Vec<String>>,
 }
 
+/// System groups are only re-seeded at startup, so a runtime edit must not take
+/// `admin` away from one; otherwise any admin could demote every admin,
+/// break-glass included, until a restart.
+fn strips_system_group_admin(system: bool, current: &str, updated: &str) -> bool {
+    let has_admin = |raw: &str| {
+        serde_json::from_str::<Vec<String>>(raw)
+            .is_ok_and(|permissions| permissions.iter().any(|p| p == "admin"))
+    };
+    system && has_admin(current) && !has_admin(updated)
+}
+
 /// PUT /api/v1/groups/{id}
 pub async fn update_group(
     State(state): State<AppState>,
@@ -214,8 +225,33 @@ pub async fn update_group(
     };
     let permissions = match req.permissions {
         Some(p) => serde_json::to_string(&p).unwrap_or_else(|_| current.4.clone()),
-        None => current.4,
+        None => current.4.clone(),
     };
+    if strips_system_group_admin(current.5, &current.4, &permissions) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("group.update", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(caller.3.clone())
+                    .resource("group", id.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "permissions": permissions,
+                            "reason": "system_group_admin_removal",
+                        })
+                        .to_string(),
+                    )
+                    .description("removing admin from a system group rejected")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cannot remove admin from a system group".to_string(),
+        ));
+    }
 
     let updated = state
         .config_db
@@ -491,7 +527,39 @@ pub async fn set_user_groups(
 
 #[cfg(test)]
 mod tests {
-    use super::can_read_user_groups;
+    use super::{can_read_user_groups, strips_system_group_admin};
+
+    #[test]
+    fn system_groups_keep_their_admin_permission() {
+        let admins = r#"["read","write","admin","infrastructure:read"]"#;
+        assert!(strips_system_group_admin(true, admins, r#"["read"]"#));
+        assert!(strips_system_group_admin(true, admins, "[]"));
+        assert!(!strips_system_group_admin(
+            true,
+            admins,
+            r#"["read","admin"]"#
+        ));
+        // Other system groups and custom groups can still be edited freely.
+        assert!(!strips_system_group_admin(
+            true,
+            r#"["read"]"#,
+            r#"["read","write"]"#
+        ));
+        assert!(!strips_system_group_admin(false, admins, r#"["read"]"#));
+
+        let source = include_str!("groups.rs");
+        let update = source
+            .split_once("pub async fn update_group(")
+            .expect("update handler")
+            .1;
+        let check = update
+            .find("strips_system_group_admin(current.5")
+            .expect("update must check system groups");
+        let write = update
+            .find(".update_group(&id")
+            .expect("update writes the group");
+        assert!(check < write);
+    }
 
     #[test]
     fn users_can_read_only_their_own_group_memberships() {
