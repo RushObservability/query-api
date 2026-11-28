@@ -75,10 +75,23 @@ pub fn spawn(
     lease: Arc<crate::leader::EngineLease>,
 ) {
     tokio::spawn(async move {
-        let http_client = reqwest::Client::new();
-        let smtp_transport = build_smtp_transport(&smtp_config);
-        let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
-        let no_data = NoDataSince::default();
+        let budget = crate::query_governor::global()
+            .map(|governor| governor.config())
+            .unwrap_or_default()
+            .background;
+        let (tenants_at_once, per_tenant) = engine_concurrency(&budget);
+        let engine = Arc::new(Engine {
+            ch,
+            config_db,
+            http_client: reqwest::Client::new(),
+            smtp_transport: build_smtp_transport(&smtp_config),
+            smtp_config,
+            eval_state: std::sync::Mutex::new(crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY)),
+            no_data: NoDataSince::default(),
+            lanes: Arc::new(tokio::sync::Semaphore::new(tenants_at_once)),
+            per_tenant,
+        });
+        let mut workers = TenantWorkers::default();
         let mut ticker = tokio::time::interval(CYCLE_PERIOD);
         // A cycle that overruns starts the next one at once, then the schedule
         // resumes, instead of adding the overrun to every later cycle.
@@ -92,15 +105,7 @@ pub fn spawn(
             ticker.tick().await;
             let start = Instant::now();
             let mut ok = true;
-            let cycle = run_evaluation_cycle(
-                &ch,
-                &config_db,
-                &http_client,
-                &smtp_config,
-                &smtp_transport,
-                &mut eval_state,
-                &no_data,
-            );
+            let cycle = run_evaluation_cycle(&engine, &mut workers, &lease);
             let (evaluated, state_changes) = match crate::leader::fenced(lease.clone(), cycle).await
             {
                 Ok(stats) => stats,
@@ -124,6 +129,77 @@ pub fn spawn(
             }
         }
     });
+}
+
+/// What every evaluation shares across cycles.
+struct Engine {
+    ch: Client,
+    config_db: Arc<ConfigDb>,
+    http_client: reqwest::Client,
+    smtp_config: alert_engine::SmtpConfig,
+    smtp_transport: Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
+    eval_state: std::sync::Mutex<crate::eval_state::EvalState>,
+    no_data: NoDataSince,
+    /// One permit per tenant evaluated at once.
+    lanes: Arc<tokio::sync::Semaphore>,
+    /// Monitors evaluated at once within one tenant.
+    per_tenant: usize,
+}
+
+/// One background batch per tenant. Ticks no longer wait for every tenant to
+/// finish: a tenant whose last batch is still running (slow queries, a long
+/// notification fan-out) is skipped, so it delays only its own monitors.
+struct TenantWorkers<T> {
+    running: HashMap<String, tokio::task::JoinHandle<T>>,
+}
+
+impl<T> Default for TenantWorkers<T> {
+    fn default() -> Self {
+        Self {
+            running: HashMap::new(),
+        }
+    }
+}
+
+impl<T: Send + 'static> TenantWorkers<T> {
+    fn is_busy(&self, tenant: &str) -> bool {
+        self.running.contains_key(tenant)
+    }
+
+    /// Run `batch` for `tenant` once it gets one of `lanes`.
+    fn spawn<F>(&mut self, tenant: String, lanes: Arc<tokio::sync::Semaphore>, batch: F)
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let handle = tokio::spawn(async move {
+            // The semaphore is never closed.
+            let _lane = lanes.acquire_owned().await.expect("lane semaphore open");
+            batch.await
+        });
+        self.running.insert(tenant, handle);
+    }
+
+    /// Results of the batches that finished since the last call.
+    async fn finished(&mut self) -> Vec<T> {
+        let done: Vec<String> = self
+            .running
+            .iter()
+            .filter(|(_, handle)| handle.is_finished())
+            .map(|(tenant, _)| tenant.clone())
+            .collect();
+        let mut results = Vec::with_capacity(done.len());
+        for tenant in done {
+            if let Some(handle) = self.running.remove(&tenant) {
+                match handle.await {
+                    Ok(result) => results.push(result),
+                    Err(error) => {
+                        tracing::error!(engine = "monitors", %tenant, %error, "monitor batch panicked")
+                    }
+                }
+            }
+        }
+        results
+    }
 }
 
 fn build_smtp_transport(
@@ -329,51 +405,62 @@ impl NotifyPolicy {
     }
 }
 
-/// Run one evaluation cycle across all enabled monitors. Returns (evaluated, state_changes).
+/// Start one evaluation cycle across all enabled monitors, one background
+/// batch per tenant that is not still busy with the previous one. Returns
+/// (monitors started, state changes from batches that finished since the last
+/// cycle); fails when any of those batches had a failed job.
 async fn run_evaluation_cycle(
-    ch: &Client,
-    config_db: &ConfigDb,
-    http_client: &reqwest::Client,
-    smtp_config: &alert_engine::SmtpConfig,
-    smtp_transport: &Option<lettre::AsyncSmtpTransport<lettre::Tokio1Executor>>,
-    eval_state: &mut crate::eval_state::EvalState,
-    no_data: &NoDataSince,
+    engine: &Arc<Engine>,
+    workers: &mut TenantWorkers<(u64, usize)>,
+    lease: &Arc<crate::leader::EngineLease>,
 ) -> anyhow::Result<(u64, u64)> {
-    use futures_util::StreamExt;
+    let mut state_changes: u64 = 0;
+    let mut failures = 0;
+    for (changes, failed) in workers.finished().await {
+        state_changes += changes;
+        failures += failed;
+    }
 
     let now = time::OffsetDateTime::now_utc();
-    let now_str = now.utc_seconds();
+    let now_str: Arc<str> = now.utc_seconds().into();
 
-    let monitors = config_db.list_enabled_monitors().await?;
-    let policy = NotifyPolicy::load(config_db, now).await;
-    let policy_ref = &policy;
+    let monitors = engine.config_db.list_enabled_monitors().await?;
+    let policy = Arc::new(NotifyPolicy::load(&engine.config_db, now).await);
 
     // States of every enabled monitor as fetched this cycle — composite monitors
     // resolve their members from this map instead of one SELECT…FINAL per member.
     // (Members may be evaluated concurrently this same cycle; composites see the
     // cycle-start states, which matches the prior racy read-at-eval behavior to
     // within one cycle.)
-    let monitor_states: HashMap<String, (String, String)> = monitors
-        .iter()
-        .map(|m| (m.id.clone(), (m.tenant_id.clone(), m.state.clone())))
-        .collect();
+    let monitor_states: Arc<HashMap<String, (String, String)>> = Arc::new(
+        monitors
+            .iter()
+            .map(|m| (m.id.clone(), (m.tenant_id.clone(), m.state.clone())))
+            .collect(),
+    );
 
     // Due = DB-side last_eval_at check (coarse: flushed 1-in-N) AND in-memory
-    // check ⇒ max(db, mem) + interval <= now semantics.
-    let jobs: Vec<(Monitor, bool)> = monitors
-        .into_iter()
-        .filter(|monitor| monitor_due(monitor, eval_state, now))
-        .map(|m| {
-            let flush = eval_state.should_flush(&m.id);
-            (m, flush)
-        })
-        .collect();
+    // check ⇒ max(db, mem) + interval <= now semantics. A busy tenant's
+    // monitors stay due and are picked up once its batch finishes.
+    let jobs: Vec<(Monitor, bool)> = {
+        let eval_state = engine.eval_state.lock().unwrap();
+        monitors
+            .into_iter()
+            .filter(|monitor| !workers.is_busy(&monitor.tenant_id))
+            .filter(|monitor| monitor_due(monitor, &eval_state, now))
+            .map(|m| {
+                let flush = eval_state.should_flush(&m.id);
+                (m, flush)
+            })
+            .collect()
+    };
 
     let evaluated = jobs.len() as u64;
-    let now_str_ref = now_str.as_str();
-    let monitor_states_ref = &monitor_states;
-
-    crate::engine_metrics::due(config_db.self_metrics(), "monitor_engine", jobs.len());
+    crate::engine_metrics::due(
+        engine.config_db.self_metrics(),
+        "monitor_engine",
+        jobs.len(),
+    );
     let mut by_tenant: BTreeMap<String, Vec<(Monitor, bool)>> = BTreeMap::new();
     for job in jobs {
         by_tenant
@@ -381,48 +468,70 @@ async fn run_evaluation_cycle(
             .or_default()
             .push(job);
     }
-    let budget = crate::query_governor::global()
-        .map(|governor| governor.config())
-        .unwrap_or_default()
-        .background;
-    let (tenants_at_once, per_tenant) = engine_concurrency(&budget);
-    let outcomes: Vec<(String, u64, bool, bool)> =
-        futures_util::stream::iter(by_tenant.into_values().map(move |jobs| {
-            futures_util::stream::iter(jobs.into_iter().map(
-                move |(monitor, should_flush)| async move {
-                    let (changes, persisted, failed) = evaluate_job(
-                        ch,
-                        config_db,
-                        &monitor,
-                        now_str_ref,
-                        http_client,
-                        smtp_config,
-                        smtp_transport,
-                        monitor_states_ref,
-                        should_flush,
-                        policy_ref,
-                        no_data,
-                    )
-                    .await;
-                    (monitor.id, changes, persisted, failed)
-                },
-            ))
-            .buffer_unordered(per_tenant)
-        }))
-        .flatten_unordered(tenants_at_once)
-        .collect()
-        .await;
-
-    let mut state_changes: u64 = 0;
-    let mut failures = 0;
-    for (id, changes, persisted, failed) in outcomes {
-        failures += usize::from(failed);
-        state_changes += changes;
-        eval_state.record(id, now, persisted);
+    for (tenant, jobs) in by_tenant {
+        let batch = evaluate_tenant(
+            engine.clone(),
+            jobs,
+            now,
+            now_str.clone(),
+            policy.clone(),
+            monitor_states.clone(),
+        );
+        // Spawned tasks don't inherit the cycle's lease scope.
+        workers.spawn(
+            tenant,
+            engine.lanes.clone(),
+            crate::leader::fenced(lease.clone(), batch),
+        );
     }
 
     anyhow::ensure!(failures == 0, "{failures} monitor evaluation job(s) failed");
     Ok((evaluated, state_changes))
+}
+
+/// Evaluate one tenant's due monitors, `per_tenant` at a time. Returns
+/// (state_changes, failed_jobs).
+async fn evaluate_tenant(
+    engine: Arc<Engine>,
+    jobs: Vec<(Monitor, bool)>,
+    now: time::OffsetDateTime,
+    now_str: Arc<str>,
+    policy: Arc<NotifyPolicy>,
+    monitor_states: Arc<HashMap<String, (String, String)>>,
+) -> (u64, usize) {
+    use futures_util::StreamExt;
+    let engine = &engine;
+    let (now_str, policy, monitor_states) = (&*now_str, &*policy, &*monitor_states);
+    futures_util::stream::iter(
+        jobs.into_iter()
+            .map(move |(monitor, should_flush)| async move {
+                let (changes, persisted, failed) = evaluate_job(
+                    &engine.ch,
+                    &engine.config_db,
+                    &monitor,
+                    now_str,
+                    &engine.http_client,
+                    &engine.smtp_config,
+                    &engine.smtp_transport,
+                    monitor_states,
+                    should_flush,
+                    policy,
+                    &engine.no_data,
+                )
+                .await;
+                engine
+                    .eval_state
+                    .lock()
+                    .unwrap()
+                    .record(monitor.id, now, persisted);
+                (changes, usize::from(failed))
+            }),
+    )
+    .buffer_unordered(engine.per_tenant)
+    .fold((0, 0), |(changes, failures), (c, f)| async move {
+        (changes + c, failures + f)
+    })
+    .await
 }
 
 /// Whether a monitor is due: both the coarse DB `last_eval_at` and the exact
@@ -3142,6 +3251,52 @@ mod schedule_tests {
             &state,
             t0 + time::Duration::milliseconds(59_990)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_slow_tenant_does_not_hold_back_the_next_cycle() {
+        let lanes = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut workers = TenantWorkers::default();
+        let (release, slow_query) = tokio::sync::oneshot::channel::<()>();
+        workers.spawn("slow".into(), lanes.clone(), async move {
+            let _ = slow_query.await;
+            "slow"
+        });
+        workers.spawn("fast".into(), lanes.clone(), async { "fast" });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Next tick: the fast tenant is free to run again, the slow one is skipped.
+        assert_eq!(workers.finished().await, vec!["fast"]);
+        assert!(!workers.is_busy("fast"));
+        assert!(workers.is_busy("slow"));
+        workers.spawn("fast".into(), lanes.clone(), async { "fast" });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(workers.finished().await, vec!["fast"]);
+
+        release.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(workers.finished().await, vec!["slow"]);
+        assert!(!workers.is_busy("slow"));
+    }
+
+    #[tokio::test]
+    async fn tenant_batches_wait_for_a_lane() {
+        let lanes = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut workers = TenantWorkers::default();
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        workers.spawn("a".into(), lanes.clone(), async move {
+            let _ = hold.await;
+            "a"
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        workers.spawn("b".into(), lanes.clone(), async { "b" });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(workers.finished().await.is_empty());
+        release.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut done = workers.finished().await;
+        done.sort();
+        assert_eq!(done, vec!["a", "b"]);
     }
 
     #[test]
