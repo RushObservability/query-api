@@ -130,7 +130,9 @@ impl Default for QueryGovernorConfig {
                 request_timeout_secs: 30,
                 max_time_range_secs: 7 * 24 * 60 * 60,
                 max_execution_time_secs: 30,
-                max_rows_to_read: 100_000_000,
+                // Sized so the byte cap, not the row cap, limits narrow scans
+                // over key columns such as log counts and histograms.
+                max_rows_to_read: 1_000_000_000,
                 max_bytes_to_read: 5 * GIB,
                 max_result_rows: 500_000,
                 max_memory_usage: 2 * GIB,
@@ -144,7 +146,7 @@ impl Default for QueryGovernorConfig {
                 request_timeout_secs: 45,
                 max_time_range_secs: 30 * 24 * 60 * 60,
                 max_execution_time_secs: 45,
-                max_rows_to_read: 250_000_000,
+                max_rows_to_read: 2_000_000_000,
                 max_bytes_to_read: 10 * GIB,
                 max_result_rows: 250_000,
                 max_memory_usage: 2 * GIB,
@@ -943,6 +945,18 @@ mod tests {
             })
         );
         assert!(ValidatedTimeRange::parse("1786320000", "1786320030", 60).is_ok());
+    }
+
+    #[test]
+    fn default_row_caps_do_not_bind_before_byte_caps_on_key_column_scans() {
+        // A logs count or histogram reads TimestampDate, TimestampTime and the
+        // tenant key, a few bytes per row. A row cap far below bytes / 8
+        // rejected those cheap scans (at 1B rows/day, anything over ~2.4h)
+        // long before they read much data.
+        let config = QueryGovernorConfig::default();
+        for budget in [&config.interactive, &config.dashboard] {
+            assert!(budget.max_rows_to_read * 8 >= budget.max_bytes_to_read);
+        }
     }
 
     #[test]
