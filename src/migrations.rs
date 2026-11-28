@@ -845,7 +845,22 @@ AS SELECT
     countState() AS cnt_state
 FROM observability.metrics_sum
 GROUP BY tenant_id, ServiceName, MetricName, Attributes, bucket",
+    // ── services MV: key on http.route only ──
+    // `spans.http_path` falls back to the raw http.target / url.path, which made one
+    // catalog row per concrete URL (`/orders?id=…`). Spans without a route collapse into
+    // one row per service and method. Idempotent; existing rows age out with the TTL.
+    SERVICES_MV_QUERY,
 ];
+
+const SERVICES_MV_QUERY: &str = r"ALTER TABLE observability.services MODIFY QUERY
+SELECT
+    tenant_id, service_name,
+    JSONExtractString(attributes, 'http.route') AS http_path,
+    http_method,
+    max(timestamp) AS last_seen,
+    count() AS request_count
+FROM observability.spans
+GROUP BY tenant_id, service_name, http_path, http_method";
 
 /// Row-level security policies for tenant isolation (defense-in-depth).
 ///
@@ -2079,6 +2094,18 @@ mod row_policy_tests {
         assert!(LOG_BODY_NGRAM_INDEX_DDL.contains("GRANULARITY 4"));
         assert!(!LOG_BODY_NGRAM_INDEX_DDL.contains("GRANULARITY 1"));
         assert!(LEGACY_LOG_BODY_NGRAM_INDEXES.contains(&"idx_body_ngram"));
+    }
+
+    #[test]
+    fn services_catalog_is_keyed_on_the_route_not_the_raw_url() {
+        let create = MIGRATIONS
+            .iter()
+            .position(|sql| sql.contains("MATERIALIZED VIEW IF NOT EXISTS observability.services"));
+        let modify = MIGRATIONS.iter().position(|sql| *sql == SERVICES_MV_QUERY);
+        assert!(matches!((create, modify), (Some(c), Some(m)) if c < m));
+        assert!(
+            SERVICES_MV_QUERY.contains("JSONExtractString(attributes, 'http.route') AS http_path")
+        );
     }
 
     #[test]

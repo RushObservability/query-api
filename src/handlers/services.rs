@@ -55,27 +55,13 @@ pub async fn list_services(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
-    let rows = crate::tenant_query(
-        &state.ch,
-        &format!(
-            "SELECT
-                    service_name,
-                    http_path,
-                    http_method,
-                    toString(last_seen) as last_seen,
-                    request_count
-                FROM services
-                WHERE tenant_id = '{escaped_tenant}'
-                ORDER BY service_name, http_path",
-        ),
-        tenant_id,
-    )
-    .fetch_all::<ServiceEntry>()
-    .await
-    .map_err(|e| {
-        tracing::error!(error = %e, handler = "list_services", "query failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-    })?;
+    let rows = crate::tenant_query(&state.ch, &list_services_sql(&escaped_tenant), tenant_id)
+        .fetch_all::<ServiceEntry>()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, handler = "list_services", "query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
 
     tracing::info!(
         tenant_id = %tenant_id,
@@ -84,6 +70,41 @@ pub async fn list_services(
     );
 
     Ok(Json(ServicesResponse { services: rows }))
+}
+
+/// Most catalog rows `list_services` returns.
+const MAX_SERVICE_ENTRIES: usize = 10_000;
+
+/// The `services` table is a ReplacingMergeTree, so unmerged parts hold duplicates:
+/// collapse them here (newest `last_seen` wins, like a merge) and cap the response.
+fn list_services_sql(escaped_tenant: &str) -> String {
+    format!(
+        "SELECT
+                service_name,
+                http_path,
+                http_method,
+                toString(max(last_seen)) AS last_seen,
+                argMax(request_count, services.last_seen) AS request_count
+            FROM services
+            WHERE tenant_id = '{escaped_tenant}'
+            GROUP BY service_name, http_path, http_method
+            ORDER BY service_name, http_path
+            LIMIT {MAX_SERVICE_ENTRIES}"
+    )
+}
+
+#[cfg(test)]
+mod list_services_tests {
+    #[test]
+    fn catalog_read_collapses_duplicates_and_is_capped() {
+        let sql = super::list_services_sql("t");
+        assert!(
+            sql.contains("GROUP BY service_name, http_path, http_method"),
+            "{sql}"
+        );
+        assert!(sql.contains("max(last_seen)"), "{sql}");
+        assert!(sql.trim_end().ends_with("LIMIT 10000"), "{sql}");
+    }
 }
 
 // ═══ Service Graph ═══
