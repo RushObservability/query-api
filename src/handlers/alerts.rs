@@ -633,13 +633,31 @@ fn merge_channel_config(
     let (Some(existing), Some(incoming)) = (existing.as_object_mut(), incoming.as_object()) else {
         return incoming;
     };
+    let blank =
+        |value: &serde_json::Value| value.is_null() || value.as_str().is_some_and(str::is_empty);
+    let destination_changed = ["url", "webhook_url"].into_iter().any(|key| {
+        incoming
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|url| {
+                !url.is_empty() && existing.get(key).and_then(|v| v.as_str()) != Some(url)
+            })
+    });
     for (key, value) in incoming {
         let preserve_secret = matches!(
             key.as_str(),
             "url" | "webhook_url" | "token" | "routing_key" | "api_key" | "headers"
-        ) && (value.is_null() || value.as_str().is_some_and(str::is_empty));
+        ) && blank(value);
         if !preserve_secret {
             existing.insert(key.clone(), value.clone());
+        }
+    }
+    // Stored credentials are only kept for the destination they were entered for.
+    if destination_changed {
+        for key in ["token", "routing_key", "api_key", "headers"] {
+            if incoming.get(key).is_none_or(blank) {
+                existing.remove(key);
+            }
         }
     }
     existing.clone().into()
@@ -838,6 +856,35 @@ mod channel_config_tests {
             assert_eq!(updated[key], "replacement");
             assert_eq!(updated["channel"], "new-channel");
         }
+    }
+
+    #[test]
+    fn changing_the_destination_drops_secrets_that_were_not_re_entered() {
+        let stored = json!({
+            "url": "https://hooks.example.test/alerts",
+            "headers": {"Authorization": "Bearer fake-secret"},
+            "token": "fake-token"
+        });
+        let moved = merge_channel_config(
+            stored.clone(),
+            json!({"url": "https://other.example.test/collect", "headers": null}),
+        );
+        assert_eq!(moved["url"], "https://other.example.test/collect");
+        assert!(moved.get("headers").is_none(), "{moved}");
+        assert!(moved.get("token").is_none(), "{moved}");
+
+        let re_entered = merge_channel_config(
+            stored.clone(),
+            json!({"url": "https://other.example.test/collect", "token": "new-token"}),
+        );
+        assert_eq!(re_entered["token"], "new-token");
+        assert!(re_entered.get("headers").is_none());
+
+        let same_url = merge_channel_config(
+            stored.clone(),
+            json!({"url": "https://hooks.example.test/alerts", "headers": ""}),
+        );
+        assert_eq!(same_url, stored);
     }
 
     #[tokio::test]
