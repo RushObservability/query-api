@@ -75,11 +75,21 @@ pub async fn suggest_log_values(
     Json(req): Json<LogSuggestRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     let sql = log_suggest_sql(&req, &tenant.tenant_id)?;
+    // The SQL carries tenant, field, prefix, time range and filters.
+    let cache_key = format!("logs\0{sql}");
+    if let Some(entry) = suggest_cache().get(&cache_key) {
+        let (cached_values, ts) = entry.value();
+        if ts.elapsed() < std::time::Duration::from_secs(30) {
+            return Ok(Json(cached_values.clone()));
+        }
+    }
     let rows = crate::tenant_query(&state.ch, &sql, &tenant.tenant_id)
         .fetch_all::<StringValueRow>()
         .await
         .map_err(|error| crate::api_error::internal_legacy("log_suggest.query", error))?;
-    Ok(Json(rows.into_iter().map(|row| row.val).collect()))
+    let values: Vec<String> = rows.into_iter().map(|row| row.val).collect();
+    suggest_cache().insert(cache_key, (values.clone(), std::time::Instant::now()));
+    Ok(Json(values))
 }
 
 #[cfg(test)]
@@ -119,6 +129,61 @@ mod log_tests {
     }
 }
 
+/// Rows of the `attributes` JSON blob sampled for attribute suggestions.
+const ATTRIBUTE_SAMPLE_ROWS: u64 = 20_000;
+
+fn span_suggest_sql(
+    col_expr: &str,
+    is_attribute: bool,
+    prewhere: &str,
+    prefix_filter: &str,
+    limit: u64,
+) -> String {
+    // Parsing 24h of attribute blobs exceeds the read budget on busy tenants, so
+    // attribute values come from the newest spans, read in key order.
+    let source = if is_attribute {
+        format!(
+            "(SELECT attributes FROM spans PREWHERE {prewhere} \
+             ORDER BY timestamp DESC LIMIT {ATTRIBUTE_SAMPLE_ROWS})"
+        )
+    } else {
+        format!("spans PREWHERE {prewhere}")
+    };
+    format!(
+        "SELECT DISTINCT {col_expr} as val \
+         FROM {source} \
+         {prefix_filter} \
+         ORDER BY val \
+         LIMIT {limit}",
+    )
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    #[test]
+    fn attribute_suggestions_read_a_bounded_sample_of_recent_spans() {
+        let prewhere = "tenant_id = 't' AND timestamp >= now() - INTERVAL 24 HOUR";
+        let sql = span_suggest_sql(
+            "JSONExtractString(attributes, 'http.route')",
+            true,
+            prewhere,
+            "WHERE val LIKE '/a%'",
+            20,
+        );
+        assert!(sql.contains(&format!(
+            "FROM (SELECT attributes FROM spans PREWHERE {prewhere} ORDER BY timestamp DESC LIMIT 20000)"
+        )));
+        assert!(sql.ends_with("ORDER BY val LIMIT 20"));
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, &sql)
+            .unwrap();
+        let column = span_suggest_sql("service_name", false, prewhere, "", 20);
+        assert!(column.contains(&format!("FROM spans PREWHERE {prewhere}")));
+        assert!(!column.contains("LIMIT 20000"));
+    }
+}
+
 pub async fn suggest_values(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -133,6 +198,7 @@ pub async fn suggest_values(
         ));
     }
     let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
+    let is_attribute = field.starts_with("attributes.");
     let col_expr = if let Some(attr_path) = field.strip_prefix("attributes.") {
         // OTel attributes use flat dotted keys — try flat key first, nested as fallback.
         // Validate every dot-separated segment to prevent SQL injection via attr_path.
@@ -200,14 +266,7 @@ pub async fn suggest_values(
         String::new()
     };
 
-    let sql = format!(
-        "SELECT DISTINCT {col_expr} as val \
-         FROM spans \
-         PREWHERE {prewhere} \
-         {prefix_filter} \
-         ORDER BY val \
-         LIMIT {limit}",
-    );
+    let sql = span_suggest_sql(&col_expr, is_attribute, &prewhere, &prefix_filter, limit);
 
     let rows = crate::tenant_query(&state.ch, &sql, tenant_id)
         .fetch_all::<StringValueRow>()
