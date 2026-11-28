@@ -1856,6 +1856,14 @@ fn credential_route_denial(
     }
 }
 
+/// Credentials that resolve without checking whether their tenant is enabled.
+fn disabled_tenant_blocks(credential: &CredentialKind) -> bool {
+    matches!(
+        credential,
+        CredentialKind::QueryKey | CredentialKind::IngestKey
+    )
+}
+
 fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
     if rush_api::notebook_delegation::route_allowed(method, path) {
         return true;
@@ -2195,6 +2203,7 @@ async fn enforce_tenant_auth_middleware(
             Err(_) => "error",
         },
     );
+    let policy_found = matches!(policy_result, Ok(Some(_)));
     let stored_auth_required = match policy_result {
         Ok(Some(required)) => required,
         Ok(None) => {
@@ -2217,6 +2226,23 @@ async fn enforce_tenant_auth_middleware(
             true
         }
     };
+    // Sessions, explicit anonymous selections and the SRE agent check `enabled`
+    // during resolution; keys are checked here. The policy lookup above just
+    // cached the tenant's flags. When it failed, ingest keys keep spooling.
+    if policy_found
+        && disabled_tenant_blocks(&resolution.credential)
+        && !state.config_db.is_tenant_enabled(&tenant_id).await
+    {
+        audit_api_key_denial(
+            &state,
+            req.headers(),
+            &resolution,
+            "tenant_disabled",
+            ingest_signal,
+        )
+        .await;
+        return (axum::http::StatusCode::FORBIDDEN, "tenant is disabled").into_response();
+    }
     let default_compatibility =
         tenant_id == "default" && rush_api::api_key_auth::allow_anonymous_default();
     let auth_required = stored_auth_required && !default_compatibility;
@@ -6213,6 +6239,20 @@ mod tenant_auth_tests {
         );
         assert_eq!(retry_after(StatusCode::OK, None), None);
         assert_eq!(retry_after(StatusCode::BAD_REQUEST, None), None);
+    }
+
+    #[test]
+    fn api_keys_stop_when_their_tenant_is_disabled() {
+        assert!(super::disabled_tenant_blocks(&CredentialKind::QueryKey));
+        assert!(super::disabled_tenant_blocks(&CredentialKind::IngestKey));
+        // These already check `enabled` while resolving the tenant.
+        for kind in [
+            CredentialKind::Session,
+            CredentialKind::Anonymous,
+            CredentialKind::InternalSre,
+        ] {
+            assert!(!super::disabled_tenant_blocks(&kind));
+        }
     }
 
     #[test]
