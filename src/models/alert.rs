@@ -23,7 +23,7 @@ pub struct NotificationChannelResponse {
     pub created_at: String,
 }
 
-const SECRET_CONFIG_KEYS: &[&str] = &[
+pub(crate) const SECRET_CONFIG_KEYS: &[&str] = &[
     "url",
     "webhook_url",
     "token",
