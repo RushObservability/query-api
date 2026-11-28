@@ -4011,6 +4011,20 @@ impl ConfigDb {
             .collect())
     }
 
+    /// True when any tenant row, live or deleted, ever used this as its name
+    /// or id (ASCII case-insensitive, like the live-name uniqueness check).
+    /// Tenants resolve by name or id, so a name equal to another id collides.
+    pub async fn tenant_name_ever_used(&self, name: &str) -> anyhow::Result<bool> {
+        let count = self
+            .client
+            .query("SELECT count() FROM config_tenants WHERE lower(name) = lower(?) OR lower(id) = lower(?)")
+            .bind(name)
+            .bind(name)
+            .fetch_one::<u64>()
+            .await?;
+        Ok(count > 0)
+    }
+
     pub async fn create_tenant(
         &self,
         id: &str,

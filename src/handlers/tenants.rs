@@ -181,6 +181,45 @@ pub async fn list_tenants(
     Ok(Json(serde_json::json!({ "tenants": tenants })))
 }
 
+/// New tenant names are keyed into telemetry, caches and URLs, so they are
+/// limited to a safe charset. Existing tenants are not checked.
+fn valid_tenant_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::valid_tenant_name;
+
+    #[test]
+    fn tenant_names_are_limited_to_a_safe_charset() {
+        for ok in ["acme", "Acme-prod_2", &"a".repeat(64)] {
+            assert!(valid_tenant_name(ok), "{ok}");
+        }
+        for bad in ["", "x|y", "a b", "a/b", "a.b", "acmé", &"a".repeat(65)] {
+            assert!(!valid_tenant_name(bad), "{bad}");
+        }
+    }
+
+    // tests/tenant_name_reuse.rs covers the ClickHouse lookup (ignored without
+    // a disposable ClickHouse); this pins that create checks it.
+    #[test]
+    fn create_tenant_rejects_names_of_deleted_tenants() {
+        let create = include_str!("tenants.rs")
+            .split_once("pub async fn create_tenant(\n")
+            .unwrap()
+            .1
+            .split("let id = Uuid::new_v4()")
+            .next()
+            .unwrap();
+        assert!(create.contains("valid_tenant_name(&name)"));
+        assert!(create.contains(".tenant_name_ever_used(&name)"));
+    }
+}
+
 pub async fn create_tenant(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -188,10 +227,10 @@ pub async fn create_tenant(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let caller = require_admin(&state, &headers).await?;
     let name = req.name.trim().to_string();
-    if name.is_empty() {
+    if !valid_tenant_name(&name) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "name must not be empty".to_string(),
+            "name must be 1-64 characters: letters, digits, '_' or '-'".to_string(),
         ));
     }
     // `_audit` is reserved for the tamper-evident audit log — refuse to let an
@@ -221,6 +260,28 @@ pub async fn create_tenant(
         return Err((
             StatusCode::CONFLICT,
             format!("a tenant named \"{name}\" already exists"),
+        ));
+    }
+    // Telemetry, dashboards and monitors of a deleted tenant stay keyed by its
+    // name, so a new tenant must never take that name over. Tenants also
+    // resolve by id, so a name must not match any tenant id either.
+    if state
+        .config_db
+        .tenant_name_ever_used(&name)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "internal error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        })?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "the name \"{name}\" was used by a deleted tenant or as a tenant id and cannot be reused"
+            ),
         ));
     }
 
