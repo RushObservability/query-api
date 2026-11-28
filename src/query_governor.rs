@@ -154,7 +154,11 @@ impl Default for QueryGovernorConfig {
             background: QueryBudget {
                 global_concurrency: 8,
                 per_tenant_concurrency: 2,
-                queue_timeout_ms: 1_000,
+                // No user waits on engine jobs, and the monitor engine sizes
+                // itself to the whole pool: a short wait made the SLO, SIEM and
+                // anomaly jobs queued behind it skip their cycle instead of
+                // taking the next free slot.
+                queue_timeout_ms: 30_000,
                 request_timeout_secs: 60,
                 max_time_range_secs: 30 * 24 * 60 * 60,
                 max_execution_time_secs: 60,
@@ -841,6 +845,35 @@ mod tests {
             serde_json::from_str::<QueryGovernorConfig>(&raw).unwrap(),
             config
         );
+    }
+
+    #[tokio::test]
+    async fn engine_jobs_wait_for_a_background_slot_instead_of_skipping() {
+        let governor =
+            QueryGovernor::new(QueryGovernorConfig::default(), Arc::new(SelfMetrics::new()))
+                .unwrap();
+        // The monitor engine fills the pool: 4 tenants x 2 monitors.
+        let mut held = Vec::new();
+        for tenant in ["t1", "t2", "t3", "t4"] {
+            for _ in 0..2 {
+                held.push(
+                    governor
+                        .admit(WorkloadClass::Background, tenant)
+                        .await
+                        .unwrap(),
+                );
+            }
+        }
+        // Monitor queries finish a little after the old 1 s queue timeout.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            drop(held);
+        });
+        let (same_tenant, other_tenant) = tokio::join!(
+            governor.admit(WorkloadClass::Background, "t1"),
+            governor.admit(WorkloadClass::Background, "t9"),
+        );
+        assert!(same_tenant.is_ok() && other_tenant.is_ok());
     }
 
     #[test]
