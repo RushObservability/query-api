@@ -379,8 +379,8 @@ pub async fn ingest_otlp_traces(
             // Reshape OTel-native rows into wide `spans` rows at ingest (the former
             // spans_mv transform) for the single `spans` table — no spans_raw copy.
             Ok(crate::models::trace::WideEvent::from_rows(otlp_trace_rows(
-                &req, &tenant,
-            )))
+                limits, &req, &tenant,
+            )?))
         },
     )
     .await?;
@@ -426,7 +426,7 @@ pub async fn ingest_otlp_logs(
         body.clone(),
         move |limits, req: ExportLogsServiceRequest| {
             validate_log_entities(limits, &req)?;
-            Ok(otlp_log_rows(&req, &tenant))
+            otlp_log_rows(limits, &req, &tenant)
         },
     )
     .await?;
@@ -689,8 +689,13 @@ pub async fn ingest_vector_logs(
 }
 
 /// Build span rows from a decoded OTLP trace request. Runs on the blocking pool.
-fn otlp_trace_rows(req: &ExportTraceServiceRequest, tenant_id: &str) -> Vec<TraceInsertRow> {
+fn otlp_trace_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    req: &ExportTraceServiceRequest,
+    tenant_id: &str,
+) -> Result<Vec<TraceInsertRow>, (StatusCode, String)> {
     let mut rows: Vec<TraceInsertRow> = Vec::new();
+    let mut fan_out = 0usize;
 
     // Arc refactor: tenant_id is shared across the whole batch — allocate once.
     let tenant_id: std::sync::Arc<str> = tenant_id.into();
@@ -717,7 +722,39 @@ fn otlp_trace_rows(req: &ExportTraceServiceRequest, tenant_id: &str) -> Vec<Trac
                 scope.map(|s| s.name.as_str()).unwrap_or("").into();
             let scope_version: std::sync::Arc<str> =
                 scope.map(|s| s.version.as_str()).unwrap_or("").into();
-            let scope_schema_url = ss.schema_url.clone();
+            // Scope attributes and schema URLs are copied into every span's
+            // attributes: build them once per scope and count the copies.
+            let mut scope_span_attrs: Vec<(String, String)> = scope
+                .map(|s| {
+                    s.attributes
+                        .iter()
+                        .map(|kv| {
+                            let val = kv
+                                .value
+                                .as_ref()
+                                .map(any_value_to_string)
+                                .unwrap_or_default();
+                            (format!("scope.{}", kv.key), val)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !resource_schema_url.is_empty() {
+                scope_span_attrs.push((
+                    "resource.schema_url".to_string(),
+                    resource_schema_url.clone(),
+                ));
+            }
+            if !ss.schema_url.is_empty() {
+                scope_span_attrs.push(("scope.schema_url".to_string(), ss.schema_url.clone()));
+            }
+            // WideEvent copies service_name into every span row.
+            limits.check_fan_out(
+                "otlp",
+                &mut fan_out,
+                service_name.len() + crate::ingest_limits::attr_bytes(&scope_span_attrs),
+                ss.spans.len(),
+            )?;
 
             for span in &ss.spans {
                 let trace_id = bytes_to_hex(&span.trace_id);
@@ -766,30 +803,10 @@ fn otlp_trace_rows(req: &ExportTraceServiceRequest, tenant_id: &str) -> Vec<Trac
                     links_attributes.push(kv_to_attrs(&lk.attributes));
                 }
 
-                // Merge scope attrs into span resource attributes for TraceInsertRow
-                // (spans_raw has ScopeAttributes as Map but TraceInsertRow doesn't have it
-                //  — we embed scope attrs into span_attributes with "scope." prefix)
+                // TraceInsertRow has no ScopeAttributes column, so scope attrs
+                // ("scope." prefix) and schema URLs go into span_attributes.
                 let mut all_span_attrs = span_attrs;
-                if let Some(scope) = ss.scope.as_ref() {
-                    for kv in &scope.attributes {
-                        let val = kv
-                            .value
-                            .as_ref()
-                            .map(any_value_to_string)
-                            .unwrap_or_default();
-                        all_span_attrs.push((format!("scope.{}", kv.key), val));
-                    }
-                }
-                // Stash schema URLs in span attrs so nothing is lost
-                if !resource_schema_url.is_empty() {
-                    all_span_attrs.push((
-                        "resource.schema_url".to_string(),
-                        resource_schema_url.clone(),
-                    ));
-                }
-                if !scope_schema_url.is_empty() {
-                    all_span_attrs.push(("scope.schema_url".to_string(), scope_schema_url.clone()));
-                }
+                all_span_attrs.extend(scope_span_attrs.iter().cloned());
 
                 rows.push(TraceInsertRow {
                     tenant_id: tenant_id.clone(),
@@ -820,12 +837,17 @@ fn otlp_trace_rows(req: &ExportTraceServiceRequest, tenant_id: &str) -> Vec<Trac
         }
     }
 
-    rows
+    Ok(rows)
 }
 
 /// Build log rows from a decoded OTLP logs request. Runs on the blocking pool.
-fn otlp_log_rows(req: &ExportLogsServiceRequest, tenant_id: &str) -> Vec<LogInsertRow> {
+fn otlp_log_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    req: &ExportLogsServiceRequest,
+    tenant_id: &str,
+) -> Result<Vec<LogInsertRow>, (StatusCode, String)> {
     let mut rows: Vec<LogInsertRow> = Vec::new();
+    let mut fan_out = 0usize;
 
     let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);
 
@@ -858,6 +880,13 @@ fn otlp_log_rows(req: &ExportLogsServiceRequest, tenant_id: &str) -> Vec<LogInse
                     .unwrap_or_default(),
             );
             let scope_schema_url: std::sync::Arc<str> = sl.schema_url.as_str().into();
+            // service_name is copied into every log row.
+            limits.check_fan_out(
+                "otlp",
+                &mut fan_out,
+                service_name.len(),
+                sl.log_records.len(),
+            )?;
 
             for lr in &sl.log_records {
                 let ts = if lr.time_unix_nano != 0 {
@@ -902,7 +931,7 @@ fn otlp_log_rows(req: &ExportLogsServiceRequest, tenant_id: &str) -> Vec<LogInse
         }
     }
 
-    rows
+    Ok(rows)
 }
 
 /// Rows built from one OTLP metrics request: gauge, sum, histogram,
@@ -1333,6 +1362,78 @@ mod tests {
                 .await
                 .unwrap_err();
         assert_eq!(error.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    fn resource(service: &str) -> Option<opentelemetry_proto::tonic::resource::v1::Resource> {
+        Some(opentelemetry_proto::tonic::resource::v1::Resource {
+            attributes: vec![KeyValue {
+                key: "service.name".into(),
+                value: Some(AnyValue {
+                    value: Some(
+                        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                            service.into(),
+                        ),
+                    ),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    fn logs(service: &str, records: usize) -> ExportLogsServiceRequest {
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: resource(service),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord::default(); records],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn traces(service: &str, spans: usize) -> ExportTraceServiceRequest {
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: resource(service),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span::default(); spans],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn shared_service_name_copied_into_every_row_is_bounded() {
+        let limits = limits();
+        // 100 bytes x 50 rows exceeds the 4096-byte test limit.
+        let long = "s".repeat(100);
+        assert_eq!(
+            otlp_log_rows(&limits, &logs(&long, 50), "t").unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            otlp_trace_rows(&limits, &traces(&long, 50), "t")
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            otlp_log_rows(&limits, &logs("svc", 50), "t").unwrap().len(),
+            50
+        );
+        assert_eq!(
+            otlp_trace_rows(&limits, &traces("svc", 50), "t")
+                .unwrap()
+                .len(),
+            50
+        );
     }
 
     #[test]

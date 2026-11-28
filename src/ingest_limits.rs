@@ -174,6 +174,22 @@ impl IngestLimits {
         Ok(())
     }
 
+    /// Count `shared_bytes` that row building copies into each of `rows` rows
+    /// (a service name, shared tags or labels) against the decompressed-bytes
+    /// limit. The body limits see such a value once, so without this a small
+    /// request with one long shared value and many empty records expands to
+    /// many times the limit in memory.
+    pub fn check_fan_out(
+        &self,
+        source: &'static str,
+        total: &mut usize,
+        shared_bytes: usize,
+        rows: usize,
+    ) -> Result<(), IngestError> {
+        *total = total.saturating_add(shared_bytes.saturating_mul(rows));
+        self.check_decompressed(source, *total)
+    }
+
     /// Run CPU-heavy ingest work (decompress, parse, build rows) on the
     /// blocking pool while holding a decode permit, so it never stalls a tokio
     /// worker and stays within the process-wide decode budget.
@@ -232,6 +248,11 @@ impl IngestLimits {
         self.record_rejection(source, reason);
         (status, message.to_string())
     }
+}
+
+/// Bytes of an attribute list's keys and values.
+pub fn attr_bytes(attrs: &[(String, String)]) -> usize {
+    attrs.iter().map(|(k, v)| k.len() + v.len()).sum()
 }
 
 fn env_limit(name: &str, default: usize, min: usize, max: usize) -> Result<usize, String> {

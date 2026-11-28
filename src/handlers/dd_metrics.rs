@@ -417,9 +417,17 @@ fn build_v1_rows(
     // Group by target table
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
+    let mut fan_out = 0usize;
 
     for series in &payload.series {
         let (svc, attrs) = extract_tags(&series.tags);
+        // The tags are copied into every point's row.
+        limits.check_fan_out(
+            "datadog",
+            &mut fan_out,
+            crate::ingest_limits::attr_bytes(&attrs),
+            series.points.len(),
+        )?;
         let is_sum = table_for_type(&series.r#type) == "metrics_sum";
         let template = build_template(
             svc,
@@ -482,9 +490,17 @@ fn build_v2_rows(
 
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
+    let mut fan_out = 0usize;
 
     for series in &payload.series {
         let (svc, attrs) = extract_tags(&series.tags);
+        // The tags are copied into every point's row.
+        limits.check_fan_out(
+            "datadog",
+            &mut fan_out,
+            crate::ingest_limits::attr_bytes(&attrs),
+            series.points.len(),
+        )?;
         let host = series
             .resources
             .iter()
@@ -585,4 +601,48 @@ fn build_check_rows(
         .collect();
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> crate::ingest_limits::IngestLimits {
+        crate::ingest_limits::IngestLimits::for_test(std::sync::Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ))
+    }
+
+    #[test]
+    fn shared_tags_copied_into_every_point_are_bounded() {
+        let limits = limits();
+        let tenant: std::sync::Arc<str> = "t".into();
+        let body = |tag: &str| {
+            let points = vec!["[1764000000,1]"; 50].join(",");
+            format!(r#"{{"series":[{{"metric":"m","points":[{points}],"tags":["k:{tag}"]}}]}}"#)
+        };
+        // 100 bytes x 50 points exceeds the 4096-byte test limit.
+        let long = body(&"a".repeat(100));
+        assert_eq!(
+            build_v1_rows(&limits, &tenant, long.as_bytes())
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let v2 = long.replace("[1764000000,1]", r#"{"timestamp":1764000000,"value":1}"#);
+        assert_eq!(
+            build_v2_rows(&limits, &tenant, v2.as_bytes())
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let short = body("v");
+        assert_eq!(
+            build_v1_rows(&limits, &tenant, short.as_bytes())
+                .unwrap()
+                .0
+                .len(),
+            50
+        );
+    }
 }

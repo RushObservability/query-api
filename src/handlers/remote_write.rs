@@ -127,15 +127,6 @@ pub async fn prom_remote_write(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    // Build metadata lookup (metric_name → description/unit)
-    let mut meta_map = std::collections::HashMap::new();
-    for m in &write_req.metadata {
-        meta_map.insert(
-            m.metric_family_name.clone(),
-            (m.help.clone(), m.unit.clone()),
-        );
-    }
-
     // Count samples for logging
     let sample_count: usize = write_req.timeseries.iter().map(|ts| ts.samples.len()).sum();
     tracing::debug!(
@@ -146,14 +137,62 @@ pub async fn prom_remote_write(
         "remote write payload decoded"
     );
 
+    let rows = build_rows(&state.ingest_limits, tenant_id, &write_req)?;
+
+    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
+        .await
+        .map_err(|e| match e {
+            WriteError::Backpressure => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
+            ),
+            WriteError::Fatal(s) => crate::api_error::internal_legacy("remote_write.write", s),
+        })?;
+
+    // Record usage for per-tenant ingest metering (use decompressed size for bytes)
+    state.usage_accumulator.record(
+        tenant_id,
+        "metrics",
+        sample_count as u64,
+        decompressed_len as u64,
+    );
+
+    tracing::info!(
+        signal = "metrics",
+        tenant_id = %tenant_id,
+        series_count = write_req.timeseries.len(),
+        samples = sample_count,
+        source = "prometheus",
+        "ingested remote write"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Build the `metrics_gauge` rows for a validated write request.
+fn build_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    tenant_id: &str,
+    write_req: &WriteRequest,
+) -> Result<Vec<GaugeRow>, (StatusCode, String)> {
+    // Build metadata lookup (metric_name → description/unit)
+    let mut meta_map = std::collections::HashMap::new();
+    for m in &write_req.metadata {
+        meta_map.insert(
+            m.metric_family_name.clone(),
+            (m.help.clone(), m.unit.clone()),
+        );
+    }
+
     // Build all gauge rows for metrics_gauge.
     // Arc refactor: tenant_id and the constant scope fields are shared across
     // every sample in the request; allocate each once and Arc-clone per row.
-    let tenant_arc: std::sync::Arc<str> = tenant_id.as_str().into();
+    let tenant_arc: std::sync::Arc<str> = tenant_id.into();
     let empty_str: std::sync::Arc<str> = "".into();
     let scope_prom: std::sync::Arc<str> = "prometheus".into();
     let empty_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(Vec::new());
     let mut rows: Vec<GaugeRow> = Vec::new();
+    let mut fan_out = 0usize;
 
     for ts in &write_req.timeseries {
         // Extract __name__ (metric name) and job (service name) from labels
@@ -176,6 +215,13 @@ pub async fn prom_remote_write(
         }
 
         let (description, unit) = meta_map.get(&metric_name).cloned().unwrap_or_default();
+        // The labels are copied into every sample's row.
+        limits.check_fan_out(
+            "prometheus",
+            &mut fan_out,
+            crate::ingest_limits::attr_bytes(&attrs),
+            ts.samples.len(),
+        )?;
 
         // P1: Build template row once per timeseries, only update time+value per sample
         let template = GaugeRow {
@@ -210,35 +256,7 @@ pub async fn prom_remote_write(
             rows.push(row);
         }
     }
-
-    crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
-        .await
-        .map_err(|e| match e {
-            WriteError::Backpressure => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "ingest backpressure: clickhouse unavailable, spool full".to_string(),
-            ),
-            WriteError::Fatal(s) => crate::api_error::internal_legacy("remote_write.write", s),
-        })?;
-
-    // Record usage for per-tenant ingest metering (use decompressed size for bytes)
-    state.usage_accumulator.record(
-        tenant_id,
-        "metrics",
-        sample_count as u64,
-        decompressed_len as u64,
-    );
-
-    tracing::info!(
-        signal = "metrics",
-        tenant_id = %tenant_id,
-        series_count = write_req.timeseries.len(),
-        samples = sample_count,
-        source = "prometheus",
-        "ingested remote write"
-    );
-
-    Ok(StatusCode::NO_CONTENT)
+    Ok(rows)
 }
 
 fn decode_write_request(
@@ -387,6 +405,36 @@ mod tests {
             error.1,
             "decompressed ingest payload exceeds configured limit"
         );
+    }
+
+    #[test]
+    fn labels_copied_into_every_sample_are_bounded() {
+        let limits = limits();
+        let request = |value: &str| WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![
+                    Label {
+                        name: "__name__".into(),
+                        value: "m".into(),
+                    },
+                    Label {
+                        name: "a".into(),
+                        value: value.into(),
+                    },
+                ],
+                samples: vec![Sample::default(); 70],
+            }],
+            metadata: Vec::new(),
+        };
+        // 65 label bytes x 70 samples exceeds the 4096-byte test limit while
+        // every per-series limit passes.
+        let wide = request(&"v".repeat(64));
+        validate_write_request(&limits, &wide).unwrap();
+        assert_eq!(
+            build_rows(&limits, "t", &wide).unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(build_rows(&limits, "t", &request("v")).unwrap().len(), 70);
     }
 
     proptest! {
