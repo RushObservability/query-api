@@ -25,6 +25,8 @@ const AGENT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const TEMPLATE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_TEMPLATE_BYTES: usize = 1024 * 1024;
+/// An investigation request is a prompt plus a little context.
+pub const MAX_INVESTIGATE_BODY_BYTES: usize = 1024 * 1024;
 
 /// SSE can run for minutes, so the client bounds inactivity without imposing
 /// a fixed total lifetime on a healthy stream.
@@ -181,26 +183,23 @@ pub async fn investigate(
     let tenant = caller.3.clone();
 
     // Override caller-supplied tenant/scopes with server-trusted values.
-    let mut payload: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))?;
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("tenant_id".into(), serde_json::json!(tenant));
-        // Code is a separate sensitive-read scope. Existing `all` access means
-        // all telemetry/infrastructure tools, not repository contents.
-        obj.insert("scopes".into(), scopes_for_caller(&caller));
-        obj.insert(
-            "notebook_access".into(),
-            serde_json::json!(crate::notebook_delegation::issue(
-                &state.config_db,
-                &headers,
-                &caller
-            )?),
-        );
-    }
+    let mut obj = parse_investigation_body(&body)?;
+    obj.insert("tenant_id".into(), serde_json::json!(tenant));
+    // Code is a separate sensitive-read scope. Existing `all` access means
+    // all telemetry/infrastructure tools, not repository contents.
+    obj.insert("scopes".into(), scopes_for_caller(&caller));
+    obj.insert(
+        "notebook_access".into(),
+        serde_json::json!(crate::notebook_delegation::issue(
+            &state.config_db,
+            &headers,
+            &caller
+        )?),
+    );
 
     let url = format!("{}/api/v1/investigate", sre_base());
     let internal_token = sre_internal_token()?;
-    let request = with_internal_token(client().post(&url), internal_token).json(&payload);
+    let request = with_internal_token(client().post(&url), internal_token).json(&obj);
     let resp = send_with_header_deadline(request, AGENT_HEADER_TIMEOUT).await?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -237,6 +236,21 @@ pub async fn investigate(
         .body(body)
         .map_err(|e| crate::api_error::internal_legacy("sre_proxy", e))?
         .into_response())
+}
+
+/// Only a JSON object can carry the server-set tenant and scopes, so anything
+/// else would reach the agent without them.
+fn parse_investigation_body(
+    body: &[u8],
+) -> Result<serde_json::Map<String, serde_json::Value>, (StatusCode, String)> {
+    match serde_json::from_slice(body) {
+        Ok(serde_json::Value::Object(obj)) => Ok(obj),
+        Ok(_) => Err((
+            StatusCode::BAD_REQUEST,
+            "investigation body must be a JSON object".into(),
+        )),
+        Err(e) => Err((StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}"))),
+    }
 }
 
 async fn send_with_header_deadline(
@@ -306,6 +320,17 @@ pub async fn list_investigation_templates(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn investigation_body_must_be_a_json_object() {
+        assert!(super::parse_investigation_body(br#"{"question":"why"}"#).is_ok());
+        for body in [&b"[]"[..], b"\"text\"", b"null", b"not json"] {
+            assert_eq!(
+                super::parse_investigation_body(body).unwrap_err().0,
+                axum::http::StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
     use super::*;
 
     #[tokio::test]
