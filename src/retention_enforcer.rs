@@ -300,66 +300,70 @@ async fn enforce_tenant_retention(
         // Escape tenant_id for a quoted SQL literal (quotes, backslashes, and `?`).
         let safe_tenant_id = crate::query_builder::escape_string_literal(tenant_id);
 
-        match signal.as_str() {
-            "metrics" => {
-                let metric_tables = [
-                    "metrics_gauge",
-                    "metrics_sum",
-                    "metrics_histogram",
-                    "metrics_exp_histogram",
-                    "metrics_summary",
-                ];
-                for table in metric_tables {
-                    let sql = format!(
-                        "ALTER TABLE observability.{table} DELETE \
-                         WHERE tenant_id = '{safe_tenant_id}' \
-                         AND toDate(TimeUnix) < today() - {retain_days}"
-                    );
-                    execute_or_log(ch, &sql, dry_run).await;
-                }
-            }
-            "traces" => {
-                // spans (single wide table — spans_raw was removed)
-                let sql = format!(
-                    "ALTER TABLE observability.spans DELETE \
-                     WHERE tenant_id = '{safe_tenant_id}' \
-                     AND toDate(timestamp) < today() - {retain_days}"
-                );
-                execute_or_log(ch, &sql, dry_run).await;
-
-                // RUM is governed by the apm cap too (per product decision).
-                let sql = format!(
-                    "ALTER TABLE observability.rum DELETE \
-                     WHERE tenant_id = '{safe_tenant_id}' \
-                     AND toDate(Timestamp) < today() - {retain_days}"
-                );
-                execute_or_log(ch, &sql, dry_run).await;
-                let sql = format!(
-                    "ALTER TABLE observability.rum_replay DELETE \
-                     WHERE tenant_id = '{safe_tenant_id}' \
-                     AND toDate(chunk_ts) < today() - {retain_days}"
-                );
-                execute_or_log(ch, &sql, dry_run).await;
-            }
-            "logs" => {
-                let sql = format!(
-                    "ALTER TABLE observability.logs DELETE \
-                     WHERE tenant_id = '{safe_tenant_id}' \
-                     AND toDate(Timestamp) < today() - {retain_days}"
-                );
-                execute_or_log(ch, &sql, dry_run).await;
-            }
-            _ => {} // already handled above
+        for (table, ts) in tenant_tables(signal) {
+            let sql = format!(
+                "ALTER TABLE observability.{table} DELETE \
+                 WHERE tenant_id = '{safe_tenant_id}' \
+                 AND toDate({ts}) < today() - {retain_days}"
+            );
+            execute_or_log(ch, &sql, dry_run).await;
         }
     }
 
     Ok(())
 }
 
+/// The tables a tenant's retention override deletes from, with each table's
+/// timestamp column.
+fn tenant_tables(signal: &str) -> &'static [(&'static str, &'static str)] {
+    match signal {
+        // Rollups too: reads over long ranges are served from them, and they
+        // keep Attributes and values as long as raw or longer.
+        "metrics" => &[
+            ("metrics_gauge", "TimeUnix"),
+            ("metrics_sum", "TimeUnix"),
+            ("metrics_histogram", "TimeUnix"),
+            ("metrics_exp_histogram", "TimeUnix"),
+            ("metrics_summary", "TimeUnix"),
+            ("metrics_gauge_1m", "bucket"),
+            ("metrics_sum_1m", "bucket"),
+            ("metrics_gauge_1h", "bucket"),
+            ("metrics_sum_1h", "bucket"),
+        ],
+        // spans is the single wide table (spans_raw was removed). RUM is
+        // governed by the apm cap too (per product decision).
+        "traces" => &[
+            ("spans", "timestamp"),
+            ("rum", "Timestamp"),
+            ("rum_replay", "chunk_ts"),
+        ],
+        "logs" => &[("logs", "Timestamp")],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::AttributeMatch;
+
+    #[test]
+    fn tenant_metric_retention_covers_the_rollups() {
+        let tables = tenant_tables("metrics");
+        for rollup in [
+            "metrics_gauge_1m",
+            "metrics_sum_1m",
+            "metrics_gauge_1h",
+            "metrics_sum_1h",
+        ] {
+            assert!(tables.contains(&(rollup, "bucket")), "{rollup} missing");
+        }
+        assert!(tables.contains(&("metrics_gauge", "TimeUnix")));
+        // Every metric table with a TTL is covered.
+        assert_eq!(tables.len(), 9);
+        assert_eq!(tenant_tables("traces")[0], ("spans", "timestamp"));
+        assert_eq!(tenant_tables("logs"), &[("logs", "Timestamp")]);
+    }
 
     #[test]
     fn rule_values_are_escaped_as_sql_literals() {
