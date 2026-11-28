@@ -447,7 +447,7 @@ pub async fn ingest_otlp_metrics(
             &headers,
             body.clone(),
             METRIC_ENTITIES,
-            move |_, req: ExportMetricsServiceRequest| Ok(otlp_metric_rows(&req, &tenant)),
+            move |limits, req: ExportMetricsServiceRequest| otlp_metric_rows(limits, &req, &tenant),
         )
         .await?;
 
@@ -918,7 +918,11 @@ type OtlpMetricRows = (
 );
 
 /// Build metric rows from a decoded OTLP metrics request. Runs on the blocking pool.
-fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpMetricRows {
+fn otlp_metric_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    req: &ExportMetricsServiceRequest,
+    tenant_id: &str,
+) -> Result<OtlpMetricRows, (StatusCode, String)> {
     let mut gauge_rows: Vec<GaugeRow> = Vec::new();
     let mut sum_rows: Vec<SumRow> = Vec::new();
     let mut histogram_rows: Vec<HistogramRow> = Vec::new();
@@ -967,6 +971,7 @@ fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpM
                     Some(MetricData::Gauge(g)) => {
                         for dp in &g.data_points {
                             let attrs = kv_to_attrs(&dp.attributes);
+                            limits.check_labels("otlp", &attrs)?;
                             let ex = extract_exemplars(&dp.exemplars);
                             use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
                             let value = match &dp.value {
@@ -1005,6 +1010,7 @@ fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpM
                         let is_monotonic = s.is_monotonic;
                         for dp in &s.data_points {
                             let attrs = kv_to_attrs(&dp.attributes);
+                            limits.check_labels("otlp", &attrs)?;
                             let ex = extract_exemplars(&dp.exemplars);
                             use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
                             let value = match &dp.value {
@@ -1044,6 +1050,7 @@ fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpM
                         let agg_temp = h.aggregation_temporality;
                         for dp in &h.data_points {
                             let attrs = kv_to_attrs(&dp.attributes);
+                            limits.check_labels("otlp", &attrs)?;
                             let ex = extract_exemplars(&dp.exemplars);
                             histogram_rows.push(HistogramRow {
                                 tenant_id: tenant_id.clone(),
@@ -1081,6 +1088,7 @@ fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpM
                         let agg_temp = eh.aggregation_temporality;
                         for dp in &eh.data_points {
                             let attrs = kv_to_attrs(&dp.attributes);
+                            limits.check_labels("otlp", &attrs)?;
                             let ex = extract_exemplars(&dp.exemplars);
                             let (pos_offset, pos_counts) = dp
                                 .positive
@@ -1131,6 +1139,7 @@ fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpM
                     Some(MetricData::Summary(s)) => {
                         for dp in &s.data_points {
                             let attrs = kv_to_attrs(&dp.attributes);
+                            limits.check_labels("otlp", &attrs)?;
                             let mut quantiles_vec = Vec::with_capacity(dp.quantile_values.len());
                             let mut values_vec = Vec::with_capacity(dp.quantile_values.len());
                             for qv in &dp.quantile_values {
@@ -1167,13 +1176,13 @@ fn otlp_metric_rows(req: &ExportMetricsServiceRequest, tenant_id: &str) -> OtlpM
         }
     }
 
-    (
+    Ok((
         gauge_rows,
         sum_rows,
         histogram_rows,
         exp_histogram_rows,
         summary_rows,
-    )
+    ))
 }
 
 /// Parse a Vector JSON logs body and build its rows. Runs on the blocking pool.
@@ -1480,6 +1489,57 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
         }
+    }
+
+    #[test]
+    fn metric_data_point_labels_have_remote_write_limits() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        };
+        let limits = limits();
+        let metrics = |attributes: Vec<KeyValue>| ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes,
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let kv = |key: String, value: &str| KeyValue {
+            key,
+            value: Some(AnyValue {
+                value: Some(
+                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                        value.into(),
+                    ),
+                ),
+            }),
+            ..Default::default()
+        };
+        // Test limits: 8 labels, 32-byte names, 64-byte values.
+        for attributes in [
+            (0..9).map(|i| kv(format!("k{i}"), "v")).collect(),
+            vec![kv("n".repeat(33), "v")],
+            vec![kv("k".into(), &"v".repeat(65))],
+        ] {
+            assert_eq!(
+                otlp_metric_rows(&limits, &metrics(attributes), "t")
+                    .unwrap_err()
+                    .0,
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        let ok = otlp_metric_rows(&limits, &metrics(vec![kv("k".into(), "v")]), "t").unwrap();
+        assert_eq!(ok.0.len(), 1);
     }
 
     #[test]

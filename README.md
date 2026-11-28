@@ -162,8 +162,8 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `RUSH_INGEST_MAX_ENTITIES` | `200000` | maximum combined decoded records, points, attributes, labels, and container entities |
 | `RUSH_INGEST_MAX_SERIES` / `RUSH_INGEST_MAX_SAMPLES` | `20000` / `200000` | Prometheus and Datadog series/point limits |
 | `RUSH_INGEST_MAX_METADATA` | `10000` | Prometheus remote-write metadata-record limit |
-| `RUSH_INGEST_MAX_LABELS_PER_SERIES` | `128` | maximum labels on one Prometheus series |
-| `RUSH_INGEST_MAX_LABEL_NAME_BYTES` / `RUSH_INGEST_MAX_LABEL_VALUE_BYTES` | `256` / `4096` | UTF-8 byte limits for Prometheus label names and values |
+| `RUSH_INGEST_MAX_LABELS_PER_SERIES` | `128` | maximum labels on one Prometheus series, OTLP metric data point or Datadog series |
+| `RUSH_INGEST_MAX_LABEL_NAME_BYTES` / `RUSH_INGEST_MAX_LABEL_VALUE_BYTES` | `256` / `4096` | UTF-8 byte limits for Prometheus, OTLP metric and Datadog metric label names and values |
 | `RUSH_INGEST_BATCH_ROWS` / `RUSH_INGEST_BATCH_MS` | `5000` / `500` | flush an in-memory table batch when either limit is reached; set rows to `1` or milliseconds to `0` for synchronous writes |
 | `RUSH_CLICKHOUSE_ASYNC_INSERT` | `true` | let ClickHouse buffer inserts server-side |
 | `RUSH_CLICKHOUSE_WAIT_FOR_ASYNC_INSERT` | `false` | wait for the ClickHouse async-insert flush; enable for stronger delivery confirmation at higher latency |

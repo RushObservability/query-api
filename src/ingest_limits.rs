@@ -174,6 +174,19 @@ impl IngestLimits {
         Ok(())
     }
 
+    /// Per-series label count and size limits, as Prometheus remote write
+    /// applies them, for an OTLP data point's or Datadog series' attributes.
+    pub fn check_labels(
+        &self,
+        source: &'static str,
+        labels: &[(String, String)],
+    ) -> Result<(), IngestError> {
+        self.check_count(source, labels.len(), self.max_labels_per_series)?;
+        labels
+            .iter()
+            .try_for_each(|(name, value)| self.check_label(source, name, value))
+    }
+
     /// Count `shared_bytes` that row building copies into each of `rows` rows
     /// (a service name, shared tags or labels) against the decompressed-bytes
     /// limit. The body limits see such a value once, so without this a small
