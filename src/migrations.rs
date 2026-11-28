@@ -1892,7 +1892,25 @@ pub async fn apply_retention_ttls(
         ("logs", "toDateTime(Timestamp)", logs_days),
     ];
 
-    for (table, ts_expr, days) in specs {
+    // spans_by_trace and services are materialized views with inner storage; the TTL
+    // has to go on the generated `.inner_id.<uuid>` table. Same window as spans, so a
+    // trace-id lookup never finds index rows for spans that already expired.
+    let mut targets: Vec<(String, &str, u32)> = specs
+        .iter()
+        .map(|(table, ts_expr, days)| ((*table).to_string(), *ts_expr, *days))
+        .collect();
+    for (view, ts_expr) in [
+        ("spans_by_trace", "toDateTime(timestamp)"),
+        ("services", "toDateTime(last_seen)"),
+    ] {
+        match mv_inner_table(client, view).await {
+            Some(inner) => targets.push((inner, ts_expr, apm_days)),
+            None => tracing::warn!("no inner table found for {view}; TTL not applied"),
+        }
+    }
+
+    for (table, ts_expr, days) in &targets {
+        let table = table.as_str();
         if ttl_matches(client, table, *days).await {
             tracing::debug!("TTL on {table} already {days}d, skipping");
             continue;
@@ -1902,16 +1920,47 @@ pub async fn apply_retention_ttls(
         // mutation that needs ~the whole part in memory (hits max_server_memory_usage,
         // fails, and locks the part against MOVE). The background TTL task still
         // moves/drops parts lazily on merges using the new rule.
-        let sql = format!(
-            "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {days} DAY DELETE \
-             SETTINGS materialize_ttl_after_modify = 0"
-        );
+        let sql = match retention_ttl_sql(table, ts_expr, *days) {
+            Ok(sql) => sql,
+            Err(e) => {
+                tracing::warn!("failed to set TTL on {table}: {e}");
+                continue;
+            }
+        };
         if let Err(e) = client.query(&sql).execute().await {
             tracing::warn!("failed to set TTL on {table}: {e}");
         }
     }
 
     Ok(())
+}
+
+fn retention_ttl_sql(table: &str, ts_expr: &str, days: u32) -> anyhow::Result<String> {
+    let table = quote_table_identifier(table)?;
+    Ok(format!(
+        "ALTER TABLE observability.{table} MODIFY TTL {ts_expr} + INTERVAL {days} DAY DELETE \
+         SETTINGS materialize_ttl_after_modify = 0"
+    ))
+}
+
+/// Inner storage table of a materialized view created without `TO` (Atomic database).
+/// Its name comes from ClickHouse (a uuid), not from user input.
+async fn mv_inner_table(client: &Client, view: &str) -> Option<String> {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct InnerRow {
+        inner_name: String,
+    }
+    let sql = format!(
+        "SELECT concat('.inner_id.', toString(uuid)) AS inner_name FROM system.tables \
+         WHERE database = 'observability' AND name = '{view}' AND engine = 'MaterializedView'"
+    );
+    client
+        .query(&sql)
+        .fetch_optional::<InnerRow>()
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.inner_name)
 }
 
 /// Apply the tiered storage policy and per-signal TTL MOVE rules.
@@ -2106,6 +2155,23 @@ mod row_policy_tests {
         assert!(
             SERVICES_MV_QUERY.contains("JSONExtractString(attributes, 'http.route') AS http_path")
         );
+    }
+
+    #[test]
+    fn retention_ttl_reaches_materialized_view_inner_tables() {
+        let sql = retention_ttl_sql(
+            ".inner_id.8ef9cf86-0ac6-484c-bede-c70a917a6c08",
+            "toDateTime(timestamp)",
+            30,
+        )
+        .unwrap();
+        assert!(
+            sql.starts_with(
+                "ALTER TABLE observability.`.inner_id.8ef9cf86-0ac6-484c-bede-c70a917a6c08` MODIFY TTL toDateTime(timestamp) + INTERVAL 30 DAY DELETE"
+            ),
+            "{sql}"
+        );
+        assert!(retention_ttl_sql("spans` DELETE", "toDateTime(timestamp)", 30).is_err());
     }
 
     #[test]

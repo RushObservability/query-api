@@ -252,18 +252,9 @@ pub async fn get_trace(
             "trace_id must be a 32-character hex string".to_string(),
         ));
     }
-    let tenant_id = &tenant.tenant_id;
-    let esc_t = escape_string_literal(tenant_id);
-
-    let mut rows = crate::tenant_query(
-        &state.ch,
-        &crate::handlers::traces::trace_spans_sql(&esc_t, ""),
-        tenant_id,
-    )
-    .bind(&trace_id)
-    .fetch_all::<WideEvent>()
-    .await
-    .map_err(ch_err)?;
+    let mut rows = crate::handlers::traces::fetch_trace_rows(&state, &tenant.tenant_id, &trace_id)
+        .await
+        .map_err(ch_err)?;
 
     if rows.is_empty() {
         return Ok(envelope(Vec::<Value>::new()));
