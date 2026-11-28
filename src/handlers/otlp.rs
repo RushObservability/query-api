@@ -27,6 +27,7 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::ingest_limits::{ProtoField, counted, nested};
 use crate::models::ingest::{
     ExpHistogramRow, GaugeRow, HistogramRow, LogInsertRow, SumRow, SummaryRow, TraceInsertRow,
 };
@@ -62,15 +63,17 @@ pub(crate) async fn decode_proto<T: Message + Default + Send + 'static>(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<T, (StatusCode, String)> {
-    decode_proto_with(limits, headers, body, |_, req| Ok(req)).await
+    decode_proto_with(limits, headers, body, &[], |_, req| Ok(req)).await
 }
 
-/// `decode_proto`, then `build` (entity checks and row building) in the same
-/// blocking task and decode permit, so none of it runs on a tokio worker.
+/// `decode_proto` with the entity limit for `entities` checked before the
+/// decode, then `build` (row building) in the same blocking task and decode
+/// permit, so none of it runs on a tokio worker.
 async fn decode_proto_with<T, R, F>(
     limits: &crate::ingest_limits::IngestLimits,
     headers: &HeaderMap,
     body: Bytes,
+    entities: &'static [ProtoField],
     build: F,
 ) -> Result<R, (StatusCode, String)>
 where
@@ -112,7 +115,10 @@ where
     // admit it through the dedicated semaphore and blocking pool.
     limits
         .spawn_decode("otlp", move |limits| {
-            build(limits, decode_proto_sync::<T>(limits, &encoding, &body)?)
+            build(
+                limits,
+                decode_proto_sync::<T>(limits, &encoding, &body, entities)?,
+            )
         })
         .await
 }
@@ -121,6 +127,7 @@ fn decode_proto_sync<T: Message + Default>(
     limits: &crate::ingest_limits::IngestLimits,
     encoding: &str,
     body: &[u8],
+    entities: &[ProtoField],
 ) -> Result<T, (StatusCode, String)> {
     let decoded: std::borrow::Cow<[u8]> = if super::dd_common::is_compressed_encoding(encoding) {
         // Capped at the decompressed-bytes limit (decompression-bomb guard).
@@ -136,6 +143,9 @@ fn decode_proto_sync<T: Message + Default>(
         std::borrow::Cow::Borrowed(body)
     };
 
+    if !entities.is_empty() {
+        limits.check_proto_entities("otlp", "invalid OTLP payload", &decoded, entities)?;
+    }
     T::decode(decoded.as_ref()).map_err(|_| limits.malformed("otlp", "invalid OTLP payload"))
 }
 
@@ -270,94 +280,61 @@ fn status_code_name(code: i32) -> &'static str {
     }
 }
 
-fn add_entities(total: &mut usize, amount: usize) {
-    *total = total.saturating_add(amount);
-}
-
-fn validate_trace_entities(
-    limits: &crate::ingest_limits::IngestLimits,
-    request: &ExportTraceServiceRequest,
-) -> Result<(), (StatusCode, String)> {
-    let mut total = request.resource_spans.len();
-    for resource in &request.resource_spans {
-        if let Some(value) = &resource.resource {
-            add_entities(&mut total, value.attributes.len());
-        }
-        add_entities(&mut total, resource.scope_spans.len());
-        for scope in &resource.scope_spans {
-            if let Some(value) = &scope.scope {
-                add_entities(&mut total, value.attributes.len());
-            }
-            add_entities(&mut total, scope.spans.len());
-            for span in &scope.spans {
-                add_entities(&mut total, span.attributes.len());
-                add_entities(&mut total, span.events.len());
-                add_entities(&mut total, span.links.len());
-                for event in &span.events {
-                    add_entities(&mut total, event.attributes.len());
-                }
-                for link in &span.links {
-                    add_entities(&mut total, link.attributes.len());
-                }
-            }
-        }
-    }
-    limits.check_entities("otlp", total)
-}
-
-fn validate_log_entities(
-    limits: &crate::ingest_limits::IngestLimits,
-    request: &ExportLogsServiceRequest,
-) -> Result<(), (StatusCode, String)> {
-    let mut total = request.resource_logs.len();
-    for resource in &request.resource_logs {
-        if let Some(value) = &resource.resource {
-            add_entities(&mut total, value.attributes.len());
-        }
-        add_entities(&mut total, resource.scope_logs.len());
-        for scope in &resource.scope_logs {
-            if let Some(value) = &scope.scope {
-                add_entities(&mut total, value.attributes.len());
-            }
-            add_entities(&mut total, scope.log_records.len());
-            for record in &scope.log_records {
-                add_entities(&mut total, record.attributes.len());
-            }
-        }
-    }
-    limits.check_entities("otlp", total)
-}
-
-fn validate_metric_entities(
-    limits: &crate::ingest_limits::IngestLimits,
-    request: &ExportMetricsServiceRequest,
-) -> Result<(), (StatusCode, String)> {
-    let mut total = request.resource_metrics.len();
-    for resource in &request.resource_metrics {
-        if let Some(value) = &resource.resource {
-            add_entities(&mut total, value.attributes.len());
-        }
-        add_entities(&mut total, resource.scope_metrics.len());
-        for scope in &resource.scope_metrics {
-            if let Some(value) = &scope.scope {
-                add_entities(&mut total, value.attributes.len());
-            }
-            add_entities(&mut total, scope.metrics.len());
-            for metric in &scope.metrics {
-                let points = match &metric.data {
-                    Some(MetricData::Gauge(value)) => value.data_points.len(),
-                    Some(MetricData::Sum(value)) => value.data_points.len(),
-                    Some(MetricData::Histogram(value)) => value.data_points.len(),
-                    Some(MetricData::ExponentialHistogram(value)) => value.data_points.len(),
-                    Some(MetricData::Summary(value)) => value.data_points.len(),
-                    None => 0,
-                };
-                add_entities(&mut total, points);
-            }
-        }
-    }
-    limits.check_entities("otlp", total)
-}
+// Entities counted before decoding: resources, scopes and records with their
+// attributes (span events and links too) for traces and logs; resources,
+// scopes, metrics and data points for metrics.
+const RESOURCE: ProtoField = nested(1, &[counted(1, &[])]);
+const SCOPE: ProtoField = nested(1, &[counted(3, &[])]);
+const TRACE_ENTITIES: &[ProtoField] = &[counted(
+    1,
+    &[
+        RESOURCE,
+        counted(
+            2,
+            &[
+                SCOPE,
+                counted(
+                    2,
+                    &[
+                        counted(9, &[]),
+                        counted(11, &[counted(3, &[])]),
+                        counted(13, &[counted(4, &[])]),
+                    ],
+                ),
+            ],
+        ),
+    ],
+)];
+const LOG_ENTITIES: &[ProtoField] = &[counted(
+    1,
+    &[
+        RESOURCE,
+        counted(2, &[SCOPE, counted(2, &[counted(6, &[])])]),
+    ],
+)];
+const POINTS: &[ProtoField] = &[counted(1, &[])];
+const METRIC_ENTITIES: &[ProtoField] = &[counted(
+    1,
+    &[
+        RESOURCE,
+        counted(
+            2,
+            &[
+                SCOPE,
+                counted(
+                    2,
+                    &[
+                        nested(5, POINTS),
+                        nested(7, POINTS),
+                        nested(9, POINTS),
+                        nested(10, POINTS),
+                        nested(11, POINTS),
+                    ],
+                ),
+            ],
+        ),
+    ],
+)];
 
 // ─── POST /v1/traces ──────────────────────────────────────────────────────────
 
@@ -374,8 +351,8 @@ pub async fn ingest_otlp_traces(
         &state.ingest_limits,
         &headers,
         body.clone(),
+        TRACE_ENTITIES,
         move |limits, req: ExportTraceServiceRequest| {
-            validate_trace_entities(limits, &req)?;
             // Reshape OTel-native rows into wide `spans` rows at ingest (the former
             // spans_mv transform) for the single `spans` table — no spans_raw copy.
             Ok(crate::models::trace::WideEvent::from_rows(otlp_trace_rows(
@@ -424,10 +401,8 @@ pub async fn ingest_otlp_logs(
         &state.ingest_limits,
         &headers,
         body.clone(),
-        move |limits, req: ExportLogsServiceRequest| {
-            validate_log_entities(limits, &req)?;
-            otlp_log_rows(limits, &req, &tenant)
-        },
+        LOG_ENTITIES,
+        move |limits, req: ExportLogsServiceRequest| otlp_log_rows(limits, &req, &tenant),
     )
     .await?;
 
@@ -471,10 +446,8 @@ pub async fn ingest_otlp_metrics(
             &state.ingest_limits,
             &headers,
             body.clone(),
-            move |limits, req: ExportMetricsServiceRequest| {
-                validate_metric_entities(limits, &req)?;
-                Ok(otlp_metric_rows(&req, &tenant))
-            },
+            METRIC_ENTITIES,
+            move |_, req: ExportMetricsServiceRequest| Ok(otlp_metric_rows(&req, &tenant)),
         )
         .await?;
 
@@ -1305,8 +1278,9 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         assert!(compressed.len() < limits.max_compressed_bytes);
 
-        let error = decode_proto_sync::<ExportLogsServiceRequest>(&limits, "gzip", &compressed)
-            .unwrap_err();
+        let error =
+            decode_proto_sync::<ExportLogsServiceRequest>(&limits, "gzip", &compressed, &[])
+                .unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(
             error.1,
@@ -1317,8 +1291,9 @@ mod tests {
     #[test]
     fn malformed_otlp_error_is_stable() {
         let limits = limits();
-        let error = decode_proto_sync::<ExportLogsServiceRequest>(&limits, "", &[0xff, 0xff, 0xff])
-            .unwrap_err();
+        let error =
+            decode_proto_sync::<ExportLogsServiceRequest>(&limits, "", &[0xff, 0xff, 0xff], &[])
+                .unwrap_err();
         assert_eq!(
             error,
             (StatusCode::BAD_REQUEST, "invalid OTLP payload".into())
@@ -1434,6 +1409,77 @@ mod tests {
                 .len(),
             50
         );
+    }
+
+    #[test]
+    fn entity_limit_runs_before_the_protobuf_decode() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        };
+        use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
+        let limits = limits();
+        let attr = || KeyValue {
+            key: "k".into(),
+            ..Default::default()
+        };
+
+        // 1 resource + 1 attr, 1 scope, 2 spans with 1 attr, event + attr and
+        // link + attr each.
+        let mut trace = traces("svc", 2);
+        let scope = &mut trace.resource_spans[0].scope_spans[0];
+        for span in &mut scope.spans {
+            span.attributes = vec![attr()];
+            span.events = vec![Event {
+                attributes: vec![attr()],
+                ..Default::default()
+            }];
+            span.links = vec![Link {
+                attributes: vec![attr()],
+                ..Default::default()
+            }];
+        }
+        assert_eq!(
+            crate::ingest_limits::count_proto_entities(&trace.encode_to_vec(), TRACE_ENTITIES),
+            Some(15)
+        );
+        let mut log = logs("svc", 3);
+        log.resource_logs[0].scope_logs[0].log_records[0].attributes = vec![attr(), attr()];
+        assert_eq!(
+            crate::ingest_limits::count_proto_entities(&log.encode_to_vec(), LOG_ENTITIES),
+            Some(8)
+        );
+        let metrics = |points: usize| ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint::default(); points],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            crate::ingest_limits::count_proto_entities(
+                &metrics(5).encode_to_vec(),
+                METRIC_ENTITIES
+            ),
+            Some(8)
+        );
+
+        // Over the 100-entity test limit: rejected before prost runs.
+        for (body, entities) in [
+            (logs("svc", 100).encode_to_vec(), LOG_ENTITIES),
+            (traces("svc", 100).encode_to_vec(), TRACE_ENTITIES),
+            (metrics(100).encode_to_vec(), METRIC_ENTITIES),
+        ] {
+            let error = decode_proto_sync::<ExportLogsServiceRequest>(&limits, "", &body, entities)
+                .unwrap_err();
+            assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        }
     }
 
     #[test]

@@ -13,7 +13,9 @@ use super::dd_common::{decode_body, validate_api_key};
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
-use crate::ingest_limits::{IngestError, IngestLimits};
+use crate::ingest_limits::{
+    IngestError, IngestLimits, ProtoField, count_proto_entities, counted, nested,
+};
 use crate::models::ingest::TraceInsertRow;
 use crate::models::trace::WideEvent;
 
@@ -384,6 +386,10 @@ enum AgentTraces {
     Undecodable(String),
 }
 
+/// Spans in an AgentPayload: tracer_payloads -> chunks (5) or traces (6) -> spans.
+const AGENT_CHUNK: &[ProtoField] = &[counted(3, &[])];
+const AGENT_SPANS: &[ProtoField] = &[nested(5, &[nested(5, AGENT_CHUNK), nested(6, AGENT_CHUNK)])];
+
 /// Decode an agent trace payload (protobuf AgentPayload first, msgpack as
 /// fallback) and build its rows. Runs on the blocking pool.
 fn decode_agent_payload(
@@ -391,8 +397,16 @@ fn decode_agent_payload(
     tenant_arc: &std::sync::Arc<str>,
     raw: &[u8],
 ) -> Result<AgentTraces, IngestError> {
-    // Try protobuf AgentPayload first
-    match AgentPayload::decode(raw) {
+    // Try protobuf AgentPayload first, counting its spans before decoding.
+    // Bytes that do not parse as protobuf fall through to msgpack.
+    let decoded = match count_proto_entities(raw, AGENT_SPANS) {
+        Some(spans) => {
+            limits.check_entities("datadog", spans)?;
+            AgentPayload::decode(raw).map_err(|e| e.to_string())
+        }
+        None => Err("malformed protobuf".to_string()),
+    };
+    match decoded {
         Err(e) => {
             tracing::debug!(error = %e, endpoint = "v0.2", "protobuf decode failed, trying msgpack");
         }
@@ -482,8 +496,6 @@ fn decode_agent_payload(
                 }
             }
 
-            limits.check_entities("datadog", span_count)?;
-
             let rows: Vec<TraceInsertRow> = all_spans
                 .iter()
                 .map(|span| {
@@ -549,6 +561,28 @@ mod tests {
         crate::ingest_limits::IngestLimits::for_test(std::sync::Arc::new(
             crate::self_metrics::SelfMetrics::new(),
         ))
+    }
+
+    #[test]
+    fn agent_spans_in_chunks_and_traces_are_counted_before_decoding() {
+        let limits = limits();
+        let tenant: std::sync::Arc<str> = "t".into();
+        // Empty spans: 2 bytes each on the wire. 60 + 41 is over the limit of 100.
+        let chunk = |spans: usize| [0x1a, 0x00].repeat(spans);
+        let len = |field: u8, body: &[u8]| {
+            let mut out = vec![field << 3 | 2];
+            prost::encoding::encode_varint(body.len() as u64, &mut out);
+            out.extend_from_slice(body);
+            out
+        };
+        let mut tracer = len(5, &chunk(60));
+        tracer.extend(len(6, &chunk(41)));
+        let body = len(5, &tracer);
+        let error = match decode_agent_payload(&limits, &tenant, &body) {
+            Err(error) => error,
+            Ok(_) => panic!("expected the entity limit"),
+        };
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

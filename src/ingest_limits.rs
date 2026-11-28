@@ -190,6 +190,21 @@ impl IngestLimits {
         self.check_decompressed(source, *total)
     }
 
+    /// Run the entity limit on a protobuf body before prost decodes it. An
+    /// empty record is 2 bytes on the wire but a full struct in memory, so
+    /// checking after the decode let a small body allocate gigabytes first.
+    pub fn check_proto_entities(
+        &self,
+        source: &'static str,
+        malformed: &'static str,
+        body: &[u8],
+        schema: &[ProtoField],
+    ) -> Result<(), IngestError> {
+        let count =
+            count_proto_entities(body, schema).ok_or_else(|| self.malformed(source, malformed))?;
+        self.check_entities(source, count)
+    }
+
     /// Run CPU-heavy ingest work (decompress, parse, build rows) on the
     /// blocking pool while holding a decode permit, so it never stalls a tokio
     /// worker and stays within the process-wide decode budget.
@@ -248,6 +263,62 @@ impl IngestLimits {
         self.record_rejection(source, reason);
         (status, message.to_string())
     }
+}
+
+/// A message field followed when counting protobuf entities.
+pub struct ProtoField {
+    pub number: u32,
+    /// Whether each occurrence counts toward the entity limit.
+    pub counted: bool,
+    pub children: &'static [ProtoField],
+}
+
+/// A message field whose every occurrence is one entity.
+pub const fn counted(number: u32, children: &'static [ProtoField]) -> ProtoField {
+    ProtoField {
+        number,
+        counted: true,
+        children,
+    }
+}
+
+/// A message field that is only walked into.
+pub const fn nested(number: u32, children: &'static [ProtoField]) -> ProtoField {
+    ProtoField {
+        number,
+        counted: false,
+        children,
+    }
+}
+
+/// Count occurrences of the `counted` fields reachable through `schema`,
+/// reading only tags and lengths (no allocation). `None` when the bytes are
+/// not well-formed protobuf; groups are rejected (no OTLP, Prometheus or
+/// Datadog message uses them).
+pub fn count_proto_entities(mut buf: &[u8], schema: &[ProtoField]) -> Option<usize> {
+    let mut count = 0usize;
+    while !buf.is_empty() {
+        let key = prost::encoding::decode_varint(&mut buf).ok()?;
+        match key & 7 {
+            0 => {
+                prost::encoding::decode_varint(&mut buf).ok()?;
+            }
+            1 => buf = buf.get(8..)?,
+            5 => buf = buf.get(4..)?,
+            2 => {
+                let len = usize::try_from(prost::encoding::decode_varint(&mut buf).ok()?).ok()?;
+                let field = buf.get(..len)?;
+                buf = &buf[len..];
+                if let Some(f) = schema.iter().find(|f| u64::from(f.number) == key >> 3) {
+                    count = count
+                        .checked_add(usize::from(f.counted))?
+                        .checked_add(count_proto_entities(field, f.children)?)?;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(count)
 }
 
 /// Bytes of an attribute list's keys and values.
@@ -309,6 +380,19 @@ mod tests {
         assert!(rendered.contains("reason=\"compressed_bytes\""));
         assert!(rendered.contains("reason=\"decompressed_bytes\""));
         assert!(rendered.contains("reason=\"entity_count\""));
+    }
+
+    #[test]
+    fn proto_entities_are_counted_without_decoding() {
+        // {1: {2: x, 2: y, 3: "s"}, 1: {}, 9: 7} counting field 1 and its field 2.
+        const SCHEMA: &[ProtoField] = &[counted(1, &[counted(2, &[])])];
+        let body = [
+            0x0a, 0x07, 0x12, 0x00, 0x12, 0x00, 0x1a, 0x01, b's', 0x0a, 0x00, 0x48, 0x07,
+        ];
+        assert_eq!(count_proto_entities(&body, SCHEMA), Some(4));
+        assert_eq!(count_proto_entities(&body, &[nested(1, &[])]), Some(0));
+        assert_eq!(count_proto_entities(&body[..3], SCHEMA), None);
+        assert_eq!(count_proto_entities(&[0x0b], SCHEMA), None);
     }
 
     #[tokio::test]
