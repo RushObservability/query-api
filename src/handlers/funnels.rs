@@ -142,7 +142,7 @@ pub async fn create_funnel(
     headers: HeaderMap,
     Json(req): Json<CreateFunnelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name required".to_string()));
     }
@@ -172,6 +172,20 @@ pub async fn create_funnel(
         .create_funnel(&id, &req.name, &steps_json, &tenant.tenant_id)
         .await
         .map_err(|e| crate::api_error::internal_legacy("funnels", e))?;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("funnel.create", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("funnel", id.clone())
+                .outcome("success")
+                .changes(
+                    serde_json::json!({ "name": req.name, "steps": req.steps.len() }).to_string(),
+                )
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": id, "ok": true })),
@@ -184,7 +198,7 @@ pub async fn delete_funnel(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_write(&state, &headers).await?;
+    let caller = require_write(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_funnel(&id, &tenant.tenant_id)
@@ -193,6 +207,17 @@ pub async fn delete_funnel(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "funnel not found".to_string()));
     }
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("funnel.delete", "user")
+                .actor(caller.0.clone(), caller.1.clone())
+                .tenant(tenant.tenant_id.clone())
+                .resource("funnel", id.clone())
+                .outcome("success")
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -305,6 +330,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn funnel_create_and_delete_write_audit_events() {
+        let source = include_str!("funnels.rs");
+        let handler = |name: &str| {
+            source
+                .split(&format!("pub async fn {name}("))
+                .nth(1)
+                .unwrap()
+                .split("pub async fn ")
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let create = handler("create_funnel");
+        assert!(create.contains("AuditEvent::new(\"funnel.create\", \"user\")"));
+        let delete = handler("delete_funnel");
+        assert!(delete.contains("AuditEvent::new(\"funnel.delete\", \"user\")"));
+        // Only a delete that removed a funnel is audited as a success.
+        assert!(delete.find("funnel not found").unwrap() < delete.find("funnel.delete").unwrap());
     }
 
     #[test]
