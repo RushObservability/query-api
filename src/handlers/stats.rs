@@ -213,27 +213,38 @@ fn stats_window(time_range: Option<&TimeRange>) -> (String, String) {
     }
 }
 
+/// Cache key for one stats response. Admins also get platform-wide storage, so
+/// their responses must never be served to other callers in the same tenant.
+fn stats_cache_key(tenant_id: &str, time_range: Option<&TimeRange>, is_admin: bool) -> String {
+    let range = match time_range {
+        Some(tr) => format!("{}|{}", bucket_ts_15s(&tr.from), bucket_ts_15s(&tr.to)),
+        None => "default".to_string(),
+    };
+    format!(
+        "{tenant_id}|{range}|{}",
+        if is_admin { "admin" } else { "member" }
+    )
+}
+
 pub async fn get_stats(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<StatsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tenant_id = &tenant.tenant_id;
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    // Storage comes from system.parts across every tenant; only admins see it.
+    let is_admin = crate::handlers::users::require_admin(&state, &headers)
+        .await
+        .is_ok();
 
     // 15s response cache. The default (no explicit range) path uses a stable key so
     // consecutive dashboard refreshes hit the cache even though from/to are
     // recomputed from `now()` on every call. Explicit ranges are bucketed to 15s
     // granularity in the key so rolling UI ranges (recomputed each refresh) can
     // still hit within the TTL.
-    let cache_key = match &req.time_range {
-        Some(tr) => format!(
-            "{tenant_id}|{}|{}",
-            bucket_ts_15s(&tr.from),
-            bucket_ts_15s(&tr.to)
-        ),
-        None => format!("{tenant_id}|default"),
-    };
+    let cache_key = stats_cache_key(tenant_id, req.time_range.as_ref(), is_admin);
     if let Some(entry) = STATS_CACHE.get(&cache_key) {
         if entry.1.elapsed() < STATS_CACHE_TTL {
             return Ok(Json(entry.0.clone()));
@@ -354,10 +365,14 @@ pub async fn get_stats(
     )
     .fetch_one::<CountResult>();
 
-    let storage_fut = state
-        .admin_ch
-        .query(
-            "SELECT \
+    let storage_fut = async {
+        if !is_admin {
+            return Ok(Vec::new());
+        }
+        state
+            .admin_ch
+            .query(
+                "SELECT \
              p.table as table_name, \
              sum(p.rows) as total_rows, \
              sum(p.bytes_on_disk) as bytes_on_disk, \
@@ -370,8 +385,10 @@ pub async fn get_stats(
          WHERE p.database = 'observability' AND p.active \
          GROUP BY table_name \
          ORDER BY bytes_on_disk DESC",
-        )
-        .fetch_all::<TableStorage>();
+            )
+            .fetch_all::<TableStorage>()
+            .await
+    };
 
     let usage_sql = format!(
         "SELECT signal, sum(events_count) AS events, sum(bytes_count) AS bytes \
@@ -799,6 +816,22 @@ mod tests {
         // 30s offset: not divisible by the 1h interval the coarse selector picks → raw.
         assert!(sql.contains("FROM metrics_sum "), "{sql}");
         assert!(!sql.contains("countMerge"), "{sql}");
+    }
+
+    #[test]
+    fn stats_cache_key_separates_admin_responses() {
+        let tr = TimeRange {
+            from: "2026-06-10T12:00:00Z".to_string(),
+            to: "2026-06-10T13:00:00Z".to_string(),
+        };
+        assert_ne!(
+            stats_cache_key("acme", Some(&tr), true),
+            stats_cache_key("acme", Some(&tr), false)
+        );
+        assert_ne!(
+            stats_cache_key("acme", None, true),
+            stats_cache_key("acme", None, false)
+        );
     }
 
     #[test]
