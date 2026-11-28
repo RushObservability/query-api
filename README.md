@@ -127,7 +127,7 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `CLICKHOUSE_URL` | `http://localhost:8123` | database endpoint |
 | `CLICKHOUSE_DATABASE` | `observability` | created on first run |
 | `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `default` / empty | migration, configuration, and write identity |
-| `CLICKHOUSE_READ_USER` / `CLICKHOUSE_READ_PASSWORD` | _(required)_ | distinct SELECT-only identity protected by tenant row policies |
+| `CLICKHOUSE_READ_USER` / `CLICKHOUSE_READ_PASSWORD` | _(required)_ | distinct identity protected by tenant row policies; grant it SELECT on the telemetry tables only, startup fails if it can read `audit_events` |
 | `RUSH_ALLOW_INSECURE_TENANT_READS` | `false` | explicit single-tenant development override; never enable in production |
 | `RUSH_ENVIRONMENT` | `production` | use `development`, `local`, or `test` only for deliberate non-production compatibility |
 | `RUSH_BASE_URL` | _(required in production)_ | canonical HTTPS public origin used for OIDC/SAML callbacks and production CSRF target-origin validation; paths, credentials, queries, and fragments are rejected |

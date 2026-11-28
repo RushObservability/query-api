@@ -160,6 +160,43 @@ pub async fn probe_row_policy_support(ch: &Client) -> anyhow::Result<()> {
     })
 }
 
+/// Verify the tenant read principal cannot read tables outside row-policy
+/// scope, so a read-path SQL bug cannot reach config or audit data.
+/// `audit_events` has no row policy and must stay unreadable by this user.
+pub async fn verify_read_grants(read: &Client) -> anyhow::Result<()> {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Probe {
+        n: u64,
+    }
+    let result = read
+        .query("SELECT count() AS n FROM observability.audit_events WHERE 0")
+        .fetch_one::<Probe>()
+        .await
+        .map(|_| ());
+    read_grants_verdict(result)
+}
+
+fn read_grants_verdict(result: Result<(), clickhouse::error::Error>) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => anyhow::bail!(
+            "CLICKHOUSE_READ_USER can read observability.audit_events; \
+             grant it SELECT on the telemetry tables only"
+        ),
+        // 497 is ACCESS_DENIED; the bare code is what the client keeps for an empty body.
+        Err(clickhouse::error::Error::BadResponse(reason))
+            if reason.contains("ACCESS_DENIED")
+                || reason.contains("Code: 497")
+                || reason == "497" =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "could not verify ClickHouse read-user grants: {error}"
+        )),
+    }
+}
+
 /// Mark row-policy enforcement verified after both policy inspection and a
 /// tenant-scoped read-principal probe succeed.
 pub fn mark_row_policy_enforced() {
@@ -308,4 +345,21 @@ pub struct AppState {
     pub collectors: Arc<integrations::CollectorManager>,
     /// Coordinates readiness, HTTP admission, and durable ingest draining.
     pub shutdown: shutdown::ShutdownController,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clickhouse::error::Error;
+
+    #[test]
+    fn read_grants_verdict_requires_access_denied() {
+        assert!(read_grants_verdict(Ok(())).is_err());
+        let denied = "Code: 497. DB::Exception: rushquery: Not enough privileges. (ACCESS_DENIED)";
+        assert!(read_grants_verdict(Err(Error::BadResponse(denied.into()))).is_ok());
+        assert!(read_grants_verdict(Err(Error::BadResponse("497".into()))).is_ok());
+        let missing = "Code: 60. DB::Exception: Unknown table (UNKNOWN_TABLE)";
+        assert!(read_grants_verdict(Err(Error::BadResponse(missing.into()))).is_err());
+        assert!(read_grants_verdict(Err(Error::TimedOut)).is_err());
+    }
 }
