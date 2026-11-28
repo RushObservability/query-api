@@ -411,14 +411,23 @@ impl NotifyPolicy {
 /// cycle); fails when any of those batches had a failed job.
 async fn run_evaluation_cycle(
     engine: &Arc<Engine>,
-    workers: &mut TenantWorkers<(u64, usize)>,
+    workers: &mut TenantWorkers<anyhow::Result<(u64, usize)>>,
     lease: &Arc<crate::leader::EngineLease>,
 ) -> anyhow::Result<(u64, u64)> {
     let mut state_changes: u64 = 0;
     let mut failures = 0;
-    for (changes, failed) in workers.finished().await {
-        state_changes += changes;
-        failures += failed;
+    for batch in workers.finished().await {
+        match batch {
+            Ok((changes, failed)) => {
+                state_changes += changes;
+                failures += failed;
+            }
+            // Cancelled because the lease lapsed.
+            Err(error) => {
+                tracing::warn!(engine = "monitors", %error, "monitor batch stopped");
+                failures += 1;
+            }
+        }
     }
 
     let now = time::OffsetDateTime::now_utc();
@@ -490,7 +499,8 @@ async fn run_evaluation_cycle(
 }
 
 /// Evaluate one tenant's due monitors, `per_tenant` at a time. Returns
-/// (state_changes, failed_jobs).
+/// (state_changes, failed_jobs); `Result` so a lease-fenced batch can report
+/// being cancelled.
 async fn evaluate_tenant(
     engine: Arc<Engine>,
     jobs: Vec<(Monitor, bool)>,
@@ -498,40 +508,40 @@ async fn evaluate_tenant(
     now_str: Arc<str>,
     policy: Arc<NotifyPolicy>,
     monitor_states: Arc<HashMap<String, (String, String)>>,
-) -> (u64, usize) {
+) -> anyhow::Result<(u64, usize)> {
     use futures_util::StreamExt;
     let engine = &engine;
     let (now_str, policy, monitor_states) = (&*now_str, &*policy, &*monitor_states);
-    futures_util::stream::iter(
-        jobs.into_iter()
-            .map(move |(monitor, should_flush)| async move {
-                let (changes, persisted, failed) = evaluate_job(
-                    &engine.ch,
-                    &engine.config_db,
-                    &monitor,
-                    now_str,
-                    &engine.http_client,
-                    &engine.smtp_config,
-                    &engine.smtp_transport,
-                    monitor_states,
-                    should_flush,
-                    policy,
-                    &engine.no_data,
-                )
-                .await;
-                engine
-                    .eval_state
-                    .lock()
-                    .unwrap()
-                    .record(monitor.id, now, persisted);
-                (changes, usize::from(failed))
-            }),
-    )
+    let totals = futures_util::stream::iter(jobs.into_iter().map(
+        move |(monitor, should_flush)| async move {
+            let (changes, persisted, failed) = evaluate_job(
+                &engine.ch,
+                &engine.config_db,
+                &monitor,
+                now_str,
+                &engine.http_client,
+                &engine.smtp_config,
+                &engine.smtp_transport,
+                monitor_states,
+                should_flush,
+                policy,
+                &engine.no_data,
+            )
+            .await;
+            engine
+                .eval_state
+                .lock()
+                .unwrap()
+                .record(monitor.id, now, persisted);
+            (changes, usize::from(failed))
+        },
+    ))
     .buffer_unordered(engine.per_tenant)
     .fold((0, 0), |(changes, failures), (c, f)| async move {
         (changes + c, failures + f)
     })
-    .await
+    .await;
+    Ok(totals)
 }
 
 /// Whether a monitor is due: both the coarse DB `last_eval_at` and the exact
