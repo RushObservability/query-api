@@ -438,6 +438,53 @@ pub fn compute_hash(secret: &[u8], row: &AuditRow) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Action of the row a writer adds at startup to record the tails of the other
+/// chains. Verification then reports rows deleted from the end of those chains,
+/// or a whole chain deleted, even though no later row of theirs links to them.
+pub const CHAIN_START_ACTION: &str = "audit.chain_start";
+
+/// The newest row of one chain, as recorded in a [`CHAIN_START_ACTION`] row.
+#[derive(Debug, Clone, PartialEq, clickhouse::Row, serde::Serialize, serde::Deserialize)]
+pub struct ChainTail {
+    pub chain_id: String,
+    pub seq: u64,
+    pub hash: String,
+    /// Nanosecond unix timestamp of that row.
+    pub timestamp: i64,
+}
+
+/// Tails recorded by one [`CHAIN_START_ACTION`] row's `changes`.
+pub fn chain_start_tails(changes: &str) -> Vec<ChainTail> {
+    #[derive(serde::Deserialize)]
+    struct Changes {
+        previous_chains: Vec<ChainTail>,
+    }
+    serde_json::from_str::<Changes>(changes)
+        .map(|changes| changes.previous_chains)
+        .unwrap_or_default()
+}
+
+/// Keep only tails that grew past what earlier chain-start rows recorded, so
+/// each start row lists the chains that changed since, not every chain ever.
+fn unanchored_tails(tails: Vec<ChainTail>, chain_starts: &[String]) -> Vec<ChainTail> {
+    let mut anchored = HashMap::<String, u64>::new();
+    for tail in chain_starts
+        .iter()
+        .flat_map(|changes| chain_start_tails(changes))
+    {
+        let seq = anchored.entry(tail.chain_id).or_default();
+        *seq = (*seq).max(tail.seq);
+    }
+    tails
+        .into_iter()
+        .filter(|tail| {
+            anchored
+                .get(&tail.chain_id)
+                .is_none_or(|seq| tail.seq > *seq)
+        })
+        .collect()
+}
+
 fn is_production_environment(value: Option<&str>) -> bool {
     !matches!(
         value
@@ -814,10 +861,54 @@ impl AuditLogger {
                 )
                 .await;
         }
+        if let Err(error) = logger.anchor_previous_chains().await {
+            // The next writer start records these tails instead.
+            tracing::error!(%error, "audit chain tails were not recorded at startup");
+        }
         if let Err(error) = logger.retry_pending().await {
             tracing::error!(%error, "audit outbox replay deferred; readiness is degraded");
         }
         Ok(logger)
+    }
+
+    /// Record the tail of every other chain that grew since it was last recorded.
+    async fn anchor_previous_chains(&self) -> anyhow::Result<()> {
+        let tails = self
+            .ch
+            .query(
+                "SELECT chain_id, s AS seq, h AS hash, t AS timestamp FROM (\
+                 SELECT chain_id, max(seq) AS s, argMax(hash, seq) AS h, \
+                 argMax(toUnixTimestamp64Nano(timestamp), seq) AS t \
+                 FROM audit_events WHERE chain_id != ? GROUP BY chain_id) ORDER BY chain_id",
+            )
+            .bind(&self.chain_id)
+            .fetch_all::<ChainTail>()
+            .await?;
+        let chain_starts = self
+            .ch
+            .query("SELECT changes FROM audit_events WHERE action = ?")
+            .bind(CHAIN_START_ACTION)
+            .fetch_all::<String>()
+            .await?;
+        let previous = unanchored_tails(tails, &chain_starts);
+        if !previous.is_empty() {
+            self.log(
+                AuditEvent::new(CHAIN_START_ACTION, "system")
+                    .resource("table", "audit_events")
+                    .changes(serde_json::json!({ "previous_chains": previous }).to_string()),
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    /// This writer's chain and a seq that ClickHouse must already hold. Rows
+    /// persisted up to `last_seq` and not yet delivered are still counted in
+    /// the outbox, so read `last_seq` first and subtract the pending count.
+    pub async fn delivered_floor(&self) -> (String, u64) {
+        let last_seq = self.state.lock().await.last_seq;
+        let pending = self.pending_events.load(Ordering::Relaxed);
+        (self.chain_id.clone(), last_seq.saturating_sub(pending))
     }
 
     async fn load_chain_tail(ch: &Client, chain_id: &str) -> anyhow::Result<ChainState> {
@@ -2122,7 +2213,8 @@ mod tests {
             restarted.retry_pending().await?;
             let rows = ch.query("SELECT id, seq, chain_id, ts AS timestamp, tenant_id, actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id, seq")
                 .fetch_all::<AuditRow>().await?;
-            assert_eq!(rows.len(), 21);
+            // 21 event rows plus one chain-start row from each writer opened here.
+            assert_eq!(rows.len(), 26);
             assert_eq!(rows.iter().filter(|row| row.action == "schema.migrate").count(), 1);
             assert_eq!(crate::handlers::audit::verify_rows(&rows, |_| Some(TEST_SECRET))["intact"], true);
             // Match the list endpoint's cross-chain chronological order SQL.
@@ -2291,6 +2383,25 @@ mod tests {
         // A closed window starts over with a full row.
         logger.log(denied_from("10.0.0.1")).await;
         assert_eq!(spooled_rows(&dir.0).len(), 6);
+    }
+
+    #[test]
+    fn chain_start_rows_record_only_chains_that_grew() {
+        let tail = |chain: &str, seq: u64| ChainTail {
+            chain_id: chain.into(),
+            seq,
+            hash: format!("{chain}{seq}"),
+            timestamp: 1,
+        };
+        let earlier =
+            serde_json::json!({ "previous_chains": [tail("a", 4), tail("b", 2)] }).to_string();
+        let left = unanchored_tails(
+            vec![tail("a", 4), tail("b", 3), tail("c", 1)],
+            &[earlier, "not json".into()],
+        );
+        assert_eq!(left, [tail("b", 3), tail("c", 1)]);
+        let row = serde_json::json!({ "previous_chains": left }).to_string();
+        assert_eq!(chain_start_tails(&row), [tail("b", 3), tail("c", 1)]);
     }
 
     #[tokio::test]

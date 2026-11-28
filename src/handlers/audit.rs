@@ -18,7 +18,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::audit::{AuditRow, compute_hash};
+use crate::audit::{AuditRow, CHAIN_START_ACTION, chain_start_tails, compute_hash};
 use crate::handlers::users::require_admin;
 use crate::query_builder::escape_string_literal;
 
@@ -165,15 +165,19 @@ pub async fn verify_audit(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    let result = verify_table(&state.admin_ch, |key_id| state.audit.secret_for_key(key_id))
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "audit verify query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
-            )
-        })?;
+    // Read before the query: every row up to this seq is already stored.
+    let live = state.audit.delivered_floor().await;
+    let result = verify_table(&state.admin_ch, live, |key_id| {
+        state.audit.secret_for_key(key_id)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "audit verify query failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    })?;
     Ok(Json(result))
 }
 
@@ -181,6 +185,7 @@ pub async fn verify_audit(
 /// number of chains, not the size of the audit table.
 pub(crate) async fn verify_table<'a>(
     ch: &clickhouse::Client,
+    live: (String, u64),
     secret_for_key: impl Fn(&str) -> Option<&'a [u8]>,
 ) -> clickhouse::error::Result<serde_json::Value> {
     let sql = "SELECT id, seq, chain_id, ts AS timestamp, tenant_id, \
@@ -189,6 +194,8 @@ pub(crate) async fn verify_table<'a>(
          FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id ASC, seq ASC";
     let mut cursor = ch.query(sql).fetch::<AuditRow>()?;
     let mut verifier = ChainVerifier::new(ttl_horizon_nanos());
+    // This writer's own chain has no later start row; its live tail anchors it.
+    verifier.anchor(live.0, live.1, i64::MAX);
     while let Some(row) = cursor.next().await? {
         verifier.push(&row, &secret_for_key);
     }
@@ -212,6 +219,7 @@ fn ttl_horizon_nanos() -> i64 {
 
 /// Verifies rows one at a time, keeping only each chain's tail. Every chain is
 /// checked to the end; a broken chain is reported once and then skipped.
+/// Tails recorded by chain-start rows must still be present at the end.
 pub(crate) struct ChainVerifier {
     checked: u64,
     /// `None` once the chain is broken.
@@ -219,6 +227,8 @@ pub(crate) struct ChainVerifier {
     broken: Vec<(String, u64)>,
     ttl_horizon: i64,
     expired_heads: u64,
+    /// Highest recorded seq per chain and that row's timestamp.
+    anchors: std::collections::BTreeMap<String, (u64, i64)>,
 }
 
 impl ChainVerifier {
@@ -229,6 +239,15 @@ impl ChainVerifier {
             broken: Vec::new(),
             ttl_horizon,
             expired_heads: 0,
+            anchors: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Require `chain_id` to reach at least `seq`, unless that row has expired.
+    pub(crate) fn anchor(&mut self, chain_id: String, seq: u64, timestamp: i64) {
+        let anchor = self.anchors.entry(chain_id).or_insert((0, i64::MIN));
+        if seq > anchor.0 {
+            *anchor = (seq, timestamp);
         }
     }
 
@@ -257,6 +276,12 @@ impl ChainVerifier {
             self.tails.insert(row.chain_id.clone(), None);
             return;
         }
+        // Only signed writer rows can anchor another chain.
+        if row.action == CHAIN_START_ACTION && row.actor_type == "system" {
+            for tail in chain_start_tails(&row.changes) {
+                self.anchor(tail.chain_id, tail.seq, tail.timestamp);
+            }
+        }
         match self.tails.get_mut(&row.chain_id) {
             Some(Some(tail)) => {
                 tail.0 = row.seq;
@@ -270,14 +295,24 @@ impl ChainVerifier {
     }
 
     pub(crate) fn result(&self) -> serde_json::Value {
-        let first = self.broken.first();
+        // Rows deleted from the end of a chain, or the whole chain, leave it
+        // short of a recorded tail. Report the first missing seq.
+        let missing = self.anchors.iter().filter_map(|(chain, (seq, timestamp))| {
+            let tail = match self.tails.get(chain) {
+                Some(None) => return None,
+                Some(Some((tail, _))) => *tail,
+                None => 0,
+            };
+            (tail < *seq && *timestamp >= self.ttl_horizon).then(|| (chain.clone(), tail + 1))
+        });
+        let broken: Vec<(String, u64)> = self.broken.iter().cloned().chain(missing).collect();
+        let first = broken.first();
         serde_json::json!({
-            "intact": self.broken.is_empty(),
+            "intact": broken.is_empty(),
             "checked": self.checked,
             "first_broken_seq": first.map(|(_, seq)| seq),
             "first_broken_chain_id": first.map(|(chain, _)| chain),
-            "broken_chains": self
-                .broken
+            "broken_chains": broken
                 .iter()
                 .map(|(chain, seq)| serde_json::json!({ "chain_id": chain, "seq": seq }))
                 .collect::<Vec<_>>(),
@@ -406,7 +441,9 @@ mod tests {
         let ch = clickhouse::Client::default()
             .with_url(mock.url())
             .with_validation(false);
-        let result = verify_table(&ch, |_| Some(SECRET)).await.unwrap();
+        let result = verify_table(&ch, (String::new(), 0), |_| Some(SECRET))
+            .await
+            .unwrap();
         assert_eq!(result["intact"], false);
         // Every row is read, including those after the break.
         assert_eq!(result["checked"], 5);
@@ -455,6 +492,104 @@ mod tests {
         let mut rows = chain("a-expired", 5);
         rows.drain(0..2);
         assert_eq!(verify_rows(&rows, |_| Some(SECRET))["intact"], true);
+    }
+
+    fn relink(rows: &mut [AuditRow]) {
+        for i in 0..rows.len() {
+            rows[i].prev_hash = if i == 0 {
+                String::new()
+            } else {
+                rows[i - 1].hash.clone()
+            };
+            rows[i].hash = compute_hash(SECRET, &rows[i]);
+        }
+    }
+
+    /// Chain `b` starts by recording the current tail of every chain in `of`.
+    fn started_after(of: &[AuditRow]) -> Vec<AuditRow> {
+        let mut tails = std::collections::BTreeMap::new();
+        for row in of {
+            tails.insert(
+                row.chain_id.clone(),
+                crate::audit::ChainTail {
+                    chain_id: row.chain_id.clone(),
+                    seq: row.seq,
+                    hash: row.hash.clone(),
+                    timestamp: row.timestamp,
+                },
+            );
+        }
+        let mut rows = chain("b-next", 2);
+        rows[0].action = CHAIN_START_ACTION.into();
+        rows[0].actor_type = "system".into();
+        rows[0].changes =
+            serde_json::json!({ "previous_chains": tails.into_values().collect::<Vec<_>>() })
+                .to_string();
+        relink(&mut rows);
+        rows
+    }
+
+    fn recent(mut rows: Vec<AuditRow>) -> Vec<AuditRow> {
+        let now = time::OffsetDateTime::now_utc().unix_nanos().unwrap();
+        for row in &mut rows {
+            row.timestamp = now - 1_000_000;
+        }
+        relink(&mut rows);
+        rows
+    }
+
+    #[test]
+    fn recorded_tails_catch_deleted_newest_rows_and_deleted_chains() {
+        let a = recent(chain("a-prev", 5));
+        let c = recent(chain("c-prev", 2));
+        let b = started_after(&[a.clone(), c.clone()].concat());
+        let all = [a.clone(), b.clone(), c.clone()].concat();
+        assert_eq!(verify_rows(&all, |_| Some(SECRET))["intact"], true);
+
+        // The newest rows of a chain were deleted.
+        let truncated = [a[..3].to_vec(), b.clone(), c.clone()].concat();
+        let result = verify_rows(&truncated, |_| Some(SECRET));
+        assert_eq!(result["intact"], false);
+        assert_eq!(
+            result["broken_chains"],
+            serde_json::json!([{ "chain_id": "a-prev", "seq": 4 }])
+        );
+
+        // A whole chain was deleted.
+        let result = verify_rows(&[a.clone(), b.clone()].concat(), |_| Some(SECRET));
+        assert_eq!(
+            result["broken_chains"],
+            serde_json::json!([{ "chain_id": "c-prev", "seq": 1 }])
+        );
+
+        // A recorded chain that aged out under the TTL is not tampering.
+        let old = chain("a-prev", 5);
+        assert_eq!(
+            verify_rows(&started_after(&old), |_| Some(SECRET))["intact"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn live_writer_tail_catches_its_own_deleted_newest_rows() {
+        let rows = chain("live", 3);
+        let mock = clickhouse::test::Mock::new();
+        mock.add(clickhouse::test::handlers::provide(rows.clone()));
+        mock.add(clickhouse::test::handlers::provide(rows));
+        let ch = clickhouse::Client::default()
+            .with_url(mock.url())
+            .with_validation(false);
+        let result = verify_table(&ch, ("live".into(), 3), |_| Some(SECRET))
+            .await
+            .unwrap();
+        assert_eq!(result["intact"], true);
+        let result = verify_table(&ch, ("live".into(), 5), |_| Some(SECRET))
+            .await
+            .unwrap();
+        assert_eq!(
+            result["broken_chains"],
+            serde_json::json!([{ "chain_id": "live", "seq": 4 }])
+        );
     }
 
     #[tokio::test]
