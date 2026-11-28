@@ -262,6 +262,7 @@ fn sum_latest(series: &[crate::promql::types::TimeSeries]) -> f64 {
 ///        rush_slo_total_count, rush_slo_compliant
 async fn write_slo_metrics(
     ch: &Client,
+    tenant_id: &str,
     slo_id: &str,
     slo_name: &str,
     current_pct: f64,
@@ -276,6 +277,7 @@ async fn write_slo_metrics(
     }
     let escaped_name = crate::query_builder::escape_string_literal(&slo_name);
     let attrs = format!("{{'slo.id': '{slo_id}', 'slo.name': '{escaped_name}'}}");
+    let tenant = crate::query_builder::escape_string_literal(tenant_id);
     let metrics = [
         ("rush_slo_current", current_pct),
         (
@@ -290,14 +292,14 @@ async fn write_slo_metrics(
         .iter()
         .map(|(name, val)| {
             format!(
-                "({{}}, '', '', '', {{}}, 0, '', 'wide-slo-engine', '{name}', '', '', {attrs}, \
+                "('{tenant}', {{}}, '', '', '', {{}}, 0, '', 'wide-slo-engine', '{name}', '', '', {attrs}, \
              {now_nanos}, {now_nanos}, {val}, 0, [], [], [], [], [])"
             )
         })
         .collect();
     let sql = format!(
         "INSERT INTO metrics_gauge \
-         (ResourceAttributes, ResourceSchemaUrl, ScopeName, ScopeVersion, ScopeAttributes, \
+         (tenant_id, ResourceAttributes, ResourceSchemaUrl, ScopeName, ScopeVersion, ScopeAttributes, \
           ScopeDroppedAttrCount, ScopeSchemaUrl, ServiceName, MetricName, MetricDescription, \
           MetricUnit, Attributes, StartTimeUnix, TimeUnix, Value, Flags, \
           Exemplars.FilteredAttributes, Exemplars.TimeUnix, Exemplars.Value, \
@@ -859,6 +861,7 @@ async fn eval_one_slo(
     let now_nanos = now.unix_nanos().unwrap_or(0);
     write_slo_metrics(
         write_ch,
+        &slo.tenant_id,
         &slo.id,
         &slo.name,
         current_pct,
@@ -894,6 +897,24 @@ mod tests {
         let interval = effective_eval_interval_secs("rolling_30d", 60);
         assert!(!state.is_due("slo", t0 + time::Duration::minutes(1), interval));
         assert!(state.is_due("slo", t0 + time::Duration::minutes(15), interval));
+    }
+
+    #[tokio::test]
+    async fn slo_metrics_are_written_to_the_slo_tenant() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let ch = Client::default()
+            .with_url(mock.url())
+            .with_validation(false);
+        let write = mock.add(handlers::record_ddl());
+        write_slo_metrics(
+            &ch, "acme", "slo-1", "checkout", 99.1, 0.4, 3.0, 1000.0, true, 1,
+        )
+        .await;
+        let sql = write.query().await;
+        // Without tenant_id the column default put every tenant's SLO series in `default`.
+        assert!(sql.contains("(tenant_id, ResourceAttributes,"), "{sql}");
+        assert!(sql.contains("VALUES ('acme', {}"), "{sql}");
     }
 
     #[test]

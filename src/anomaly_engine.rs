@@ -401,7 +401,7 @@ async fn eval_anomaly_rules(
     // Flush all per-series eval logs in one INSERT (previously one per series).
     if !eval_log_values.is_empty() && crate::leader::ensure_leader().is_ok() {
         let sql = format!(
-            "INSERT INTO logs (Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES {}",
+            "INSERT INTO logs (tenant_id, Timestamp, SeverityText, SeverityNumber, ServiceName, Body, LogAttributes) VALUES {}",
             eval_log_values.join(", ")
         );
         if let Err(e) = write_ch.query(&sql).execute().await {
@@ -604,10 +604,11 @@ fn anomaly_log_tuple(
     );
 
     format!(
-        "({ts_nanos}, '{severity_text}', {severity_number}, 'wide-anomaly-engine', '{body}', \
+        "('{tenant}', {ts_nanos}, '{severity_text}', {severity_number}, 'wide-anomaly-engine', '{body}', \
          {{'anomaly.rule_id': '{rule_id}', 'anomaly.rule_name': '{rule_name}', 'anomaly.state': '{state}', \
          'anomaly.metric': '{metric}', 'anomaly.value': '{value:.2}', 'anomaly.expected': '{expected:.2}', \
          'anomaly.deviation': '{deviation:.1}'}})",
+        tenant = crate::query_builder::escape_string_literal(&rule.tenant_id),
         ts_nanos = ts_nanos,
         severity_text = severity_text,
         severity_number = severity_number,
@@ -725,6 +726,21 @@ mod tests {
             assert_eq!(admitted, rules.iter().map(|r| &r.id).collect::<Vec<_>>());
         }
         results.iter().filter(|r| r.is_err()).count()
+    }
+
+    #[test]
+    fn eval_log_rows_belong_to_the_rule_tenant() {
+        // Without tenant_id the column default put every tenant's rows in `default`.
+        let row = anomaly_log_tuple(
+            &time::OffsetDateTime::now_utc(),
+            &test_rule("r", "prometheus"),
+            "anomalous",
+            "up",
+            1.0,
+            2.0,
+            3.0,
+        );
+        assert!(row.starts_with("('acme', "), "{row}");
     }
 
     #[tokio::test]
