@@ -24,19 +24,57 @@ pub async fn get_trace(
         ));
     }
 
-    let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
+    let mut rows = fetch_trace_rows(&state, tenant_id, &trace_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, signal = "traces", handler = "get_trace", "ClickHouse query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
+        })?;
 
-    // Fast path: the spans_by_trace MV is ORDER BY (tenant_id, trace_id, timestamp), so
-    // resolving the trace's time bounds is a primary-key lookup instead of a
-    // whole-retention bloom-filter probe. The wide-column spans fetch is then bounded
-    // to that window (±5 min for clock skew), pruning to a handful of granules.
-    #[derive(clickhouse::Row, serde::Deserialize)]
-    struct TraceTimeBounds {
-        min_ns: i64,
-        max_ns: i64,
-        cnt: u64,
+    if rows.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "trace not found".to_string()));
     }
 
+    let truncated = cap_trace_rows(&mut rows);
+    let mut trace = assemble_trace(&trace_id, rows);
+    trace.truncated = truncated;
+    Ok(Json(trace))
+}
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct TraceTimeBounds {
+    min_ns: i64,
+    max_ns: i64,
+    cnt: u64,
+}
+
+/// Time filter for the spans fetch from the `spans_by_trace` bounds. `None` means the
+/// trace isn't indexed, so it doesn't exist: the MV fires on the same insert as `spans`
+/// and expires with it, so a miss must not fall back to a whole-retention bloom scan.
+/// lo/hi are server-computed i64 nanoseconds, padded ±5 min for clock skew.
+fn trace_time_bound(bounds: &TraceTimeBounds) -> Option<String> {
+    const PAD_NS: i64 = 300_000_000_000;
+    if bounds.cnt == 0 {
+        return None;
+    }
+    let lo = bounds.min_ns.saturating_sub(PAD_NS);
+    let hi = bounds.max_ns.saturating_add(PAD_NS);
+    Some(format!(
+        " AND timestamp >= fromUnixTimestamp64Nano({lo}) AND timestamp <= fromUnixTimestamp64Nano({hi})"
+    ))
+}
+
+/// Spans of one trace (at most `MAX_TRACE_SPANS + 1`), empty when it doesn't exist.
+/// `trace_id` must already be validated as 32 hex chars.
+pub(crate) async fn fetch_trace_rows(
+    state: &AppState,
+    tenant_id: &str,
+    trace_id: &str,
+) -> Result<Vec<WideEvent>, clickhouse::error::Error> {
+    let escaped_tenant = crate::query_builder::escape_string_literal(tenant_id);
+
+    // spans_by_trace is ORDER BY (tenant_id, trace_id, timestamp), so the bounds are a
+    // primary-key lookup and the wide spans fetch then prunes to a handful of granules.
     let bounds = crate::tenant_query(
         &state.ch,
         &format!(
@@ -47,68 +85,33 @@ pub async fn get_trace(
         ),
         tenant_id,
     )
-    .bind(&trace_id)
+    .bind(trace_id)
     .fetch_one::<TraceTimeBounds>()
     .await;
 
-    // Time bound for the spans fetch, when the MV knows the trace. lo/hi are
-    // server-computed i64 nanoseconds (not user input). ±5 min pad for clock skew.
-    const PAD_NS: i64 = 300_000_000_000;
     let time_bound = match &bounds {
-        Ok(b) if b.cnt > 0 => {
-            let lo = b.min_ns.saturating_sub(PAD_NS);
-            let hi = b.max_ns.saturating_add(PAD_NS);
-            format!(
-                " AND timestamp >= fromUnixTimestamp64Nano({lo}) AND timestamp <= fromUnixTimestamp64Nano({hi})"
-            )
-        }
-        Ok(_) => String::new(),
+        Ok(b) => match trace_time_bound(b) {
+            Some(bound) => bound,
+            None => return Ok(Vec::new()),
+        },
         Err(e) => {
             // MV missing/unhealthy: fall back to the unbounded scan rather than 404ing.
-            tracing::warn!(error = %e, signal = "traces", handler = "get_trace", "spans_by_trace bounds lookup failed; falling back to unbounded scan");
+            tracing::warn!(error = %e, signal = "traces", "spans_by_trace bounds lookup failed; falling back to unbounded scan");
             String::new()
         }
     };
 
-    let fetch_spans = |time_bound: String| {
-        // Single WHERE (no explicit PREWHERE): `trace_id` is served by the
-        // `idx_trace_id` bloom filter, which an explicit PREWHERE on tenant/time
-        // would defeat (CH would read the whole bloom instead of pruning) — most
-        // damaging on the MV-miss fallback where `time_bound` is empty.
-        // `optimize_move_to_prewhere` still promotes tenant/time to prewhere.
-        let sql = trace_spans_sql(&escaped_tenant, &time_bound);
-        let q = crate::tenant_query(&state.ch, &sql, tenant_id).bind(&trace_id);
-        async move { q.fetch_all::<WideEvent>().await }
-    };
-
-    let mut rows = fetch_spans(time_bound.clone())
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, signal = "traces", handler = "get_trace", "ClickHouse query failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-        })?;
-
-    // Defensive fallback: the MV is populated asynchronously, so if the bounded fetch
-    // found nothing while the MV claimed knowledge (or the MV had no rows but the
-    // trace exists only in spans, e.g. data ingested before the MV was created),
-    // retry without the time bound before declaring 404.
-    if rows.is_empty() && !time_bound.is_empty() {
-        rows = fetch_spans(String::new())
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, signal = "traces", handler = "get_trace", "ClickHouse fallback query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "query failed".into())
-            })?;
-    }
-
-    if rows.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "trace not found".to_string()));
-    }
-
-    let truncated = cap_trace_rows(&mut rows);
-    let mut trace = assemble_trace(&trace_id, rows);
-    trace.truncated = truncated;
-    Ok(Json(trace))
+    // Single WHERE (no explicit PREWHERE): `trace_id` is served by the `idx_trace_id`
+    // bloom filter, which an explicit PREWHERE on tenant/time would defeat.
+    // `optimize_move_to_prewhere` still promotes tenant/time to prewhere.
+    crate::tenant_query(
+        &state.ch,
+        &trace_spans_sql(&escaped_tenant, &time_bound),
+        tenant_id,
+    )
+    .bind(trace_id)
+    .fetch_all::<WideEvent>()
+    .await
 }
 
 /// Most spans one trace response carries. The earliest spans are kept and the response
@@ -329,6 +332,31 @@ mod tests {
         assert_eq!(count, 100_000, "every span is kept");
         assert_eq!(max_depth, MAX_TREE_DEPTH);
         assert!(len > 0);
+    }
+
+    #[test]
+    fn unindexed_trace_id_is_not_found_instead_of_scanning_retention() {
+        let miss = TraceTimeBounds {
+            min_ns: 0,
+            max_ns: 0,
+            cnt: 0,
+        };
+        assert_eq!(trace_time_bound(&miss), None);
+
+        let hit = TraceTimeBounds {
+            min_ns: 1_000_000_000_000,
+            max_ns: 2_000_000_000_000,
+            cnt: 3,
+        };
+        let bound = trace_time_bound(&hit).unwrap();
+        assert!(
+            bound.contains("fromUnixTimestamp64Nano(700000000000)"),
+            "{bound}"
+        );
+        assert!(
+            bound.contains("fromUnixTimestamp64Nano(2300000000000)"),
+            "{bound}"
+        );
     }
 
     #[test]
