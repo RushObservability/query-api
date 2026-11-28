@@ -322,7 +322,12 @@ fn request_origin_allowed_with_policy(
     same_web_origin(&origin_url, &request_url)
 }
 
-fn requires_csrf_origin(method: &Method, path: &str, credential: Option<&CredentialKind>) -> bool {
+fn requires_csrf_origin(
+    method: &Method,
+    path: &str,
+    credential: Option<&CredentialKind>,
+    session_cookie: bool,
+) -> bool {
     if matches!(
         path,
         "/api/v1/kubernetes/gateway/authorize" | "/api/v1/kubernetes/gateway/ready"
@@ -333,7 +338,10 @@ fn requires_csrf_origin(method: &Method, path: &str, credential: Option<&Credent
     if !is_state_changing_method(method) {
         return false;
     }
-    if credential.is_some_and(|kind| *kind == CredentialKind::Session) {
+    // Handlers authenticate by the session cookie whatever credential tenant
+    // resolution picked (a key header or a denied tenant path can mask it), so
+    // any cookie-bearing mutation gets the Origin check.
+    if session_cookie || credential.is_some_and(|kind| *kind == CredentialKind::Session) {
         return true;
     }
 
@@ -378,6 +386,7 @@ async fn csrf_protection_middleware(
         req.method(),
         &path,
         resolution.as_ref().map(|value| &value.credential),
+        handlers::auth::extract_session_cookie(req.headers()).is_some(),
     ) && !request_origin_allowed(&req, &state)
     {
         tracing::warn!(
@@ -4757,7 +4766,8 @@ mod tenant_auth_tests {
         assert!(requires_csrf_origin(
             &Method::POST,
             path,
-            Some(&CredentialKind::Session)
+            Some(&CredentialKind::Session),
+            false
         ));
         assert_eq!(
             credential_route_denial(&CredentialKind::Session, true, false),
@@ -5839,22 +5849,57 @@ mod tenant_auth_tests {
                 &Method::POST,
                 path,
                 Some(&CredentialKind::Anonymous),
+                false,
             ));
         }
         assert!(requires_csrf_origin(
             &Method::DELETE,
             "/api/v1/users/user-1",
             Some(&CredentialKind::Session),
+            false,
         ));
         assert!(!requires_csrf_origin(
             &Method::POST,
             "/auth/sso/acs",
             Some(&CredentialKind::Anonymous),
+            false,
         ));
         assert!(!requires_csrf_origin(
             &Method::GET,
             "/api/v1/sso/setup-session",
             Some(&CredentialKind::Anonymous),
+            true,
+        ));
+    }
+
+    #[test]
+    fn csrf_covers_every_cookie_mutation_whatever_the_resolved_credential() {
+        // A key header or an unknown tenant path changes the resolved
+        // credential, but handlers still read the cookie.
+        for credential in [
+            None,
+            Some(&CredentialKind::QueryKey),
+            Some(&CredentialKind::TenantDenied),
+            Some(&CredentialKind::Anonymous),
+        ] {
+            assert!(requires_csrf_origin(
+                &Method::DELETE,
+                "/api/v1/tenants/acme",
+                credential,
+                true,
+            ));
+        }
+        assert!(!requires_csrf_origin(
+            &Method::POST,
+            "/api/v1/query",
+            Some(&CredentialKind::QueryKey),
+            false,
+        ));
+        assert!(!requires_csrf_origin(
+            &Method::GET,
+            "/api/v1/users",
+            Some(&CredentialKind::QueryKey),
+            true,
         ));
     }
 
@@ -6421,11 +6466,13 @@ mod tenant_auth_tests {
             &Method::POST,
             "/api/v1/kubernetes/gateway/authorize",
             Some(&CredentialKind::Session),
+            true,
         ));
         assert!(!requires_csrf_origin(
             &Method::POST,
             "/api/v1/kubernetes/gateway/ready",
             None,
+            false,
         ));
     }
 
