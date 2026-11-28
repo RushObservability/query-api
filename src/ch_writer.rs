@@ -192,7 +192,65 @@ impl SpoolBatch {
             ),
         }
     }
+
+    /// Split into one batch per tenant, ordered by tenant id so a replay pass
+    /// that stops part way resumes at the same piece.
+    fn split_by_tenant(self) -> Vec<SpoolBatch> {
+        fn split<T>(
+            rows: Vec<T>,
+            tenant: fn(&T) -> &str,
+            wrap: fn(Vec<T>) -> SpoolBatch,
+        ) -> Vec<SpoolBatch> {
+            let mut groups = std::collections::BTreeMap::<String, Vec<T>>::new();
+            for row in rows {
+                groups.entry(tenant(&row).to_owned()).or_default().push(row);
+            }
+            groups.into_values().map(wrap).collect()
+        }
+        match self {
+            SpoolBatch::SpansRaw(v) => split(v, |r| &r.tenant_id, SpoolBatch::SpansRaw),
+            SpoolBatch::Spans(v) => split(v, |r| &r.tenant_id, SpoolBatch::Spans),
+            SpoolBatch::Logs(v) => split(v, |r| &r.tenant_id, SpoolBatch::Logs),
+            SpoolBatch::Gauge(v) => split(v, |r| &r.tenant_id, SpoolBatch::Gauge),
+            SpoolBatch::Sum(v) => split(v, |r| &r.tenant_id, SpoolBatch::Sum),
+            SpoolBatch::Rum(v) => split(v, |r| &r.tenant_id, SpoolBatch::Rum),
+            SpoolBatch::RumReplay(v) => split(v, |r| &r.tenant_id, SpoolBatch::RumReplay),
+            SpoolBatch::Histogram(v) => split(v, |r| &r.tenant_id, SpoolBatch::Histogram),
+            SpoolBatch::ExpHistogram(v) => split(v, |r| &r.tenant_id, SpoolBatch::ExpHistogram),
+            SpoolBatch::Summary(v) => split(v, |r| &r.tenant_id, SpoolBatch::Summary),
+            SpoolBatch::Profiles(v) => split(v, |r| &r.tenant_id, SpoolBatch::Profiles),
+        }
+    }
+
+    /// Drop rows whose partition timestamp (ns since epoch) is after `max_ns`
+    /// and return how many were dropped.
+    fn drop_rows_after(&mut self, max_ns: i64) -> usize {
+        fn keep<T>(rows: &mut Vec<T>, ts: fn(&T) -> i64, max: i64) -> usize {
+            let before = rows.len();
+            rows.retain(|r| ts(r) <= max);
+            before - rows.len()
+        }
+        match self {
+            SpoolBatch::SpansRaw(v) => keep(v, |r| r.timestamp, max_ns),
+            SpoolBatch::Spans(v) => keep(v, |r| r.timestamp, max_ns),
+            SpoolBatch::Logs(v) => keep(v, |r| r.timestamp, max_ns),
+            SpoolBatch::Gauge(v) => keep(v, |r| r.time_unix, max_ns),
+            SpoolBatch::Sum(v) => keep(v, |r| r.time_unix, max_ns),
+            SpoolBatch::Rum(v) => keep(v, |r| r.timestamp, max_ns),
+            // chunk_ts is DateTime64(3): milliseconds.
+            SpoolBatch::RumReplay(v) => keep(v, |r| r.chunk_ts, max_ns / 1_000_000),
+            SpoolBatch::Histogram(v) => keep(v, |r| r.time_unix, max_ns),
+            SpoolBatch::ExpHistogram(v) => keep(v, |r| r.time_unix, max_ns),
+            SpoolBatch::Summary(v) => keep(v, |r| r.time_unix, max_ns),
+            SpoolBatch::Profiles(v) => keep(v, |r| r.timestamp, max_ns),
+        }
+    }
 }
+
+/// Rows timestamped further ahead than this are dropped before batching: they
+/// would outlive the table TTL, and spread over many days they make ClickHouse
+/// reject the whole shared insert (too many partitions).
+const MAX_FUTURE_SKEW: Duration = Duration::from_secs(24 * 60 * 60);
 
 // ─── Spool payload codec ───────────────────────────────────────────────────────
 //
@@ -774,6 +832,15 @@ impl ChWriter {
         // (allow→block precedence + label stripping all happen pre-buffer). The
         // spooled/inserted data is therefore already filtered, exactly as before.
         self.apply_firewall(&mut batch);
+        let max_ns = (unix_millis() + MAX_FUTURE_SKEW.as_millis() as u64) as i64 * 1_000_000;
+        let dropped = batch.drop_rows_after(max_ns);
+        if dropped > 0 {
+            self.metrics.inc_counter(
+                "rush_ingest_rows_dropped_total",
+                &[("table", batch.table()), ("reason", "future_timestamp")],
+                dropped as u64,
+            );
+        }
         if batch.is_empty() {
             return Ok(());
         }
@@ -1217,6 +1284,10 @@ impl ChWriter {
 struct ReplayProgress {
     batch: String,
     next: usize,
+    /// The record at `next` is being replayed one tenant at a time; `done`
+    /// holds the pieces already delivered.
+    split: bool,
+    done: Vec<usize>,
     rejections: u32,
     discarded_records: u64,
     discarded_bytes: u64,
@@ -1238,11 +1309,14 @@ fn is_permanent_rejection(error: &clickhouse::error::Error) -> bool {
     let clickhouse::error::Error::BadResponse(reason) = error else {
         return false;
     };
-    reason
+    let code = reason
         .strip_prefix("Code: ")
         .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|code| code.parse().ok())
-        .is_some_and(|code| PERMANENT_INSERT_ERRORS.contains(&code))
+        .and_then(|code| code.parse::<u32>().ok());
+    // 252 also means "too many parts" (merge backlog), which is transient; only
+    // the per-block partition limit is a property of the rows themselves.
+    code.is_some_and(|code| PERMANENT_INSERT_ERRORS.contains(&code))
+        || (code == Some(252) && reason.contains("Too many partitions for single INSERT block"))
 }
 
 impl ChWriter {
@@ -1269,44 +1343,84 @@ impl ChWriter {
                     continue;
                 }
             };
-
-            if let Err(e) = try_insert(&self.ch, &batch).await {
-                if is_permanent_rejection(&e) {
-                    progress.rejections += 1;
-                    if progress.rejections >= REPLAY_MAX_REJECTIONS {
-                        tracing::error!(
-                            error = %e,
-                            table = table,
-                            rows = batch.len(),
-                            attempts = progress.rejections,
-                            "replayer: ClickHouse keeps rejecting record — discarding it"
-                        );
-                        progress.rejected_records += 1;
-                        progress.rejected_bytes += payload.len() as u64;
-                        progress.next += 1;
-                        progress.rejections = 0;
+            let mut parts = if progress.split {
+                batch.split_by_tenant()
+            } else {
+                vec![batch]
+            };
+            let rejected = loop {
+                let mut rejected = None;
+                for (i, part) in parts.iter().enumerate() {
+                    if progress.done.contains(&i) {
+                        continue;
+                    }
+                    match try_insert(&self.ch, part).await {
+                        Ok(()) => progress.done.push(i),
+                        Err(e) if is_permanent_rejection(&e) => rejected = Some(e),
+                        Err(e) => {
+                            tracing::warn!(error = %e, table = table, "replayer: CH insert failed — backing off");
+                            self.metrics.inc_counter(
+                                "rush_ingest_replay_records_total",
+                                &[("backend", backend), ("outcome", "insert_error")],
+                                1,
+                            );
+                            return false;
+                        }
+                    }
+                }
+                // Rows from many tenants share one insert. When ClickHouse rejects
+                // the rows, retry per tenant so one sender's bad rows cannot hold
+                // back everyone else's.
+                if rejected.is_some() && !progress.split {
+                    parts = parts.remove(0).split_by_tenant();
+                    if parts.len() > 1 {
+                        progress.split = true;
                         continue;
                     }
                 }
-                tracing::warn!(
-                    error = %e,
-                    table = table,
-                    "replayer: CH insert failed — backing off"
-                );
+                break rejected;
+            };
+            if let Some(e) = rejected {
+                progress.rejections += 1;
+                if progress.rejections < REPLAY_MAX_REJECTIONS {
+                    tracing::warn!(error = %e, table = table, "replayer: CH insert failed — backing off");
+                    self.metrics.inc_counter(
+                        "rush_ingest_replay_records_total",
+                        &[("backend", backend), ("outcome", "insert_error")],
+                        1,
+                    );
+                    return false;
+                }
+                for (i, part) in parts.iter().enumerate() {
+                    if progress.done.contains(&i) {
+                        continue;
+                    }
+                    tracing::error!(
+                        error = %e,
+                        table = table,
+                        rows = part.len(),
+                        attempts = progress.rejections,
+                        "replayer: ClickHouse keeps rejecting record — discarding it"
+                    );
+                    progress.rejected_records += 1;
+                    progress.rejected_bytes += if progress.split {
+                        encode_spool(part).map_or(0, |p| p.len() as u64)
+                    } else {
+                        payload.len() as u64
+                    };
+                }
+            }
+            if !progress.done.is_empty() {
                 self.metrics.inc_counter(
                     "rush_ingest_replay_records_total",
-                    &[("backend", backend), ("outcome", "insert_error")],
+                    &[("backend", backend), ("outcome", "inserted")],
                     1,
                 );
-                return false;
             }
             progress.next += 1;
+            progress.split = false;
+            progress.done.clear();
             progress.rejections = 0;
-            self.metrics.inc_counter(
-                "rush_ingest_replay_records_total",
-                &[("backend", backend), ("outcome", "inserted")],
-                1,
-            );
         }
         true
     }
@@ -1764,6 +1878,13 @@ mod batch_tests {
         assert!(!rejected("Code: 241. DB::Exception: Memory limit exceeded"));
         assert!(!rejected("Code: 60. DB::Exception: Unknown table"));
         assert!(!rejected("503 Service Unavailable"));
+        assert!(rejected(
+            "Code: 252. DB::Exception: Too many partitions for single INSERT block (more than 100). (TOO_MANY_PARTS)"
+        ));
+        // Same code, but a merge backlog: retry, never discard.
+        assert!(!rejected(
+            "Code: 252. DB::Exception: Too many parts (300). Merges are processing significantly slower than inserts. (TOO_MANY_PARTS)"
+        ));
         assert!(!is_permanent_rejection(&Error::TimedOut));
     }
 
@@ -2038,5 +2159,116 @@ mod batch_tests {
             "rush_ingest_batch_rejections_total{reason=\"busy\",table=\"metrics_gauge\"} 1"
         ));
         server.abort();
+    }
+
+    fn tenant_gauge(tenant: &str, name: &str) -> SpoolBatch {
+        let SpoolBatch::Gauge(mut rows) = gauge(1) else {
+            unreachable!()
+        };
+        rows[0].tenant_id = tenant.into();
+        rows[0].metric_name = name.into();
+        SpoolBatch::Gauge(rows)
+    }
+
+    /// One tenant's rows span too many partitions, so ClickHouse rejects the
+    /// shared insert. The other tenant's rows in that insert, and records
+    /// spooled after it, must still be delivered.
+    #[tokio::test]
+    async fn rejected_rows_of_one_tenant_do_not_block_other_tenants() {
+        use axum::{Router, body::Bytes, http::StatusCode, routing::any};
+        let inserted = Arc::new(std::sync::Mutex::new(Vec::<&str>::new()));
+        let seen = inserted.clone();
+        let router = Router::new().route(
+            "/",
+            any(move |body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let has = |m: &str| body.windows(m.len()).any(|w| w == m.as_bytes());
+                    if has("poison") {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Code: 252. DB::Exception: Too many partitions for single INSERT block (more than 100). (TOO_MANY_PARTS)",
+                        );
+                    }
+                    for name in ["good-b", "later-b"] {
+                        if has(name) {
+                            seen.lock().unwrap().push(name);
+                        }
+                    }
+                    (StatusCode::OK, "")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("rush-replay-{}", uuid::Uuid::new_v4()));
+        let buffer = Arc::new(IngestBuffer::Disk(
+            crate::spool::Spool::open(&dir, 1 << 20).unwrap(),
+        ));
+        let writer = ChWriter::with_batch_config(
+            Client::default()
+                .with_url(url)
+                .with_validation(false)
+                .with_compression(clickhouse::Compression::None),
+            buffer.clone(),
+            BatchConfig {
+                max_rows: 1000,
+                max_age: Duration::from_secs(60),
+                max_bytes: 1 << 20,
+            },
+        );
+        // Both tenants coalesce into one insert, which fails and is spooled.
+        writer
+            .write(tenant_gauge("tenant-a", "poison"))
+            .await
+            .unwrap();
+        writer
+            .write(tenant_gauge("tenant-b", "good-b"))
+            .await
+            .unwrap();
+        writer.flush_all().await;
+        let later = encode_spool(&tenant_gauge("tenant-b", "later-b")).unwrap();
+        buffer.append("metrics_gauge", later).await.unwrap();
+
+        let mut progress = ReplayProgress::default();
+        let drain = buffer.next_batch().await.unwrap();
+        assert!(!writer.replay_records(&drain, &mut progress).await);
+        // Tenant B's rows from the shared insert land on the first pass.
+        assert_eq!(*inserted.lock().unwrap(), ["good-b"]);
+        for _ in 2..REPLAY_MAX_REJECTIONS {
+            let drain = buffer.next_batch().await.unwrap();
+            assert!(!writer.replay_records(&drain, &mut progress).await);
+        }
+        let drain = buffer.next_batch().await.unwrap();
+        assert!(writer.replay_records(&drain, &mut progress).await);
+        assert_eq!(progress.rejected_records, 1);
+        assert!(buffer.commit(drain).await);
+        assert_eq!(*inserted.lock().unwrap(), ["good-b", "later-b"]);
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rows_timestamped_far_in_the_future_are_dropped_and_counted() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let test = TestWriter::new(mock.url(), BatchConfig::default());
+        let now_ns = unix_millis() as i64 * 1_000_000;
+        let SpoolBatch::Gauge(mut rows) = gauge(3) else {
+            unreachable!()
+        };
+        rows[0].time_unix = now_ns + 3_600_000_000_000; // an hour of clock skew is kept
+        rows[1].time_unix = now_ns + 2 * MAX_FUTURE_SKEW.as_nanos() as i64;
+        rows[2].time_unix = i64::MAX;
+        let received = mock.add(handlers::record::<GaugeRow>());
+        test.0.write(SpoolBatch::Gauge(rows)).await.unwrap();
+        test.0.flush_all().await;
+        let rows = received.collect::<Vec<_>>().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].time_unix, now_ns + 3_600_000_000_000);
+        assert!(test.0.metrics.render_prometheus().contains(
+            "rush_ingest_rows_dropped_total{reason=\"future_timestamp\",table=\"metrics_gauge\"} 2"
+        ));
     }
 }
