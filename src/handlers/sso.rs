@@ -469,6 +469,66 @@ async fn claim_sso_key_once(
         })
 }
 
+/// A setup link acts for the admin who created it, so it stops working once
+/// that account is disabled, deleted or no longer an admin.
+fn setup_link_creator_allowed(creator: Option<&crate::clickhouse_config::SessionUser>) -> bool {
+    creator.is_some_and(|user| user.4 == "admin")
+}
+
+async fn check_setup_link_creator(
+    state: &AppState,
+    headers: &HeaderMap,
+    provider: &str,
+    created_by: &str,
+) -> Result<(), (StatusCode, String)> {
+    let creator = state
+        .config_db
+        .get_active_kubernetes_user(created_by)
+        .await
+        .map_err(|error| {
+            public_sso_internal_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "setup_link_creator_lookup",
+                error,
+                "SSO setup is temporarily unavailable",
+            )
+        })?;
+    if setup_link_creator_allowed(creator.as_ref()) {
+        return Ok(());
+    }
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("sso.setup_session_consume", "anonymous")
+                .actor_name("SSO setup link")
+                .outcome("failure")
+                .changes(
+                    serde_json::json!({
+                        "provider": provider,
+                        "created_by": created_by,
+                        "reason": "creator_not_admin",
+                    })
+                    .to_string(),
+                )
+                .description("SSO setup link from a former administrator rejected")
+                .context(crate::audit::actor_context_from_headers(headers)),
+        )
+        .await;
+    Err((
+        StatusCode::FORBIDDEN,
+        "setup link is no longer valid".to_string(),
+    ))
+}
+
+/// A setup link may only configure SSO when none is active. Replacing the
+/// active provider logs out its users, so that stays with an administrator.
+fn setup_link_replacement_rejected(
+    is_setup_session: bool,
+    active_provider_id: Option<&str>,
+) -> bool {
+    is_setup_session && active_provider_id.is_some()
+}
+
 fn provider_session_revocation(
     is_update: bool,
     provider_id: &str,
@@ -2040,6 +2100,7 @@ pub async fn save_sso_provider(
                     .to_string(),
             ));
         }
+        check_setup_link_creator(&state, &headers, &session.provider, &session.created_by).await?;
     }
 
     let existing_provider = if is_update {
@@ -2329,6 +2390,32 @@ pub async fn save_sso_provider(
                 "SSO provider change is temporarily unavailable",
             )
         })?;
+    if setup_link_replacement_rejected(setup_session.is_some(), active_before_change.as_deref()) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("sso.config_update", "anonymous")
+                    .actor_name("SSO setup link")
+                    .tenant("default".to_string())
+                    .resource("sso_provider", id.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "protocol": protocol,
+                            "active_provider_id": active_before_change,
+                            "reason": "setup_link_active_provider",
+                        })
+                        .to_string(),
+                    )
+                    .description("SSO setup link cannot replace the active provider")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+        return Err((
+            StatusCode::CONFLICT,
+            "an SSO provider is already active; an administrator must change it".to_string(),
+        ));
+    }
     let session_revocation = if is_update
         && admission_settings_changed
         && active_before_change.as_deref() == Some(id.as_str())
@@ -3343,6 +3430,7 @@ pub async fn exchange_setup_token(
             "setup token is invalid or expired".to_string(),
         )
     })?;
+    check_setup_link_creator(&state, &headers, &provider, &created_by).await?;
     if !claim_sso_key_once(
         &state,
         format!("sso-setup-link:{token_hash}"),
@@ -4259,6 +4347,57 @@ mod tests {
             sso_transaction_cookie_with_mode("", "saml", 0, true).unwrap(),
             "rush_sso_tx=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
         );
+    }
+
+    #[test]
+    fn setup_link_cannot_replace_an_active_provider() {
+        assert!(setup_link_replacement_rejected(true, Some("corp-okta")));
+        assert!(!setup_link_replacement_rejected(true, None));
+        // Administrators may still switch providers.
+        assert!(!setup_link_replacement_rejected(false, Some("corp-okta")));
+
+        let source = include_str!("sso.rs");
+        let save = source
+            .split_once("pub async fn save_sso_provider(")
+            .expect("save handler")
+            .1;
+        let check = save
+            .find("setup_link_replacement_rejected(setup_session.is_some()")
+            .expect("save must refuse a setup-link replacement");
+        let revoke = save
+            .find("revoke_sso_provider_sessions(")
+            .expect("save revokes replaced sessions");
+        assert!(check < revoke);
+    }
+
+    #[test]
+    fn setup_link_dies_with_its_creators_admin_role() {
+        let user = |role: &str| {
+            (
+                "admin-id".to_string(),
+                "alice".to_string(),
+                "Alice".to_string(),
+                "default".to_string(),
+                role.to_string(),
+            )
+        };
+        assert!(setup_link_creator_allowed(Some(&user("admin"))));
+        assert!(!setup_link_creator_allowed(Some(&user("viewer"))));
+        // Disabled or deleted accounts resolve to no active user.
+        assert!(!setup_link_creator_allowed(None));
+
+        let source = include_str!("sso.rs");
+        for handler in [
+            "pub async fn exchange_setup_token(",
+            "pub async fn save_sso_provider(",
+        ] {
+            let body = source.split_once(handler).expect("handler").1;
+            let body = &body[..body.find("\npub async fn ").expect("next handler")];
+            assert!(
+                body.contains("check_setup_link_creator(&state, &headers"),
+                "{handler} must re-check the link creator"
+            );
+        }
     }
 
     #[test]
