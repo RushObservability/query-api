@@ -7,7 +7,7 @@ use axum::{
 use regex::Regex;
 
 use crate::AppState;
-use crate::handlers::users::{require_principal, require_write};
+use crate::handlers::users::{require_admin, require_principal};
 use crate::models::custom_skills::{
     CreateCustomSkillRequest, CustomSkill, UpdateCustomSkillRequest,
 };
@@ -122,7 +122,9 @@ fn validate_skill_fields(
 }
 
 // Skills are instance-wide (the SRE agent loads them for every tenant), so
-// reading them needs an authenticated caller, never anonymous tenant access.
+// reading them needs an authenticated caller, never anonymous tenant access,
+// and changing them needs a platform admin: a tenant writer must not edit the
+// prompts other tenants' agents run.
 pub async fn list_custom_skills(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -158,7 +160,7 @@ pub async fn create_custom_skill(
     headers: HeaderMap,
     Json(req): Json<CreateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     validate_skill_fields(
         &req.name,
         &req.title,
@@ -213,7 +215,7 @@ pub async fn update_custom_skill(
     Path(id): Path<String>,
     Json(req): Json<UpdateCustomSkillRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     // Fetch the existing skill so we can validate against its immutable name.
     let existing = state
         .config_db
@@ -263,7 +265,7 @@ pub async fn delete_custom_skill(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let caller = require_write(&state, &headers).await?;
+    let caller = require_admin(&state, &headers).await?;
     let deleted = state
         .config_db
         .delete_custom_skill(&id)
@@ -290,4 +292,33 @@ pub async fn delete_custom_skill(
         .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_admins_change_instance_wide_skills() {
+        let source = include_str!("custom_skills.rs");
+        for handler in [
+            "pub async fn create_custom_skill(",
+            "pub async fn update_custom_skill(",
+            "pub async fn delete_custom_skill(",
+        ] {
+            let body = source
+                .split_once(handler)
+                .unwrap_or_else(|| panic!("{handler} must exist"))
+                .1
+                .split("pub async fn ")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("require_admin(&state, &headers)"),
+                "{handler} must require a platform admin"
+            );
+            assert!(
+                body.contains("AuditEvent::new(\"skill."),
+                "{handler} must be audited"
+            );
+        }
+    }
 }
