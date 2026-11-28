@@ -81,7 +81,8 @@ pub struct AuditLogger {
 /// Unauthenticated failures (no actor id) can be triggered by anyone, and each
 /// row costs several fsyncs on a serialized writer. Repeats of the same action
 /// from the same client inside one window are counted in memory and written as
-/// a single summary row when the window closes.
+/// a single summary row when the window closes. Credential denials in
+/// [`THROTTLED_DENIALS`] are counted per actor (API key id) the same way.
 struct FailureAggregator {
     window: Duration,
     max_clients: usize,
@@ -95,6 +96,10 @@ struct FailureBucket {
 
 /// Client key shared by every new client once `max_clients` are tracked.
 const OVERFLOW_CLIENT: &str = "*";
+
+/// Per-request denials of a valid credential. A key holder can repeat these
+/// at request rate, so they are throttled per actor like anonymous failures.
+const THROTTLED_DENIALS: &[&str] = &["apikey.scope_denied", "llm.auth_denied"];
 
 impl Default for FailureAggregator {
     fn default() -> Self {
@@ -112,14 +117,20 @@ impl FailureAggregator {
     }
 
     fn applies_to(ev: &AuditEvent) -> bool {
-        ev.outcome == "failure" && ev.actor_id.is_empty()
+        ev.outcome == "failure"
+            && (ev.actor_id.is_empty() || THROTTLED_DENIALS.contains(&ev.action.as_str()))
     }
 
     /// Returns the bucket key when `ev` opens a new window and must be written
     /// now, or `None` when it was counted into an open window.
     fn admit(&self, ev: &AuditEvent) -> Option<(String, String)> {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        let mut key = (ev.action.clone(), ev.ip_address.clone());
+        let client = if ev.actor_id.is_empty() {
+            ev.ip_address.clone()
+        } else {
+            format!("actor:{}", ev.actor_id)
+        };
+        let mut key = (ev.action.clone(), client);
         // Past the bound, new clients share one bucket per action. Actions are
         // code literals, so the map holds at most max_clients + actions entries.
         if !buckets.contains_key(&key) && buckets.len() >= self.max_clients {
@@ -154,6 +165,12 @@ impl FailureAggregator {
         if overflow {
             summary.ip_address.clear();
             summary.user_agent.clear();
+            if !summary.actor_id.is_empty() {
+                // The bucket mixes several keys; don't attribute it to one.
+                summary.actor_id.clear();
+                summary.actor_name.clear();
+                summary.resource_id.clear();
+            }
         }
         summary.request_id.clear();
         Some(
@@ -2255,6 +2272,51 @@ mod tests {
         // A closed window starts over with a full row.
         logger.log(denied_from("10.0.0.1")).await;
         assert_eq!(spooled_rows(&dir.0).len(), 6);
+    }
+
+    #[tokio::test]
+    async fn api_key_denials_are_throttled_per_key() {
+        let dir = TestDirectory::new();
+        let mut logger = test_logger(
+            Client::default().with_url("http://127.0.0.1:9"),
+            dir.0.clone(),
+        );
+        logger.failures = Arc::new(FailureAggregator::new(Duration::from_secs(2), 64));
+        let denied = |key: &str, ip: &str| {
+            AuditEvent::new("apikey.scope_denied", "api_key")
+                .actor(key, key)
+                .resource("api_key", key)
+                .outcome("failure")
+                .context((ip.to_string(), "ua".to_string(), "req".to_string()))
+        };
+
+        logger.log(denied("key-a", "10.0.0.1")).await;
+        logger.log(denied("key-b", "10.0.0.1")).await;
+        // A flood from one key, even across addresses, must not queue on the
+        // single outbox writer that every audited action shares.
+        let held = lock_spool_directory(&dir.0).await.unwrap();
+        for i in 0..200 {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                logger.log(denied("key-a", &format!("10.0.2.{}", i % 250))),
+            )
+            .await
+            .expect("a repeated denial must not wait for persistence");
+        }
+        drop(held);
+        assert_eq!(spooled_rows(&dir.0).len(), 2);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while spooled_rows(&dir.0).len() < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("repeats are summarized, never dropped");
+        let rows = spooled_rows(&dir.0);
+        assert_eq!(rows[2].actor_id, "key-a");
+        let metadata: serde_json::Value = serde_json::from_str(&rows[2].metadata).unwrap();
+        assert_eq!(metadata["aggregated_repeats"], 200);
     }
 
     #[tokio::test]
