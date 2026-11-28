@@ -362,10 +362,55 @@ pub async fn delete_tenant(
         ));
     }
 
-    let deleted = state.config_db.delete_tenant(&id).await.map_err(|e| {
+    let internal = |e: anyhow::Error| {
         tracing::error!(error = %e, "internal error");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-    })?;
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    };
+    let (_, name, ..) = state
+        .config_db
+        .get_tenant(&id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "tenant not found".to_string()))?;
+
+    // Keys are stored by tenant name, so they must be revoked before the
+    // tenant goes: otherwise they attach to a later tenant with the same name.
+    // Revoke first so a failure leaves the tenant in place to retry.
+    for key_id in state
+        .config_db
+        .tenant_api_key_ids(&id, &name)
+        .await
+        .map_err(internal)?
+    {
+        if !state
+            .config_db
+            .delete_api_key(&key_id)
+            .await
+            .map_err(internal)?
+        {
+            continue;
+        }
+        state.ingest_key_limiter.remove(&key_id);
+        state.api_key_cache.evict_key_id(&key_id);
+        // AUDIT: API key revoked because its tenant is being deleted.
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("apikey.revoke", "user")
+                    .actor(caller.0.clone(), caller.1.clone())
+                    .tenant(id.clone())
+                    .resource("api_key", key_id.clone())
+                    .changes(serde_json::json!({ "reason": "tenant.delete" }).to_string())
+                    .description("api key revoked with its tenant")
+                    .context(crate::audit::actor_context_from_headers(&headers)),
+            )
+            .await;
+    }
+
+    let deleted = state.config_db.delete_tenant(&id).await.map_err(internal)?;
 
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "tenant not found".to_string()));
@@ -379,6 +424,7 @@ pub async fn delete_tenant(
                 .actor(caller.0.clone(), caller.1.clone())
                 .tenant(id.clone())
                 .resource("tenant", id.clone())
+                .changes(serde_json::json!({ "name": name }).to_string())
                 .description("tenant deleted")
                 .context(crate::audit::actor_context_from_headers(&headers)),
         )
@@ -653,4 +699,38 @@ pub async fn set_tenant_signals(
     let signals = resolve_signal_flags(&state, &id).await;
     let dropped = dropped_counts(&state, &id).await;
     Ok(Json(TenantSignalsResponse { signals, dropped }))
+}
+
+#[cfg(test)]
+mod tests {
+    // The ClickHouse side is covered by tests/tenant_delete_revokes_keys.rs
+    // (ignored without a disposable ClickHouse); this pins the handler wiring.
+    #[test]
+    fn delete_tenant_revokes_and_evicts_its_api_keys_first() {
+        let handler = include_str!("tenants.rs")
+            .split_once("pub async fn delete_tenant")
+            .expect("delete handler must exist")
+            .1
+            .split("pub async fn set_auth_required")
+            .next()
+            .unwrap();
+        let revoke = handler
+            .find(".tenant_api_key_ids(&id, &name)")
+            .expect("delete must list the tenant's keys");
+        let delete = handler
+            .find(".delete_tenant(&id)")
+            .expect("delete must remove the tenant");
+        assert!(
+            revoke < delete,
+            "keys must be revoked before the tenant row"
+        );
+        for wiring in [
+            ".delete_api_key(&key_id)",
+            "api_key_cache.evict_key_id(&key_id)",
+            "ingest_key_limiter.remove(&key_id)",
+            "AuditEvent::new(\"apikey.revoke\"",
+        ] {
+            assert!(handler.contains(wiring), "missing {wiring}");
+        }
+    }
 }

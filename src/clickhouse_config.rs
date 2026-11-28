@@ -7031,6 +7031,29 @@ impl ConfigDb {
         Ok(true)
     }
 
+    /// Ids of a tenant's live keys. Keys store the tenant name or id, so both
+    /// are matched.
+    pub async fn tenant_api_key_ids(
+        &self,
+        tenant_id: &str,
+        tenant_name: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            id: String,
+        }
+        let rows = self
+            .client
+            .query(
+                "SELECT id FROM config_api_keys FINAL WHERE tenant_id IN (?, ?) AND is_deleted = 0",
+            )
+            .bind(tenant_id)
+            .bind(tenant_name)
+            .fetch_all::<Row>()
+            .await?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
+    }
+
     // ── Settings operations ────────────────────────────────────────────────────
 
     pub async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
