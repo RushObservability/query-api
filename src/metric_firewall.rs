@@ -112,14 +112,23 @@ impl CompiledRule {
         if !self.metric.matches(name) {
             return false;
         }
-        if let Some(key) = &self.label_key {
-            match attrs.iter().find(|(k, _)| k == key) {
-                Some((_, v)) => self.label_value.matches(v),
-                None => false,
+        let Some(key) = &self.label_key else {
+            return true;
+        };
+        // A series can repeat a key. Block and drop rules match if any value
+        // does; allow rules need every value to match, so a duplicate key can
+        // neither hide a blocked value nor earn an exemption.
+        let mut values = attrs
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| self.label_value.matches(v))
+            .peekable();
+        values.peek().is_some()
+            && if matches!(self.action, CompiledAction::Allow) {
+                values.all(|matched| matched)
+            } else {
+                values.any(|matched| matched)
             }
-        } else {
-            true
-        }
     }
 }
 
@@ -507,5 +516,32 @@ mod tests {
         let mut rows = vec![row("node_cpu", &[]), row("http_x", &[])];
         assert_eq!(fw.apply(&mut rows), 1);
         assert_eq!(rows[0].name, "http_x");
+    }
+
+    #[test]
+    fn duplicate_label_keys_cannot_dodge_a_block_or_earn_an_allow() {
+        let block = MetricFirewall::compile(&[raw(
+            "block",
+            "",
+            false,
+            "env",
+            "prod-secret",
+            false,
+            "",
+            false,
+        )]);
+        let mut rows = vec![row("m", &[("env", "ok"), ("env", "prod-secret")])];
+        assert_eq!(block.apply(&mut rows), 1);
+
+        let allowlist = MetricFirewall::compile(&[
+            raw("block", "", false, "", "", false, "", false),
+            raw("allow", "", false, "team", "payments", false, "", false),
+        ]);
+        let mut rows = vec![
+            row("m", &[("team", "other"), ("team", "payments")]),
+            row("m", &[("team", "payments")]),
+        ];
+        assert_eq!(allowlist.apply(&mut rows), 1);
+        assert_eq!(rows[0].attrs, vec![("team".into(), "payments".into())]);
     }
 }
