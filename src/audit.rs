@@ -92,7 +92,12 @@ struct FailureAggregator {
 struct FailureBucket {
     first: AuditEvent,
     repeats: u64,
+    /// Distinct non-empty actor names seen in the window, capped.
+    names: Vec<String>,
 }
+
+/// Cap on distinct actor names listed in one summary row.
+const MAX_SUMMARY_NAMES: usize = 100;
 
 /// Client key shared by every new client once `max_clients` are tracked.
 const OVERFLOW_CLIENT: &str = "*";
@@ -125,10 +130,14 @@ impl FailureAggregator {
     /// now, or `None` when it was counted into an open window.
     fn admit(&self, ev: &AuditEvent) -> Option<(String, String)> {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        let client = if ev.actor_id.is_empty() {
-            ev.ip_address.clone()
-        } else {
+        let client = if !ev.actor_id.is_empty() {
             format!("actor:{}", ev.actor_id)
+        } else if ev.action.starts_with("auth.login.") {
+            // The attempted username is the target. Never merge two accounts'
+            // failures or lockouts into one row.
+            format!("{}\nname:{}", ev.ip_address, ev.actor_name)
+        } else {
+            ev.ip_address.clone()
         };
         let mut key = (ev.action.clone(), client);
         // Past the bound, new clients share one bucket per action. Actions are
@@ -138,6 +147,12 @@ impl FailureAggregator {
         }
         if let Some(bucket) = buckets.get_mut(&key) {
             bucket.repeats += 1;
+            if !ev.actor_name.is_empty()
+                && bucket.names.len() < MAX_SUMMARY_NAMES
+                && !bucket.names.contains(&ev.actor_name)
+            {
+                bucket.names.push(ev.actor_name.clone());
+            }
             return None;
         }
         buckets.insert(
@@ -145,6 +160,10 @@ impl FailureAggregator {
             FailureBucket {
                 first: ev.clone(),
                 repeats: 0,
+                names: Some(ev.actor_name.clone())
+                    .filter(|name| !name.is_empty())
+                    .into_iter()
+                    .collect(),
             },
         );
         Some(key)
@@ -163,14 +182,13 @@ impl FailureAggregator {
         let overflow = key.1 == OVERFLOW_CLIENT;
         let mut summary = bucket.first;
         if overflow {
+            // The bucket mixes several clients and actors; don't attribute it
+            // to the first one. Its distinct names go into the metadata.
             summary.ip_address.clear();
             summary.user_agent.clear();
-            if !summary.actor_id.is_empty() {
-                // The bucket mixes several keys; don't attribute it to one.
-                summary.actor_id.clear();
-                summary.actor_name.clear();
-                summary.resource_id.clear();
-            }
+            summary.actor_id.clear();
+            summary.actor_name.clear();
+            summary.resource_id.clear();
         }
         summary.request_id.clear();
         Some(
@@ -186,6 +204,7 @@ impl FailureAggregator {
                         "aggregated_repeats": bucket.repeats,
                         "window_seconds": self.window.as_secs_f64(),
                         "multiple_clients": overflow,
+                        "actor_names": bucket.names,
                     })
                     .to_string(),
                 ),
@@ -2317,6 +2336,69 @@ mod tests {
         assert_eq!(rows[2].actor_id, "key-a");
         let metadata: serde_json::Value = serde_json::from_str(&rows[2].metadata).unwrap();
         assert_eq!(metadata["aggregated_repeats"], 200);
+    }
+
+    #[tokio::test]
+    async fn login_failures_and_lockouts_keep_every_targeted_account() {
+        let dir = TestDirectory::new();
+        let mut logger = test_logger(
+            Client::default().with_url("http://127.0.0.1:9"),
+            dir.0.clone(),
+        );
+        logger.failures = Arc::new(FailureAggregator::new(Duration::from_secs(2), 64));
+        let attempt = |action: &str, user: &str| {
+            AuditEvent::new(action, "anonymous")
+                .actor_name(user)
+                .outcome("failure")
+                .context(("203.0.113.7".into(), "ua".into(), String::new()))
+        };
+        // A decoy opens the window, then real accounts are sprayed.
+        for user in ["decoy", "admin", "root", "admin"] {
+            logger.log(attempt("auth.login.failure", user)).await;
+        }
+        for user in ["ops1", "ops2", "ops3"] {
+            logger.log(attempt("auth.login.lockout", user)).await;
+        }
+        let names: Vec<String> = spooled_rows(&dir.0)
+            .into_iter()
+            .map(|row| row.actor_name)
+            .collect();
+        assert_eq!(names, ["decoy", "admin", "root", "ops1", "ops2", "ops3"]);
+    }
+
+    #[tokio::test]
+    async fn overflow_summary_lists_distinct_targets() {
+        let dir = TestDirectory::new();
+        let mut logger = test_logger(
+            Client::default().with_url("http://127.0.0.1:9"),
+            dir.0.clone(),
+        );
+        logger.failures = Arc::new(FailureAggregator::new(Duration::from_secs(1), 1));
+        for user in ["first", "a", "b", "a"] {
+            logger
+                .log(
+                    AuditEvent::new("auth.login.failure", "anonymous")
+                        .actor_name(user)
+                        .outcome("failure"),
+                )
+                .await;
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while spooled_rows(&dir.0).len() < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("overflow summary is written when the window closes");
+        let rows = spooled_rows(&dir.0);
+        let summary = rows
+            .iter()
+            .find(|row| row.metadata.contains("aggregated_repeats"))
+            .unwrap();
+        assert!(summary.actor_name.is_empty());
+        let metadata: serde_json::Value = serde_json::from_str(&summary.metadata).unwrap();
+        assert_eq!(metadata["actor_names"], serde_json::json!(["a", "b"]));
+        assert_eq!(metadata["aggregated_repeats"], 2);
     }
 
     #[tokio::test]
