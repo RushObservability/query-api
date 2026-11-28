@@ -87,6 +87,7 @@ struct GatewayInner {
     provider: Option<Provider>,
     limits: Limits,
     concurrency: Arc<Semaphore>,
+    tenant_in_flight: Arc<DashMap<String, usize>>,
     user_windows: DashMap<String, QuotaWindow>,
     tenant_windows: DashMap<String, QuotaWindow>,
     metrics: Arc<SelfMetrics>,
@@ -106,6 +107,7 @@ struct Limits {
     max_response_bytes: usize,
     max_completion_tokens: u32,
     max_limiter_keys: usize,
+    tenant_concurrency: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -114,8 +116,43 @@ struct QuotaWindow {
     started: Instant,
 }
 
+/// One in-flight request counted against its tenant's concurrency cap.
+struct TenantSlot {
+    in_flight: Arc<DashMap<String, usize>>,
+    tenant_id: String,
+}
+
+impl TenantSlot {
+    fn acquire(
+        in_flight: &Arc<DashMap<String, usize>>,
+        tenant_id: &str,
+        cap: usize,
+    ) -> Option<Self> {
+        let mut count = in_flight.entry(tenant_id.to_string()).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            in_flight: in_flight.clone(),
+            tenant_id: tenant_id.to_string(),
+        })
+    }
+}
+
+impl Drop for TenantSlot {
+    fn drop(&mut self) {
+        if let Some(mut count) = self.in_flight.get_mut(&self.tenant_id) {
+            *count = count.saturating_sub(1);
+        }
+        self.in_flight
+            .remove_if(&self.tenant_id, |_, count| *count == 0);
+    }
+}
+
 struct AdmissionGuard {
     _permit: OwnedSemaphorePermit,
+    _tenant_slot: TenantSlot,
     metrics: Arc<SelfMetrics>,
     operation: &'static str,
 }
@@ -134,7 +171,7 @@ impl LlmGateway {
     /// Build the provider exactly once. A configured provider is DNS-resolved
     /// and pinned here so a later DNS rebinding cannot change its destination.
     pub async fn from_env(metrics: Arc<SelfMetrics>) -> anyhow::Result<Self> {
-        let limits = Limits {
+        let mut limits = Limits {
             user_requests_per_minute: env_u32(
                 "RUSH_LLM_USER_REQUESTS_PER_MINUTE",
                 DEFAULT_USER_REQUESTS_PER_MINUTE,
@@ -171,12 +208,21 @@ impl LlmGateway {
                 100,
                 1_000_000,
             )?,
+            tenant_concurrency: 1,
         };
         let concurrency = env_usize(
             "RUSH_LLM_GLOBAL_CONCURRENCY",
             DEFAULT_GLOBAL_CONCURRENCY,
             1,
             1_024,
+        )?;
+        // Long agent streams hold a slot for minutes, so one tenant must not
+        // be able to take every global slot.
+        limits.tenant_concurrency = env_usize(
+            "RUSH_LLM_TENANT_CONCURRENCY",
+            (concurrency / 2).max(1),
+            1,
+            concurrency,
         )?;
         let connect_timeout_ms = env_u64(
             "RUSH_LLM_CONNECT_TIMEOUT_MS",
@@ -242,6 +288,7 @@ impl LlmGateway {
                 limits.tenant_requests_per_minute as f64,
             ),
             ("global_concurrency", concurrency as f64),
+            ("tenant_concurrency", limits.tenant_concurrency as f64),
             ("max_input_bytes", limits.max_input_bytes as f64),
             ("max_response_bytes", limits.max_response_bytes as f64),
             ("max_completion_tokens", limits.max_completion_tokens as f64),
@@ -257,6 +304,7 @@ impl LlmGateway {
                 provider,
                 limits,
                 concurrency: Arc::new(Semaphore::new(concurrency)),
+                tenant_in_flight: Arc::default(),
                 user_windows: DashMap::new(),
                 tenant_windows: DashMap::new(),
                 metrics,
@@ -747,6 +795,19 @@ impl LlmGateway {
                 "LLM tenant request quota exceeded",
             ));
         }
+        let tenant_slot = TenantSlot::acquire(
+            &self.inner.tenant_in_flight,
+            &caller.tenant_id,
+            self.inner.limits.tenant_concurrency,
+        )
+        .ok_or_else(|| {
+            self.quota_denied(operation, caller, "tenant_concurrency");
+            public_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "llm_tenant_concurrency_exceeded",
+                "Too many LLM requests are running for this tenant; retry shortly",
+            )
+        })?;
         let permit = self
             .inner
             .concurrency
@@ -768,6 +829,7 @@ impl LlmGateway {
         );
         Ok(AdmissionGuard {
             _permit: permit,
+            _tenant_slot: tenant_slot,
             metrics: self.inner.metrics.clone(),
             operation: operation.as_str(),
         })
@@ -1394,6 +1456,7 @@ mod tests {
             max_response_bytes: 1_024,
             max_completion_tokens: 100,
             max_limiter_keys: 100,
+            tenant_concurrency: 4,
         }
     }
 
@@ -1419,6 +1482,7 @@ mod tests {
                 }),
                 limits,
                 concurrency: Arc::new(Semaphore::new(concurrency)),
+                tenant_in_flight: Arc::default(),
                 user_windows: DashMap::new(),
                 tenant_windows: DashMap::new(),
                 metrics: Arc::new(SelfMetrics::new()),
@@ -1739,6 +1803,44 @@ mod tests {
             .unwrap_err();
         assert_eq!(busy.0, StatusCode::TOO_MANY_REQUESTS);
         first.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn one_tenant_cannot_hold_every_concurrency_slot() {
+        let gateway = test_gateway(
+            Url::parse("http://127.0.0.1:9/").unwrap(),
+            Limits {
+                tenant_concurrency: 2,
+                ..limits()
+            },
+            4,
+            Duration::from_secs(1),
+        );
+        let busy = LlmCaller::new("user-1", "busy-tenant");
+        let first = gateway
+            .admit(LlmOperation::SreInvestigation, &busy)
+            .unwrap();
+        let _second = gateway
+            .admit(LlmOperation::SreInvestigation, &busy)
+            .unwrap();
+        let denied = gateway
+            .admit(
+                LlmOperation::SreInvestigation,
+                &LlmCaller::new("user-2", "busy-tenant"),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(denied.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            gateway
+                .admit(
+                    LlmOperation::SreInvestigation,
+                    &LlmCaller::new("user-3", "other-tenant")
+                )
+                .is_ok()
+        );
+        drop(first);
+        assert!(gateway.admit(LlmOperation::SreInvestigation, &busy).is_ok());
     }
 
     #[tokio::test]
