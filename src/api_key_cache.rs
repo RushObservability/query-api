@@ -20,8 +20,8 @@ const MAX_ENTRIES: usize = 8_192;
 #[derive(Default)]
 struct Inner {
     grants: HashMap<String, (ApiKeyGrant, Instant)>,
-    /// Bumped by every eviction so a lookup that started before a revoke
-    /// cannot re-insert the revoked grant.
+    /// Bumped whenever a cached grant is revoked or evicted, so a lookup that
+    /// started before that cannot re-insert the revoked grant.
     generation: u64,
 }
 
@@ -103,11 +103,14 @@ impl ApiKeyCache {
         inner.grants.insert(key_hash.to_string(), (grant, now));
     }
 
-    /// The key no longer resolves (revoked on another replica).
+    /// The key no longer resolves (revoked on another replica). Unknown keys
+    /// were never cached, so they leave the generation alone; otherwise a flood
+    /// of random keys would refuse every real grant's insert.
     pub fn remove(&self, key_hash: &str) {
         let mut inner = self.lock();
-        inner.generation = inner.generation.wrapping_add(1);
-        inner.grants.remove(key_hash);
+        if inner.grants.remove(key_hash).is_some() {
+            inner.generation = inner.generation.wrapping_add(1);
+        }
     }
 
     /// Drop a revoked or changed key from this replica's cache.
@@ -185,6 +188,21 @@ mod tests {
         cache.insert("h", grant("k1", "ingest"), cache.generation());
         cache.remove("h");
         assert!(cache.stale_ingest("h").is_none());
+    }
+
+    #[test]
+    fn unknown_key_misses_do_not_block_caching_real_keys() {
+        let cache = ApiKeyCache::default();
+        let generation = cache.generation(); // a real key's lookup starts
+        cache.remove("unknown"); // a random key misses meanwhile
+        cache.insert("real", grant("k1", "ingest"), generation);
+        assert_eq!(cache.fresh("real").unwrap().id, "k1");
+
+        // A cached key that stops resolving still blocks racing inserts.
+        let before_miss = cache.generation();
+        cache.remove("real");
+        cache.insert("real", grant("k1", "ingest"), before_miss);
+        assert!(cache.fresh("real").is_none());
     }
 
     #[test]
