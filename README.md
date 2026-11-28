@@ -28,7 +28,7 @@ Its configuration plane also lives in ClickHouse in the `config_*` tables.
 - Prometheus `remote_write`
 - Vector log shipping and RUM beacons
 
-Every write goes through the same path. If ClickHouse is down or overloaded, batches spill to a durable on-disk spool and replay on recovery; when the spool fills, callers get a `429` instead of silent data loss. An optional object-store (S3/MinIO) buffer makes that backlog survive a pod restart and be shared by replicas. In HA, API replicas produce into the shared prefix while exactly one dedicated drain worker replays it; running multiple replayers is rejected because the queue is at-least-once and has no distributed claim protocol. A metric firewall can drop or relabel series at ingest before they're ever stored.
+Every write goes through the same path. If ClickHouse is down or overloaded, batches spill to a durable on-disk spool and replay on recovery; when the spool fills, callers get a `429` instead of silent data loss. If ClickHouse rejects a shared batch because of its rows, replay retries it per tenant so other tenants' rows still land. Rows timestamped more than a day in the future are dropped before batching and counted in `rush_ingest_rows_dropped_total`. An optional object-store (S3/MinIO) buffer makes that backlog survive a pod restart and be shared by replicas. In HA, API replicas produce into the shared prefix while exactly one dedicated drain worker replays it; running multiple replayers is rejected because the queue is at-least-once and has no distributed claim protocol. A metric firewall can drop or relabel series at ingest before they're ever stored.
 
 ### Query
 
