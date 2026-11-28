@@ -73,11 +73,11 @@ pub async fn evaluate_range_query(
 ) -> Result<Vec<TimeSeries>, String> {
     let step_timestamps = generate_steps(start, end, step)?;
     let expr = parser::parse(query).map_err(|e| format!("{e}"))?;
-    let lookback = extract_lookback(&expr);
+    // Staleness skirt for instant vectors; matrix selectors size their own window.
     evaluate(
         &expr,
         ch,
-        start - lookback,
+        start - prom_lookback_secs(),
         end,
         &step_timestamps,
         tenant_id,
@@ -115,10 +115,11 @@ fn evaluate<'a>(
 
             Expr::MatrixSelector(ms) => {
                 // MatrixSelector wraps a VectorSelector with a range duration.
-                // We query the full range needed and keep ALL raw samples
-                // so that range functions (rate, increase, etc.) have enough data.
+                // Each step t needs the raw samples in (t - range, t], so fetch from
+                // the first step minus the range and keep ALL raw samples.
                 let range_secs = ms.range.as_secs_f64();
-                let adjusted_start = query_start - range_secs;
+                let first_step = step_timestamps.first().copied().unwrap_or(query_end);
+                let adjusted_start = first_step - range_secs;
                 query_clickhouse(
                     ch,
                     &ms.vs,
@@ -324,7 +325,7 @@ async fn evaluate_range_call(
     let raw_series = evaluate(
         matrix_arg,
         ch,
-        query_start - range_secs,
+        query_start,
         query_end,
         step_timestamps,
         tenant_id,
@@ -861,24 +862,6 @@ fn extract_number_literal(expr: &Expr) -> Option<f64> {
         Expr::NumberLiteral(n) => Some(n.val),
         Expr::Unary(u) => extract_number_literal(&u.expr).map(|v| -v),
         _ => None,
-    }
-}
-
-/// Extract the maximum range/lookback duration from an expression tree.
-pub fn extract_lookback(expr: &Expr) -> f64 {
-    match expr {
-        Expr::MatrixSelector(ms) => ms.range.as_secs_f64(),
-        Expr::Call(call) => call
-            .args
-            .args
-            .iter()
-            .map(|a| extract_lookback(a))
-            .fold(0.0_f64, f64::max),
-        Expr::Aggregate(agg) => extract_lookback(&agg.expr),
-        Expr::Binary(bin) => extract_lookback(&bin.lhs).max(extract_lookback(&bin.rhs)),
-        Expr::Unary(u) => extract_lookback(&u.expr),
-        Expr::Paren(p) => extract_lookback(&p.expr),
-        _ => prom_lookback_secs(), // default 5m staleness (RUSH_PROM_LOOKBACK_SECS)
     }
 }
 
@@ -1538,5 +1521,42 @@ mod tests {
         let steps = vec![0.0, 10.0, 20.0];
         let got = bucketed_rows_to_series(&[], &[], &steps);
         assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn range_functions_fetch_only_their_own_range_before_the_first_step() {
+        use clickhouse::test::{Mock, handlers};
+        fn lower_bound(sql: &str) -> i64 {
+            let marker = "TimeUnix >= toDateTime64(";
+            let rest = &sql[sql.find(marker).expect("lower bound") + marker.len()..];
+            rest[..rest.find(',').unwrap()].trim().parse().unwrap()
+        }
+        let start = 1_800_000_000.0;
+        let mock = Mock::new();
+        let client = Client::default().with_url(mock.url());
+        let range = [
+            mock.add(handlers::record_ddl()),
+            mock.add(handlers::record_ddl()),
+        ];
+        evaluate_range_query(
+            &client,
+            "rate(lookback_a_total[1h])",
+            start,
+            start + 21_600.0,
+            60.0,
+            "t",
+        )
+        .await
+        .unwrap();
+        let instant = [
+            mock.add(handlers::record_ddl()),
+            mock.add(handlers::record_ddl()),
+        ];
+        evaluate_instant_query(&client, "rate(lookback_b_total[1h])", start, 300.0, "t")
+            .await
+            .unwrap();
+        for recorded in range.into_iter().chain(instant) {
+            assert_eq!(lower_bound(&recorded.query().await), start as i64 - 3600);
+        }
     }
 }
