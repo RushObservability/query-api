@@ -140,6 +140,7 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `RUSH_AUDIT_HMAC_SECRET` | _(required in production)_ | current 32+ byte audit-chain signing key |
 | `RUSH_AUDIT_HMAC_KEY_ID` | `primary` | non-secret identifier written to new audit rows; change it with a planned signing-key rotation |
 | `RUSH_AUDIT_HMAC_PREVIOUS_KEYS` | _(empty)_ | JSON object of prior key IDs to 32+ byte secrets, required to verify historical segments after rotation; use `legacy` for rows predating key IDs |
+| `RUSH_AUDIT_RETENTION_DAYS` | `730` | audit table TTL, applied when the table is created; chain verification accepts chains whose oldest rows aged out under it, so keep it equal to the table's TTL |
 | `RUSH_AUDIT_SPOOL_DIR` | `./data/audit-spool` | fsynced ordered audit outbox; use persistent storage in production |
 | `RUSH_AUDIT_SPOOL_MAX_BYTES` | `268435456` | maximum audit outbox bytes before readiness remains degraded and new audit events follow the documented fail-open policy |
 | `RUSH_QUERY_API_REPLICAS` | `1` | positive replica count; values above one require a shared SSO replay store |

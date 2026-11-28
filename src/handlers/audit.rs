@@ -155,7 +155,8 @@ fn audit_where_clause(params: &AuditQuery) -> String {
 ///
 /// Walks each writer chain in `seq ASC` order and recomputes each row's hash using the
 /// SAME canonical function as the writer. Reports `intact`, how many rows were
-/// `checked`, and the `first_broken_seq` if any link fails to reproduce —
+/// `checked`, every broken chain in `broken_chains` (and the first one in
+/// `first_broken_seq`/`first_broken_chain_id`) if any link fails to reproduce —
 /// either because a row's own hash was tampered, or because its `prev_hash`
 /// does not match the previous row's recomputed hash (insert/delete/reorder).
 pub async fn verify_audit(
@@ -187,59 +188,100 @@ pub(crate) async fn verify_table<'a>(
          ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
          FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id ASC, seq ASC";
     let mut cursor = ch.query(sql).fetch::<AuditRow>()?;
-    let mut verifier = ChainVerifier::default();
+    let mut verifier = ChainVerifier::new(ttl_horizon_nanos());
     while let Some(row) = cursor.next().await? {
-        if !verifier.push(&row, &secret_for_key) {
-            break;
-        }
+        verifier.push(&row, &secret_for_key);
     }
     Ok(verifier.result())
 }
 
-/// Verifies rows one at a time, keeping only each chain's tail.
-#[derive(Default)]
+/// A chain whose oldest surviving row is older than this may have lost its
+/// head to the `audit_events` TTL. The slack covers the gap between that row
+/// and the expired one before it, and TTL merges running late.
+fn ttl_horizon_nanos() -> i64 {
+    const SLACK_DAYS: i64 = 7;
+    // Same setting and default as `migrations::create_audit_table`.
+    let retention_days: i64 = std::env::var("RUSH_AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(730);
+    let horizon = time::OffsetDateTime::now_utc()
+        - time::Duration::days(retention_days.saturating_sub(SLACK_DAYS).max(0));
+    horizon.unix_nanos().unwrap_or(i64::MIN)
+}
+
+/// Verifies rows one at a time, keeping only each chain's tail. Every chain is
+/// checked to the end; a broken chain is reported once and then skipped.
 pub(crate) struct ChainVerifier {
     checked: u64,
-    tails: std::collections::HashMap<String, (u64, String)>,
-    broken: Option<(u64, String)>,
+    /// `None` once the chain is broken.
+    tails: std::collections::HashMap<String, Option<(u64, String)>>,
+    broken: Vec<(String, u64)>,
+    ttl_horizon: i64,
+    expired_heads: u64,
 }
 
 impl ChainVerifier {
-    /// Check the next row of its chain. Returns `false` at the first break.
+    pub(crate) fn new(ttl_horizon: i64) -> Self {
+        Self {
+            checked: 0,
+            tails: std::collections::HashMap::new(),
+            broken: Vec::new(),
+            ttl_horizon,
+            expired_heads: 0,
+        }
+    }
+
+    /// Check the next row of its chain.
     pub(crate) fn push<'a>(
         &mut self,
         row: &AuditRow,
         secret_for_key: impl Fn(&str) -> Option<&'a [u8]>,
-    ) -> bool {
+    ) {
         self.checked += 1;
-        let tail = self.tails.get(&row.chain_id);
-        let (seq, hash) = tail.map_or((0, ""), |(seq, hash)| (*seq, hash.as_str()));
-        let valid = row.seq == seq + 1
-            && row.prev_hash == hash
-            && secret_for_key(&row.key_id).is_some_and(|key| compute_hash(key, row) == row.hash);
+        let signed =
+            || secret_for_key(&row.key_id).is_some_and(|key| compute_hash(key, row) == row.hash);
+        let valid = match self.tails.get(&row.chain_id) {
+            Some(None) => return,
+            Some(Some((seq, hash))) => row.seq == seq + 1 && row.prev_hash == *hash && signed(),
+            None if row.seq == 1 => row.prev_hash.is_empty() && signed(),
+            // Older rows of this chain expired by TTL; the rest must still link.
+            None => {
+                let expired = row.timestamp < self.ttl_horizon && signed();
+                self.expired_heads += u64::from(expired);
+                expired
+            }
+        };
         if !valid {
-            self.broken = Some((row.seq, row.chain_id.clone()));
-            return false;
+            self.broken.push((row.chain_id.clone(), row.seq));
+            self.tails.insert(row.chain_id.clone(), None);
+            return;
         }
         match self.tails.get_mut(&row.chain_id) {
-            Some(tail) => {
+            Some(Some(tail)) => {
                 tail.0 = row.seq;
                 tail.1.clone_from(&row.hash);
             }
-            None => {
+            _ => {
                 self.tails
-                    .insert(row.chain_id.clone(), (row.seq, row.hash.clone()));
+                    .insert(row.chain_id.clone(), Some((row.seq, row.hash.clone())));
             }
         }
-        true
     }
 
     pub(crate) fn result(&self) -> serde_json::Value {
+        let first = self.broken.first();
         serde_json::json!({
-            "intact": self.broken.is_none(),
+            "intact": self.broken.is_empty(),
             "checked": self.checked,
-            "first_broken_seq": self.broken.as_ref().map(|(seq, _)| seq),
-            "first_broken_chain_id": self.broken.as_ref().map(|(_, chain)| chain),
+            "first_broken_seq": first.map(|(_, seq)| seq),
+            "first_broken_chain_id": first.map(|(chain, _)| chain),
+            "broken_chains": self
+                .broken
+                .iter()
+                .map(|(chain, seq)| serde_json::json!({ "chain_id": chain, "seq": seq }))
+                .collect::<Vec<_>>(),
+            "ttl_expired_chain_heads": self.expired_heads,
         })
     }
 }
@@ -251,11 +293,9 @@ pub(crate) fn verify_rows<'a>(
     rows: &[AuditRow],
     secret_for_key: impl Fn(&str) -> Option<&'a [u8]>,
 ) -> serde_json::Value {
-    let mut verifier = ChainVerifier::default();
+    let mut verifier = ChainVerifier::new(ttl_horizon_nanos());
     for row in rows {
-        if !verifier.push(row, &secret_for_key) {
-            break;
-        }
+        verifier.push(row, &secret_for_key);
     }
     verifier.result()
 }
@@ -368,9 +408,53 @@ mod tests {
             .with_validation(false);
         let result = verify_table(&ch, |_| Some(SECRET)).await.unwrap();
         assert_eq!(result["intact"], false);
-        assert_eq!(result["checked"], 4);
+        // Every row is read, including those after the break.
+        assert_eq!(result["checked"], 5);
         assert_eq!(result["first_broken_chain_id"], "writer-b");
         assert_eq!(result["first_broken_seq"], 1);
+    }
+
+    #[test]
+    fn ttl_expiry_is_tolerated_and_every_broken_chain_is_reported() {
+        let now = time::OffsetDateTime::now_utc().unix_nanos().unwrap();
+        let mut rows = chain("a-expired", 5);
+        // TTL removed the oldest rows of a chain written before the horizon.
+        rows.drain(0..2);
+        let mut tampered = chain("b-tampered", 3);
+        tampered[1].description = "changed".into();
+        rows.extend(tampered);
+        // The same gap in a recent chain cannot be TTL and is still reported.
+        let mut recent = chain("c-recent", 4);
+        for row in &mut recent {
+            row.timestamp = now - 1_000;
+            row.prev_hash.clear();
+        }
+        for i in 0..recent.len() {
+            if i > 0 {
+                recent[i].prev_hash = recent[i - 1].hash.clone();
+            }
+            recent[i].hash = compute_hash(SECRET, &recent[i]);
+        }
+        rows.extend(recent.drain(1..));
+        rows.extend(chain("d-intact", 2));
+
+        let result = verify_rows(&rows, |_| Some(SECRET));
+        assert_eq!(result["intact"], false);
+        assert_eq!(result["ttl_expired_chain_heads"], 1);
+        assert_eq!(result["first_broken_chain_id"], "b-tampered");
+        assert_eq!(result["first_broken_seq"], 2);
+        assert_eq!(
+            result["broken_chains"],
+            serde_json::json!([
+                { "chain_id": "b-tampered", "seq": 2 },
+                { "chain_id": "c-recent", "seq": 2 },
+            ])
+        );
+
+        // An expired head alone is not tampering.
+        let mut rows = chain("a-expired", 5);
+        rows.drain(0..2);
+        assert_eq!(verify_rows(&rows, |_| Some(SECRET))["intact"], true);
     }
 
     #[tokio::test]
