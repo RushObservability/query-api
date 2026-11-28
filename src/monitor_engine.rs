@@ -566,7 +566,7 @@ fn monitor_due(
 /// (tenants evaluated at once, monitors at once per tenant), sized to the
 /// background query budget so the engine fills it without queueing work the
 /// governor would reject, and one slow tenant holds only its own share.
-fn engine_concurrency(budget: &crate::query_governor::QueryBudget) -> (usize, usize) {
+pub(crate) fn engine_concurrency(budget: &crate::query_governor::QueryBudget) -> (usize, usize) {
     let per_tenant = (budget.per_tenant_concurrency as usize).max(1);
     let tenants = (budget.global_concurrency as usize / per_tenant).max(1);
     (tenants, per_tenant)
