@@ -728,6 +728,12 @@ fn explicit_ingest_tenant(path: &str) -> Option<String> {
     None
 }
 
+/// The explicit path tenant when it differs from the resolved tenant and so
+/// must be checked against it (by name or id) before the handler runs.
+fn explicit_ingest_tenant_mismatch(path: &str, resolved_tenant: &str) -> Option<String> {
+    explicit_ingest_tenant(path).filter(|requested| requested != resolved_tenant)
+}
+
 /// Routes that must remain reachable before a tenant-authenticated session
 /// exists. All other routes are subject to the resolved tenant's
 /// `auth_required` policy.
@@ -2277,6 +2283,25 @@ async fn enforce_tenant_auth_middleware(
     }
 
     if let Some(signal) = ingest_signal {
+        // The explicit-tenant handlers write to the path tenant, so it must be
+        // the tenant this request authenticated for, keyed or open ingest.
+        if let Some(requested_tenant) = explicit_ingest_tenant_mismatch(&path, &tenant_id) {
+            if !same_tenant(&state, &tenant_id, &requested_tenant).await {
+                audit_api_key_denial(
+                    &state,
+                    req.headers(),
+                    &resolution,
+                    "tenant_not_allowed",
+                    Some(signal),
+                )
+                .await;
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "tenant not allowed for this request",
+                )
+                    .into_response();
+            }
+        }
         if !anonymous_ingest {
             let Some(grant) = resolution.api_key.as_ref() else {
                 return (
@@ -2299,23 +2324,6 @@ async fn enforce_tenant_auth_middleware(
                     "signal not allowed for API key",
                 )
                     .into_response();
-            }
-            if let Some(requested_tenant) = explicit_ingest_tenant(&path) {
-                if !same_tenant(&state, &grant.tenant_id, &requested_tenant).await {
-                    audit_api_key_denial(
-                        &state,
-                        req.headers(),
-                        &resolution,
-                        "tenant_not_allowed",
-                        Some(signal),
-                    )
-                    .await;
-                    return (
-                        axum::http::StatusCode::FORBIDDEN,
-                        "tenant not allowed for API key",
-                    )
-                        .into_response();
-                }
             }
             if !grant.source_cidrs.is_empty() {
                 let source_ip = req
@@ -6218,6 +6226,34 @@ mod tenant_auth_tests {
             Some("acme".to_string())
         );
         assert_eq!(explicit_ingest_tenant("/api/v2/logs/t/acme/extra"), None);
+    }
+
+    #[test]
+    fn open_ingest_cannot_write_into_another_path_tenant() {
+        for path in ["/api/v2/logs/t/locked", "/cloudwatch/firehose/t/locked"] {
+            assert_eq!(
+                super::explicit_ingest_tenant_mismatch(path, "open").as_deref(),
+                Some("locked")
+            );
+        }
+        assert_eq!(
+            super::explicit_ingest_tenant_mismatch("/api/v2/logs/t/open", "open"),
+            None
+        );
+        assert_eq!(
+            super::explicit_ingest_tenant_mismatch("/v1/logs", "open"),
+            None
+        );
+        // The path check must cover anonymous open ingest, not only keyed requests.
+        let source = include_str!("main.rs");
+        let gate = source
+            .split("if let Some(signal) = ingest_signal {")
+            .nth(1)
+            .expect("ingest gate");
+        let check = gate
+            .find("explicit_ingest_tenant_mismatch(&path, &tenant_id)")
+            .expect("path tenant check");
+        assert!(check < gate.find("if !anonymous_ingest {").expect("keyed branch"));
     }
 
     #[test]
