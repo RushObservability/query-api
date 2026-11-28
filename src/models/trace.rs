@@ -177,6 +177,9 @@ pub struct TraceResponse {
     pub span_count: usize,
     pub duration_ns: u64,
     pub services: Vec<String>,
+    /// True when the trace had more spans than the response cap and only the earliest were kept.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// A span node in the assembled trace tree.

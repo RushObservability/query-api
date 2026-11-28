@@ -254,16 +254,13 @@ pub async fn get_trace(
     }
     let tenant_id = &tenant.tenant_id;
     let esc_t = escape_string_literal(tenant_id);
-    let esc_id = escape_string_literal(&trace_id);
 
-    let rows = crate::tenant_query(
+    let mut rows = crate::tenant_query(
         &state.ch,
-        &format!(
-            "SELECT ?fields FROM spans WHERE tenant_id = '{esc_t}' AND trace_id = '{esc_id}' \
-             ORDER BY timestamp ASC"
-        ),
+        &crate::handlers::traces::trace_spans_sql(&esc_t, ""),
         tenant_id,
     )
+    .bind(&trace_id)
     .fetch_all::<WideEvent>()
     .await
     .map_err(ch_err)?;
@@ -271,7 +268,15 @@ pub async fn get_trace(
     if rows.is_empty() {
         return Ok(envelope(Vec::<Value>::new()));
     }
-    Ok(envelope(vec![build_jaeger_trace(&trace_id, rows)]))
+    let truncated = crate::handlers::traces::cap_trace_rows(&mut rows);
+    let mut trace = build_jaeger_trace(&trace_id, rows);
+    if truncated {
+        trace["warnings"] = json!([format!(
+            "trace truncated to its first {} spans",
+            crate::handlers::traces::MAX_TRACE_SPANS
+        )]);
+    }
+    Ok(envelope(vec![trace]))
 }
 
 /// GET /jaeger/api/dependencies — stub (no precomputed dependency graph).
