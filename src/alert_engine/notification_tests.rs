@@ -19,14 +19,14 @@ use tokio::{
 };
 
 #[derive(Clone)]
-pub(super) struct MockTransport {
+pub(crate) struct MockTransport {
     pub client: reqwest::Client,
     pub url: String,
     pub destinations: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
 tokio::task_local! {
-    pub(super) static HTTP_MOCK: MockTransport;
+    pub(crate) static HTTP_MOCK: MockTransport;
 }
 
 #[derive(Debug)]
