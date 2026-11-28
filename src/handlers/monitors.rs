@@ -100,6 +100,11 @@ pub async fn create_monitor(
         req.critical,
         req.warning,
     )?;
+    validate_schedule(
+        &req.monitor_type,
+        req.eval_window_secs,
+        req.eval_interval_secs,
+    )?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let query_config = serde_json::to_string(&req.query_config)
@@ -259,6 +264,11 @@ pub async fn update_monitor(
         &req.comparator,
         req.critical,
         req.warning,
+    )?;
+    validate_schedule(
+        &req.monitor_type,
+        req.eval_window_secs,
+        req.eval_interval_secs,
     )?;
 
     let query_config = serde_json::to_string(&req.query_config)
@@ -614,6 +624,31 @@ fn validate_threshold_order(
         return Err((StatusCode::BAD_REQUEST, message.to_string()));
     }
 
+    Ok(())
+}
+
+/// Same window bounds as preview. The engine starts a cycle every 60 s, so a
+/// shorter interval can't be honoured. Forecast and composite monitors don't
+/// use the stored window.
+fn validate_schedule(
+    monitor_type: &str,
+    eval_window_secs: i64,
+    eval_interval_secs: i64,
+) -> Result<(), (StatusCode, String)> {
+    if !matches!(monitor_type, "forecast" | "composite")
+        && !(60..=604_800).contains(&eval_window_secs)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "eval_window_secs must be between 60 seconds and 7 days".to_string(),
+        ));
+    }
+    if !(60..=86_400).contains(&eval_interval_secs) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "eval_interval_secs must be between 60 seconds and 1 day".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1068,6 +1103,20 @@ pub async fn suggest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_monitors_need_a_bounded_window_and_interval() {
+        // An unbounded window ran every evaluation to the background time limit.
+        assert!(validate_schedule("metric", 300, 60).is_ok());
+        assert!(validate_schedule("metric", 315_360_000, 60).is_err());
+        assert!(validate_schedule("log", 0, 60).is_err());
+        assert!(validate_schedule("apm", 604_800, 86_400).is_ok());
+        assert!(validate_schedule("metric", 300, 0).is_err());
+        assert!(validate_schedule("metric", 300, 86_401).is_err());
+        // The stored window is ignored for these.
+        assert!(validate_schedule("forecast", 0, 300).is_ok());
+        assert!(validate_schedule("composite", 0, 60).is_ok());
+    }
 
     #[test]
     fn autocomplete_queries_only_scan_the_last_day() {
