@@ -113,6 +113,11 @@ pub fn compile_count_query(
     window_start: &str,
     window_end: &str,
 ) -> Result<CompiledDetectionQuery, DetectionQueryError> {
+    // ClickHouse reads backslash escapes inside quoted identifiers as well as
+    // literals; sqlparser does not, so the two would disagree on where a token ends.
+    if query_sql.contains('\\') {
+        return Err(invalid("backslashes are not supported in query_sql"));
+    }
     let expanded = expand_window_placeholders(query_sql, window_start, window_end)?;
     let dialect = ClickHouseDialect {};
     let (mut statements, comments) = Parser::parse_sql_with_comments(&dialect, &expanded)
@@ -749,6 +754,18 @@ mod tests {
         }
         // The read-back check also covers values injected after validation.
         assert!(compile_count_query("SELECT count() FROM logs", "a\\", "s", "e").is_err());
+    }
+
+    #[test]
+    fn rejects_backslashes_in_quoted_identifiers_and_aliases() {
+        for sql in [
+            "SELECT 1 AS `a\\`, ` FROM logs WHERE 1 = 1) AS s SETTINGS x = 1 -- ` FROM logs",
+            "SELECT `Body\\` FROM logs",
+            "SELECT count() FROM logs WHERE \"Body\\\" = 'x'",
+        ] {
+            assert!(compile(sql).is_err(), "accepted: {sql}");
+        }
+        compile("SELECT `Body` AS `b` FROM logs").unwrap();
     }
 
     #[test]
