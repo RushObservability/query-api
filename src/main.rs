@@ -661,23 +661,60 @@ async fn tenant_middleware_scoped(state: AppState, mut req: Request, next: Next)
             rush_api::request_auth::set_api_key_grant(grant);
         }
     }
-    if rush_api::notebook_delegation::route_allowed(req.method(), req.uri().path()) {
+    let notebook_route =
+        rush_api::notebook_delegation::route_allowed(req.method(), req.uri().path());
+    // The shared SRE token alone must not pick the tenant. Every agent call
+    // carries the access query-api issued for the investigating caller, which
+    // binds the tenant, principal and role.
+    let delegated_sre = resolution.credential == CredentialKind::InternalSre
+        && sre_route_needs_delegation(req.method(), req.uri().path());
+    if notebook_route || delegated_sre {
         match rush_api::notebook_delegation::authorize(
             &state.config_db,
             req.headers(),
             &resolution.tenant_id,
-            req.method() == Method::POST,
+            notebook_route && req.method() == Method::POST,
         )
         .await
         {
             Ok((principal, identity)) => {
+                if !sre_route_allowed_for_role(req.uri().path(), &principal.4) {
+                    state
+                        .audit
+                        .log(
+                            rush_api::audit::AuditEvent::for_request(
+                                "sre_agent.scope_denied",
+                                &identity,
+                            )
+                            .tenant(resolution.tenant_id.clone())
+                            .resource("http_route", req.uri().path())
+                            .outcome("failure")
+                            .changes(
+                                serde_json::json!({ "reason": "role_not_allowed" }).to_string(),
+                            )
+                            .context(rush_api::audit::actor_context_from_headers(req.headers())),
+                        )
+                        .await;
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "the investigating user's role does not allow this route",
+                    )
+                        .into_response();
+                }
                 rush_api::request_auth::set_notebook_principal(principal);
                 request_identity = identity;
             }
             Err(error) => {
                 let event = if resolution.credential == CredentialKind::InternalSre {
-                    rush_api::audit::AuditEvent::new("notebook.delegation_denied", "system")
-                        .actor_name("sre-agent")
+                    rush_api::audit::AuditEvent::new(
+                        if notebook_route {
+                            "notebook.delegation_denied"
+                        } else {
+                            "sre_agent.delegation_denied"
+                        },
+                        "system",
+                    )
+                    .actor_name("sre-agent")
                 } else {
                     rush_api::audit::AuditEvent::for_request(
                         "notebook.delegation_denied",
@@ -1834,6 +1871,17 @@ fn credential_route_denial(
     } else {
         None
     }
+}
+
+/// SRE agent routes that need the investigating caller's delegated access.
+/// Only the LLM readiness probe, which reads no tenant data, goes without.
+fn sre_route_needs_delegation(method: &Method, path: &str) -> bool {
+    !(method == Method::GET && path == "/api/v1/internal/sre/llm/ready")
+}
+
+/// Mirrors the scopes `sre_proxy` grants by role: cluster access is admin-only.
+fn sre_route_allowed_for_role(path: &str, role: &str) -> bool {
+    path != "/api/v1/internal/kubernetes-access-events" || role == "admin"
 }
 
 fn internal_sre_route_allowed(method: &Method, path: &str) -> bool {
@@ -4950,6 +4998,34 @@ mod tenant_auth_tests {
                 "{method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn sre_agent_tenant_and_role_come_from_the_delegated_caller() {
+        for (method, path) in [
+            (Method::POST, "/api/v1/query"),
+            (Method::POST, "/api/v1/logs"),
+            (Method::GET, "/prom/api/v1/query_range"),
+            (Method::GET, "/api/v1/traces/abc"),
+            (Method::GET, "/api/v1/internal/sre/sessions"),
+            (Method::POST, "/api/v1/internal/sre/context"),
+            (Method::POST, "/api/v1/internal/sre/llm/chat"),
+            (Method::GET, "/api/v1/internal/kubernetes-access-events"),
+        ] {
+            assert!(
+                super::sre_route_needs_delegation(&method, path),
+                "{method} {path}"
+            );
+        }
+        assert!(!super::sre_route_needs_delegation(
+            &Method::GET,
+            "/api/v1/internal/sre/llm/ready"
+        ));
+        let kube = "/api/v1/internal/kubernetes-access-events";
+        assert!(super::sre_route_allowed_for_role(kube, "admin"));
+        assert!(!super::sre_route_allowed_for_role(kube, "write"));
+        assert!(!super::sre_route_allowed_for_role(kube, "viewer"));
+        assert!(super::sre_route_allowed_for_role("/api/v1/query", "viewer"));
     }
 
     #[test]
