@@ -164,15 +164,7 @@ pub async fn verify_audit(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers).await?;
 
-    let sql = "SELECT id, seq, chain_id, ts AS timestamp, tenant_id, \
-         actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
-         ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
-         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id ASC, seq ASC";
-
-    let rows = state
-        .admin_ch
-        .query(sql)
-        .fetch_all::<AuditRow>()
+    let result = verify_table(&state.admin_ch, |key_id| state.audit.secret_for_key(key_id))
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "audit verify query failed");
@@ -181,38 +173,91 @@ pub async fn verify_audit(
                 "internal error".to_string(),
             )
         })?;
-
-    let result = verify_rows(&rows, |key_id| state.audit.secret_for_key(key_id));
     Ok(Json(result))
 }
 
-/// Verify each writer independently, including the legacy chain with an empty
-/// id. Input must be ordered by sequence within each chain.
-pub(crate) fn verify_rows<'a>(
-    rows: &[AuditRow],
+/// Stream every row through [`ChainVerifier`] so memory stays bounded by the
+/// number of chains, not the size of the audit table.
+pub(crate) async fn verify_table<'a>(
+    ch: &clickhouse::Client,
     secret_for_key: impl Fn(&str) -> Option<&'a [u8]>,
-) -> serde_json::Value {
-    let mut checked: u64 = 0;
-    let mut broken: Option<&AuditRow> = None;
-    let mut tails = std::collections::HashMap::<&str, (u64, &str)>::new();
-    for row in rows {
-        checked += 1;
-        let (seq, hash) = tails.get(row.chain_id.as_str()).copied().unwrap_or((0, ""));
+) -> clickhouse::error::Result<serde_json::Value> {
+    let sql = "SELECT id, seq, chain_id, ts AS timestamp, tenant_id, \
+         actor_id, actor_name, actor_type, action, resource_type, resource_id, outcome, \
+         ip_address, user_agent, request_id, changes, description, metadata, key_id, segment_id, prev_hash, hash \
+         FROM (SELECT *, toUnixTimestamp64Nano(timestamp) AS ts FROM audit_events) ORDER BY chain_id ASC, seq ASC";
+    let mut cursor = ch.query(sql).fetch::<AuditRow>()?;
+    let mut verifier = ChainVerifier::default();
+    while let Some(row) = cursor.next().await? {
+        if !verifier.push(&row, &secret_for_key) {
+            break;
+        }
+    }
+    Ok(verifier.result())
+}
+
+/// Verifies rows one at a time, keeping only each chain's tail.
+#[derive(Default)]
+pub(crate) struct ChainVerifier {
+    checked: u64,
+    tails: std::collections::HashMap<String, (u64, String)>,
+    broken: Option<(u64, String)>,
+}
+
+impl ChainVerifier {
+    /// Check the next row of its chain. Returns `false` at the first break.
+    pub(crate) fn push<'a>(
+        &mut self,
+        row: &AuditRow,
+        secret_for_key: impl Fn(&str) -> Option<&'a [u8]>,
+    ) -> bool {
+        self.checked += 1;
+        let tail = self.tails.get(&row.chain_id);
+        let (seq, hash) = tail.map_or((0, ""), |(seq, hash)| (*seq, hash.as_str()));
         let valid = row.seq == seq + 1
             && row.prev_hash == hash
             && secret_for_key(&row.key_id).is_some_and(|key| compute_hash(key, row) == row.hash);
         if !valid {
-            broken = Some(row);
+            self.broken = Some((row.seq, row.chain_id.clone()));
+            return false;
+        }
+        match self.tails.get_mut(&row.chain_id) {
+            Some(tail) => {
+                tail.0 = row.seq;
+                tail.1.clone_from(&row.hash);
+            }
+            None => {
+                self.tails
+                    .insert(row.chain_id.clone(), (row.seq, row.hash.clone()));
+            }
+        }
+        true
+    }
+
+    pub(crate) fn result(&self) -> serde_json::Value {
+        serde_json::json!({
+            "intact": self.broken.is_none(),
+            "checked": self.checked,
+            "first_broken_seq": self.broken.as_ref().map(|(seq, _)| seq),
+            "first_broken_chain_id": self.broken.as_ref().map(|(_, chain)| chain),
+        })
+    }
+}
+
+/// Verify each writer independently, including the legacy chain with an empty
+/// id. Input must be ordered by sequence within each chain.
+#[cfg(test)]
+pub(crate) fn verify_rows<'a>(
+    rows: &[AuditRow],
+    secret_for_key: impl Fn(&str) -> Option<&'a [u8]>,
+) -> serde_json::Value {
+    let mut verifier = ChainVerifier::default();
+    for row in rows {
+        if !verifier.push(row, &secret_for_key) {
             break;
         }
-        tails.insert(&row.chain_id, (row.seq, &row.hash));
     }
-    serde_json::json!({
-        "intact": broken.is_none(),
-        "checked": checked,
-        "first_broken_seq": broken.map(|row| row.seq),
-        "first_broken_chain_id": broken.map(|row| &row.chain_id),
-    })
+    verifier.result()
 }
 
 /// Render an `AuditRow` as JSON with the timestamp as an RFC3339 string instead
@@ -274,6 +319,58 @@ mod tests {
         });
         assert!(clause.starts_with(&format!("WHERE {USER_ACTIVITY_FILTER} AND ")));
         assert!(clause.contains(&escape_string_literal("alice' OR 1=1 --")));
+    }
+
+    const SECRET: &[u8] = b"0123456789012345678901234567890123456789";
+
+    fn chain(chain_id: &str, n: u64) -> Vec<AuditRow> {
+        let mut out: Vec<AuditRow> = Vec::new();
+        for seq in 1..=n {
+            let mut row = AuditRow {
+                id: format!("{chain_id}-{seq}"),
+                seq,
+                chain_id: chain_id.into(),
+                timestamp: 1_700_000_000_000_000_000 + seq as i64,
+                tenant_id: "_audit".into(),
+                actor_id: "u1".into(),
+                actor_name: "admin".into(),
+                actor_type: "user".into(),
+                action: "settings.update".into(),
+                resource_type: String::new(),
+                resource_id: String::new(),
+                outcome: "success".into(),
+                ip_address: String::new(),
+                user_agent: String::new(),
+                request_id: String::new(),
+                changes: String::new(),
+                description: String::new(),
+                metadata: String::new(),
+                key_id: "primary".into(),
+                segment_id: "s".into(),
+                prev_hash: out.last().map(|r| r.hash.clone()).unwrap_or_default(),
+                hash: String::new(),
+            };
+            row.hash = compute_hash(SECRET, &row);
+            out.push(row);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn verify_streams_rows_from_clickhouse() {
+        let mut rows = chain("writer-a", 3);
+        rows.extend(chain("writer-b", 2));
+        rows[3].actor_name = "changed".into();
+        let mock = clickhouse::test::Mock::new();
+        mock.add(clickhouse::test::handlers::provide(rows));
+        let ch = clickhouse::Client::default()
+            .with_url(mock.url())
+            .with_validation(false);
+        let result = verify_table(&ch, |_| Some(SECRET)).await.unwrap();
+        assert_eq!(result["intact"], false);
+        assert_eq!(result["checked"], 4);
+        assert_eq!(result["first_broken_chain_id"], "writer-b");
+        assert_eq!(result["first_broken_seq"], 1);
     }
 
     #[tokio::test]
