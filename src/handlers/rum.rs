@@ -313,6 +313,28 @@ mod rum_enabled_cache_tests {
     use super::*;
 
     #[test]
+    fn meta_copied_into_every_event_is_bounded() {
+        let limits = crate::ingest_limits::IngestLimits::for_test(std::sync::Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ));
+        let payload = |page_url: &str| -> RumIngestPayload {
+            serde_json::from_value(serde_json::json!({
+                "meta": {"app_name": "web", "page_url": page_url},
+                "events": vec![serde_json::json!({"event_type": "view"}); 50],
+            }))
+            .unwrap()
+        };
+        // 100 bytes x 50 events exceeds the 4096-byte test limit.
+        assert_eq!(
+            check_meta_fan_out(&limits, &payload(&"u".repeat(100)))
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        check_meta_fan_out(&limits, &payload("/home")).unwrap();
+    }
+
+    #[test]
     fn rum_enabled_is_cached_briefly_and_forgotten_on_toggle() {
         let now = std::time::Instant::now();
         *RUM_ENABLED.lock().unwrap() = Some((false, now));
@@ -344,6 +366,45 @@ pub async fn ingest(
     ingest_events(state, tenant, payload, wire_bytes).await
 }
 
+/// The meta strings are copied into every event's row, and again into the
+/// synthetic span of each event with a trace id.
+fn check_meta_fan_out(
+    limits: &crate::ingest_limits::IngestLimits,
+    payload: &RumIngestPayload,
+) -> Result<(), (StatusCode, String)> {
+    let m = &payload.meta;
+    let meta_bytes: usize = [
+        &m.app_name,
+        &m.app_version,
+        &m.environment,
+        &m.session_id,
+        &m.user_id,
+        &m.page_url,
+        &m.page_path,
+        &m.view_name,
+        &m.referrer,
+        &m.browser_name,
+        &m.browser_version,
+        &m.os_name,
+        &m.os_version,
+        &m.device_type,
+    ]
+    .iter()
+    .map(|s| s.len())
+    .sum();
+    let traced = payload
+        .events
+        .iter()
+        .filter(|e| !e.trace_id.is_empty() && !e.span_id.is_empty())
+        .count();
+    limits.check_fan_out(
+        "rum",
+        &mut 0,
+        meta_bytes,
+        payload.events.len().saturating_add(traced),
+    )
+}
+
 /// Shared durable RUM write path after the route-specific credential and payload checks.
 pub(super) async fn ingest_events(
     state: AppState,
@@ -354,6 +415,7 @@ pub(super) async fn ingest_events(
     state
         .ingest_limits
         .check_entities("rum", payload.events.len())?;
+    check_meta_fan_out(&state.ingest_limits, &payload)?;
     let tenant_id = &tenant.tenant_id;
     let meta = &payload.meta;
     let now_ns = time::OffsetDateTime::now_utc().unix_nanos().unwrap_or(0);

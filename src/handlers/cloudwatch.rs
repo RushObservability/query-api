@@ -343,6 +343,7 @@ fn firehose_record_rows(
     let mut rows: Vec<LogInsertRow> = Vec::new();
     let mut decoded_entities = req.records.len();
     let mut decompressed_total = outer_len;
+    let mut fan_out = 0usize;
     limits.check_entities("cloudwatch", decoded_entities)?;
 
     for record in &req.records {
@@ -376,6 +377,14 @@ fn firehose_record_rows(
         if payload.message_type == "CONTROL_MESSAGE" {
             continue;
         }
+
+        // logGroup is copied into every event's row.
+        limits.check_fan_out(
+            "cloudwatch",
+            &mut fan_out,
+            payload.log_group.len(),
+            payload.log_events.len(),
+        )?;
 
         // Resource attributes are constant across this record's events.
         let resource_attrs: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(vec![
@@ -429,4 +438,44 @@ fn firehose_record_rows(
     }
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use std::io::Write;
+
+    fn limits() -> crate::ingest_limits::IngestLimits {
+        crate::ingest_limits::IngestLimits::for_test(std::sync::Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ))
+    }
+
+    fn request(log_group: &str, events: usize) -> FirehoseRequest {
+        let inner = format!(
+            r#"{{"messageType":"DATA_MESSAGE","logGroup":"{log_group}","logEvents":[{}]}}"#,
+            vec!["{}"; events].join(",")
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(inner.as_bytes()).unwrap();
+        FirehoseRequest {
+            request_id: String::new(),
+            timestamp: 0,
+            records: vec![FirehoseRecord {
+                data: base64::engine::general_purpose::STANDARD.encode(gz.finish().unwrap()),
+            }],
+        }
+    }
+
+    #[test]
+    fn log_group_copied_into_every_event_is_bounded() {
+        let limits = limits();
+        // 100 bytes x 50 events exceeds the 4096-byte test limit.
+        let error =
+            firehose_record_rows(&limits, "t", &request(&"g".repeat(100), 50), 0).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        let rows = firehose_record_rows(&limits, "t", &request("/aws/lambda/f", 50), 0).unwrap();
+        assert_eq!(rows.len(), 50);
+    }
 }

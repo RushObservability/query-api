@@ -157,7 +157,7 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `INITIAL_ADMIN_PASSWORD` | _(required for a new database)_ | initial administrator seed supplied through a secret; it is never generated or written to application logs |
 | `RUSH_ALLOWED_ORIGINS` | _(empty; cross-origin disabled)_ | Comma-separated exact HTTP(S) browser origins. Invalid, `null`, wildcard, credential-bearing, or path-bearing entries stop startup; production browser mutations must still match `RUSH_BASE_URL` |
 | `RUSH_INGEST_MAX_COMPRESSED_BYTES` | `8388608` | maximum wire body accepted by an ingest endpoint before decoding |
-| `RUSH_INGEST_MAX_DECOMPRESSED_BYTES` | `33554432` | maximum inflated bytes per ingest request, including cumulative nested CloudWatch records |
+| `RUSH_INGEST_MAX_DECOMPRESSED_BYTES` | `33554432` | maximum inflated bytes per ingest request, including cumulative nested CloudWatch records; also caps the bytes of shared values (service name, tags, labels) copied into every row |
 | `RUSH_INGEST_MAX_ENTITIES` | `200000` | maximum combined decoded records, points, attributes, labels, and container entities |
 | `RUSH_INGEST_MAX_SERIES` / `RUSH_INGEST_MAX_SAMPLES` | `20000` / `200000` | Prometheus and Datadog series/point limits |
 | `RUSH_INGEST_MAX_METADATA` | `10000` | Prometheus remote-write metadata-record limit |

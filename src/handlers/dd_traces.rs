@@ -425,6 +425,7 @@ fn decode_agent_payload(
                 );
             }
             let mut span_count = 0usize;
+            let mut fan_out = 0usize;
             // Collect all spans from the protobuf payload
             let mut all_spans: Vec<DdSpan> = Vec::new();
             for tp in &payload.tracer_payloads {
@@ -433,6 +434,17 @@ fn decode_agent_payload(
                 } else {
                     &tp.hostname
                 };
+                // env, hostname and app version are copied into every span.
+                limits.check_fan_out(
+                    "datadog",
+                    &mut fan_out,
+                    env.len() + tp_hostname.len() + tp.app_version.len(),
+                    tp.chunks
+                        .iter()
+                        .chain(tp.traces.iter())
+                        .map(|c| c.spans.len())
+                        .sum(),
+                )?;
                 // DD agent uses both tag 5 (chunks) and tag 6 (traces/deprecated) for TraceChunks
                 let all_chunks = tp.chunks.iter().chain(tp.traces.iter());
                 for chunk in all_chunks {
@@ -527,4 +539,68 @@ fn msgpack_spans(
         })
         .collect();
     Ok((WideEvent::from_rows(rows), span_count, traces.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> crate::ingest_limits::IngestLimits {
+        crate::ingest_limits::IngestLimits::for_test(std::sync::Arc::new(
+            crate::self_metrics::SelfMetrics::new(),
+        ))
+    }
+
+    #[test]
+    fn agent_env_copied_into_every_span_is_bounded() {
+        let limits = limits();
+        let tenant: std::sync::Arc<str> = "t".into();
+        let payload = |env: &str| {
+            AgentPayload {
+                host_name: String::new(),
+                env: env.into(),
+                tracer_payloads: vec![TracerPayload {
+                    container_id: String::new(),
+                    language_name: String::new(),
+                    language_version: String::new(),
+                    tracer_version: String::new(),
+                    chunks: vec![TraceChunk {
+                        priority: 0,
+                        origin: String::new(),
+                        spans: vec![
+                            PbSpan {
+                                service: "s".into(),
+                                name: "n".into(),
+                                resource: String::new(),
+                                trace_id: 1,
+                                span_id: 1,
+                                parent_id: 0,
+                                start: 0,
+                                duration: 0,
+                                error: 0,
+                                meta: HashMap::new(),
+                                metrics: HashMap::new(),
+                                r#type: String::new(),
+                            };
+                            50
+                        ],
+                    }],
+                    traces: Vec::new(),
+                    app_version: String::new(),
+                    hostname: String::new(),
+                }],
+            }
+            .encode_to_vec()
+        };
+        // 100 bytes x 50 spans exceeds the 4096-byte test limit.
+        let error = match decode_agent_payload(&limits, &tenant, &payload(&"e".repeat(100))) {
+            Err(error) => error,
+            Ok(_) => panic!("expected the fan-out limit"),
+        };
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        match decode_agent_payload(&limits, &tenant, &payload("prod")).unwrap() {
+            AgentTraces::Spans { span_count, .. } => assert_eq!(span_count, 50),
+            AgentTraces::Undecodable(e) => panic!("{e}"),
+        }
+    }
 }
