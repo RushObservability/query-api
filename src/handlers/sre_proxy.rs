@@ -243,6 +243,14 @@ pub async fn investigate(
 fn parse_investigation_body(
     body: &[u8],
 ) -> Result<serde_json::Map<String, serde_json::Value>, (StatusCode, String)> {
+    // The route layer enforces this too; checking here keeps the parse bounded
+    // wherever it is called from.
+    if body.len() > MAX_INVESTIGATE_BODY_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "investigation body is too large".into(),
+        ));
+    }
     match serde_json::from_slice(body) {
         Ok(serde_json::Value::Object(obj)) => Ok(obj),
         Ok(_) => Err((
@@ -329,6 +337,11 @@ mod tests {
                 axum::http::StatusCode::BAD_REQUEST
             );
         }
+        let oversized = vec![b' '; super::MAX_INVESTIGATE_BODY_BYTES + 1];
+        assert_eq!(
+            super::parse_investigation_body(&oversized).unwrap_err().0,
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     use super::*;
