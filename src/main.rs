@@ -2738,6 +2738,7 @@ async fn main() -> anyhow::Result<()> {
         rush_api::probe_row_policy_support(&admin_ch).await?;
         migrations::apply_row_policies(&admin_ch, user).await?;
         migrations::verify_row_policies(&admin_ch, &ch, user).await?;
+        rush_api::verify_read_grants(&ch).await?;
         anyhow::Ok(())
     }
     .await;
