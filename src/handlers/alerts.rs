@@ -862,6 +862,41 @@ mod channel_config_tests {
         }
     }
 
+    #[tokio::test]
+    async fn pagerduty_validation_and_secret_preservation() {
+        let saved = json!({"routing_key": "saved-key", "region": "eu", "severity": "error"});
+        let merged = merge_channel_config(saved.clone(), json!({"routing_key": ""}));
+        assert_eq!(merged, saved);
+        assert!(validate_channel_config("pagerduty", &merged).await.is_ok());
+        let rotated = merge_channel_config(saved, json!({"routing_key": "new-key"}));
+        assert_eq!(rotated["routing_key"], "new-key");
+        assert!(
+            validate_channel_config("pagerduty", &json!({"routing_key": " "}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rootly_validation_and_secret_preservation() {
+        let saved =
+            json!({"url": crate::alert_engine::rootly::WEBHOOK_URL, "token": "saved-secret"});
+        assert!(validate_channel_config("rootly", &saved).await.is_ok());
+        let merged = merge_channel_config(saved.clone(), json!({"url": "", "token": ""}));
+        assert_eq!(merged, saved);
+        assert!(validate_channel_config("rootly", &merged).await.is_ok());
+        assert!(
+            validate_channel_config(
+                "rootly",
+                &json!({"url": crate::alert_engine::rootly::WEBHOOK_URL})
+            )
+            .await
+            .is_err()
+        );
+        let rotated = merge_channel_config(saved, json!({"token": "rotated-secret"}));
+        assert_eq!(rotated["token"], "rotated-secret");
+    }
+
     async fn post_with_mock(destination: String) -> Result<(), (StatusCode, String)> {
         let transport = crate::alert_engine::notification_tests::MockTransport {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -907,40 +942,5 @@ mod channel_config_tests {
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_GATEWAY);
         server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn pagerduty_validation_and_secret_preservation() {
-        let saved = json!({"routing_key": "saved-key", "region": "eu", "severity": "error"});
-        let merged = merge_channel_config(saved.clone(), json!({"routing_key": ""}));
-        assert_eq!(merged, saved);
-        assert!(validate_channel_config("pagerduty", &merged).await.is_ok());
-        let rotated = merge_channel_config(saved, json!({"routing_key": "new-key"}));
-        assert_eq!(rotated["routing_key"], "new-key");
-        assert!(
-            validate_channel_config("pagerduty", &json!({"routing_key": " "}))
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn rootly_validation_and_secret_preservation() {
-        let saved =
-            json!({"url": crate::alert_engine::rootly::WEBHOOK_URL, "token": "saved-secret"});
-        assert!(validate_channel_config("rootly", &saved).await.is_ok());
-        let merged = merge_channel_config(saved.clone(), json!({"url": "", "token": ""}));
-        assert_eq!(merged, saved);
-        assert!(validate_channel_config("rootly", &merged).await.is_ok());
-        assert!(
-            validate_channel_config(
-                "rootly",
-                &json!({"url": crate::alert_engine::rootly::WEBHOOK_URL})
-            )
-            .await
-            .is_err()
-        );
-        let rotated = merge_channel_config(saved, json!({"token": "rotated-secret"}));
-        assert_eq!(rotated["token"], "rotated-secret");
     }
 }
