@@ -19,19 +19,22 @@ use crate::promql;
 /// Short-TTL cache for Prometheus metadata endpoints (/labels, /label/{name}/values).
 /// Grafana variable refresh hammers these with the same expressions; each miss costs
 /// two 1h table scans. Keys embed the tenant_id so entries never cross tenants.
-static PROM_META_CACHE: LazyLock<DashMap<String, (Vec<String>, Instant)>> =
+/// Keys are (endpoint, tenant, label, match) tuples, not joined strings, so a
+/// tenant name or label containing a separator cannot collide with another key.
+type PromMetaKey = (&'static str, String, String, String);
+static PROM_META_CACHE: LazyLock<DashMap<PromMetaKey, (Vec<String>, Instant)>> =
     LazyLock::new(DashMap::new);
 const PROM_META_TTL: Duration = Duration::from_secs(60);
 const PROM_META_CACHE_MAX: usize = 10_000;
 
-fn prom_meta_cache_get(key: &str) -> Option<Vec<String>> {
+fn prom_meta_cache_get(key: &PromMetaKey) -> Option<Vec<String>> {
     PROM_META_CACHE
         .get(key)
         .filter(|e| e.1.elapsed() < PROM_META_TTL)
         .map(|e| e.0.clone())
 }
 
-fn prom_meta_cache_put(key: String, values: Vec<String>) {
+fn prom_meta_cache_put(key: PromMetaKey, values: Vec<String>) {
     if PROM_META_CACHE.len() > PROM_META_CACHE_MAX {
         // Evict only expired entries first — clear() would also wipe hot entries
         // (keys embed client-controllable match exprs, so churn is expected).
@@ -41,6 +44,24 @@ fn prom_meta_cache_put(key: String, values: Vec<String>) {
         }
     }
     PROM_META_CACHE.insert(key, (values, Instant::now()));
+}
+
+fn labels_cache_key(tenant: &str, match_expr: Option<&str>) -> PromMetaKey {
+    (
+        "labels",
+        tenant.to_string(),
+        String::new(),
+        match_expr.unwrap_or("").to_string(),
+    )
+}
+
+fn values_cache_key(tenant: &str, label: &str, match_expr: Option<&str>) -> PromMetaKey {
+    (
+        "values",
+        tenant.to_string(),
+        label.to_string(),
+        match_expr.unwrap_or("").to_string(),
+    )
 }
 
 // ═══ Prometheus-compatible API endpoints ═══
@@ -439,10 +460,7 @@ pub async fn prom_labels(
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
 
     // 60s TTL cache keyed by (tenant, match expression).
-    let cache_key = format!(
-        "labels|{tenant_id}|{}",
-        params.match_expr.as_deref().unwrap_or("")
-    );
+    let cache_key = labels_cache_key(tenant_id, params.match_expr.as_deref());
     if let Some(cached) = prom_meta_cache_get(&cache_key) {
         state.self_metrics.record_query(
             "promql_metadata",
@@ -556,10 +574,7 @@ pub async fn prom_label_values(
     let escaped_tenant = crate::query_builder::escape_string_literal(&tenant_id);
 
     // 60s TTL cache keyed by (tenant, label, match expression).
-    let cache_key = format!(
-        "values|{tenant_id}|{label_name}|{}",
-        params.match_expr.as_deref().unwrap_or("")
-    );
+    let cache_key = values_cache_key(tenant_id, &label_name, params.match_expr.as_deref());
     if let Some(cached) = prom_meta_cache_get(&cache_key) {
         state.self_metrics.record_query(
             "promql_metadata",
@@ -744,6 +759,19 @@ mod tests {
     // `use super::*;` re-exports the parent module's `use crate::models::metrics::*;`,
     // so PromResponse/VectorData/MatrixData/etc. are already in scope here.
     use super::*;
+
+    #[test]
+    fn prom_meta_cache_keys_do_not_collide_across_tenants() {
+        assert_ne!(
+            labels_cache_key("x", Some("y|up")),
+            labels_cache_key("x|y", Some("up"))
+        );
+        assert_ne!(
+            values_cache_key("x", "y|job", Some("")),
+            values_cache_key("x|y", "job", Some(""))
+        );
+        assert_ne!(values_cache_key("x", "", None), labels_cache_key("x", None));
+    }
 
     // ── parse_step ──
 
