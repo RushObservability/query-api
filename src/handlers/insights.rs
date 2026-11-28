@@ -159,6 +159,8 @@ fn log_patterns_sql(escaped_tenant: &str, from: OffsetDateTime, to: OffsetDateTi
          PREWHERE tenant_id = '{escaped_tenant}' \
             AND TimestampDate >= toDate(parseDateTime64BestEffort('{from}', 9)) \
             AND TimestampDate <= toDate(parseDateTime64BestEffort('{to}', 9)) \
+            AND TimestampTime >= toDateTime(parseDateTime64BestEffort('{from}', 9)) \
+            AND TimestampTime <= toDateTime(parseDateTime64BestEffort('{to}', 9)) \
             AND Timestamp >= parseDateTime64BestEffort('{from}', 9) \
             AND Timestamp <= parseDateTime64BestEffort('{to}', 9) \
          WHERE SeverityText IN ('ERROR', 'WARN', 'FATAL') \
@@ -367,6 +369,14 @@ mod tests {
         ));
         assert!(sql.contains(
             "Timestamp <= parseDateTime64BestEffort('2026-11-07T04:30:00.000000000Z', 9)"
+        ));
+        // `Timestamp` is not in the logs primary key; without these the read
+        // covers the whole day.
+        assert!(sql.contains(
+            "TimestampTime >= toDateTime(parseDateTime64BestEffort('2026-11-07T04:15:00.000000000Z', 9))"
+        ));
+        assert!(sql.contains(
+            "TimestampTime <= toDateTime(parseDateTime64BestEffort('2026-11-07T04:30:00.000000000Z', 9))"
         ));
         // The clickhouse crate treats `?` as a bind placeholder.
         assert!(!sql.contains('?'));

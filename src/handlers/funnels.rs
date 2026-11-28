@@ -93,6 +93,23 @@ fn step_clauses(step: &FunnelStep, from: &str, to: &str, tenant_id: &str) -> Que
     }
 }
 
+/// Each run fans out one query per step, so its window gets the same
+/// workload cap as every other telemetry read.
+fn validate_run_range(
+    req: &RunFunnelRequest,
+    max_seconds: u64,
+) -> Result<(), (StatusCode, String)> {
+    crate::query_governor::ValidatedTimeRange::parse(&req.from, &req.to, max_seconds)
+        .map(|_| ())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "from and to must be an ordered time range within the query workload limit"
+                    .to_string(),
+            )
+        })
+}
+
 pub async fn list_funnels(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -187,6 +204,9 @@ pub async fn run_funnel(
     Json(req): Json<RunFunnelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_write(&state, &headers).await?;
+    let max_range = crate::query_governor::active_budget()
+        .map_or(30 * 86400, |budget| budget.max_time_range_secs);
+    validate_run_range(&req, max_range)?;
     let row = state
         .config_db
         .get_funnel(&id, &tenant.tenant_id)
@@ -263,6 +283,29 @@ pub async fn run_funnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_range_is_capped_by_the_workload_limit() {
+        let run = |from: &str, to: &str| RunFunnelRequest {
+            from: from.into(),
+            to: to.into(),
+        };
+        let week = 7 * 86400;
+        assert!(
+            validate_run_range(&run("1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z"), week).is_err()
+        );
+        assert!(
+            validate_run_range(&run("2026-01-01T01:00:00Z", "2026-01-01T00:00:00Z"), week).is_err()
+        );
+        assert!(validate_run_range(&run("yesterday", "2026-01-01T00:00:00Z"), week).is_err());
+        assert!(
+            validate_run_range(
+                &run("2026-01-01T00:00:00.000Z", "2026-01-01T01:00:00.000Z"),
+                week
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn step_clauses_escape_quotes_question_marks_and_like_wildcards() {

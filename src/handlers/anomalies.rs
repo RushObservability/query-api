@@ -13,6 +13,36 @@ use crate::handlers::users::{require_principal, require_principal_write, require
 use crate::llm_gateway::{LlmCaller, LlmOperation, MAX_ANOMALY_ADDITIONAL_CONTEXT_BYTES};
 use crate::models::anomaly::*;
 
+/// Recent logs of the correlated services. `from`/`to` are formatted
+/// `YYYY-MM-DD HH:MM:SS` times and `services` are already quoted literals.
+/// `Timestamp` is not in the logs primary key, so the key columns bound the
+/// read to the window instead of every partition.
+fn correlation_logs_sql(
+    escaped_tenant: &str,
+    from: &str,
+    to: &str,
+    services: &[String],
+    limit: u32,
+) -> String {
+    format!(
+        "SELECT toString(Timestamp) as timestamp, \
+                ServiceName as service_name, \
+                SeverityText as severity_text, \
+                Body as body, \
+                TraceId as trace_id \
+         FROM logs \
+         WHERE tenant_id = '{escaped_tenant}' \
+           AND TimestampDate >= toDate('{from}') AND TimestampDate <= toDate('{to}') \
+           AND TimestampTime >= toDateTime('{from}') AND TimestampTime <= toDateTime('{to}') \
+           AND Timestamp >= parseDateTimeBestEffort('{from}') \
+           AND Timestamp <= parseDateTimeBestEffort('{to}') \
+           AND ServiceName IN ({}) \
+         ORDER BY Timestamp DESC \
+         LIMIT {limit}",
+        services.join(", ")
+    )
+}
+
 pub async fn analyze_anomaly_event(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -60,6 +90,23 @@ pub async fn analyze_anomaly_event(
                 .ok();
 
             if let Some(ts) = event_ts {
+                // The route is not admitted as a whole because its LLM call
+                // outlives the interactive request timeout; the permit covers
+                // only these reads and is released before the call.
+                let _admission = match crate::query_governor::global() {
+                    Some(governor) => Some(
+                        governor
+                            .admit(crate::query_governor::WorkloadClass::Interactive, tenant_id)
+                            .await
+                            .map_err(|_| {
+                                (
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    "query capacity is busy; retry shortly".to_string(),
+                                )
+                            })?,
+                    ),
+                    None => None,
+                };
                 let from = ts - time::Duration::minutes(5);
                 let to = ts + time::Duration::minutes(5);
                 let from_str = from.clickhouse_seconds();
@@ -103,22 +150,12 @@ pub async fn analyze_anomaly_event(
 
                     // Fetch logs for top services
                     if !svc_names.is_empty() {
-                        let log_query = format!(
-                            "SELECT toString(Timestamp) as timestamp, \
-                                    ServiceName as service_name, \
-                                    SeverityText as severity_text, \
-                                    Body as body, \
-                                    TraceId as trace_id \
-                             FROM logs \
-                             WHERE tenant_id = '{escaped_tenant}' \
-                               AND Timestamp >= parseDateTimeBestEffort('{}') \
-                               AND Timestamp <= parseDateTimeBestEffort('{}') \
-                               AND ServiceName IN ({}) \
-                             ORDER BY Timestamp DESC \
-                             LIMIT 50",
-                            from_str,
-                            to_str,
-                            svc_names.join(", ")
+                        let log_query = correlation_logs_sql(
+                            &escaped_tenant,
+                            &from_str,
+                            &to_str,
+                            &svc_names,
+                            50,
                         );
 
                         if let Ok(logs) = crate::tenant_query(&state.ch, &log_query, tenant_id)
@@ -578,23 +615,7 @@ pub async fn get_event_correlations(
             })
             .map(|s| format!("'{}'", s.name))
             .collect();
-        let log_query = format!(
-            "SELECT toString(Timestamp) as timestamp, \
-                    ServiceName as service_name, \
-                    SeverityText as severity_text, \
-                    Body as body, \
-                    TraceId as trace_id \
-             FROM logs \
-             WHERE tenant_id = '{escaped_tenant}' \
-               AND Timestamp >= parseDateTimeBestEffort('{}') \
-               AND Timestamp <= parseDateTimeBestEffort('{}') \
-               AND ServiceName IN ({}) \
-             ORDER BY Timestamp DESC \
-             LIMIT 200",
-            from_str,
-            to_str,
-            svc_list.join(", ")
-        );
+        let log_query = correlation_logs_sql(&escaped_tenant, &from_str, &to_str, &svc_list, 200);
 
         crate::tenant_query(&state.ch, &log_query, tenant_id)
             .fetch_all::<CorrelationLog>()
@@ -612,4 +633,30 @@ pub async fn get_event_correlations(
         services,
         logs,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correlation_logs_are_bounded_by_the_logs_key_columns() {
+        let sql = correlation_logs_sql(
+            "acme",
+            "2026-11-07 04:25:00",
+            "2026-11-07 04:35:00",
+            &["'checkout'".to_string(), "'cart'".to_string()],
+            50,
+        );
+        assert!(sql.contains("tenant_id = 'acme'"));
+        assert!(sql.contains(
+            "TimestampDate >= toDate('2026-11-07 04:25:00') AND TimestampDate <= toDate('2026-11-07 04:35:00')"
+        ));
+        assert!(sql.contains(
+            "TimestampTime >= toDateTime('2026-11-07 04:25:00') AND TimestampTime <= toDateTime('2026-11-07 04:35:00')"
+        ));
+        assert!(sql.contains("ServiceName IN ('checkout', 'cart')"));
+        assert!(sql.ends_with("LIMIT 50"));
+        assert!(!sql.contains('?'));
+    }
 }
