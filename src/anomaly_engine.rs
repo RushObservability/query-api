@@ -755,10 +755,13 @@ mod tests {
 
     #[tokio::test]
     async fn prometheus_rules_do_not_need_an_http_prom_endpoint() {
-        // Nothing listens here. The old self-call to /prom failed (as it did on
-        // auth-required tenants) and set the rule to no_data; in-process PromQL
-        // treats an unreadable table as no samples, like the /prom handler.
-        let ch = Client::default().with_url("http://127.0.0.1:9");
+        // Only ClickHouse is reachable, no /prom endpoint. The old self-call to
+        // /prom failed (as it did on auth-required tenants) and set the rule to
+        // no_data; in-process PromQL reads the metric tables directly.
+        let mock = clickhouse::test::Mock::new();
+        mock.add(clickhouse::test::handlers::record_ddl());
+        mock.add(clickhouse::test::handlers::record_ddl());
+        let ch = Client::default().with_url(mock.url());
         let series = fetch_prom_data(
             &ch,
             &test_rule("r", "prometheus"),
