@@ -1032,7 +1032,7 @@ mod auth_storage_tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let worker_limit = limit.clone();
         let request = tokio::spawn(async move {
-            password_work_with_limit(worker_limit, move || {
+            password_work_with_limit(worker_limit, Duration::from_secs(5), move || {
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             })
@@ -1044,7 +1044,7 @@ mod auth_storage_tests {
             .unwrap();
         // A timer still runs on this single-thread runtime while the worker is blocked.
         tokio::time::sleep(Duration::from_millis(1)).await;
-        let error = password_work_with_limit(limit.clone(), || ())
+        let error = password_work_with_limit(limit.clone(), Duration::from_millis(10), || ())
             .await
             .unwrap_err();
         assert!(error.is::<PasswordWorkBusy>());
@@ -1061,16 +1061,48 @@ mod auth_storage_tests {
             .unwrap()
             .unwrap();
         drop(permit);
-        assert_eq!(password_work_with_limit(limit, || 42).await.unwrap(), 42);
+        assert_eq!(
+            password_work_with_limit(limit, Duration::from_secs(5), || 42)
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn password_work_queues_for_a_busy_worker_instead_of_failing() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let running = tokio::spawn(password_work_with_limit(
+            limit.clone(),
+            Duration::from_secs(5),
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+        ));
+        started_rx.await.unwrap();
+        let queued = tokio::spawn(password_work_with_limit(
+            limit.clone(),
+            Duration::from_secs(5),
+            || 7,
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release_tx.send(()).unwrap();
+        running.await.unwrap().unwrap();
+        assert_eq!(queued.await.unwrap().unwrap(), 7);
     }
 
     #[tokio::test]
     async fn password_worker_panic_releases_capacity() {
         let limit = Arc::new(tokio::sync::Semaphore::new(1));
         assert!(
-            password_work_with_limit(limit.clone(), || panic!("test worker failure"))
-                .await
-                .is_err()
+            password_work_with_limit(limit.clone(), Duration::from_secs(5), || panic!(
+                "test worker failure"
+            ))
+            .await
+            .is_err()
         );
         assert_eq!(limit.available_permits(), 1);
     }
@@ -1945,6 +1977,9 @@ mod slo_event_tests {
 }
 
 const PASSWORD_WORK_CONCURRENCY: usize = 4;
+/// How long a password check waits for a free worker before giving up. A short
+/// burst queues instead of failing real logins with 503.
+const PASSWORD_WORK_QUEUE_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 #[error("password verification capacity is temporarily exhausted")]
@@ -1952,15 +1987,20 @@ pub struct PasswordWorkBusy;
 
 async fn password_work_with_limit<T, F>(
     limit: Arc<tokio::sync::Semaphore>,
+    wait: Duration,
     work: F,
 ) -> anyhow::Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    // Acquire before submitting to Tokio's blocking pool. There is no waiting
-    // request queue, and cancellation cannot release a running job's permit.
-    let permit = limit.try_acquire_owned().map_err(|_| PasswordWorkBusy)?;
+    // Acquire before submitting to Tokio's blocking pool. Waiters queue in
+    // order for up to `wait`; a cancelled waiter leaves the queue, and
+    // cancellation cannot release a running job's permit.
+    let permit = tokio::time::timeout(wait, limit.acquire_owned())
+        .await
+        .map_err(|_| PasswordWorkBusy)?
+        .map_err(|_| PasswordWorkBusy)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         work()
@@ -1979,6 +2019,7 @@ where
         LIMIT
             .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(PASSWORD_WORK_CONCURRENCY)))
             .clone(),
+        PASSWORD_WORK_QUEUE_WAIT,
         work,
     )
     .await
