@@ -1238,10 +1238,19 @@ mod auth_storage_tests {
     #[test]
     fn session_auth_coalesces_user_role_and_sso_policy_into_one_query() {
         let source = include_str!("clickhouse_config.rs");
-        assert!(
-            source.contains("FROM config_sessions s\n                   JOIN config_users u FINAL")
-        );
+        assert!(source.contains("FROM config_sessions s\n                   JOIN (\n"));
         assert!(source.contains("LEFT JOIN (\n                       SELECT ug.user_id"));
+        // Users and memberships are read for the session's user only, not for
+        // every user in the instance on every request.
+        assert!(source.contains(
+            "(SELECT user_id FROM config_sessions WHERE token = ? LIMIT 1) AS session_user_id\n"
+        ));
+        assert!(source.contains(
+            "FROM config_users FINAL\n                       WHERE id = session_user_id"
+        ));
+        assert!(source.contains(
+            "FROM config_user_groups FINAL\n                           WHERE user_id = session_user_id"
+        ));
         assert!(source.contains("FROM config_sso_active_provider FINAL"));
         assert!(source.contains("ifNull(roles.role, 'viewer') AS role"));
     }
@@ -5018,13 +5027,20 @@ impl ConfigDb {
             active_provider_present: u8,
         }
         let now = Self::now_str();
-        let sql = "SELECT u.id, u.username, u.display_name, u.tenant_id,
+        // Resolve the session's user first so the users and group-membership
+        // reads touch one user, not every user in the instance.
+        let sql = "WITH (SELECT user_id FROM config_sessions WHERE token = ? LIMIT 1) AS session_user_id
+                   SELECT u.id, u.username, u.display_name, u.tenant_id,
                           s.expires_at, s.user_id, s.auth_method, s.provider_id, s.sso_revision,
                           ifNull(roles.role, 'viewer') AS role,
                           ifNull(active.provider_id, '') AS active_provider_id,
                           ifNull(active.present, 0) AS active_provider_present
                    FROM config_sessions s
-                   JOIN config_users u FINAL ON s.user_id = u.id
+                   JOIN (
+                       SELECT id, username, display_name, tenant_id, version, enabled, is_deleted
+                       FROM config_users FINAL
+                       WHERE id = session_user_id
+                   ) u ON s.user_id = u.id
                    LEFT JOIN (
                        SELECT ug.user_id,
                               multiIf(
@@ -5032,7 +5048,11 @@ impl ConfigDb {
                                   countIf(has(JSONExtract(g.permissions, 'Array(String)'), 'write')) > 0, 'write',
                                   'viewer'
                               ) AS role
-                       FROM config_user_groups ug FINAL
+                       FROM (
+                           SELECT user_id, group_id, is_deleted
+                           FROM config_user_groups FINAL
+                           WHERE user_id = session_user_id
+                       ) ug
                        JOIN config_groups g FINAL ON ug.group_id = g.id
                        WHERE ug.is_deleted = 0 AND g.is_deleted = 0
                        GROUP BY ug.user_id
@@ -5061,6 +5081,7 @@ impl ConfigDb {
         let result = self
             .client
             .query(sql)
+            .bind(&stored_token)
             .bind(&stored_token)
             .bind(&now)
             .bind(&now)
