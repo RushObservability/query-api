@@ -140,6 +140,7 @@ pub async fn run_anomaly_engine(
         "anomaly engine started"
     );
 
+    let mut eval_state = crate::eval_state::EvalState::new(EVAL_FLUSH_EVERY);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
@@ -154,6 +155,7 @@ pub async fn run_anomaly_engine(
             &http_client,
             &smtp_config,
             &smtp_transport,
+            &mut eval_state,
         );
         let ok = match crate::leader::fenced(lease.clone(), cycle).await {
             Ok(()) => true,
@@ -166,6 +168,9 @@ pub async fn run_anomaly_engine(
     }
 }
 
+/// Write an unchanged rule's `last_eval_at` once per this many evaluations.
+const EVAL_FLUSH_EVERY: u32 = 10;
+
 async fn eval_anomaly_rules(
     config_db: &ConfigDb,
     read_ch: &Client,
@@ -173,229 +178,85 @@ async fn eval_anomaly_rules(
     http_client: &reqwest::Client,
     smtp_config: &SmtpConfig,
     smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+    eval_state: &mut crate::eval_state::EvalState,
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let now_str = now.utc_seconds();
-    let due_rules = config_db.get_due_anomaly_rules(&now_str).await?;
-    crate::engine_metrics::due(config_db.self_metrics(), "anomaly_engine", due_rules.len());
+    // DB-side due filter (coarse: last_eval_at is only flushed 1-in-N) combined
+    // with the in-memory check ⇒ max(db, mem) + interval <= now semantics.
+    let jobs: Vec<(AnomalyRule, bool)> = config_db
+        .get_due_anomaly_rules(&now_str)
+        .await?
+        .into_iter()
+        .filter(|rule| eval_state.is_due(&rule.id, now, rule.eval_interval_secs))
+        .map(|rule| {
+            let flush = eval_state.should_flush(&rule.id);
+            (rule, flush)
+        })
+        .collect();
+    crate::engine_metrics::due(config_db.self_metrics(), "anomaly_engine", jobs.len());
 
-    if due_rules.is_empty() {
+    if jobs.is_empty() {
         tracing::debug!(engine = "anomaly", "tick -- no rules due");
     } else {
         tracing::debug!(
             engine = "anomaly",
-            rules_due = due_rules.len(),
+            rules_due = jobs.len(),
             "tick -- evaluating rules"
         );
     }
 
-    // Prefetch due rules' data concurrently, but no more at once than one tenant
-    // may hold background permits: starting them all at once left the rest
-    // waiting out the admission queue and failing.
-    let concurrency = crate::query_governor::global().map_or(2, |governor| {
-        governor.config().background.per_tenant_concurrency as usize
-    });
-    let fetched = prefetch(&due_rules, concurrency, |rule| async move {
-        let mut observation =
-            EvaluationObservation::new(config_db.self_metrics(), "anomaly_engine");
-        let fetched = crate::query_governor::run_background(&rule.tenant_id, async {
-            match rule.source.as_str() {
-                "apm" => Some(fetch_apm_data(read_ch, rule, &now).await),
-                "prometheus" => Some(fetch_prom_data(read_ch, rule, &now).await),
-                _ => None,
-            }
-        })
-        .await;
-        match fetched {
-            Ok(result) => Some((result, observation)),
-            Err(error) => {
-                observation.finish(EvaluationOutcome::AdmissionRejected);
-                tracing::debug!(engine = "anomaly", rule_id = %rule.id, ?error, "background pool busy; rule retried next tick");
-                None
-            }
-        }
-    })
+    // Each rule is fetched under a background permit and evaluated as soon as
+    // its data arrives, so only in-flight rules' series are held in memory.
+    // Tenants take turns; half the background pool is left for the monitor
+    // and SLO engines that share it.
+    let budget = crate::query_governor::global()
+        .map(|governor| governor.config())
+        .unwrap_or_default()
+        .background;
+    let (tenants_at_once, per_tenant) = crate::monitor_engine::engine_concurrency(&budget);
+    let now_str_ref = now_str.as_str();
+    let outcomes = run_tenant_fair(
+        jobs,
+        |(rule, _)| rule.tenant_id.clone(),
+        (tenants_at_once / 2).max(1),
+        per_tenant,
+        |(rule, should_flush)| async move {
+            let mut log_rows = Vec::new();
+            let result = evaluate_rule(
+                config_db,
+                read_ch,
+                http_client,
+                smtp_config,
+                smtp_transport,
+                &rule,
+                now,
+                now_str_ref,
+                should_flush,
+                &mut log_rows,
+            )
+            .await;
+            (rule.id, result, log_rows)
+        },
+    )
     .await;
 
     // Per-series eval logs are accumulated here and written as ONE batch insert
     // at the end of the tick (previously one INSERT per series per rule).
     let mut eval_log_values: Vec<String> = Vec::new();
-
     let mut failures = 0;
-    for (rule, fetched) in due_rules.into_iter().zip(fetched) {
-        // Not admitted: keep the rule's state; it is still due next tick.
-        let Some((prefetched, mut observation)) = fetched else {
-            continue;
-        };
-        observation.finish(EvaluationOutcome::Error);
-        tracing::debug!(
-            engine = "anomaly",
-            rule_name = %rule.name,
-            source = %rule.source,
-            state = %rule.state,
-            "evaluating rule"
-        );
-
-        let all_series = match prefetched {
-            Some(r) => r,
-            None => {
-                observation.finish(EvaluationOutcome::InvalidConfig);
+    for (id, result, log_rows) in outcomes {
+        eval_log_values.extend(log_rows);
+        match result {
+            // Not admitted: keep the rule due for the next tick.
+            Ok(None) => {}
+            Ok(Some(persisted)) => eval_state.record(id, now, persisted),
+            Err(error) => {
                 failures += 1;
-                tracing::warn!(engine = "anomaly", rule_id = %rule.id, source = %rule.source, "unknown data source");
-                continue;
-            }
-        };
-
-        let series_list = match all_series {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => {
-                tracing::debug!(engine = "anomaly", rule_name = %rule.name, "no data points returned");
-                config_db
-                    .update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None)
-                    .await?;
-                observation.finish(EvaluationOutcome::NoData);
-                continue;
-            }
-            Err(e) => {
-                failures += 1;
-                tracing::warn!(error = %e, engine = "anomaly", rule_id = %rule.id, "data fetch failed");
-                config_db
-                    .update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", &now_str, None)
-                    .await?;
-                continue;
-            }
-        };
-
-        tracing::debug!(
-            engine = "anomaly",
-            rule_name = %rule.name,
-            series_count = series_list.len(),
-            "series to evaluate"
-        );
-
-        // Evaluate each series independently; if ANY is anomalous the rule triggers
-        let mut any_anomalous = false;
-        let mut worst_deviation = 0.0_f64;
-        let mut worst_metric = String::new();
-        let mut worst_val = 0.0_f64;
-        let mut worst_expected = 0.0_f64;
-
-        for (values, metric_label) in &series_list {
-            if values.is_empty() {
-                continue;
-            }
-            let latest_val = *values.last().unwrap_or(&0.0);
-            let result = ewma_eval(values, rule.alpha, rule.sensitivity);
-
-            let series_state = if result.anomalous {
-                "anomalous"
-            } else {
-                "normal"
-            };
-
-            tracing::debug!(
-                engine = "anomaly",
-                rule_name = %rule.name,
-                metric = %metric_label,
-                data_points = values.len(),
-                latest_value = format_args!("{:.2}", latest_val),
-                ewma_mean = format_args!("{:.2}", result.mean),
-                deviation_sigma = format_args!("{:.1}", result.deviation),
-                anomalous = result.anomalous,
-                "series evaluated"
-            );
-
-            // Collect the eval log row; flushed in one batch insert per tick.
-            eval_log_values.push(anomaly_log_tuple(
-                &now,
-                &rule,
-                series_state,
-                metric_label,
-                latest_val,
-                result.mean,
-                result.deviation,
-            ));
-
-            if result.anomalous {
-                any_anomalous = true;
-            }
-            if result.deviation > worst_deviation {
-                worst_deviation = result.deviation;
-                worst_metric = metric_label.clone();
-                worst_val = latest_val;
-                worst_expected = result.mean;
+                tracing::warn!(engine = "anomaly", rule_id = %id, %error, "anomaly evaluation failed");
+                eval_state.record(id, now, false);
             }
         }
-
-        let new_state = if any_anomalous { "anomalous" } else { "normal" };
-        let old_state = rule.state.as_str();
-
-        if new_state != old_state {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            let message = format!(
-                "Anomaly '{}': {} (metric={}, value={:.2}, expected={:.2}, deviation={:.1}σ)",
-                rule.name,
-                if any_anomalous {
-                    "ANOMALOUS"
-                } else {
-                    "RESOLVED"
-                },
-                worst_metric,
-                worst_val,
-                worst_expected,
-                worst_deviation,
-            );
-
-            config_db
-                .create_anomaly_event(
-                    &event_id,
-                    &rule.id,
-                    &rule.tenant_id,
-                    new_state,
-                    &worst_metric,
-                    worst_val,
-                    worst_expected,
-                    worst_deviation,
-                    &message,
-                )
-                .await?;
-
-            let triggered_at = if any_anomalous {
-                Some(now_str.as_str())
-            } else {
-                None
-            };
-            config_db
-                .update_anomaly_state(&rule.id, &rule.tenant_id, new_state, &now_str, triggered_at)
-                .await?;
-
-            // Send notifications
-            send_notifications(
-                config_db,
-                http_client,
-                smtp_config,
-                smtp_transport,
-                &rule,
-                &message,
-                any_anomalous,
-            )
-            .await;
-
-            tracing::info!(
-                engine = "anomaly",
-                rule_name = %rule.name,
-                old_state = %old_state,
-                new_state = %new_state,
-                metric = %worst_metric,
-                deviation_sigma = format_args!("{:.1}", worst_deviation),
-                "anomaly state changed"
-            );
-        } else {
-            config_db
-                .update_anomaly_state(&rule.id, &rule.tenant_id, new_state, &now_str, None)
-                .await?;
-        }
-        observation.finish(EvaluationOutcome::Completed);
     }
 
     // Flush all per-series eval logs in one INSERT (previously one per series).
@@ -424,20 +285,244 @@ async fn eval_anomaly_rules(
     Ok(())
 }
 
-/// Runs `fetch` for each rule, at most `concurrency` at a time, in rule order.
-async fn prefetch<'a, T, Fut>(
-    rules: &'a [AnomalyRule],
-    concurrency: usize,
-    fetch: impl FnMut(&'a AnomalyRule) -> Fut,
+/// Fetch and evaluate one rule, pushing its per-series eval log rows. Returns
+/// `None` when the background pool refused the fetch, otherwise whether the
+/// rule row was written. Errors end only this rule.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_rule(
+    config_db: &ConfigDb,
+    read_ch: &Client,
+    http_client: &reqwest::Client,
+    smtp_config: &SmtpConfig,
+    smtp_transport: &Option<AsyncSmtpTransport<Tokio1Executor>>,
+    rule: &AnomalyRule,
+    now: time::OffsetDateTime,
+    now_str: &str,
+    should_flush: bool,
+    log_rows: &mut Vec<String>,
+) -> anyhow::Result<Option<bool>> {
+    let mut observation = EvaluationObservation::new(config_db.self_metrics(), "anomaly_engine");
+    let fetched = crate::query_governor::run_background(&rule.tenant_id, async {
+        match rule.source.as_str() {
+            "apm" => Some(fetch_apm_data(read_ch, rule, &now).await),
+            "prometheus" => Some(fetch_prom_data(read_ch, rule, &now).await),
+            _ => None,
+        }
+    })
+    .await;
+    let prefetched = match fetched {
+        Ok(result) => result,
+        Err(error) => {
+            observation.finish(EvaluationOutcome::AdmissionRejected);
+            tracing::debug!(engine = "anomaly", rule_id = %rule.id, ?error, "background pool busy; rule retried next tick");
+            return Ok(None);
+        }
+    };
+    observation.finish(EvaluationOutcome::Error);
+    tracing::debug!(
+        engine = "anomaly",
+        rule_name = %rule.name,
+        source = %rule.source,
+        state = %rule.state,
+        "evaluating rule"
+    );
+
+    let Some(all_series) = prefetched else {
+        observation.finish(EvaluationOutcome::InvalidConfig);
+        anyhow::bail!("unknown data source {:?}", rule.source);
+    };
+
+    let series_list = match all_series {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => {
+            tracing::debug!(engine = "anomaly", rule_name = %rule.name, "no data points returned");
+            let persisted = persist_no_data(config_db, rule, now_str, should_flush).await?;
+            observation.finish(EvaluationOutcome::NoData);
+            return Ok(Some(persisted));
+        }
+        Err(e) => {
+            persist_no_data(config_db, rule, now_str, should_flush).await?;
+            return Err(e.context("data fetch failed"));
+        }
+    };
+
+    tracing::debug!(
+        engine = "anomaly",
+        rule_name = %rule.name,
+        series_count = series_list.len(),
+        "series to evaluate"
+    );
+
+    // Evaluate each series independently; if ANY is anomalous the rule triggers
+    let mut any_anomalous = false;
+    let mut worst_deviation = 0.0_f64;
+    let mut worst_metric = String::new();
+    let mut worst_val = 0.0_f64;
+    let mut worst_expected = 0.0_f64;
+
+    for (values, metric_label) in &series_list {
+        if values.is_empty() {
+            continue;
+        }
+        let latest_val = *values.last().unwrap_or(&0.0);
+        let result = ewma_eval(values, rule.alpha, rule.sensitivity);
+
+        let series_state = if result.anomalous {
+            "anomalous"
+        } else {
+            "normal"
+        };
+
+        tracing::debug!(
+            engine = "anomaly",
+            rule_name = %rule.name,
+            metric = %metric_label,
+            data_points = values.len(),
+            latest_value = format_args!("{:.2}", latest_val),
+            ewma_mean = format_args!("{:.2}", result.mean),
+            deviation_sigma = format_args!("{:.1}", result.deviation),
+            anomalous = result.anomalous,
+            "series evaluated"
+        );
+
+        // Collect the eval log row; flushed in one batch insert per tick.
+        log_rows.push(anomaly_log_tuple(
+            &now,
+            rule,
+            series_state,
+            metric_label,
+            latest_val,
+            result.mean,
+            result.deviation,
+        ));
+
+        if result.anomalous {
+            any_anomalous = true;
+        }
+        if result.deviation > worst_deviation {
+            worst_deviation = result.deviation;
+            worst_metric = metric_label.clone();
+            worst_val = latest_val;
+            worst_expected = result.mean;
+        }
+    }
+
+    let new_state = if any_anomalous { "anomalous" } else { "normal" };
+    let old_state = rule.state.as_str();
+
+    let persisted = if new_state != old_state {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let message = format!(
+            "Anomaly '{}': {} (metric={}, value={:.2}, expected={:.2}, deviation={:.1}σ)",
+            rule.name,
+            if any_anomalous {
+                "ANOMALOUS"
+            } else {
+                "RESOLVED"
+            },
+            worst_metric,
+            worst_val,
+            worst_expected,
+            worst_deviation,
+        );
+
+        config_db
+            .create_anomaly_event(
+                &event_id,
+                &rule.id,
+                &rule.tenant_id,
+                new_state,
+                &worst_metric,
+                worst_val,
+                worst_expected,
+                worst_deviation,
+                &message,
+            )
+            .await?;
+
+        let triggered_at = if any_anomalous { Some(now_str) } else { None };
+        config_db
+            .update_anomaly_state(&rule.id, &rule.tenant_id, new_state, now_str, triggered_at)
+            .await?;
+
+        // Send notifications
+        send_notifications(
+            config_db,
+            http_client,
+            smtp_config,
+            smtp_transport,
+            rule,
+            &message,
+            any_anomalous,
+        )
+        .await;
+
+        tracing::info!(
+            engine = "anomaly",
+            rule_name = %rule.name,
+            old_state = %old_state,
+            new_state = %new_state,
+            metric = %worst_metric,
+            deviation_sigma = format_args!("{:.1}", worst_deviation),
+            "anomaly state changed"
+        );
+        true
+    } else if should_flush {
+        // Unchanged: only refresh last_eval_at on the flush cadence.
+        config_db
+            .update_anomaly_state(&rule.id, &rule.tenant_id, new_state, now_str, None)
+            .await?;
+        true
+    } else {
+        false
+    };
+    observation.finish(EvaluationOutcome::Completed);
+    Ok(Some(persisted))
+}
+
+/// Set the rule to `no_data`, writing only on a change or the flush cadence.
+async fn persist_no_data(
+    config_db: &ConfigDb,
+    rule: &AnomalyRule,
+    now_str: &str,
+    should_flush: bool,
+) -> anyhow::Result<bool> {
+    if rule.state == "no_data" && !should_flush {
+        return Ok(false);
+    }
+    config_db
+        .update_anomaly_state(&rule.id, &rule.tenant_id, "no_data", now_str, None)
+        .await?;
+    Ok(true)
+}
+
+/// Runs `job` for every item, at most `per_tenant` at a time within a tenant
+/// and `tenants` tenants at a time, returning results in completion order.
+async fn run_tenant_fair<I, T, Fut>(
+    items: Vec<I>,
+    tenant_of: impl Fn(&I) -> String,
+    tenants: usize,
+    per_tenant: usize,
+    job: impl Fn(I) -> Fut,
 ) -> Vec<T>
 where
     Fut: std::future::Future<Output = T>,
 {
+    let mut by_tenant: std::collections::BTreeMap<String, Vec<I>> = Default::default();
+    for item in items {
+        by_tenant.entry(tenant_of(&item)).or_default().push(item);
+    }
     // Build the futures up front; a lazily mapped stream trips the `Send`
     // check on the spawned engine task.
-    let fetches: Vec<Fut> = rules.iter().map(fetch).collect();
-    futures_util::stream::iter(fetches)
-        .buffered(concurrency.max(1))
+    let lanes: Vec<_> = by_tenant
+        .into_values()
+        .map(|items| {
+            let jobs: Vec<Fut> = items.into_iter().map(&job).collect();
+            futures_util::stream::iter(jobs).buffer_unordered(per_tenant.max(1))
+        })
+        .collect();
+    futures_util::stream::iter(lanes)
+        .flatten_unordered(tenants.max(1))
         .collect()
         .await
 }
@@ -700,57 +785,121 @@ mod tests {
         }
     }
 
-    /// Fetches each rule while holding a background permit for `hold`, and
+    /// Fetches each rule while holding a background permit for 50 ms, and
     /// returns how many were refused admission.
-    async fn rejected_fetches(concurrency: usize) -> usize {
+    async fn rejected_fetches(rules: Vec<AnomalyRule>, tenants: usize, per_tenant: usize) -> usize {
         use crate::query_governor::{QueryGovernor, QueryGovernorConfig, WorkloadClass};
         let mut config = QueryGovernorConfig::default();
         config.background.queue_timeout_ms = 10;
         let governor =
             QueryGovernor::new(config, Arc::new(crate::self_metrics::SelfMetrics::new())).unwrap();
-        let rules: Vec<AnomalyRule> = (0..6).map(|i| test_rule(&i.to_string(), "apm")).collect();
-        let results = prefetch(&rules, concurrency, |rule| {
-            let governor = &governor;
-            async move {
+        let governor = &governor;
+        let results = run_tenant_fair(
+            rules,
+            |rule| rule.tenant_id.clone(),
+            tenants,
+            per_tenant,
+            |rule| async move {
                 let guard = governor
                     .admit(WorkloadClass::Background, &rule.tenant_id)
                     .await?;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 drop(guard);
-                Ok::<_, crate::query_governor::AdmissionError>(rule.id.clone())
-            }
-        })
+                Ok::<_, crate::query_governor::AdmissionError>(rule.id)
+            },
+        )
         .await;
-        let admitted: Vec<&String> = results.iter().flatten().collect();
-        if admitted.len() == rules.len() {
-            assert_eq!(admitted, rules.iter().map(|r| &r.id).collect::<Vec<_>>());
-        }
         results.iter().filter(|r| r.is_err()).count()
     }
 
-    #[test]
-    fn eval_log_rows_belong_to_the_rule_tenant() {
-        // Without tenant_id the column default put every tenant's rows in `default`.
-        let row = anomaly_log_tuple(
-            &time::OffsetDateTime::now_utc(),
-            &test_rule("r", "prometheus"),
-            "anomalous",
-            "up",
-            1.0,
-            2.0,
-            3.0,
+    #[tokio::test]
+    async fn fetches_stay_within_the_background_pool() {
+        let budget = crate::query_governor::QueryGovernorConfig::default().background;
+        let (tenants, per_tenant) = crate::monitor_engine::engine_concurrency(&budget);
+        let one_tenant = || (0..6).map(|i| test_rule(&i.to_string(), "apm")).collect();
+        // Starting every rule at once (the old join_all) overflowed the pool.
+        assert!(rejected_fetches(one_tenant(), 1, 6).await > 0);
+        assert_eq!(rejected_fetches(one_tenant(), tenants, per_tenant).await, 0);
+        let many_tenants = (0..12)
+            .map(|i| {
+                let mut rule = test_rule(&i.to_string(), "apm");
+                rule.tenant_id = format!("t{}", i % 4);
+                rule
+            })
+            .collect();
+        assert_eq!(
+            rejected_fetches(many_tenants, (tenants / 2).max(1), per_tenant).await,
+            0
         );
-        assert!(row.starts_with("('acme', "), "{row}");
     }
 
     #[tokio::test]
-    async fn prefetch_stays_within_the_tenant_background_pool() {
-        let per_tenant = crate::query_governor::QueryGovernorConfig::default()
-            .background
-            .per_tenant_concurrency as usize;
-        // Starting every rule at once (the old join_all) overflowed the pool.
-        assert!(rejected_fetches(6).await > 0);
-        assert_eq!(rejected_fetches(per_tenant).await, 0);
+    async fn a_tenant_with_many_rules_does_not_go_first() {
+        // Rules used to be fetched in list order, two at a time across all
+        // tenants, so a tenant listed after a large one waited for all of it.
+        let mut rules: Vec<AnomalyRule> =
+            (0..6).map(|i| test_rule(&i.to_string(), "apm")).collect();
+        let mut other = test_rule("other", "apm");
+        other.tenant_id = "zeta".into();
+        rules.push(other);
+        let order = run_tenant_fair(
+            rules,
+            |rule| rule.tenant_id.clone(),
+            2,
+            2,
+            |rule| async move {
+                if rule.tenant_id == "acme" {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                rule.id
+            },
+        )
+        .await;
+        assert_eq!(order[0], "other", "{order:?}");
+        assert_eq!(order.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn unchanged_rules_skip_the_config_write_until_the_flush() {
+        // No handlers: any config read or write fails.
+        let config_mock = clickhouse::test::Mock::new();
+        let config_db = crate::clickhouse_config::session_tenant_regressions::config(&config_mock);
+        // Nothing listens here, so the rule has no data.
+        let ch = Client::default().with_url("http://127.0.0.1:9");
+        let mut rule = test_rule("r", "prometheus");
+        rule.state = "no_data".into();
+        let evaluate = |should_flush| {
+            let (config_db, ch, rule) = (&config_db, &ch, &rule);
+            async move {
+                let mut rows = Vec::new();
+                evaluate_rule(
+                    config_db,
+                    ch,
+                    &reqwest::Client::new(),
+                    &SmtpConfig {
+                        host: None,
+                        port: 25,
+                        user: None,
+                        pass: None,
+                        from: String::new(),
+                    },
+                    &None,
+                    rule,
+                    time::OffsetDateTime::now_utc(),
+                    "2026-01-01 00:00:00",
+                    should_flush,
+                    &mut rows,
+                )
+                .await
+            }
+        };
+        // Every evaluation used to do a SELECT FINAL and a full-row INSERT.
+        assert_eq!(evaluate(false).await.unwrap(), Some(false));
+        // The flush writes, and a failed write ends only this rule.
+        config_mock.add(clickhouse::test::handlers::failure(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+        assert!(evaluate(true).await.is_err());
     }
 
     #[tokio::test]
