@@ -864,8 +864,13 @@ mod tests {
         // No handlers: any config read or write fails.
         let config_mock = clickhouse::test::Mock::new();
         let config_db = crate::clickhouse_config::session_tenant_regressions::config(&config_mock);
-        // Nothing listens here, so the rule has no data.
-        let ch = Client::default().with_url("http://127.0.0.1:9");
+        // Empty metric reads, so the rule has no data. An unreachable
+        // ClickHouse is now a fetch error, not no data.
+        let data_mock = clickhouse::test::Mock::new();
+        for _ in 0..4 {
+            data_mock.add(clickhouse::test::handlers::record_ddl());
+        }
+        let ch = Client::default().with_url(data_mock.url());
         let mut rule = test_rule("r", "prometheus");
         rule.state = "no_data".into();
         let evaluate = |should_flush| {
