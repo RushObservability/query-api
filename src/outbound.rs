@@ -69,6 +69,19 @@ pub(crate) fn blocked_address(ip: IpAddr) -> bool {
     }
 }
 
+/// Link-local and cloud metadata endpoints. These stay refused even when
+/// private notification targets are allowed.
+fn metadata_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_link_local() || ip == Ipv4Addr::new(100, 100, 100, 200),
+        IpAddr::V6(ip) => {
+            embedded_ipv4(ip).is_some_and(|v4| metadata_address(IpAddr::V4(v4)))
+                || ip.is_unicast_link_local()
+                || ip == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+        }
+    }
+}
+
 /// IPv4 address that an IPv6 destination may be translated or tunnelled to:
 /// NAT64 well-known prefix, 6to4, and IPv4-mapped/compatible addresses.
 fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -159,6 +172,14 @@ async fn guarded_request(
         DNS_TIMEOUT,
     )
     .await?;
+    if addresses
+        .iter()
+        .any(|address| metadata_address(address.ip()))
+    {
+        return Err(
+            "notification URL must not resolve to link-local or metadata addresses".to_string(),
+        );
+    }
     if !allow_private
         && addresses
             .iter()
@@ -285,6 +306,28 @@ mod tests {
         );
         assert!(!proxy_seen.load(std::sync::atomic::Ordering::SeqCst));
         target.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_flag_still_refuses_cloud_metadata() {
+        for raw in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://169.254.170.2/v2/credentials",
+            "http://100.100.100.200/",
+        ] {
+            let error = super::guarded_request(reqwest::Method::GET, raw, true)
+                .await
+                .unwrap_err();
+            assert!(error.contains("metadata"), "{raw}: {error}");
+        }
+        for v6 in ["fd00:ec2::254", "::ffff:169.254.169.254", "fe80::1"] {
+            assert!(super::metadata_address(v6.parse().unwrap()), "{v6}");
+        }
+        assert!(
+            super::guarded_request(reqwest::Method::GET, "http://10.0.0.1/", true)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
