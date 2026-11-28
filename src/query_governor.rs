@@ -262,6 +262,10 @@ fn validate_budget(class: WorkloadClass, budget: &QueryBudget) -> Result<(), Str
 struct ClassAdmission {
     budget: QueryBudget,
     global: Arc<Semaphore>,
+    /// Global slots a tenant's second and later concurrent queries may use.
+    /// The rest are kept for tenants with nothing in flight, so a few busy
+    /// tenants cannot lock every other tenant out of the class.
+    burst: Arc<Semaphore>,
     tenants: Arc<DashMap<String, Arc<Semaphore>>>,
 }
 
@@ -280,6 +284,7 @@ impl AdmissionState {
                     class,
                     ClassAdmission {
                         global: Arc::new(Semaphore::new(budget.global_concurrency as usize)),
+                        burst: Arc::new(Semaphore::new(burst_slots(budget.global_concurrency))),
                         tenants: Arc::new(DashMap::new()),
                         budget,
                     },
@@ -427,7 +432,7 @@ impl QueryGovernor {
 
         // Acquire the tenant slot first: one noisy tenant cannot reserve every
         // global slot while waiting on its own smaller pool.
-        let tenant_permit = acquire(tenant, timeout).await.map_err(|_| {
+        let tenant_permit = acquire(tenant.clone(), timeout).await.map_err(|_| {
             self.metrics.inc_counter(
                 "rush_query_admission_total",
                 &[("workload", label), ("outcome", "tenant_rejected")],
@@ -437,8 +442,23 @@ impl QueryGovernor {
                 retry_after_secs: retry_after_secs(&admission.budget),
             }
         })?;
-        let global_permit = match acquire(admission.global.clone(), timeout).await {
-            Ok(permit) => permit,
+        // Our own permit is counted, so fewer than `per_tenant - 1` free means
+        // another query of this tenant is already running.
+        let bursting =
+            tenant.available_permits() + 1 < admission.budget.per_tenant_concurrency as usize;
+        let burst_permit = if bursting {
+            acquire(admission.burst.clone(), timeout).await.map(Some)
+        } else {
+            Ok(None)
+        };
+        let global_permit = match burst_permit {
+            Ok(burst) => acquire(admission.global.clone(), timeout)
+                .await
+                .map(|global| (burst, global)),
+            Err(()) => Err(()),
+        };
+        let (burst_permit, global_permit) = match global_permit {
+            Ok(permits) => permits,
             Err(()) => {
                 drop(tenant_permit);
                 self.metrics.inc_counter(
@@ -461,6 +481,7 @@ impl QueryGovernor {
             .add_gauge("rush_query_admission_inflight", &[("workload", label)], 1.0);
         Ok(QueryAdmissionGuard {
             _tenant: tenant_permit,
+            _burst: burst_permit,
             _global: global_permit,
             budget: admission.budget,
             metrics: self.metrics.clone(),
@@ -478,6 +499,13 @@ async fn acquire(semaphore: Arc<Semaphore>, timeout: Duration) -> Result<OwnedSe
             .map_err(|_| ())?
             .map_err(|_| ())
     }
+}
+
+/// Half of a class's global slots (rounded up) for burst queries: a tenant
+/// with nothing in flight is refused only once `global / 2` other tenants are
+/// running queries in that class.
+fn burst_slots(global_concurrency: u32) -> usize {
+    (global_concurrency - global_concurrency / 2) as usize
 }
 
 fn retry_after_secs(budget: &QueryBudget) -> u64 {
@@ -545,6 +573,7 @@ pub fn spawn_limits_reload(
 
 pub struct QueryAdmissionGuard {
     _tenant: OwnedSemaphorePermit,
+    _burst: Option<OwnedSemaphorePermit>,
     _global: OwnedSemaphorePermit,
     budget: QueryBudget,
     metrics: Arc<SelfMetrics>,
@@ -969,6 +998,50 @@ mod tests {
                 retry_after_secs: 1
             })
         );
+    }
+
+    #[tokio::test]
+    async fn busy_tenants_cannot_take_the_slots_an_idle_tenant_needs() {
+        let mut config = QueryGovernorConfig::default();
+        config.interactive.queue_timeout_ms = 0;
+        let governor = QueryGovernor::new(config, Arc::new(SelfMetrics::new())).unwrap();
+        // Four tenants each try to run their full per-tenant share (8), which
+        // with the old pool was all 32 global slots.
+        let mut held = Vec::new();
+        for tenant in ["heavy-a", "heavy-b", "heavy-c", "heavy-d"] {
+            for _ in 0..8 {
+                if let Ok(guard) = governor.admit(WorkloadClass::Interactive, tenant).await {
+                    held.push(guard);
+                }
+            }
+        }
+        assert!(
+            governor
+                .admit(WorkloadClass::Interactive, "idle")
+                .await
+                .is_ok()
+        );
+        // A tenant on its own still reaches its per-tenant limit.
+        drop(held);
+        let alone: Vec<_> = futures_util::future::join_all(
+            (0..8).map(|_| governor.admit(WorkloadClass::Interactive, "solo")),
+        )
+        .await;
+        assert!(alone.iter().all(Result::is_ok));
+        // Burst slots are bounded: half the pool stays for idle tenants.
+        let mut busy = Vec::new();
+        for tenant in 0..8 {
+            for _ in 0..8 {
+                if let Ok(guard) = governor
+                    .admit(WorkloadClass::Interactive, &format!("busy-{tenant}"))
+                    .await
+                {
+                    busy.push(guard);
+                }
+            }
+        }
+        // 8 solo + 8 busy tenants' first queries + 16 burst slots fill the pool.
+        assert_eq!(busy.len(), 8 + 16 - 7);
     }
 
     #[tokio::test]
