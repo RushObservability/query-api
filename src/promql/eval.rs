@@ -442,6 +442,12 @@ fn prom_lookback_secs() -> f64 {
     })
 }
 
+/// A failed read (including a read-limit overflow) must not look like "no data".
+fn metrics_query_error(error: clickhouse::error::Error) -> String {
+    tracing::error!(%error, "promql metrics query failed");
+    "metrics query failed; narrow the time range or add label matchers".to_string()
+}
+
 /// When `align` is true, step-align samples to step_timestamps (for instant vectors).
 /// When false, return all raw samples (for range vectors used by rate/increase/etc).
 async fn query_clickhouse(
@@ -585,14 +591,14 @@ async fn query_clickhouse(
             let rows = crate::tenant_query(ch, &make_sql("metrics_gauge"), tenant_id)
                 .fetch_all::<MetricSample>()
                 .await
-                .unwrap_or_default();
+                .map_err(metrics_query_error)?;
             (rows, Vec::new())
         }
         Some(MetricTable::Sum) => {
             let rows = crate::tenant_query(ch, &make_sql("metrics_sum"), tenant_id)
                 .fetch_all::<MetricSample>()
                 .await
-                .unwrap_or_default();
+                .map_err(metrics_query_error)?;
             (Vec::new(), rows)
         }
         _ => {
@@ -603,8 +609,8 @@ async fn query_clickhouse(
                 crate::tenant_query(ch, &make_sql("metrics_sum"), tenant_id)
                     .fetch_all::<MetricSample>(),
             );
-            let gauge_rows = gauge_res.unwrap_or_default();
-            let sum_rows = sum_res.unwrap_or_default();
+            let gauge_rows = gauge_res.map_err(metrics_query_error)?;
+            let sum_rows = sum_res.map_err(metrics_query_error)?;
 
             // Record which table(s) actually had data (only on a true miss, and only
             // when at least one table returned rows — an empty result tells us nothing).
@@ -975,6 +981,30 @@ fn collect_metrics(expr: &Expr, names: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clickhouse_failure_is_an_error_not_an_empty_result() {
+        use clickhouse::test::{Mock, handlers};
+        let mock = Mock::new();
+        let client = Client::default().with_url(mock.url());
+        METRIC_TABLE_CACHE.insert(
+            ("t".into(), "failing_total".into()),
+            (MetricTable::Gauge, Instant::now()),
+        );
+        mock.add(handlers::failure(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+        let result = evaluate_range_query(
+            &client,
+            "rate(failing_total[5m])",
+            1e9,
+            1e9 + 3600.0,
+            15.0,
+            "t",
+        )
+        .await;
+        assert!(result.is_err(), "got {result:?}");
+    }
 
     fn range_series(samples: &[(f64, f64)]) -> TimeSeries {
         TimeSeries {
