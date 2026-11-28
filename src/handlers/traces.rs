@@ -76,9 +76,7 @@ pub async fn get_trace(
         // would defeat (CH would read the whole bloom instead of pruning) — most
         // damaging on the MV-miss fallback where `time_bound` is empty.
         // `optimize_move_to_prewhere` still promotes tenant/time to prewhere.
-        let sql = format!(
-            "SELECT ?fields FROM spans WHERE tenant_id = '{escaped_tenant}' AND trace_id = ?{time_bound} ORDER BY timestamp ASC"
-        );
+        let sql = trace_spans_sql(&escaped_tenant, &time_bound);
         let q = crate::tenant_query(&state.ch, &sql, tenant_id).bind(&trace_id);
         async move { q.fetch_all::<WideEvent>().await }
     };
@@ -107,8 +105,31 @@ pub async fn get_trace(
         return Err((StatusCode::NOT_FOUND, "trace not found".to_string()));
     }
 
-    let trace = assemble_trace(&trace_id, rows);
+    let truncated = cap_trace_rows(&mut rows);
+    let mut trace = assemble_trace(&trace_id, rows);
+    trace.truncated = truncated;
     Ok(Json(trace))
+}
+
+/// Most spans one trace response carries. The earliest spans are kept and the response
+/// says `truncated`, so one huge trace can't build a response of hundreds of MB.
+pub(crate) const MAX_TRACE_SPANS: usize = 10_000;
+
+/// Spans of one trace, earliest first, one row past the cap so truncation is detectable.
+/// `escaped_tenant` must already be escaped; the trace id is bound as `?`.
+pub(crate) fn trace_spans_sql(escaped_tenant: &str, time_bound: &str) -> String {
+    format!(
+        "SELECT ?fields FROM spans WHERE tenant_id = '{escaped_tenant}' AND trace_id = ?{time_bound} \
+         ORDER BY timestamp ASC LIMIT {}",
+        MAX_TRACE_SPANS + 1
+    )
+}
+
+/// Drop rows past `MAX_TRACE_SPANS`; true when any were dropped.
+pub(crate) fn cap_trace_rows(rows: &mut Vec<WideEvent>) -> bool {
+    let truncated = rows.len() > MAX_TRACE_SPANS;
+    rows.truncate(MAX_TRACE_SPANS);
+    truncated
 }
 
 /// Deepest nesting level in the assembled tree; deeper spans are attached flat at this level.
@@ -256,6 +277,7 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
         span_count,
         duration_ns: total_duration,
         services,
+        truncated: false,
     }
 }
 
@@ -307,6 +329,24 @@ mod tests {
         assert_eq!(count, 100_000, "every span is kept");
         assert_eq!(max_depth, MAX_TREE_DEPTH);
         assert!(len > 0);
+    }
+
+    #[test]
+    fn trace_fetch_is_capped_and_reports_truncation() {
+        let sql = trace_spans_sql("t", "");
+        assert!(
+            sql.ends_with(&format!("LIMIT {}", MAX_TRACE_SPANS + 1)),
+            "{sql}"
+        );
+
+        let mut rows: Vec<WideEvent> = (0..MAX_TRACE_SPANS + 1).map(|i| span(i, None)).collect();
+        assert!(cap_trace_rows(&mut rows));
+        assert_eq!(rows.len(), MAX_TRACE_SPANS);
+        assert!(!cap_trace_rows(&mut rows));
+
+        let trace = assemble_trace("0af7651916cd43dd8448eb211c80319c", vec![span(0, None)]);
+        let json = serde_json::to_value(&trace).unwrap();
+        assert_eq!(json["truncated"], false);
     }
 
     #[test]
