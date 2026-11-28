@@ -136,6 +136,19 @@ fn normalize_provider_body(mut body: ProviderBody) -> Result<ProviderBody, (Stat
     Ok(body)
 }
 
+/// A stored key is only reused for the provider type and base URL it was entered for.
+fn require_key_for_new_destination(
+    current: &LlmProviderSecret,
+    body: &ProviderBody,
+) -> Result<(), (StatusCode, String)> {
+    if body.api_key.is_empty() && (body.kind != current.kind || body.base_url != current.base_url) {
+        return Err(invalid(
+            "re-enter the provider credential when changing the provider type or base_url",
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_model_body(mut body: ModelBody) -> Result<ModelBody, (StatusCode, String)> {
     validate_identifier(body.provider_id.trim(), "provider_id").map_err(invalid)?;
     body.provider_id = body.provider_id.trim().to_string();
@@ -231,6 +244,7 @@ pub async fn update_provider(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "LLM provider not found".into()))?;
     let body = normalize_provider_body(body)?;
+    require_key_for_new_destination(&current, &body)?;
     let key_updated = !body.api_key.is_empty();
     let api_key = if key_updated {
         body.api_key
@@ -694,6 +708,32 @@ mod tests {
             body.routing.provider_order,
             vec!["amazon-bedrock", "anthropic"]
         );
+    }
+
+    #[test]
+    fn changing_the_base_url_requires_the_credential_again() {
+        let current = LlmProviderSecret {
+            id: "p1".into(),
+            tenant_id: "default".into(),
+            name: "Primary router".into(),
+            kind: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "stored-secret".into(),
+            key_hint: String::new(),
+            routing: LlmProviderRouting::default(),
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let mut body = provider_body();
+        body.api_key = String::new();
+        body.base_url = current.base_url.clone();
+        assert!(require_key_for_new_destination(&current, &body).is_ok());
+        body.base_url = "https://other.example.test/v1".into();
+        let error = require_key_for_new_destination(&current, &body).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        body.api_key = "new-secret".into();
+        assert!(require_key_for_new_destination(&current, &body).is_ok());
     }
 
     #[test]
