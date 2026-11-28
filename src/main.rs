@@ -3627,7 +3627,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/services/errors", get(handlers::services::service_errors))
         // SRE-agent gateway: live runs and agent-owned templates are proxied,
         // while stored session history is served directly from query-api.
-        .route("/api/v1/investigate", post(handlers::sre_proxy::investigate))
+        .route(
+            "/api/v1/investigate",
+            post(handlers::sre_proxy::investigate).layer(DefaultBodyLimit::max(
+                handlers::sre_proxy::MAX_INVESTIGATE_BODY_BYTES,
+            )),
+        )
         .route("/api/v1/sessions", get(handlers::sre_sessions::list_sessions))
         .route("/api/v1/sessions/{id}/dashboard-draft", post(handlers::dashboard_drafts::create_draft))
         .route(
