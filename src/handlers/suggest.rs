@@ -59,10 +59,11 @@ fn log_suggest_sql(req: &LogSuggestRequest, tenant: &str) -> Result<String, (Sta
     let field = super::logs::resolve_log_field(&req.field);
     let prefix = crate::query_builder::escape_string_literal(&req.prefix);
     // Bound distinct-value work to recent matching rows. The inner predicate
-    // applies the same tenant, time range and saved-view filters as Explore.
+    // applies the same tenant, time range and saved-view filters as Explore;
+    // ordering by the key prefix lets the LIMIT stop the read early.
     Ok(format!(
         "SELECT DISTINCT val FROM (SELECT toString({field}) AS val FROM logs {} \
-         ORDER BY Timestamp DESC LIMIT 20000) \
+         ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT 20000) \
          WHERE val != '' AND length(val) <= 512 AND startsWith(lowerUTF8(val), lowerUTF8('{prefix}')) \
          ORDER BY val LIMIT 20",
         clauses.to_sql()
@@ -101,7 +102,9 @@ mod log_tests {
         assert!(sql.contains("= 'event_data'"));
         assert!(sql.contains("JSON_VALUE(Body, '$.airline')"));
         assert!(sql.contains("lowerUTF8('Ex''_%')"));
-        assert!(sql.contains("LIMIT 20000"));
+        assert!(sql.contains(
+            "ORDER BY TimestampDate DESC, TimestampTime DESC, Timestamp DESC LIMIT 20000"
+        ));
         assert!(sql.ends_with("LIMIT 20"));
         sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, &sql)
             .unwrap();
