@@ -9,6 +9,7 @@ use prost::Message;
 use crate::AppState;
 use crate::TenantContext;
 use crate::ch_writer::{SpoolBatch, WriteError};
+use crate::ingest_limits::{ProtoField, counted};
 use crate::models::ingest::GaugeRow;
 
 // ═══ Prometheus remote write protobuf types ═══
@@ -259,6 +260,13 @@ fn build_rows(
     Ok(rows)
 }
 
+/// Series, their labels and samples, and metadata records: the same total
+/// `validate_write_request` checks, counted before decoding.
+const WRITE_ENTITIES: &[ProtoField] = &[
+    counted(1, &[counted(1, &[]), counted(2, &[])]),
+    counted(3, &[]),
+];
+
 fn decode_write_request(
     limits: &crate::ingest_limits::IngestLimits,
     is_snappy: bool,
@@ -283,6 +291,12 @@ fn decode_write_request(
     };
     let len = decompressed.len();
     limits.check_decompressed("prometheus", len)?;
+    limits.check_proto_entities(
+        "prometheus",
+        "invalid Prometheus remote-write payload",
+        &decompressed,
+        WRITE_ENTITIES,
+    )?;
     WriteRequest::decode(decompressed.as_slice())
         .map(|request| (request, len))
         .map_err(|_| limits.malformed("prometheus", "invalid Prometheus remote-write payload"))
@@ -435,6 +449,23 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE
         );
         assert_eq!(build_rows(&limits, "t", &request("v")).unwrap().len(), 70);
+    }
+
+    #[test]
+    fn entity_limit_runs_before_the_protobuf_decode() {
+        let limits = limits();
+        let request = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: Vec::new(),
+                samples: vec![Sample::default(); 100],
+            }],
+            metadata: Vec::new(),
+        };
+        let body = snap::raw::Encoder::new()
+            .compress_vec(&request.encode_to_vec())
+            .unwrap();
+        let error = decode_write_request(&limits, true, &body).unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     proptest! {
