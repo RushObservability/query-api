@@ -421,6 +421,8 @@ fn build_v1_rows(
 
     for series in &payload.series {
         let (svc, attrs) = extract_tags(&series.tags);
+        limits.check_labels("datadog", &attrs)?;
+        limits.check_label("datadog", "service", &svc)?;
         // The tags are copied into every point's row.
         limits.check_fan_out(
             "datadog",
@@ -494,6 +496,8 @@ fn build_v2_rows(
 
     for series in &payload.series {
         let (svc, attrs) = extract_tags(&series.tags);
+        limits.check_labels("datadog", &attrs)?;
+        limits.check_label("datadog", "service", &svc)?;
         // The tags are copied into every point's row.
         limits.check_fan_out(
             "datadog",
@@ -581,10 +585,12 @@ fn build_check_rows(
 
     let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
 
-    let rows = checks
+    checks
         .iter()
         .map(|check| {
             let (svc, attrs) = extract_tags(&check.tags);
+            limits.check_labels("datadog", &attrs)?;
+            limits.check_label("datadog", "service", &svc)?;
             let ts = check.timestamp.unwrap_or(now_s) * 1_000_000_000;
             let mut row = build_template(
                 svc,
@@ -596,11 +602,9 @@ fn build_check_rows(
             );
             row.time_unix = ts;
             row.value = check.status as f64;
-            row
+            Ok(row)
         })
-        .collect();
-
-    Ok(rows)
+        .collect()
 }
 
 #[cfg(test)]
@@ -614,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_tags_copied_into_every_point_are_bounded() {
+    fn shared_tags_copied_into_every_point_and_label_limits_are_bounded() {
         let limits = limits();
         let tenant: std::sync::Arc<str> = "t".into();
         let body = |tag: &str| {
@@ -636,6 +640,31 @@ mod tests {
                 .0,
             StatusCode::PAYLOAD_TOO_LARGE
         );
+        // Label limits match remote write: 33-byte name, 65-byte value, 9 labels.
+        for tags in [
+            format!(r#"["{}:v"]"#, "n".repeat(33)),
+            format!(r#"["k:{}"]"#, "v".repeat(65)),
+            format!(r#"["service:{}"]"#, "v".repeat(65)),
+            serde_json::to_string(&(0..9).map(|i| format!("k{i}:v")).collect::<Vec<_>>()).unwrap(),
+        ] {
+            let series = format!(r#"{{"series":[{{"metric":"m","points":[],"tags":{tags}}}]}}"#);
+            assert_eq!(
+                build_v1_rows(&limits, &tenant, series.as_bytes())
+                    .unwrap_err()
+                    .0,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{tags}"
+            );
+            let check = format!(r#"[{{"check":"c","tags":{tags}}}]"#);
+            assert_eq!(
+                build_check_rows(&limits, &tenant, check.as_bytes())
+                    .unwrap_err()
+                    .0,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{tags}"
+            );
+        }
+
         let short = body("v");
         assert_eq!(
             build_v1_rows(&limits, &tenant, short.as_bytes())
