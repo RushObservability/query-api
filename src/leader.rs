@@ -200,10 +200,62 @@ tokio::task_local! {
     static CURRENT: Arc<EngineLease>;
 }
 
+/// How often a running cycle checks that its lease still holds.
+const FENCE_POLL: Duration = Duration::from_millis(250);
+
 /// Run one engine cycle with its lease in scope, so [`ensure_leader`] calls
 /// anywhere inside the cycle check that lease.
-pub async fn fenced<F: std::future::Future>(lease: Arc<EngineLease>, cycle: F) -> F::Output {
-    CURRENT.scope(lease, cycle).await
+///
+/// `ensure_leader` is only checked before a side effect starts, and a send can
+/// outlast the lease margin (DNS plus HTTP, or SMTP per recipient). So the
+/// cycle is also dropped, cancelling whatever it is waiting on, within
+/// [`FENCE_POLL`] of the lease lapsing, well before another replica can take
+/// it over. A cancelled cycle returns [`Fenceable::lost`].
+pub async fn fenced<F>(lease: Arc<EngineLease>, cycle: F) -> F::Output
+where
+    F: std::future::Future,
+    F::Output: Fenceable,
+{
+    let engine = lease.name;
+    let watch = lease.clone();
+    let lapsed = async move {
+        while watch.is_leader() {
+            tokio::time::sleep(FENCE_POLL).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        output = CURRENT.scope(lease, cycle) => output,
+        () = lapsed => {
+            tracing::warn!(engine, "leader lease lapsed mid-cycle; cycle cancelled");
+            F::Output::lost(NotLeader { engine })
+        }
+    }
+}
+
+/// What a [`fenced`] cycle returns when it was cancelled because the lease lapsed.
+pub trait Fenceable {
+    fn lost(error: NotLeader) -> Self;
+}
+
+impl<T> Fenceable for anyhow::Result<T> {
+    fn lost(error: NotLeader) -> Self {
+        Err(error.into())
+    }
+}
+
+/// `false`: the cycle did not complete.
+impl Fenceable for bool {
+    fn lost(_: NotLeader) -> Self {
+        false
+    }
+}
+
+/// Admitted, but the work itself was cancelled.
+impl<T: Fenceable> Fenceable for Result<T, crate::query_governor::AdmissionError> {
+    fn lost(error: NotLeader) -> Self {
+        Ok(T::lost(error))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,11 +730,47 @@ mod tests {
         let result = fenced(lease.clone(), async {
             let first = ensure_leader();
             held.step_down();
-            (first, ensure_leader())
+            anyhow::Ok((first, ensure_leader()))
         })
-        .await;
+        .await
+        .unwrap();
         assert_eq!(result.0, Ok(()));
         assert_eq!(result.1, Err(NotLeader { engine: DETECTIONS }));
         assert!(ensure_leader().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_send_in_flight_is_cancelled_when_the_lease_lapses() {
+        let lease = Arc::new(EngineLease::new(
+            MONITORS,
+            "pod-a/1".into(),
+            LeaseMode::Keeper,
+        ));
+        // Held for 600 ms, then not renewed (a Keeper partition).
+        lease.act_until_ms.store(
+            to_millis(Instant::now() + Duration::from_millis(600)),
+            Ordering::Release,
+        );
+        let started = Instant::now();
+        let sent = Arc::new(AtomicBool::new(false));
+        let flag = sent.clone();
+        let result = fenced(lease, async move {
+            // Passes the pre-send check, then the send takes longer than the
+            // lease has left (an SMTP or webhook timeout).
+            ensure_leader()?;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            flag.store(true, Ordering::Release);
+            anyhow::Ok(())
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<NotLeader>(),
+            Some(&NotLeader { engine: MONITORS })
+        );
+        assert!(!sent.load(Ordering::Acquire));
+        // Stopped within a poll of the lapse, inside the lease margin.
+        assert!(started.elapsed() < Duration::from_millis(600) + FENCE_POLL * 2);
+        assert!(!bool::lost(NotLeader { engine: MONITORS }));
     }
 }
