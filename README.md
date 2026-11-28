@@ -146,8 +146,8 @@ views. Send collector traffic to port `8080` to start ingesting data.
 | `RUSH_SSO_REPLAY_STORE` | `auto` | `auto`, `local`, or `keeper`; `auto` selects KeeperMap for multiple replicas and refuses an unsafe local override |
 | `RUSH_CONFIG_ENCRYPTION_KEY` | _(required when SSO or LLM provider secrets exist)_ | stable 32+ byte key for AES-256-GCM encryption of SSO and LLM provider secrets; rotating it requires re-encrypting stored values |
 | `RUSH_LOGIN_RATE_LIMIT_SECRET` | falls back to SSO/API-key secret | stable 32+ byte HMAC key for privacy-preserving distributed login-limit identifiers |
-| `RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE` | `10` | maximum login attempts against one normalized account per minute across replicas |
-| `RUSH_LOGIN_IP_LIMIT_PER_MINUTE` | `50` | maximum login attempts from one resolved client address per minute across replicas |
+| `RUSH_LOGIN_ACCOUNT_LIMIT_PER_MINUTE` | `10` | maximum failed logins against one normalized account per minute across replicas; once reached, further attempts get 429 until the minute ends, even with the right password |
+| `RUSH_LOGIN_IP_LIMIT_PER_MINUTE` | `50` | maximum login attempts from one resolved client address (an IPv6 client counts per /64) per minute across replicas |
 | `RUSH_SESSION_IDLE_TIMEOUT_SECS` | `7200` | initial inactivity window for browser sessions; Settings → Users → Idle logout overrides it; must be at least 60 seconds and no longer than the absolute lifetime |
 | `RUSH_SESSION_ABSOLUTE_TIMEOUT_SECS` | `86400` | hard browser-session lifetime; must be at least the idle timeout and no more than 31 days |
 | `RUSH_SESSION_RENEWAL_INTERVAL_SECS` | `300` | minimum activity interval before the HttpOnly bearer is rotated; must be 30 seconds or more and less than the idle timeout |

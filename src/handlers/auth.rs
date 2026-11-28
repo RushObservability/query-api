@@ -185,15 +185,25 @@ fn consume_local_login_limit(
     }
 }
 
-fn account_failure_limit_exceeded(
-    credentials_valid: bool,
-    local_allowed: bool,
-    distributed_allowed: bool,
-) -> bool {
-    // A valid password must never be rejected because an attacker previously
-    // targeted the username. Account limits classify failed credentials only;
-    // the IP limit still applies before password verification.
-    !credentials_valid && !(local_allowed && distributed_allowed)
+/// Gives back a slot taken by [`consume_local_login_limit`], used when a
+/// reserved login attempt turns out to have the right password.
+fn refund_local_login_limit(limiter: &dashmap::DashMap<String, (u32, Instant)>, key: &str) {
+    if let Some(mut entry) = limiter.get_mut(key) {
+        entry.0 = entry.0.saturating_sub(1);
+    }
+}
+
+/// The address used as the login IP budget key. A single IPv6 client usually
+/// holds a whole /64, so the /64 is one bucket; IPv4-mapped addresses count as
+/// their IPv4 address.
+fn login_rate_limit_bucket(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let prefix = std::net::Ipv6Addr::from_bits(v6.to_bits() & (u128::MAX << 64));
+            format!("{prefix}/64")
+        }
+    }
 }
 
 fn login_window_start() -> String {
@@ -251,7 +261,7 @@ async fn record_password_account_failure(
 fn password_limit_hashes(client_ip: IpAddr, username: &str) -> anyhow::Result<(String, String)> {
     let secret = login_rate_limit_secret().map_err(anyhow::Error::msg)?;
     Ok((
-        keyed_login_identifier(b"ip", &client_ip.to_string(), &secret),
+        keyed_login_identifier(b"ip", &login_rate_limit_bucket(client_ip), &secret),
         keyed_login_identifier(b"account", &username.trim().to_lowercase(), &secret),
     ))
 }
@@ -353,7 +363,7 @@ pub async fn login(
         )
     })?;
     let account = req.username.trim().to_lowercase();
-    let ip_hash = keyed_login_identifier(b"ip", &client_ip.to_string(), &secret);
+    let ip_hash = keyed_login_identifier(b"ip", &login_rate_limit_bucket(client_ip), &secret);
     let account_hash = keyed_login_identifier(b"account", &account, &secret);
     let since = login_window_start();
     let ip_allowed = match consume_password_ip_budget(&state, &ip_hash, &since).await {
@@ -404,6 +414,71 @@ pub async fn login(
         ));
     }
 
+    // The account budget is checked before the password is verified, so once
+    // an account has used its failures for the window no further guess is
+    // tried, right or wrong. The local slot is reserved atomically to stop a
+    // burst of parallel guesses from all passing the check; a correct password
+    // gives it back.
+    let account_key = format!("account:{account_hash}");
+    let account_reserved = consume_local_login_limit(
+        &state.login_limiter,
+        account_key.clone(),
+        state.login_account_limit_per_minute,
+        Instant::now(),
+    );
+    let account_failures = match state
+        .config_db
+        .login_account_failure_count(&account_hash, &since)
+        .await
+    {
+        Ok(failures) => failures,
+        Err(error) => {
+            refund_local_login_limit(&state.login_limiter, &account_key);
+            tracing::error!(%error, "failed to apply account login rate limit");
+            state
+                .audit
+                .log(
+                    crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
+                        .actor_name(req.username.clone())
+                        .outcome("failure")
+                        .changes(
+                            serde_json::json!({ "reason": "rate_limit_store_unavailable" })
+                                .to_string(),
+                        )
+                        .description("authentication unavailable")
+                        .context(login_audit_context(&headers, client_ip)),
+                )
+                .await;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable".to_string(),
+            ));
+        }
+    };
+    if !account_reserved || account_failures >= u64::from(state.login_account_limit_per_minute) {
+        state
+            .audit
+            .log(
+                crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
+                    .actor_name(req.username.clone())
+                    .outcome("failure")
+                    .changes(
+                        serde_json::json!({
+                            "ip_limit_exceeded": false,
+                            "account_limit_exceeded": true,
+                        })
+                        .to_string(),
+                    )
+                    .description("login rate limit exceeded")
+                    .context(login_audit_context(&headers, client_ip)),
+            )
+            .await;
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many login attempts, try again later".to_string(),
+        ));
+    }
+
     let mut authenticated = match state
         .config_db
         .authenticate(&req.username, &req.password)
@@ -411,6 +486,7 @@ pub async fn login(
     {
         Ok(authenticated) => authenticated,
         Err(error) => {
+            refund_local_login_limit(&state.login_limiter, &account_key);
             let reason = if error.is::<crate::clickhouse_config::PasswordWorkBusy>() {
                 "password_capacity_exhausted"
             } else {
@@ -442,6 +518,7 @@ pub async fn login(
         let sso_enabled = match state.config_db.is_sso_enabled().await {
             Ok(enabled) => enabled,
             Err(error) => {
+                refund_local_login_limit(&state.login_limiter, &account_key);
                 tracing::error!(operation = "sso_policy_lookup", %error, "authentication request failed");
                 state
                     .audit
@@ -472,61 +549,33 @@ pub async fn login(
     let (user_id, username, display_name, tenant_id, role, user_version) = match authenticated {
         Some(u) => u,
         None => {
-            // Only failed credentials consume the account budget. Checking
-            // this after password verification ensures targeted failures can
-            // never deny a legitimate login with the correct password.
-            let (local_account_allowed, distributed_account_allowed) =
-                match record_password_account_failure(&state, &account_hash, &since).await {
-                    Ok(allowed) => allowed,
-                    Err(error) => {
-                        tracing::error!(%error, "failed to record account login failure");
-                        state
-                            .audit
-                            .log(
-                                crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
-                                    .actor_name(req.username.clone())
-                                    .outcome("failure")
-                                    .changes(
-                                        serde_json::json!({
-                                            "reason": "rate_limit_store_unavailable"
-                                        })
-                                        .to_string(),
-                                    )
-                                    .description("authentication unavailable")
-                                    .context(login_audit_context(&headers, client_ip)),
-                            )
-                            .await;
-                        return Err((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "authentication temporarily unavailable".to_string(),
-                        ));
-                    }
-                };
-            if account_failure_limit_exceeded(
-                false,
-                local_account_allowed,
-                distributed_account_allowed,
-            ) {
+            // The failure keeps the local slot reserved above and is recorded
+            // for the other replicas.
+            if let Err(error) = state
+                .config_db
+                .record_login_account_failure(&account_hash)
+                .await
+            {
+                tracing::error!(%error, "failed to record account login failure");
                 state
                     .audit
                     .log(
-                        crate::audit::AuditEvent::new("auth.login.lockout", "anonymous")
+                        crate::audit::AuditEvent::new("auth.login.failure", "anonymous")
                             .actor_name(req.username.clone())
                             .outcome("failure")
                             .changes(
                                 serde_json::json!({
-                                    "ip_limit_exceeded": false,
-                                    "account_limit_exceeded": true,
+                                    "reason": "rate_limit_store_unavailable"
                                 })
                                 .to_string(),
                             )
-                            .description("login rate limit exceeded")
+                            .description("authentication unavailable")
                             .context(login_audit_context(&headers, client_ip)),
                     )
                     .await;
                 return Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "too many login attempts, try again later".to_string(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication temporarily unavailable".to_string(),
                 ));
             }
 
@@ -554,6 +603,8 @@ pub async fn login(
             ));
         }
     };
+    // A correct password does not count against the account's failure budget.
+    refund_local_login_limit(&state.login_limiter, &account_key);
 
     let issued = state
         .config_db
@@ -1072,7 +1123,8 @@ mod tests {
             .1;
         let login = &login[..login.find(".create_session_at_version(").expect("session")];
         assert!(login.contains("consume_password_ip_budget(&state"));
-        assert!(login.contains("record_password_account_failure(&state"));
+        assert!(login.contains("format!(\"account:{account_hash}\")"));
+        assert!(login.contains(".record_login_account_failure(&account_hash)"));
 
         let users = include_str!("users.rs");
         let change = users
@@ -1257,11 +1309,50 @@ mod tests {
     }
 
     #[test]
-    fn valid_credentials_are_not_rejected_by_account_failure_limit() {
-        assert!(!account_failure_limit_exceeded(true, false, false));
-        assert!(account_failure_limit_exceeded(false, false, true));
-        assert!(account_failure_limit_exceeded(false, true, false));
-        assert!(!account_failure_limit_exceeded(false, true, true));
+    fn ipv6_login_budget_is_shared_per_slash_64() {
+        let bucket = |ip: &str| login_rate_limit_bucket(ip.parse().unwrap());
+        assert_eq!(bucket("2001:db8:1:2::1"), bucket("2001:db8:1:2:ffff::ffff"));
+        assert_eq!(bucket("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_ne!(bucket("2001:db8:1:2::1"), bucket("2001:db8:1:3::1"));
+        // IPv4-mapped peers from a dual-stack socket keep per-address buckets.
+        assert_eq!(bucket("::ffff:203.0.113.9"), "203.0.113.9");
+        assert_ne!(bucket("::ffff:203.0.113.9"), bucket("::ffff:203.0.113.10"));
+    }
+
+    #[test]
+    fn account_budget_is_checked_before_the_password() {
+        let source = include_str!("auth.rs");
+        let login = source
+            .split_once("pub async fn login(")
+            .map(|(_, body)| body)
+            .expect("login handler must exist");
+        let check = login
+            .find(".login_account_failure_count(&account_hash, &since)")
+            .expect("login must read the account failure budget");
+        let verify = login
+            .find(".authenticate(&req.username, &req.password)")
+            .expect("login must verify the password");
+        assert!(check < verify, "account budget must gate verification");
+    }
+
+    #[test]
+    fn spent_account_budget_blocks_until_window_ends_and_success_refunds() {
+        let limiter = dashmap::DashMap::new();
+        let now = Instant::now();
+        let key = "account:a";
+        // Two failed guesses keep their slots; a correct one gives its slot back.
+        assert!(consume_local_login_limit(&limiter, key.into(), 2, now));
+        assert!(consume_local_login_limit(&limiter, key.into(), 2, now));
+        refund_local_login_limit(&limiter, key);
+        assert!(consume_local_login_limit(&limiter, key.into(), 2, now));
+        // The budget is spent: the next attempt is refused before verification.
+        assert!(!consume_local_login_limit(&limiter, key.into(), 2, now));
+        assert!(consume_local_login_limit(
+            &limiter,
+            key.into(),
+            2,
+            now + std::time::Duration::from_secs(60)
+        ));
     }
 
     #[test]
