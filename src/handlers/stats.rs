@@ -16,8 +16,11 @@ static OBJECT_STORE_ENABLED: OnceLock<bool> = OnceLock::new();
 /// Short-TTL response cache: stats are dashboard eye-candy, recomputing 12+
 /// aggregate scans per tenant per refresh is wasted I/O. Keyed by
 /// (tenant_id + requested range) so explicit time ranges never cross-contaminate.
-static STATS_CACHE: LazyLock<DashMap<String, (serde_json::Value, Instant)>> =
+static STATS_CACHE: LazyLock<DashMap<StatsCacheKey, (serde_json::Value, Instant)>> =
     LazyLock::new(DashMap::new);
+/// (tenant, bucketed (from, to) or None for the default window, is_admin). A tuple,
+/// not a joined string, so no tenant name or range text can collide with another key.
+type StatsCacheKey = (String, Option<(String, String)>, bool);
 const STATS_CACHE_TTL: Duration = Duration::from_secs(15);
 const STATS_CACHE_MAX: usize = 10_000;
 
@@ -215,15 +218,13 @@ fn stats_window(time_range: Option<&TimeRange>) -> (String, String) {
 
 /// Cache key for one stats response. Admins also get platform-wide storage, so
 /// their responses must never be served to other callers in the same tenant.
-fn stats_cache_key(tenant_id: &str, time_range: Option<&TimeRange>, is_admin: bool) -> String {
-    let range = match time_range {
-        Some(tr) => format!("{}|{}", bucket_ts_15s(&tr.from), bucket_ts_15s(&tr.to)),
-        None => "default".to_string(),
-    };
-    format!(
-        "{tenant_id}|{range}|{}",
-        if is_admin { "admin" } else { "member" }
-    )
+fn stats_cache_key(
+    tenant_id: &str,
+    time_range: Option<&TimeRange>,
+    is_admin: bool,
+) -> StatsCacheKey {
+    let range = time_range.map(|tr| (bucket_ts_15s(&tr.from), bucket_ts_15s(&tr.to)));
+    (tenant_id.to_string(), range, is_admin)
 }
 
 pub async fn get_stats(
@@ -831,6 +832,20 @@ mod tests {
         assert_ne!(
             stats_cache_key("acme", None, true),
             stats_cache_key("acme", None, false)
+        );
+    }
+
+    #[test]
+    fn stats_cache_key_does_not_collide_across_tenants() {
+        // Tenant "x" asking for from="y", to="default" must not share tenant
+        // "x|y"'s default-window entry.
+        let tr = TimeRange {
+            from: "y".to_string(),
+            to: "default".to_string(),
+        };
+        assert_ne!(
+            stats_cache_key("x", Some(&tr), false),
+            stats_cache_key("x|y", None, false)
         );
     }
 
