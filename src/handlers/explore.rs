@@ -798,8 +798,9 @@ fn build_log_plan(
     )?;
     let predicate = clauses.to_sql();
     let rows_sql = format!(
-        "SELECT {} FROM logs {predicate} ORDER BY Timestamp DESC, ServiceName DESC, TraceId DESC, SpanId DESC, hex(SHA256(Body)) DESC LIMIT {limit}",
-        super::logs::log_list_select(&req.display_fields)?
+        "SELECT {} FROM logs {predicate} ORDER BY {} LIMIT {limit}",
+        super::logs::log_list_select(&req.display_fields)?,
+        super::logs::LOG_ORDER,
     );
     let group_expr = req
         .group_by
@@ -1057,6 +1058,22 @@ mod tests {
             assert_clickhouse_sql_parses(&plan.rows_sql);
             assert_clickhouse_sql_parses(&plan.summary_sql);
         }
+    }
+
+    #[test]
+    fn log_rows_are_read_in_primary_key_order() {
+        let plan = build_plan(&request(ExploreSignal::Logs), "tenant-a").expect("log plan");
+        assert!(
+            plan.rows_sql
+                .contains(&format!("ORDER BY {}", super::super::logs::LOG_ORDER)),
+            "{}",
+            plan.rows_sql
+        );
+        assert!(
+            plan.rows_sql
+                .contains("ORDER BY TimestampDate DESC, TimestampTime DESC")
+        );
+        assert_clickhouse_sql_parses(&plan.rows_sql);
     }
 
     #[test]

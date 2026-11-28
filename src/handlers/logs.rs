@@ -362,7 +362,13 @@ impl LogQueryRows {
     }
 }
 
-const LOG_ORDER: &str =
+/// Row order for the logs table. The leading primary-key columns (functions of
+/// `Timestamp`, so the order is unchanged) let ClickHouse read in key order and
+/// stop after the LIMIT instead of reading and hashing every row in the window.
+pub(crate) const LOG_ORDER: &str = "TimestampDate DESC, TimestampTime DESC, Timestamp DESC, \
+    ServiceName DESC, TraceId DESC, SpanId DESC, hex(SHA256(Body)) DESC";
+/// The same order over selected rows, for queries over a subquery.
+const LOG_ROW_ORDER: &str =
     "Timestamp DESC, ServiceName DESC, TraceId DESC, SpanId DESC, hex(SHA256(Body)) DESC";
 
 fn invalid_cursor() -> (StatusCode, String) {
@@ -388,10 +394,17 @@ fn log_before_predicate(
     let service = crate::query_builder::escape_string_literal(service);
     let trace_id = crate::query_builder::escape_string_literal(trace_id);
     let span_id = crate::query_builder::escape_string_literal(span_id);
+    // The key-column bound skips the granules of earlier pages.
     Ok(format!(
-        "(Timestamp, ServiceName, TraceId, SpanId, hex(SHA256(Body))) < \
+        "TimestampTime <= toDateTime({}) AND \
+         (Timestamp, ServiceName, TraceId, SpanId, hex(SHA256(Body))) < \
          (fromUnixTimestamp64Nano({}), '{}', '{}', '{}', '{}')",
-        position.timestamp_ns, service, trace_id, span_id, body_hash,
+        position.timestamp_ns.div_euclid(1_000_000_000),
+        position.timestamp_ns,
+        service,
+        trace_id,
+        span_id,
+        body_hash,
     ))
 }
 
@@ -806,7 +819,8 @@ fn default_context_side() -> u64 {
     100
 }
 
-fn context_anchor_tuple(anchor: &LogContextAnchor) -> Result<String, (StatusCode, String)> {
+/// The anchor's ordering tuple and its whole second (for the key-column bound).
+fn context_anchor_tuple(anchor: &LogContextAnchor) -> Result<(String, i64), (StatusCode, String)> {
     let timestamp = anchor.timestamp_ns.parse::<i64>().map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -824,8 +838,11 @@ fn context_anchor_tuple(anchor: &LogContextAnchor) -> Result<String, (StatusCode
     let trace = crate::query_builder::escape_string_literal(&anchor.trace_id);
     let span = crate::query_builder::escape_string_literal(&anchor.span_id);
     let body = crate::query_builder::escape_string_literal(&anchor.body);
-    Ok(format!(
-        "(fromUnixTimestamp64Nano({timestamp}), '{service}', '{trace}', '{span}', hex(SHA256('{body}')))"
+    Ok((
+        format!(
+            "(fromUnixTimestamp64Nano({timestamp}), '{service}', '{trace}', '{span}', hex(SHA256('{body}')))"
+        ),
+        timestamp.div_euclid(1_000_000_000),
     ))
 }
 
@@ -846,7 +863,7 @@ pub async fn get_log_context(
     {
         return Err((StatusCode::BAD_REQUEST, "search query too long".into()));
     }
-    let anchor = context_anchor_tuple(&req.anchor)?;
+    let (anchor, anchor_secs) = context_anchor_tuple(&req.anchor)?;
     let before = req.before.clamp(1, 250);
     let after = req.after.clamp(1, 250);
     let clauses = build_log_where(
@@ -857,17 +874,21 @@ pub async fn get_log_context(
         &tenant.tenant_id,
     )?;
     let tuple = "(Timestamp, ServiceName, TraceId, SpanId, hex(SHA256(Body)))";
-    let newer = clauses.with_where_extra(&format!("{tuple} > {anchor}"));
-    let older = clauses.with_where_extra(&format!("{tuple} <= {anchor}"));
-    let ascending =
-        "Timestamp ASC, ServiceName ASC, TraceId ASC, SpanId ASC, hex(SHA256(Body)) ASC";
+    let newer = clauses.with_where_extra(&format!(
+        "TimestampTime >= toDateTime({anchor_secs}) AND {tuple} > {anchor}"
+    ));
+    let older = clauses.with_where_extra(&format!(
+        "TimestampTime <= toDateTime({anchor_secs}) AND {tuple} <= {anchor}"
+    ));
+    let ascending = "TimestampDate ASC, TimestampTime ASC, Timestamp ASC, ServiceName ASC, \
+        TraceId ASC, SpanId ASC, hex(SHA256(Body)) ASC";
     let select_cols = log_list_select(&[])?;
     let sql = format!(
         "SELECT * FROM (\
            (SELECT {select_cols} FROM logs {} ORDER BY {ascending} LIMIT {before}) \
            UNION ALL \
            (SELECT {select_cols} FROM logs {} ORDER BY {LOG_ORDER} LIMIT {after})\
-         ) ORDER BY {LOG_ORDER}",
+         ) ORDER BY {LOG_ROW_ORDER}",
         newer.to_sql(),
         older.to_sql(),
     );
@@ -1732,7 +1753,10 @@ mod tests {
             tie: vec!["gateway".into(), "abc".into(), "def".into(), "A".repeat(64)],
         })
         .unwrap();
-        assert!(LOG_ORDER.starts_with("Timestamp DESC, ServiceName DESC"));
+        // Key-prefix first so ClickHouse can read in order; same row order after it.
+        assert!(LOG_ORDER.starts_with("TimestampDate DESC, TimestampTime DESC, Timestamp DESC, "));
+        assert!(LOG_ORDER.ends_with(LOG_ROW_ORDER));
+        assert!(predicate.starts_with("TimestampTime <= toDateTime(1749600000) AND "));
         assert!(predicate.contains("fromUnixTimestamp64Nano(1749600000123456789)"));
         assert!(predicate.contains("'gateway', 'abc', 'def'"));
         assert!(predicate.contains("hex(SHA256(Body))"));
