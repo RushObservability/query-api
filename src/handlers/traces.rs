@@ -111,6 +111,9 @@ pub async fn get_trace(
     Ok(Json(trace))
 }
 
+/// Deepest nesting level in the assembled tree; deeper spans are attached flat at this level.
+const MAX_TREE_DEPTH: usize = 256;
+
 /// Build the span tree from a flat list of wide events.
 fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
     // Deduplicate by span_id, keeping the first occurrence
@@ -199,26 +202,52 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
         }
     }
 
-    // Take ownership via Option::take — no cloning
-    fn build_tree(
-        index: usize,
-        nodes: &mut Vec<Option<SpanNode>>,
-        children_map: &HashMap<String, Vec<usize>>,
-    ) -> SpanNode {
-        let mut node = nodes[index].take().expect("node already taken");
+    // Iterative build: recursion here (and in serde/Drop of the nested result) overflowed
+    // the worker stack on a deep parent chain. Breadth-first order gives each node its
+    // attach target; spans below MAX_TREE_DEPTH attach flat to their depth-cap ancestor,
+    // so the nested response stays shallow while every span is kept.
+    let mut order: Vec<usize> = Vec::with_capacity(span_count);
+    let mut attach_to: Vec<usize> = vec![usize::MAX; nodes.len()];
+    let mut depth: Vec<usize> = vec![0; nodes.len()];
+    let mut queue: std::collections::VecDeque<usize> = root_indices.iter().copied().collect();
+    while let Some(i) = queue.pop_front() {
+        order.push(i);
+        let Some(node) = nodes[i].as_ref() else {
+            continue;
+        };
         if let Some(child_indices) = children_map.get(&node.span_id) {
-            node.children = child_indices
-                .iter()
-                .map(|&ci| build_tree(ci, nodes, children_map))
-                .collect();
-            node.children.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            let (target, child_depth) = if depth[i] < MAX_TREE_DEPTH {
+                (i, depth[i] + 1)
+            } else {
+                (attach_to[i], depth[i])
+            };
+            for &ci in child_indices {
+                attach_to[ci] = target;
+                depth[ci] = child_depth;
+                queue.push_back(ci);
+            }
         }
-        node
+    }
+
+    // Reverse BFS order: a node's children are all attached before it moves to its parent.
+    for &i in order.iter().rev() {
+        if attach_to[i] == usize::MAX {
+            continue; // root
+        }
+        let mut node = nodes[i].take().expect("node already taken");
+        node.children.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        if let Some(parent) = nodes[attach_to[i]].as_mut() {
+            parent.children.push(node);
+        }
     }
 
     let spans: Vec<SpanNode> = root_indices
         .iter()
-        .map(|&ri| build_tree(ri, &mut nodes, &children_map))
+        .filter_map(|&ri| nodes[ri].take())
+        .map(|mut root| {
+            root.children.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            root
+        })
         .collect();
 
     TraceResponse {
@@ -227,5 +256,74 @@ fn assemble_trace(trace_id: &str, events: Vec<WideEvent>) -> TraceResponse {
         span_count,
         duration_ns: total_duration,
         services,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Ids start at 1: an all-zero parent id means "no parent".
+    fn span(i: usize, parent: Option<usize>) -> WideEvent {
+        serde_json::from_value(serde_json::json!({
+            "tenant_id": "t", "timestamp": 1_800_000_000_000_000_000i64 + i as i64 * 1000,
+            "trace_id": "0af7651916cd43dd8448eb211c80319c", "span_id": format!("{:016x}", i + 1),
+            "parent_span_id": parent.map(|p| format!("{:016x}", p + 1)).unwrap_or_default(),
+            "service_name": "svc", "span_name": "work", "kind": "INTERNAL", "status": "OK",
+            "duration_ns": 1, "http_method": "", "http_path": "", "http_status_code": 0,
+            "attributes": "{}", "event_names": [], "event_timestamps": [], "event_attributes": [],
+            "link_trace_ids": [], "link_span_ids": []
+        }))
+        .unwrap()
+    }
+
+    fn walk(nodes: &[SpanNode], depth: usize, max_depth: &mut usize, count: &mut usize) {
+        // Explicit stack so the check itself cannot overflow.
+        let mut stack: Vec<(&SpanNode, usize)> = nodes.iter().map(|n| (n, depth)).collect();
+        while let Some((n, d)) = stack.pop() {
+            *count += 1;
+            *max_depth = (*max_depth).max(d);
+            stack.extend(n.children.iter().map(|c| (c, d + 1)));
+        }
+    }
+
+    #[test]
+    fn deep_parent_chain_does_not_overflow_the_worker_stack() {
+        // 2 MiB = tokio worker default stack. Assemble, serialize and drop must all fit.
+        let handle = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let depth = 100_000;
+                let rows: Vec<WideEvent> = (0..depth).map(|i| span(i, i.checked_sub(1))).collect();
+                let trace = assemble_trace("0af7651916cd43dd8448eb211c80319c", rows);
+                let (mut max_depth, mut count) = (0, 0);
+                walk(&trace.spans, 0, &mut max_depth, &mut count);
+                let body = serde_json::to_vec(&trace).unwrap();
+                drop(trace);
+                (max_depth, count, body.len())
+            })
+            .unwrap();
+        let (max_depth, count, len) = handle.join().expect("assembling a deep trace crashed");
+        assert_eq!(count, 100_000, "every span is kept");
+        assert_eq!(max_depth, MAX_TREE_DEPTH);
+        assert!(len > 0);
+    }
+
+    #[test]
+    fn shallow_tree_keeps_nesting_and_child_order() {
+        // root 0 -> children 2, 1 (out of order) -> 3 under 1
+        let rows = vec![
+            span(3, Some(1)),
+            span(2, Some(0)),
+            span(0, None),
+            span(1, Some(0)),
+        ];
+        let trace = assemble_trace("0af7651916cd43dd8448eb211c80319c", rows);
+        assert_eq!(trace.spans.len(), 1);
+        let root = &trace.spans[0];
+        let ids: Vec<&str> = root.children.iter().map(|c| c.span_id.as_str()).collect();
+        assert_eq!(ids, ["0000000000000002", "0000000000000003"]);
+        assert_eq!(root.children[0].children[0].span_id, "0000000000000004");
+        assert_eq!(trace.span_count, 4);
     }
 }
