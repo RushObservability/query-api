@@ -108,37 +108,32 @@ pub async fn prom_remote_write(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("snappy"));
 
-    // Decompress snappy — Prometheus remote write always uses snappy framing.
-    // Decompression + protobuf decode are synchronous CPU work; run them on the
-    // blocking pool so large remote_write batches don't stall a tokio worker.
-    // If decompression fails and content-encoding isn't snappy, treat as raw
-    // protobuf (for flexibility with custom senders).
-    let decode_permit = state.ingest_limits.acquire_decode("prometheus").await?;
-    let limits = state.ingest_limits.clone();
-    let (write_req, decompressed_len) = tokio::task::spawn_blocking(move || {
-        let _decode_permit = decode_permit;
-        decode_write_request(&limits, is_snappy, &body)
-    })
-    .await
-    .map_err(|e| crate::api_error::internal_legacy("remote_write.decode_task", e))??;
-
-    validate_write_request(&state.ingest_limits, &write_req)?;
-
-    if write_req.timeseries.is_empty() {
+    // Decompression, protobuf decode, validation and row building are
+    // synchronous CPU work; run them on the blocking pool under a decode permit
+    // so large remote_write batches don't stall a tokio worker.
+    let tenant = tenant_id.clone();
+    let Some(decoded) = state
+        .ingest_limits
+        .spawn_decode("prometheus", move |limits| {
+            decode_rows(limits, &tenant, is_snappy, &body)
+        })
+        .await?
+    else {
         return Ok(StatusCode::NO_CONTENT);
-    }
-
-    // Count samples for logging
-    let sample_count: usize = write_req.timeseries.iter().map(|ts| ts.samples.len()).sum();
+    };
+    let DecodedRows {
+        rows,
+        series_count,
+        sample_count,
+        decompressed_len,
+    } = decoded;
     tracing::debug!(
         signal = "metrics",
         source = "prometheus",
-        timeseries = write_req.timeseries.len(),
+        timeseries = series_count,
         samples = sample_count,
         "remote write payload decoded"
     );
-
-    let rows = build_rows(&state.ingest_limits, tenant_id, &write_req)?;
 
     crate::handlers::ingest_gate::write_gated(&state, tenant_id, SpoolBatch::Gauge(rows))
         .await
@@ -161,13 +156,43 @@ pub async fn prom_remote_write(
     tracing::info!(
         signal = "metrics",
         tenant_id = %tenant_id,
-        series_count = write_req.timeseries.len(),
+        series_count = series_count,
         samples = sample_count,
         source = "prometheus",
         "ingested remote write"
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rows and counts from one remote-write body.
+struct DecodedRows {
+    rows: Vec<GaugeRow>,
+    series_count: usize,
+    sample_count: usize,
+    decompressed_len: usize,
+}
+
+/// Decompress, decode, validate and build rows. `None` for a request with no
+/// series. If decompression fails and content-encoding isn't snappy, the body
+/// is treated as raw protobuf (for flexibility with custom senders).
+fn decode_rows(
+    limits: &crate::ingest_limits::IngestLimits,
+    tenant_id: &str,
+    is_snappy: bool,
+    body: &[u8],
+) -> Result<Option<DecodedRows>, (StatusCode, String)> {
+    let (write_req, decompressed_len) = decode_write_request(limits, is_snappy, body)?;
+    validate_write_request(limits, &write_req)?;
+    if write_req.timeseries.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DecodedRows {
+        rows: build_rows(limits, tenant_id, &write_req)?,
+        series_count: write_req.timeseries.len(),
+        sample_count: write_req.timeseries.iter().map(|ts| ts.samples.len()).sum(),
+        decompressed_len,
+    }))
 }
 
 /// Build the `metrics_gauge` rows for a validated write request.
@@ -466,6 +491,43 @@ mod tests {
             .unwrap();
         let error = decode_write_request(&limits, true, &body).unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn body_is_decoded_into_rows_in_one_blocking_step() {
+        let limits = limits();
+        let label = |name: &str, value: &str| Label {
+            name: name.into(),
+            value: value.into(),
+        };
+        let request = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![
+                    label("__name__", "up"),
+                    label("job", "api"),
+                    label("a", "b"),
+                ],
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 1_764_000_000_000,
+                }],
+            }],
+            metadata: Vec::new(),
+        };
+        let raw = request.encode_to_vec();
+        let body = snap::raw::Encoder::new().compress_vec(&raw).unwrap();
+        let decoded = decode_rows(&limits, "t", true, &body).unwrap().unwrap();
+        assert_eq!((decoded.series_count, decoded.sample_count), (1, 1));
+        assert_eq!(decoded.decompressed_len, raw.len());
+        let row = &decoded.rows[0];
+        assert_eq!((&*row.metric_name, &*row.service_name), ("up", "api"));
+        assert_eq!(row.attributes, vec![("a".to_string(), "b".to_string())]);
+        assert_eq!(row.time_unix, 1_764_000_000_000_000_000);
+
+        let empty = snap::raw::Encoder::new()
+            .compress_vec(&WriteRequest::default().encode_to_vec())
+            .unwrap();
+        assert!(decode_rows(&limits, "t", true, &empty).unwrap().is_none());
     }
 
     proptest! {
