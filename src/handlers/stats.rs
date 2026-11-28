@@ -200,6 +200,19 @@ fn metric_count_source(
     )
 }
 
+/// Resolve the requested window (default: last hour). `from`/`to` are spliced
+/// into SQL literals below, so strip everything but datetime characters.
+fn stats_window(time_range: Option<&TimeRange>) -> (String, String) {
+    use crate::query_builder::sanitize_datetime;
+    if let Some(tr) = time_range {
+        (sanitize_datetime(&tr.from), sanitize_datetime(&tr.to))
+    } else {
+        let to = time::OffsetDateTime::now_utc();
+        let from = to - time::Duration::hours(1);
+        (from.to_rfc3339(), to.to_rfc3339())
+    }
+}
+
 pub async fn get_stats(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
@@ -227,13 +240,7 @@ pub async fn get_stats(
         }
     }
 
-    let (from, to) = if let Some(tr) = &req.time_range {
-        (tr.from.clone(), tr.to.clone())
-    } else {
-        let to = time::OffsetDateTime::now_utc();
-        let from = to - time::Duration::hours(1);
-        (from.to_rfc3339(), to.to_rfc3339())
-    };
+    let (from, to) = stats_window(req.time_range.as_ref());
 
     let today_start = time::OffsetDateTime::now_utc().date().to_string();
     let range_secs = format!(
@@ -792,6 +799,17 @@ mod tests {
         // 30s offset: not divisible by the 1h interval the coarse selector picks → raw.
         assert!(sql.contains("FROM metrics_sum "), "{sql}");
         assert!(!sql.contains("countMerge"), "{sql}");
+    }
+
+    #[test]
+    fn stats_window_strips_quotes_from_time_range() {
+        let tr = TimeRange {
+            from: "2026-01-01') OR ('1'='1".to_string(),
+            to: "2026-12-01T00:00:00Z".to_string(),
+        };
+        let (from, to) = stats_window(Some(&tr));
+        assert!(!from.contains('\'') && !from.contains(')'), "{from}");
+        assert_eq!(to, "2026-12-01T00:00:00Z");
     }
 
     #[test]
