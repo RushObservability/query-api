@@ -227,9 +227,9 @@ fn build_slack_payload(
     serde_json::json!({ "attachments": [attachment] })
 }
 
-mod delivery;
+pub(crate) mod delivery;
 #[cfg(test)]
-mod notification_tests;
+pub(crate) mod notification_tests;
 pub(crate) mod pagerduty;
 pub(crate) mod rootly;
 

@@ -595,21 +595,43 @@ pub async fn notify_channel(
             )
         })?;
 
-    crate::outbound::public_https_request(reqwest::Method::POST, url)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| {
-            crate::api_error::internal_legacy_with_status(
-                StatusCode::BAD_GATEWAY,
-                "alerts.notify_channel",
-                e,
-            )
-        })?;
-
+    let result = post_url_channel(url, &payload, &channel.channel_type).await;
+    state
+        .audit
+        .log(
+            crate::audit::AuditEvent::new("notification_channel.notify", "user")
+                .actor(caller.0, caller.1)
+                .tenant(tenant.tenant_id.clone())
+                .resource("notification_channel", &id)
+                .outcome(if result.is_ok() { "success" } else { "failure" })
+                .context(crate::audit::actor_context_from_headers(&headers)),
+        )
+        .await;
+    result.map_err(|(status, e)| {
+        if status == StatusCode::BAD_GATEWAY {
+            crate::api_error::internal_legacy_with_status(status, "alerts.notify_channel", e)
+        } else {
+            (status, e)
+        }
+    })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Send a manual notification to a URL-based channel. The error text is logged,
+/// so it must never contain the URL, which often carries the webhook token.
+async fn post_url_channel(
+    url: &str,
+    payload: &serde_json::Value,
+    channel_type: &str,
+) -> Result<(), (StatusCode, String)> {
+    use crate::alert_engine::delivery;
+    let request = delivery::request(reqwest::Method::POST, url, false)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    delivery::send_json(request, payload, channel_type)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    Ok(())
 }
 
 pub async fn list_notification_log(
@@ -920,5 +942,52 @@ mod channel_config_tests {
         );
         let rotated = merge_channel_config(saved, json!({"token": "rotated-secret"}));
         assert_eq!(rotated["token"], "rotated-secret");
+    }
+
+    async fn post_with_mock(destination: String) -> Result<(), (StatusCode, String)> {
+        let transport = crate::alert_engine::notification_tests::MockTransport {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            url: destination,
+            destinations: Default::default(),
+        };
+        crate::alert_engine::notification_tests::HTTP_MOCK
+            .scope(
+                transport,
+                post_url_channel(
+                    "https://hooks.example.test/services/T0001/B0001/SECRETWEBHOOKTOKEN",
+                    &json!({"text": "manual"}),
+                    "webhook",
+                ),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn manual_notify_errors_hide_the_url_and_report_rejections() {
+        // The mock sends to this closed port; reqwest's own error would print the path.
+        let error =
+            post_with_mock("http://127.0.0.1:9/services/T0001/B0001/SECRETWEBHOOKTOKEN".into())
+                .await
+                .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert!(!error.1.contains("SECRETWEBHOOKTOKEN"), "{}", error.1);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let error = post_with_mock(format!("http://{address}/"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        server.await.unwrap();
     }
 }
